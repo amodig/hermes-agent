@@ -161,3 +161,107 @@ def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
 # (landed via #28754 / #28781).  The original PR shipped a duplicate test
 # here; dropped during salvage to avoid two assertions of the same contract.
 # ---------------------------------------------------------------------------
+
+
+def test_initial_blocked_creation_is_sticky_across_dispatch_ticks(
+    kanban_home: Path, all_assignees_spawnable,
+) -> None:
+    """Initial human blocks cannot be promoted or dispatched implicitly."""
+    spawned: list[str] = []
+
+    def fake_spawn(task, *_args, **_kwargs):
+        spawned.append(task.id)
+        return 4242
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="wait for approval",
+            assignee="worker",
+            initial_status="blocked",
+        )
+        assert any(event.kind == "blocked" for event in kb.list_events(conn, tid))
+
+        for _ in range(3):
+            assert kb.recompute_ready(conn) == 0
+            result = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+            assert result.promoted == 0
+            assert not result.spawned
+            assert kb.get_task(conn, tid).status == "blocked"
+
+        assert not spawned
+        kinds = [event.kind for event in kb.list_events(conn, tid)]
+        assert "claimed" not in kinds
+        assert "spawned" not in kinds
+
+
+def test_initial_blocked_status_and_event_roll_back_together(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed blocked-event insert cannot leave a dispatchable card behind."""
+    original_append = kb._append_event
+
+    def fail_block_event(conn, task_id, kind, payload=None, **kwargs):
+        if kind == "blocked":
+            raise RuntimeError("blocked event failure")
+        return original_append(conn, task_id, kind, payload, **kwargs)
+
+    monkeypatch.setattr(kb, "_append_event", fail_block_event)
+    with kb.connect() as conn:
+        with pytest.raises(RuntimeError, match="blocked event failure"):
+            kb.create_task(conn, title="atomic blocked", initial_status="blocked")
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE title = 'atomic blocked'"
+        ).fetchone()[0] == 0
+
+
+def test_manual_promotion_rejects_initially_blocked_root(kanban_home: Path) -> None:
+    """The CLI/database promotion path requires an explicit unblock."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="blocked root",
+            assignee="worker",
+            initial_status="blocked",
+        )
+        ok, error = kb.promote_task(conn, tid, actor="operator", force=True)
+        assert not ok
+        assert error and "unblock" in error
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_blocking_running_task_closes_its_run(kanban_home: Path) -> None:
+    """A successful block is terminal for the active run attempt."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="active", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        run_id = kb.get_task(conn, tid).current_run_id
+        assert run_id is not None
+
+        assert kb.block_task(conn, tid, reason="needs operator", expected_run_id=run_id)
+        task = kb.get_task(conn, tid)
+        run = kb.get_run(conn, run_id)
+        assert task.status == "blocked"
+        assert task.current_run_id is None
+        assert run is not None
+        assert run.outcome == "blocked"
+        assert run.ended_at is not None
+
+
+def test_sticky_block_cannot_be_claimed_after_inconsistent_ready_flip(
+    kanban_home: Path, all_assignees_spawnable,
+) -> None:
+    """Eligibility remains blocked even if a stale writer flipped the column."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="blocked root",
+            assignee="worker",
+            initial_status="blocked",
+        )
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        conn.commit()
+
+        assert not kb.has_spawnable_ready(conn)
+        assert kb.claim_task(conn, tid) is None
+        assert kb.get_task(conn, tid).status == "ready"

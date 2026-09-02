@@ -3565,6 +3565,18 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if initial_status == "blocked":
+                    # Keep an initial human block sticky just like
+                    # kanban_block. This event is inside the create
+                    # transaction so a dispatcher cannot observe a blocked
+                    # task without its unblock guard.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {"source": "initial_status"},
+                    )
+
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
@@ -4451,35 +4463,8 @@ def _synthesize_ended_run(
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------
 
-def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return True when ``task_id`` is sticky-blocked by an explicit
-    worker/operator ``kanban_block`` call (#28712).
-
-    A ``blocked`` status can come from two very different sources:
-
-    * **Worker- or operator-initiated** — a worker called
-      ``kanban_block(reason="review-required: ...")`` (or somebody ran
-      ``hermes kanban block <id>``).  This is a deliberate handoff that
-      should stay blocked until an operator unblocks it.  The block tool
-      emits a ``"blocked"`` event row in ``task_events``.
-
-    * **Circuit-breaker** — ``_record_task_failure`` tripped after
-      repeated crashes / spawn failures / timeouts.  This emits
-      ``"gave_up"``, *not* ``"blocked"``, and is meant to recover
-      automatically once the underlying conditions change (e.g. parents
-      finish, transient infra error clears).
-
-    The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
-    no ``"unblocked"`` event has fired since), the task is sticky and
-    ``recompute_ready`` must *not* auto-promote it.
-
-    Returns ``False`` when there is no such event at all (e.g. the task
-    was set to ``status='blocked'`` by the circuit breaker or by direct
-    DB manipulation) — preserves the pre-#28712 auto-recover semantics
-    for that path.
-    """
+def _is_sticky_blocked(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when the latest block/unblock event leaves a task blocked."""
     row = conn.execute(
         "SELECT kind FROM task_events "
         "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
@@ -4487,6 +4472,11 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
         (task_id,),
     ).fetchone()
     return bool(row) and row["kind"] == "blocked"
+
+
+# Existing internal callers use this name; keep one implementation.
+_has_sticky_block = _is_sticky_blocked
+
 
 
 def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
@@ -4641,6 +4631,15 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if _is_sticky_blocked(conn, task_id):
+            _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {"reason": "sticky_blocked"},
+            )
+            return None
+
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -6811,6 +6810,11 @@ def promote_task(
             f"'todo' or 'blocked'"
         )
 
+    if cur_status == "blocked" and _is_sticky_blocked(conn, task_id):
+        return False, (
+            f"task {task_id} is intentionally blocked; "
+            "unblock it before promoting"
+        )
     if not force:
         parents = conn.execute(
             "SELECT t.id, t.status FROM tasks t "
@@ -9565,7 +9569,13 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL "
+        "    AND COALESCE(("
+        "      SELECT e.kind FROM task_events e "
+        "      WHERE e.task_id = tasks.id "
+        "        AND e.kind IN ('blocked', 'unblocked') "
+        "      ORDER BY e.id DESC LIMIT 1"
+        "    ), '') <> 'blocked'"
     ).fetchall()
     if not rows:
         return False
@@ -10047,6 +10057,11 @@ def _dispatch_once_locked(
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
+        "AND COALESCE(("
+        "  SELECT e.kind FROM task_events e "
+        "  WHERE e.task_id = tasks.id AND e.kind IN ('blocked', 'unblocked') "
+        "  ORDER BY e.id DESC LIMIT 1"
+        "), '') <> 'blocked' "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     # Review rows are enumerated up front (not after the ready loop) so the
