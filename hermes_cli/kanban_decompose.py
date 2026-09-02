@@ -114,6 +114,10 @@ Title: {title}
 Body:
 {body}
 
+Prior task purpose and graph/history (authoritative; do not recreate work
+already represented here):
+{context}
+
 Available profiles (assignees you may pick from):
 {roster}
 
@@ -283,11 +287,29 @@ def decompose_task(
     """
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
+        context = kb.task_decomposition_context(conn, task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, "unknown task id")
     if task.status != "triage":
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
+        )
+    if context.get("latest_block_kind") == "capability":
+        return DecomposeOutcome(
+            task_id, False,
+            "operational capability block is not a decomposition signal",
+        )
+    if context.get("nontrivial_graph"):
+        with kb.connect_closing() as conn:
+            kb.record_decompose_proposal(
+                conn,
+                task_id,
+                author=author,
+                reason="existing implementation/review/test graph",
+            )
+        return DecomposeOutcome(
+            task_id, False,
+            "existing task graph; proposal recorded without mutation",
         )
 
     cfg = _load_config()
@@ -307,6 +329,10 @@ def decompose_task(
         task_id=task.id,
         title=_truncate(task.title or "", 400),
         body=_truncate(task.body or "(no body)", 4000),
+        context=_truncate(
+            json.dumps(context, ensure_ascii=False, sort_keys=True),
+            12000,
+        ),
         roster=_format_roster(roster),
         default_assignee=default_assignee,
     )
