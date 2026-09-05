@@ -1,31 +1,13 @@
-"""Regression tests for #28712 — kanban dispatcher must not auto-promote
-worker-initiated ``kanban_block`` (sticky blocks), but must keep
-auto-recovering circuit-breaker blocks.
+"""Regression tests for issue #8 — exhausted kanban runs are final.
 
-The bug: when a worker called ``kanban_block(reason="review-required:
-...")`` to hand off to a human, the dispatcher's ``recompute_ready``
-would promote the task back to ``ready`` on the next tick.  The fresh
-worker found nothing to do (work already applied), exited cleanly, and
-got recorded as a ``protocol_violation`` → ``gave_up`` → promote → loop
-until manual intervention.
+Worker / operator blocks remain sticky, and a circuit-breaker ``gave_up`` event
+is now sticky as well.  The dispatcher must not promote an exhausted task or
+spawn another worker until an explicit operator retry/unblock transition.
 
-These tests pin down:
-
-* Worker / operator-initiated blocks are sticky and survive
-  ``recompute_ready``.
-* Circuit-breaker blocks (``gave_up`` event, status flipped via
-  ``_record_task_failure``) still auto-recover — the original intent
-  of #40c1decb3 is preserved.
-* An explicit ``kanban_unblock`` clears the sticky state.
-* The full block → promote → crash → ``gave_up`` loop is broken after
-  this fix: subsequent ticks leave the task blocked.
-
-The tangentially related schema-init ordering bug originally reported
-in #28712 (``init_db`` crashing on legacy DBs that pre-dated the
-``session_id`` migration) is covered separately by
-``test_kanban_db.py::test_connect_migrates_legacy_db_before_optional_column_indexes``,
-landed via #28754 / #28781 ahead of this fix.
+The worker-side stop guard and protocol accounting are covered in the focused
+agent/core tests; this module pins the dispatcher state-machine contract.
 """
+
 
 from __future__ import annotations
 
@@ -79,11 +61,57 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
 
 
 # ---------------------------------------------------------------------------
-# Circuit-breaker blocks still auto-recover (preserve #40c1decb3 intent)
+# Circuit-breaker exhaustion is final until an operator recovery transition
 # ---------------------------------------------------------------------------
 
 
+def test_gave_up_is_not_auto_promoted_until_unblocked(kanban_home: Path) -> None:
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="exhausted", max_retries=1)
+        assert kb.claim_task(conn, tid) is not None
+        assert kb._record_task_failure(
+            conn,
+            tid,
+            "worker crashed",
+            outcome="crashed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb._has_sticky_block(conn, tid)
 
+        # Exercise the event guard rather than only the legacy counter guard.
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures = 0 WHERE id = ?", (tid,),
+        )
+        conn.commit()
+        for _ in range(3):
+            assert kb.recompute_ready(conn) == 0
+            assert kb.get_task(conn, tid).status == "blocked"
+
+        assert not kb.promote_task(conn, tid, actor="operator")[0]
+        assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "ready"
+        assert not kb._has_sticky_block(conn, tid)
+
+
+def test_gave_up_notifications_are_deduplicated_per_incident(kanban_home: Path) -> None:
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="notify exhaustion")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(conn, tid, "gave_up", {"incident": "same"})
+        kb._append_event(conn, tid, "gave_up", {"incident": "same"})
+        conn.commit()
+
+        _, _, events = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            kinds=["gave_up"],
+        )
+        assert len(events) == 1
 
 # ---------------------------------------------------------------------------
 # unblock_task clears the sticky state
@@ -128,13 +156,9 @@ def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
         # First dispatcher tick — must NOT promote.
         assert kb.recompute_ready(conn) == 0
         assert kb.get_task(conn, tid).status == "blocked"
-
-        # Simulate the (hypothetical) protocol_violation + gave_up
-        # entries that the dispatcher would have written if the bug
-        # were still present.  Even with those event rows in place,
-        # the worker-initiated ``blocked`` event is the most recent
-        # of the ``{blocked, unblocked}`` pair, so the sticky guard
-        # still fires.
+        # Simulate the protocol_violation + gave_up entries that an exhausted
+        # clean-exit run produces. The latest ``gave_up`` recovery event is
+        # itself terminal, so the sticky guard must continue to fire.
         now = int(time.time())
         conn.execute(
             "INSERT INTO task_events (task_id, kind, payload, created_at) "
