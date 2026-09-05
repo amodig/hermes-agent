@@ -154,6 +154,7 @@ def specify_task(
     """
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
+        effective_goal = kb.get_effective_goal(conn, task_id)
     if task is None:
         return SpecifyOutcome(task_id, False, "unknown task id")
     if task.status != "triage":
@@ -167,11 +168,28 @@ def specify_task(
         logger.debug("specify: auxiliary client import failed: %s", exc)
         return SpecifyOutcome(task_id, False, "auxiliary client unavailable")
 
+    goal_title = (
+        effective_goal.get("title")
+        if isinstance(effective_goal, dict)
+        and isinstance(effective_goal.get("title"), str)
+        else task.title
+    )
+    goal_body = (
+        effective_goal.get("body")
+        if isinstance(effective_goal, dict)
+        else task.body
+    )
     user_msg = _USER_TEMPLATE.format(
         task_id=task.id,
-        title=_truncate(task.title or "", 400),
-        body=_truncate(task.body or "(no body)", 4000),
+        title=_truncate(goal_title or "", 400),
+        body=_truncate(goal_body or "(no body)", 4000),
     )
+    if isinstance(effective_goal, dict):
+        user_msg += (
+            "\n\nAuthoritative goal revision: "
+            f"v{effective_goal.get('version', effective_goal.get('goal_version'))}; "
+            f"reason: {effective_goal.get('reason') or 'unspecified'}"
+        )
 
     try:
         # Route through call_llm so auxiliary.triage_specifier.* config
@@ -232,14 +250,17 @@ def specify_task(
                 task_id, False, "LLM response missing title and body"
             )
 
-    with kb.connect_closing() as conn:
-        ok = kb.specify_triage_task(
-            conn,
-            task_id,
-            title=new_title,
-            body=new_body,
-            author=author or _profile_author(),
-        )
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.specify_triage_task(
+                conn,
+                task_id,
+                title=new_title,
+                body=new_body,
+                author=author or _profile_author(),
+            )
+    except kb.GoalRevisionConflict as exc:
+        return SpecifyOutcome(task_id, False, str(exc))
     if not ok:
         # Race: someone else promoted / archived the task between our
         # read above and the write. Report, don't crash.

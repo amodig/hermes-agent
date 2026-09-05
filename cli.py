@@ -21543,13 +21543,19 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             logger.warning("invalid HERMES_KANBAN_RUN_ID=%r", raw_run_id)
 
     from hermes_cli import kanban_db as _kb
-    from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
+    from hermes_cli.goals import (
+        run_kanban_goal_loop as _run_loop,
+        render_effective_goal as _render_goal,
+        DEFAULT_MAX_TURNS as _DEF_TURNS,
+    )
 
-    # Resolve goal text from the card (title + body = the acceptance
-    # criteria the judge evaluates against).
+    # Resolve the current effective revision from the card. Goal revisions
+    # are the authoritative contract; raw task fields can be stale after a
+    # triage/specifier race.
     conn = _kb.connect()
     try:
         task = _kb.get_task(conn, task_id)
+        effective_goal = _kb.get_effective_goal(conn, task_id)
     finally:
         try:
             conn.close()
@@ -21558,14 +21564,32 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     if task is None:
         return
 
-    goal_parts = [task.title or ""]
-    if task.body:
-        goal_parts.append(task.body)
-    goal_text = "\n\n".join(p for p in goal_parts if p).strip()
+    goal_text = _render_goal(
+        effective_goal,
+        fallback_title=task.title,
+        fallback_body=task.body,
+    )
     if not goal_text:
         return
 
     max_turns = task.goal_max_turns or _DEF_TURNS
+
+    def _goal_text() -> str:
+        c = _kb.connect()
+        try:
+            current = _kb.get_task(c, task_id)
+            if current is None:
+                return ""
+            return _render_goal(
+                _kb.get_effective_goal(c, task_id),
+                fallback_title=current.title,
+                fallback_body=current.body,
+            )
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
 
     def _run_turn(prompt: str) -> str:
         result = cli.agent.run_conversation(
@@ -21611,6 +21635,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     _run_loop(
         task_id=task_id,
         goal_text=goal_text,
+        goal_text_fn=_goal_text,
         run_turn=_run_turn,
         task_status_fn=_task_status,
         block_fn=_block,

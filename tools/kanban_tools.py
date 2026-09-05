@@ -34,7 +34,7 @@ import os
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
-from hermes_cli.goals import judge_goal
+from hermes_cli.goals import judge_goal, render_effective_goal
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
@@ -252,7 +252,11 @@ def _goal_judge_available() -> bool:
 
 
 def _goal_mode_handoff_rejection(
-    task, evidence: str, metadata: Optional[dict] = None
+    task,
+    evidence: str,
+    metadata: Optional[dict] = None,
+    *,
+    effective_goal: Optional[dict] = None,
 ) -> Optional[str]:
     """Return a rejection reason when a goal-mode terminal handoff is premature."""
     if not task or not task.goal_mode or not _goal_judge_available():
@@ -279,7 +283,11 @@ def _goal_mode_handoff_rejection(
     reason = ""
     try:
         verdict, reason, _, _, _ = judge_goal(
-            goal=f"{task.title}\n\n{task.body or ''}".strip(),
+            goal=render_effective_goal(
+                effective_goal,
+                fallback_title=task.title,
+                fallback_body=task.body,
+            ),
             last_response=evidence.strip(),
         )
     except Exception as judge_exc:
@@ -772,16 +780,15 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            # Goal-mode pre-completion judge gate (Issue #38367).
-            # Prevent workers from bypassing the auxiliary judge by
-            # calling kanban_complete before acceptance criteria are met.
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
+            effective_goal = kb.get_effective_goal(conn, tid)
             rejection = _goal_mode_handoff_rejection(
                 task,
                 (summary or result or "").strip(),
                 metadata=metadata,
+                effective_goal=effective_goal,
             )
             if rejection is not None:
                 return tool_error(
@@ -798,6 +805,12 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                )
+            except kb.CompletionContractError as contract_err:
+                return tool_error(
+                    f"kanban_complete blocked: {contract_err}. "
+                    "No task state changed; use kanban_update to revise the "
+                    "goal or remove the implementation patch before retrying."
                 )
             except kb.HandoffValidationError as handoff_err:
                 return tool_error(
@@ -970,7 +983,13 @@ def _handle_request_review(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(task, summary, metadata=metadata)
+            effective_goal = kb.get_effective_goal(conn, tid)
+            rejection = _goal_mode_handoff_rejection(
+                task,
+                summary,
+                metadata=metadata,
+                effective_goal=effective_goal,
+            )
             if rejection is not None:
                 return tool_error(
                     f"Goal review handoff rejected by judge: {rejection}. "
