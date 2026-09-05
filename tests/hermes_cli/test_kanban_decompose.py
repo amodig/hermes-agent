@@ -78,7 +78,9 @@ def _patch_list_profiles(names: list[str]):
 def test_decompose_with_fanout_creates_children(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="ship a feature", triage=True)
-
+        correction_id = kb.add_comment(
+            conn, tid, "cto", "Use the supported hermes-github command."
+        )
     llm_payload = jsonlib.dumps({
         "fanout": True,
         "rationale": "test split",
@@ -92,7 +94,7 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     for p in patches:
         p.start()
     try:
-        with _patch_aux_client(llm_payload), _patch_extra_body():
+        with _patch_aux_client(llm_payload) as aux, _patch_extra_body():
             outcome = decomp.decompose_task(tid, author="me")
     finally:
         for p in patches:
@@ -111,6 +113,17 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     assert c1.status == "todo"
     assert c0.assignee == "researcher"
     assert c1.assignee == "engineer"
+    prompt = aux.call_args.kwargs["messages"][1]["content"]
+    assert "supported hermes-github command" in prompt
+    with kb.connect() as conn:
+        events = kb.list_events(conn, tid)
+    decomposed = [event for event in events if event.kind == "decomposed"]
+    assert decomposed[-1].payload["comment_ids_seen"] == [correction_id]
+
+    outcome_again = decomp.decompose_task(tid, author="me")
+    assert outcome_again.ok is False
+    with kb.connect() as conn:
+        assert len(kb.list_tasks(conn, include_archived=True)) == 3
 
 
 def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
@@ -159,5 +172,31 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
             p.stop()
     assert outcome.ok is False
     assert "not in triage" in outcome.reason
+
+
+def test_decompose_skips_capability_block_with_existing_review_graph(kanban_home):
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="implement the change", assignee="worker")
+        reviewer = kb.create_task(conn, title="review implementation", assignee="reviewer")
+        tester = kb.create_task(conn, title="test implementation", assignee="tester")
+        kb.link_tasks(conn, root, reviewer)
+        kb.link_tasks(conn, reviewer, tester)
+        kb.block_task(conn, root, reason="old authorization gate", kind="needs_input")
+        kb.unblock_task(conn, root)
+        kb.block_task(
+            conn,
+            root,
+            reason="GitHub access is unavailable",
+            kind="external-blocker",
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (root,))
+
+    outcome = decomp.decompose_task(root, author="auto-decomposer")
+    assert outcome.ok is False
+    assert "not a decomposition signal" in outcome.reason
+    with kb.connect() as conn:
+        assert kb.child_ids(conn, root) == [reviewer]
+        assert kb.child_ids(conn, reviewer) == [tester]
 
 

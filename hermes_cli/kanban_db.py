@@ -132,6 +132,72 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # spirit (default 2) but counts a different signal: manual unblock recurrences,
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
+# Normalize the small set of names used by older workers and orchestration
+# prompts into the persisted block taxonomy. Keeping the recurrence key on
+# this canonical value prevents aliases (or an omitted ``kind`` with a typed
+# reason) from accidentally sharing or splitting a loop.
+_BLOCK_KIND_ALIASES = {
+    "parent-gating": "dependency",
+    "parent_gating": "dependency",
+    "external-blocker": "capability",
+    "external_blocker": "capability",
+    "external": "capability",
+    "access": "capability",
+    "auth": "capability",
+    "authorization": "capability",
+    "needs-input": "needs_input",
+}
+
+
+def normalize_block_kind(
+    kind: Optional[str],
+    reason: Optional[str] = None,
+) -> Optional[str]:
+    """Return the canonical block kind, inferring it from a typed reason.
+
+    ``None`` remains the legacy/untyped kind unless the reason carries one of
+    the established prefixes or clearly describes an access wall. Explicit
+    unknown kinds return ``None`` so callers can preserve their validation
+    error rather than silently changing the caller's intent.
+    """
+    raw = str(kind or "").strip().lower().replace(" ", "_")
+    if raw:
+        canonical = _BLOCK_KIND_ALIASES.get(raw, raw)
+        return canonical if canonical in VALID_BLOCK_KINDS else None
+
+    text = str(reason or "").strip().lower()
+    prefix = re.match(r"^([a-z][a-z0-9_-]*)\s*:", text)
+    if prefix:
+        canonical = _BLOCK_KIND_ALIASES.get(prefix.group(1), prefix.group(1))
+        if canonical in VALID_BLOCK_KINDS:
+            return canonical
+    # A plain authorization gate is a human decision; an authentication or
+    # access failure is an operational capability wall.
+    if (
+        re.search(r"\bauthori[sz]ation\b", text)
+        and not re.search(
+            r"\b(?:access|auth(?:entication)?|credential|"
+            r"unauthenticated|permission|forbidden)\b",
+            text,
+        )
+    ):
+        return "needs_input"
+    if re.search(
+        r"\b(?:access|auth(?:entication|orization)?|credential|"
+        r"unauthenticated|permission|forbidden)\b",
+        text,
+    ):
+        return "capability"
+    return None
+
+
+def normalized_block_cause(
+    kind: Optional[str],
+    reason: Optional[str] = None,
+) -> str:
+    """Return the stable taxonomy value used by the unblock-loop breaker."""
+    return normalize_block_kind(kind, reason) or "untyped"
+
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
@@ -3983,6 +4049,95 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
     return task_graph_contexts(conn, [task_id])[task_id]
 
 
+def task_decomposition_context(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    max_comments: int = 20,
+    max_events: int = 20,
+    max_descendants: int = 100,
+) -> dict:
+    """Load the bounded graph and history used by the decomposer.
+
+    This is deliberately read-only so callers can use it both before the LLM
+    request and again after acquiring the decomposition write lock.
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return {}
+
+    graph = task_graph_context(conn, task_id)
+    descendants = conn.execute(
+        """
+        WITH RECURSIVE descendants(id) AS (
+            SELECT child_id FROM task_links WHERE parent_id = ?
+            UNION
+            SELECT l.child_id
+              FROM task_links l
+              JOIN descendants d ON d.id = l.parent_id
+        )
+        SELECT t.id, t.title, t.status, t.assignee
+          FROM descendants d
+          JOIN tasks t ON t.id = d.id
+         ORDER BY t.id
+         LIMIT ?
+        """,
+        (task_id, max(1, int(max_descendants))),
+    ).fetchall()
+    comments = list_comments(conn, task_id)[-max(1, int(max_comments)) :]
+    events = list_events(conn, task_id)[-max(1, int(max_events)) :]
+
+    latest_block_kind = normalize_block_kind(task.block_kind)
+    for event in reversed(events):
+        if event.kind not in {"blocked", "block_loop_detected", "dependency_wait"}:
+            continue
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        latest_block_kind = normalize_block_kind(
+            payload.get("kind") or payload.get("block_kind"),
+            payload.get("reason"),
+        ) or latest_block_kind
+        if latest_block_kind is not None:
+            break
+
+    return {
+        "parents": graph["parents"],
+        "children": graph["children"],
+        "descendants": [
+            {
+                "id": row["id"],
+                "title": row["title"],
+                "status": row["status"],
+                "assignee": row["assignee"],
+            }
+            for row in descendants
+        ],
+        "nontrivial_graph": bool(
+            graph["parents"] or graph["children"] or descendants
+        ),
+        "comments": [
+            {
+                "id": comment.id,
+                "author": comment.author,
+                "body": comment.body,
+                "created_at": comment.created_at,
+            }
+            for comment in comments
+        ],
+        "events": [
+            {"kind": event.kind, "payload": event.payload}
+            for event in events
+        ],
+        "latest_block_kind": latest_block_kind,
+        "prior_purpose": {
+            "title": task.title,
+            "body": task.body,
+            "result": task.result,
+            "created_by": task.created_by,
+            "idempotency_key": task.idempotency_key,
+        },
+    }
+
+
 def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Optional[str]]]:
     """Return ``(parent_id, result)`` for every done parent of ``task_id``."""
     rows = conn.execute(
@@ -6288,7 +6443,8 @@ def block_task(
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
-    if kind is not None and kind not in VALID_BLOCK_KINDS:
+    normalized_kind = normalize_block_kind(kind, reason)
+    if kind is not None and str(kind).strip() and normalized_kind is None:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
@@ -6305,7 +6461,9 @@ def block_task(
             if cur_row["status"] == "running"
             else "ready"
         )
-        prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
+        prev_kind = normalize_block_kind(
+            cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
+        )
         prev_recurrences = (
             int(cur_row["block_recurrences"])
             if "block_recurrences" in cur_row.keys()
@@ -6317,7 +6475,7 @@ def block_task(
         # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
-        if kind == "dependency":
+        if normalized_kind == "dependency":
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -6347,7 +6505,8 @@ def block_task(
                 conn, task_id, "dependency_wait",
                 {
                     "reason": reason,
-                    "kind": kind,
+                    "kind": normalized_kind,
+                    "cause": normalized_block_cause(normalized_kind, reason),
                     "source_status": source_status,
                 },
                 run_id=run_id,
@@ -6364,12 +6523,10 @@ def block_task(
             return True
 
         # Truly-blocked kinds. Increment the unblock-loop counter when this is a
-        # re-block for the SAME reason after a prior unblock. block_task only
-        # fires from running/ready (i.e. AFTER an unblock returned the task to
-        # the work pool), so a stored block_kind that matches the incoming kind
-        # means: blocked → unblocked → about-to-re-block for the same cause.
-        # An un-typed (None) block compares as "same" to a prior un-typed block.
-        same_cause = prev_kind == kind
+        # re-block for the SAME normalized cause after a prior unblock. The
+        # persisted block kind is the recurrence key, so aliases and typed
+        # reason prefixes cannot make semantically identical blocks diverge.
+        same_cause = prev_kind == normalized_kind
         recurrences = prev_recurrences + 1 if same_cause else 1
 
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
@@ -6387,8 +6544,8 @@ def block_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
+                (normalized_kind, recurrences, task_id) if expected_run_id is None
+                else (normalized_kind, recurrences, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -6405,7 +6562,8 @@ def block_task(
                 conn, task_id, "block_loop_detected",
                 {
                     "reason": reason,
-                    "kind": kind,
+                    "kind": normalized_kind,
+                    "cause": normalized_block_cause(normalized_kind, reason),
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
                     "source_status": source_status,
@@ -6426,7 +6584,7 @@ def block_task(
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                     """,
-                    (kind, recurrences, task_id),
+                    (normalized_kind, recurrences, task_id),
                 )
             else:
                 cur = conn.execute(
@@ -6442,7 +6600,7 @@ def block_task(
                        AND status IN ('running', 'ready')
                        AND current_run_id = ?
                     """,
-                    (kind, recurrences, task_id, int(expected_run_id)),
+                    (normalized_kind, recurrences, task_id, int(expected_run_id)),
                 )
             if cur.rowcount != 1:
                 return False
@@ -6463,7 +6621,8 @@ def block_task(
                 conn, task_id, "blocked",
                 {
                     "reason": reason,
-                    "kind": kind,
+                    "kind": normalized_kind,
+                    "cause": normalized_block_cause(normalized_kind, reason),
                     "recurrences": recurrences,
                     "source_status": source_status,
                 },
@@ -7292,6 +7451,42 @@ def specify_triage_task(
     return True
 
 
+def record_decompose_proposal(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    author: Optional[str] = None,
+    reason: str = "existing task graph",
+) -> bool:
+    """Record a no-mutation decomposition proposal for a nontrivial graph."""
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None or row["status"] != "triage":
+            return False
+        context = task_decomposition_context(conn, task_id)
+        if not context.get("nontrivial_graph"):
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "decompose_proposed",
+            {
+                "dry_run": True,
+                "mutation": False,
+                "reason": reason,
+                "parents": context["parents"],
+                "children": context["children"],
+                "descendants": context["descendants"],
+                "comment_ids": [c["id"] for c in context["comments"]],
+                "prior_purpose": context["prior_purpose"],
+                "author": author or "decomposer",
+            },
+        )
+    return True
+
+
 def decompose_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7392,6 +7587,29 @@ def decompose_triage_task(
         if root_row is None:
             return None
         if root_row["status"] != "triage":
+            return None
+        # Re-read the graph and comments only after BEGIN IMMEDIATE. This is
+        # the last race barrier before any child can be inserted.
+        current_context = task_decomposition_context(conn, task_id)
+        if current_context.get("nontrivial_graph"):
+            _append_event(
+                conn,
+                task_id,
+                "decompose_proposed",
+                {
+                    "dry_run": True,
+                    "mutation": False,
+                    "reason": "existing task graph",
+                    "parents": current_context["parents"],
+                    "children": current_context["children"],
+                    "descendants": current_context["descendants"],
+                    "comment_ids": [
+                        c["id"] for c in current_context["comments"]
+                    ],
+                    "prior_purpose": current_context["prior_purpose"],
+                    "author": author or "decomposer",
+                },
+            )
             return None
         tenant = root_row["tenant"]
         # Children inherit the root's workspace by default so a fan-out
@@ -7512,6 +7730,9 @@ def decompose_triage_task(
             {
                 "child_ids": child_ids,
                 "root_assignee": root_assignee,
+                "comment_ids_seen": [
+                    c["id"] for c in current_context["comments"]
+                ],
             },
         )
 
