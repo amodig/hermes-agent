@@ -4054,16 +4054,35 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     from hermes_cli import kanban_db as _kb
     from hermes_cli import kanban_db_connect as _kbc
     from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
+    from hermes_cli.goals import render_effective_goal as _render_goal
 
-    # Goal text = title + body (the acceptance criteria the judge evaluates against).
+    # Resolve the current effective revision from the card. Goal revisions
+    # are the authoritative contract; raw task fields can be stale after a
+    # triage/specifier race.
     with _kbc.connect_closing() as conn:
         task = _kb.get_task(conn, task_id)
+        effective_goal = _kb.get_effective_goal(conn, task_id)
     if task is None:
         return
 
-    goal_text = "\n\n".join(p for p in (task.title or "", task.body) if p).strip()
+    goal_text = _render_goal(
+        effective_goal,
+        fallback_title=task.title,
+        fallback_body=task.body,
+    )
     if not goal_text:
         return
+
+    def _goal_text() -> str:
+        with _kbc.connect_closing() as c:
+            current = _kb.get_task(c, task_id)
+            if current is None:
+                return ""
+            return _render_goal(
+                _kb.get_effective_goal(c, task_id),
+                fallback_title=current.title,
+                fallback_body=current.body,
+            )
 
     def _run_turn(prompt: str) -> str:
         result = cli.agent.run_conversation(user_message=prompt, conversation_history=cli.conversation_history)
@@ -4082,7 +4101,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             _kb.block_task(c, task_id, reason=reason, expected_run_id=worker_run_id)
 
     _run_loop(
-        task_id=task_id, goal_text=goal_text, run_turn=_run_turn, task_status_fn=_task_status, block_fn=_block,
+        task_id=task_id, goal_text=goal_text, goal_text_fn=_goal_text, run_turn=_run_turn, task_status_fn=_task_status, block_fn=_block,
         max_turns=task.goal_max_turns or _DEF_TURNS, first_response=first_response or "",
         log=lambda m: logger.info("%s", m),
     )

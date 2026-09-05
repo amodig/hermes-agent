@@ -190,10 +190,36 @@ def specify_task(
     if task is None:
         return SpecifyOutcome(task_id, False, reason)
 
+    with kbc.connect_closing() as conn:
+        effective_goal = kb.get_effective_goal(conn, task_id)
+    goal_title = (
+        effective_goal.get("title")
+        if isinstance(effective_goal, dict)
+        and isinstance(effective_goal.get("title"), str)
+        else task.title
+    )
+    goal_body = (
+        effective_goal.get("body") if isinstance(effective_goal, dict) else task.body
+    )
+    user_msg = _USER_TEMPLATE.format(
+        task_id=task.id,
+        title=_truncate(goal_title or "", 400),
+        body=_truncate(goal_body or "(no body)", 4000),
+    )
+    if isinstance(effective_goal, dict):
+        user_msg += (
+            "\n\nAuthoritative goal revision: "
+            f"v{effective_goal.get('version', effective_goal.get('goal_version'))}; "
+            f"reason: {effective_goal.get('reason') or 'unspecified'}"
+        )
     raw, reason = _call_aux(
-        "specify", task_id, aux_task="triage_specifier", system=_SYSTEM_PROMPT,
-        user=_USER_TEMPLATE.format(**_task_prompt_fields(task)),
-        max_tokens=HERMES_KANBAN_SPECIFY_MAX_TOKENS, timeout=timeout or 120,
+        "specify",
+        task_id,
+        aux_task="triage_specifier",
+        system=_SYSTEM_PROMPT,
+        user=user_msg,
+        max_tokens=HERMES_KANBAN_SPECIFY_MAX_TOKENS,
+        timeout=timeout or 120,
     )
     if raw is None:
         return SpecifyOutcome(task_id, False, reason)
@@ -210,14 +236,17 @@ def specify_task(
         if new_body is None and new_title is None:
             return SpecifyOutcome(task_id, False, "LLM response missing title and body")
 
-    with kbc.connect_closing() as conn:
-        ok = kb.specify_triage_task(
-            conn,
-            task_id,
-            title=new_title,
-            body=new_body,
-            author=author or _profile_author(),
-        )
+    try:
+        with kbc.connect_closing() as conn:
+            ok = kb.specify_triage_task(
+                conn,
+                task_id,
+                title=new_title,
+                body=new_body,
+                author=author or _profile_author(),
+            )
+    except kb.GoalRevisionConflict as exc:
+        return SpecifyOutcome(task_id, False, str(exc))
     if not ok:
         # Race: promoted/archived between our read and the write.
         return SpecifyOutcome(task_id, False, "task moved out of triage before promotion")

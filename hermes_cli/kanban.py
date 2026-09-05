@@ -215,13 +215,14 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "gc",
+    "gc", "update",
 })
 
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
     "create", "new", "rm", "remove", "delete", "switch", "use", "rename",
     "set-default-workdir",
 })
+
 
 
 def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
@@ -480,12 +481,32 @@ def _cmd_show(args: argparse.Namespace) -> int:
         runs = kb.list_runs(conn, args.task_id, **rsk)
         # Workers hand off via task_runs.summary; tasks.result stays NULL unless set.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        effective_goal = kb.get_effective_goal(conn, args.task_id)
+        display_title = (
+            effective_goal.get("title")
+            if isinstance(effective_goal, dict)
+            and isinstance(effective_goal.get("title"), str)
+            else task.title
+        )
+        display_body = (
+            effective_goal.get("body")
+            if isinstance(effective_goal, dict)
+            else task.body
+        )
         if not want_json:
             graph = kb.task_graph_context(conn, task.id)
 
     if want_json:
+        task_payload = _task_to_dict(task)
+        task_payload.update({
+            "version": task.version,
+            "revision": task.revision,
+            "goal_revision_id": task.goal_revision_id,
+            "goal_mode": task.goal_mode,
+        })
         _print_json({
-            "task": _task_to_dict(task), "latest_summary": latest_summary, "parents": parents, "children": children,
+            "task": task_payload, "effective_goal": effective_goal,
+            "latest_summary": latest_summary, "parents": parents, "children": children,
             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
@@ -495,7 +516,15 @@ def _cmd_show(args: argparse.Namespace) -> int:
     def field(label: str, value) -> None:
         print(f"  {label + ':':<11}{value}")
 
-    print(f"Task {task.id}: {task.title}")
+    print(f"Task {task.id}: {display_title}")
+    field("version", task.version)
+    field("revision", task.revision)
+    field("goal-revision", task.goal_revision_id or "-")
+    if effective_goal:
+        field("effective-goal",
+              f"v{effective_goal.get('version', effective_goal.get('goal_version', '?'))} "
+              f"by {effective_goal.get('author') or '-'}")
+        field("goal-reason", effective_goal.get("reason") or "-")
     field("status", task.status)
     field("assignee", task.assignee or "-")
     if task.tenant:
@@ -533,8 +562,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         field("parents", ", ".join(parents))
     if children:
         field("children", ", ".join(children))
-    if task.body:
-        _print_section("Body:", [task.body])
+    if display_body:
+        _print_section("Body:", [display_body])
     if task.result:
         _print_section("Result:", [task.result])
     elif latest_summary:
@@ -562,6 +591,49 @@ def _cmd_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_update(args: argparse.Namespace) -> int:
+    """Revise a task through the shared atomic optimistic-concurrency path."""
+
+    def optional(value):
+        if value is None:
+            return kb._UPDATE_UNSET
+        if isinstance(value, str) and value.lower() in {"none", "-", "null"}:
+            return None
+        return value
+
+    goal_mode = getattr(args, "goal_mode", None)
+    with kbc.connect_closing() as conn:
+        ok = kb.update_task(
+            conn,
+            args.task_id,
+            expected_version=args.expected_version,
+            reason=args.reason,
+            title=optional(args.title),
+            body=kb._UPDATE_UNSET if args.body is None else args.body,
+            assignee=optional(args.assignee),
+            model=optional(getattr(args, "model", None)),
+            provider=optional(getattr(args, "provider", None)),
+            goal_mode=kb._UPDATE_UNSET if goal_mode is None else goal_mode,
+            transition=getattr(args, "transition", None),
+            author=getattr(args, "author", None) or _profile_author(),
+        )
+        if not ok:
+            return _err(f"no such task: {args.task_id}")
+        task = kb.get_task(conn, args.task_id)
+        effective_goal = kb.get_effective_goal(conn, args.task_id)
+
+    task_payload = _task_to_dict(task)
+    task_payload.update({
+        "version": task.version,
+        "revision": task.revision,
+        "goal_revision_id": task.goal_revision_id,
+        "goal_mode": task.goal_mode,
+    })
+    if getattr(args, "json", False):
+        _print_json({"task": task_payload, "effective_goal": effective_goal})
+    else:
+        print(f"Updated {args.task_id}: version={task.version}, status={task.status}")
+    return 0
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
     with kbc.connect_closing() as conn:
@@ -792,7 +864,12 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
-def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
+def _goal_mode_handoff_rejection(
+    task: Optional[kb.Task],
+    evidence: str,
+    *,
+    effective_goal: Optional[dict] = None,
+):
     """Goal judge for every terminal worker handoff (including review).
 
     Returns ``(verdict, reason_or_None)``: ``"done"`` allows; ``"blocked"`` = judge ruled the goal
@@ -815,12 +892,18 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
     if client is None or not model:
         return ("done", None)
 
-    from hermes_cli.goals import judge_goal
+    from hermes_cli.goals import judge_goal, render_effective_goal
 
     verdict, reason = "done", ""
     try:
-        verdict, reason, _, _, _ = judge_goal(goal=f"{task.title}\n\n{task.body or ''}".strip(),
-                                              last_response=evidence.strip())
+        verdict, reason, _, _, _ = judge_goal(
+            goal=render_effective_goal(
+                effective_goal,
+                fallback_title=task.title,
+                fallback_body=task.body,
+            ),
+            last_response=evidence.strip(),
+        )
     except Exception as judge_exc:
         import logging as _logging
 
@@ -828,13 +911,16 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
                                              judge_exc, exc_info=True)
     return (verdict, None if verdict == "done" else reason)
 
-
 def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint: str,
                      continue_hint: str) -> Optional[str]:
     """Goal-mode judge gate shared by ``complete`` / ``request-review`` (mirrors tools/kanban_tools.py);
     applied to every terminal handoff so request-review can't bypass it. Returns the error line, or
     None to allow."""
-    verdict, rejection = _goal_mode_handoff_rejection(kb.get_task(conn, tid), evidence)
+    task = kb.get_task(conn, tid)
+    effective_goal = kb.get_effective_goal(conn, tid)
+    verdict, rejection = _goal_mode_handoff_rejection(
+        task, evidence, effective_goal=effective_goal
+    )
     if verdict == "blocked":
         return (f"kanban: goal {handoff} of {tid} rejected: judge ruled "
                 f"the goal unachievable — {rejection}. {blocked_hint}")
@@ -868,9 +954,16 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             if gate_err:
                 fail_msg[tid] = gate_err
                 return False
-            fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
-            return kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
-                                    expected_run_id=_worker_run_id_for(tid))
+            try:
+                return kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
+                                        expected_run_id=_worker_run_id_for(tid))
+            except kb.CompletionContractError as exc:
+                fail_msg[tid] = (
+                    f"kanban: completion of {tid} blocked: {exc}. "
+                    "No task state changed; use kanban update to revise the "
+                    "goal or remove the implementation patch before retrying."
+                )
+                return False
 
         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
 
@@ -953,9 +1046,16 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             "Provide acceptance evidence matching the task.")
         if gate_err:
             return _err(gate_err)
-        ok, reason = kb.request_review(
-            conn, tid, summary=summary, metadata=metadata, reviewer=getattr(args, "reviewer", None),
-            expected_run_id=_worker_run_id_for(tid), force=bool(getattr(args, "force", False)), with_reason=True)
+        try:
+            ok, reason = kb.request_review(
+                conn, tid, summary=summary, metadata=metadata, reviewer=getattr(args, "reviewer", None),
+                expected_run_id=_worker_run_id_for(tid), force=bool(getattr(args, "force", False)), with_reason=True)
+        except kb.CompletionContractError as exc:
+            return _err(
+                f"kanban: review handoff for {tid} blocked: {exc}. "
+                "No task state changed; use kanban update to revise the "
+                "goal or remove the implementation patch before retrying."
+            )
         if not ok:
             return _err(f"cannot request review for {tid}: {reason or 'not running/ready?'}")
         persisted_run = kb.latest_run(conn, tid)
@@ -1218,7 +1318,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
-    "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
+    "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show, "update": _cmd_update,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,

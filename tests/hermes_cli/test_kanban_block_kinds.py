@@ -78,6 +78,61 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
         assert payload.get("recurrences") == 2
         assert payload.get("kind") == "capability"
 
+def test_block_recurrence_normalizes_cause_and_resets_across_kinds(
+    kanban_home: Path,
+) -> None:
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="Authorization is required from a human approver",
+        )
+        first = kb.get_task(conn, tid)
+        assert first is not None
+        assert first.status == "blocked"
+        assert first.block_kind == "needs_input"
+        assert first.block_recurrences == 1
+
+        assert kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="GitHub access is unavailable",
+        )
+        second = kb.get_task(conn, tid)
+        assert second is not None
+        assert second.status == "blocked"
+        assert second.block_kind == "capability"
+        assert second.block_recurrences == 1
+
+        assert kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="The access credential has expired",
+            kind="auth",
+        )
+        third = kb.get_task(conn, tid)
+        assert third is not None
+        assert third.status == "triage"
+        assert third.block_kind == "capability"
+        assert third.block_recurrences == 2
+        loop_events = [
+            event
+            for event in kb.list_events(conn, tid)
+            if event.kind == "block_loop_detected"
+        ]
+        assert loop_events
+        assert loop_events[-1].payload["kind"] == "capability"
+        assert loop_events[-1].payload["recurrences"] == 2
+
+
+
+
 
 # ---------------------------------------------------------------------------
 # Dependency routing
@@ -111,3 +166,35 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+
+def test_legacy_null_block_kind_reuses_historical_recurrence_cause(
+    kanban_home: Path,
+) -> None:
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+        assert kb.block_task(conn, tid, reason="GitHub access is unavailable")
+
+        # Simulate an upgraded legacy row: the persisted kind was not
+        # backfilled, but its recurrence count and blocking history remain.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', block_kind = NULL, "
+                "block_recurrences = 1 WHERE id = ?",
+                (tid,),
+            )
+
+        assert kb.block_task(conn, tid, reason="GitHub access is unavailable")
+        task = kb.get_task(conn, tid)
+        loop_events = [
+            event
+            for event in kb.list_events(conn, tid)
+            if event.kind == "block_loop_detected"
+        ]
+
+    assert task is not None
+    assert task.status == "triage"
+    assert task.block_kind == "capability"
+    assert task.block_recurrences == 2
+    assert loop_events
+    assert loop_events[-1].payload["cause"] == "capability"
+    assert loop_events[-1].payload["recurrences"] == 2
