@@ -78,6 +78,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "max_retries": t.max_retries,
         "model_override": t.model_override,
         "provider_override": t.provider_override,
+        "block_kind": t.block_kind,
+        "block_metadata": t.block_metadata,
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
@@ -720,9 +722,22 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "when parents finish, no human); 'needs_input'/'capability' go to "
             "blocked for a human; 'transient' marks a maybe-flaky failure. "
             "Repeated same-kind re-blocks after unblock route the task to "
-            "triage to break unblock loops. Omit for a generic block."
+            "triage to break unblock loops. An expected gate stays blocked "
+            "even when kind is 'dependency'. Omit for a generic block."
         ),
     )
+    p_block.add_argument(
+        "--expected", nargs="?", const="true", choices=("true", "false"), default=None,
+        help="Intentional waiting/approval gate; remains blocked until unblocked.",
+    )
+    p_block.add_argument(
+        "--notify", nargs="?", const="true", choices=("true", "false"), default=None,
+        help="Whether routine gate notifications should be delivered.",
+    )
+    p_block.add_argument("--waiting-for", dest="waiting_for", default=None)
+    p_block.add_argument("--wake-condition", dest="wake_condition", default=None)
+    p_block.add_argument("--reminder-at", dest="reminder_at", type=int, default=None)
+    p_block.add_argument("--escalation-at", dest="escalation_at", type=int, default=None)
 
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
@@ -2572,6 +2587,10 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     kind = getattr(args, "kind", None)
+    expected_arg = getattr(args, "expected", None)
+    notify_arg = getattr(args, "notify", None)
+    expected = None if expected_arg is None else expected_arg == "true"
+    notify = None if notify_arg is None else notify_arg == "true"
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
@@ -2584,6 +2603,12 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 tid,
                 reason=reason,
                 kind=kind,
+                expected=expected,
+                notify=notify,
+                waiting_for=getattr(args, "waiting_for", None),
+                wake_condition=getattr(args, "wake_condition", None),
+                reminder_at=getattr(args, "reminder_at", None),
+                escalation_at=getattr(args, "escalation_at", None),
                 expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)

@@ -745,3 +745,41 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def test_expected_gate_can_suppress_routine_notification(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "gate-silent.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="waiting", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb.block_task(
+            conn, tid, reason="approval", expected=True, notify=False,
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert adapter.sent == []
+
+
+def test_expected_gate_release_and_failure_transition_notify(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "gate-release.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="approval", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb.block_task(conn, tid, reason="approval", expected=True)
+        assert kb.unblock_task(conn, tid)
+        assert kb.block_task(conn, tid, reason="unexpected failure")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    messages = [item["text"] for item in adapter.sent]
+    assert any("waiting gate released" in text for text in messages)
+    assert any("expected gate failed unexpectedly" in text for text in messages)

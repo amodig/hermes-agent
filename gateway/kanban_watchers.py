@@ -208,6 +208,64 @@ def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
     return None
 
 
+def _event_gate_metadata(event: Any) -> dict[str, Any]:
+    payload = event.payload if event and isinstance(event.payload, dict) else {}
+    for key in ("gate", "block_metadata"):
+        gate = payload.get(key)
+        if isinstance(gate, dict):
+            return gate
+    if "expected" in payload:
+        return {
+            key: payload[key]
+            for key in (
+                "expected", "notify", "waiting_for", "wake_condition",
+                "reminder_at", "escalation_at",
+            )
+            if key in payload
+        }
+    return {}
+
+
+def _event_is_gate_alert(event: Any, task: Any) -> bool:
+    kind = event.kind
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    if kind in ("gate_reminder", "gate_escalation", "claim_rejected"):
+        return kind != "claim_rejected" or (
+            payload.get("reason") == "sticky_blocked"
+            and _event_gate_metadata(event).get("expected")
+        )
+    if kind == "unblocked":
+        return bool(payload.get("gate_released"))
+    if kind in ("blocked", "block_loop_detected"):
+        gate = _event_gate_metadata(event)
+        if payload.get("gate_transition") == "expected_to_unexpected":
+            return True
+        if gate.get("expected"):
+            return bool(gate.get("notify", False))
+        return bool(gate.get("notify", True))
+    return True
+
+
+def _event_wakes(event: Any) -> bool:
+    if event.kind in ("gate_reminder", "gate_escalation", "claim_rejected"):
+        return True
+    if event.kind == "unblocked":
+        return bool(
+            isinstance(event.payload, dict)
+            and event.payload.get("gate_released")
+        )
+    if event.kind in ("blocked", "block_loop_detected"):
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        gate = _event_gate_metadata(event)
+        return bool(
+            payload.get("gate_transition") == "expected_to_unexpected"
+            or not gate.get("expected")
+        )
+    return event.kind in {
+        "completed", "gave_up", "crashed", "timed_out",
+        "review_requested", "changes_requested",
+    }
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -227,8 +285,9 @@ class GatewayKanbanWatchersMixin:
         For each subscription row, fetches ``task_events`` newer than the
         stored cursor with kind in the terminal set (``completed``,
         ``blocked``, ``gave_up``, ``crashed``, ``timed_out``,
-        ``review_requested``, ``changes_requested``,
-        ``block_loop_detected``). Sends one
+        ``review_requested``, ``changes_requested``, ``block_loop_detected``,
+        ``claim_rejected``, ``gate_reminder``, and ``gate_escalation``).
+        Sends one
         message per new event to ``(platform, chat_id, thread_id)``,
         then advances the cursor. The subscription is removed only when the
         task is ``archived``. A ``done`` task can be reopened for review or
@@ -263,7 +322,12 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+        TERMINAL_KINDS = (
+            "completed", "blocked", "gave_up", "crashed", "timed_out",
+            "status", "archived", "unblocked", "block_loop_detected",
+            "review_requested", "changes_requested", "claim_rejected",
+            "gate_reminder", "gate_escalation",
+        )
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -453,6 +517,13 @@ class GatewayKanbanWatchersMixin:
                             # a legacy DB. `_add_column_if_missing` now
                             # tolerates that race, but we still skip the
                             # redundant call to avoid the wasted work.
+                            try:
+                                _kb.emit_due_gate_events(conn)
+                            except Exception as _gate_exc:
+                                logger.debug(
+                                    "kanban notifier: gate deadline scan failed: %s",
+                                    _gate_exc,
+                                )
                             subs = _kb.list_notify_subs(
                                 conn,
                                 notifier_profiles=notifier_profiles,
@@ -573,6 +644,8 @@ class GatewayKanbanWatchersMixin:
                     wake_review_detail = ""
                     for ev in d["events"]:
                         kind = ev.kind
+                        if not _event_is_gate_alert(ev, task):
+                            continue
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
@@ -603,10 +676,22 @@ class GatewayKanbanWatchersMixin:
                                 f" — {title}{handoff}"
                             )
                         elif kind == "blocked":
+                            payload = ev.payload if isinstance(ev.payload, dict) else {}
                             reason = ""
-                            if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                            if payload.get("reason"):
+                                reason = f": {str(payload['reason'])[:160]}"
+                            if payload.get("gate_transition") == "expected_to_unexpected":
+                                msg = (
+                                    f"🚨 {board_tag}{tag}Kanban {sub['task_id']} "
+                                    f"expected gate failed unexpectedly{reason}"
+                                )
+                            elif _event_gate_metadata(ev).get("expected"):
+                                msg = (
+                                    f"⏳ {board_tag}{tag}Kanban {sub['task_id']} "
+                                    f"waiting as designed{reason}"
+                                )
+                            else:
+                                msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
@@ -687,14 +772,30 @@ class GatewayKanbanWatchersMixin:
                                 f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
                                 f" — needs a human decision{rc}{reason}"
                             )
+                        elif kind == "claim_rejected":
+                            msg = (
+                                f"🚨 {board_tag}{tag}Kanban {sub['task_id']} "
+                                "expected gate claim/spawn rejected"
+                            )
+                        elif kind == "gate_reminder":
+                            msg = (
+                                f"⏰ {board_tag}{tag}Kanban {sub['task_id']} "
+                                "waiting gate reminder"
+                            )
+                        elif kind == "gate_escalation":
+                            msg = (
+                                f"🚨 {board_tag}{tag}Kanban {sub['task_id']} "
+                                "waiting gate escalation"
+                            )
+                        elif kind == "unblocked":
+                            payload = ev.payload if isinstance(ev.payload, dict) else {}
+                            msg = (
+                                f"▶ {board_tag}{tag}Kanban {sub['task_id']} "
+                                "waiting gate released"
+                            )
                         else:
-                            # archived / unblocked are claimed by TERMINAL_KINDS
-                            # (so the cursor advances past them and they can't
-                            # wedge a later completed/blocked event behind an
-                            # unclaimed row) but are intentionally SILENT: an
-                            # archive needs no user ping, and unblocked is an
-                            # internal transition. They are also excluded from
-                            # _WAKE_KINDS below, so they never wake the creator.
+                            # archived is claimed so its cursor advances, but
+                            # it does not need a user-facing notification.
                             continue
                         delivery_metadata = sub.get("delivery_metadata")
                         metadata: dict[str, Any] = (
@@ -839,13 +940,11 @@ class GatewayKanbanWatchersMixin:
                         # (routed to triage) belong here for the same reason
                         # ``blocked`` does. ``status`` / ``archived`` /
                         # ``unblocked`` stay out: bookkeeping.
-                        _WAKE_KINDS = (
-                            "completed", "gave_up", "crashed", "timed_out",
-                            "blocked", "review_requested", "changes_requested",
-                            "block_loop_detected",
-                        )
                         _wake_kinds = (
-                            {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                            {
+                                ev.kind for ev in d["events"]
+                                if _event_is_gate_alert(ev, task) and _event_wakes(ev)
+                            }
                             if wake_agent
                             else set()
                         )
@@ -883,6 +982,10 @@ class GatewayKanbanWatchersMixin:
                             if "review_requested" in _wake_kinds: _parts.append(t("gateway.kanban.wake.review_requested"))
                             if "changes_requested" in _wake_kinds: _parts.append(t("gateway.kanban.wake.changes_requested"))
                             if "block_loop_detected" in _wake_kinds: _parts.append(t("gateway.kanban.wake.block_loop_detected"))
+                            if "unblocked" in _wake_kinds: _parts.append("gate_released")
+                            if "claim_rejected" in _wake_kinds: _parts.append("claim_rejected")
+                            if "gate_reminder" in _wake_kinds: _parts.append("gate_reminder")
+                            if "gate_escalation" in _wake_kinds: _parts.append("gate_escalation")
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",

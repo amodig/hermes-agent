@@ -123,6 +123,77 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+# Structured metadata for an intentional waiting/approval gate.  Keep this
+# separate from ``reason`` so notification policy never depends on prose.
+BLOCK_GATE_METADATA_FIELDS = (
+    "expected",
+    "notify",
+    "waiting_for",
+    "wake_condition",
+    "reminder_at",
+    "escalation_at",
+)
+
+
+def _coerce_gate_bool(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes"}:
+        return True
+    if text in {"false", "0", "no"}:
+        return False
+    raise ValueError("gate metadata booleans must be true or false")
+
+
+def _normalize_gate_time(value: Any, field: str) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be an epoch-seconds integer") from exc
+    if parsed < 0:
+        raise ValueError(f"{field} must be >= 0")
+    return parsed
+
+
+def normalize_block_gate_metadata(
+    *,
+    expected: Any = None,
+    notify: Any = None,
+    waiting_for: Any = None,
+    wake_condition: Any = None,
+    reminder_at: Any = None,
+    escalation_at: Any = None,
+) -> dict[str, Any]:
+    """Validate and canonicalise structured waiting-gate metadata."""
+    expected_value = _coerce_gate_bool(expected, default=False)
+    out: dict[str, Any] = {
+        "expected": expected_value,
+        "notify": _coerce_gate_bool(
+            notify,
+            default=not expected_value,
+        ),
+    }
+    for key, value in (
+        ("waiting_for", waiting_for),
+        ("wake_condition", wake_condition),
+    ):
+        if value is not None and str(value).strip():
+            out[key] = str(value).strip()
+    for key, value in (
+        ("reminder_at", reminder_at),
+        ("escalation_at", escalation_at),
+    ):
+        parsed = _normalize_gate_time(value, key)
+        if parsed is not None:
+            out[key] = parsed
+    return out
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -1221,6 +1292,9 @@ class Task:
     # blocks. Set by ``block_task``; preserved across unblock so a re-block for
     # the same kind is recognisable as an unblock↔re-block loop.
     block_kind: Optional[str] = None
+    # Structured waiting/approval metadata for the current block. This is
+    # intentionally separate from the human-readable reason.
+    block_metadata: Optional[dict] = None
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
@@ -1253,6 +1327,14 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        block_metadata_value: Optional[dict] = None
+        if "block_metadata" in keys and row["block_metadata"]:
+            try:
+                parsed = json.loads(row["block_metadata"])
+                if isinstance(parsed, dict):
+                    block_metadata_value = parsed
+            except (TypeError, ValueError):
+                pass
         return cls(
             id=row["id"],
             title=row["title"],
@@ -1329,6 +1411,7 @@ class Task:
             block_kind=(
                 row["block_kind"] if "block_kind" in keys and row["block_kind"] else None
             ),
+            block_metadata=block_metadata_value,
             block_recurrences=(
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
@@ -1525,6 +1608,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- to ``blocked`` for a human. Preserved across unblock so a re-block for
     -- the SAME kind can be recognised as a loop.
     block_kind           TEXT,
+    -- Structured waiting/approval gate metadata as a JSON object.
+    block_metadata       TEXT,
     -- Unblock-loop counter. Incremented each time a task is re-blocked for the
     -- same truly-blocked reason after having been unblocked. When it reaches
     -- BLOCK_RECURRENCE_LIMIT the task is routed to ``triage`` instead of
@@ -2808,6 +2893,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # blocks. Existing blocked rows get NULL, which is treated as a
         # generic human blocker — same behaviour they had before the column.
         _add_column_if_missing(conn, "tasks", "block_kind", "block_kind TEXT")
+    if "block_metadata" not in cols:
+        # Structured waiting/approval gate metadata. Existing tasks have no
+        # gate and therefore remain ordinary failure blocks.
+        _add_column_if_missing(
+            conn, "tasks", "block_metadata", "block_metadata TEXT"
+        )
 
     if "block_recurrences" not in cols:
         # Unblock-loop counter. Existing rows start at 0, so the loop breaker
@@ -5344,11 +5435,13 @@ def claim_task(
             _record_parent_handoff_start_error(conn, task_id, handoff_error)
             return None
         if _is_sticky_blocked(conn, task_id):
+            rejected_payload: dict[str, Any] = {"reason": "sticky_blocked"}
+            gate = _latest_gate_metadata(conn, task_id)
+            if gate.get("expected"):
+                rejected_payload.update(gate)
+                rejected_payload["gate"] = dict(gate)
             _append_event(
-                conn,
-                task_id,
-                "claim_rejected",
-                {"reason": "sticky_blocked"},
+                conn, task_id, "claim_rejected", rejected_payload,
             )
             return None
 
@@ -6744,6 +6837,7 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
+                       block_metadata = NULL,
                        block_recurrences = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
@@ -6761,6 +6855,7 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
+                       block_metadata = NULL,
                        block_recurrences = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
@@ -7539,12 +7634,129 @@ def edit_completed_task_result(
     return True
 
 
+def _latest_gate_metadata(
+    conn: sqlite3.Connection, task_id: str,
+) -> dict[str, Any]:
+    """Recover the prior gate after ``unblock_task`` clears the task column."""
+    rows = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('blocked', 'block_loop_detected', 'dependency_wait', "
+        "'unblocked', 'completed') ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            continue
+        if row["kind"] == "completed":
+            return {}
+        gate = payload.get("gate")
+        if isinstance(gate, dict):
+            return dict(gate)
+        if "expected" in payload:
+            return {
+                key: payload[key]
+                for key in BLOCK_GATE_METADATA_FIELDS
+                if key in payload
+            }
+    return {}
+
+
+def _block_event_payload(
+    *,
+    reason: Optional[str],
+    kind: Optional[str],
+    cause: str,
+    recurrences: int,
+    source_status: str,
+    gate: dict[str, Any],
+    previous_gate: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "reason": reason,
+        "kind": kind,
+        "cause": cause,
+        "recurrences": recurrences,
+        "source_status": source_status,
+        **gate,
+        "gate": dict(gate),
+    }
+    if (
+        previous_gate
+        and previous_gate.get("expected")
+        and not gate.get("expected")
+    ):
+        payload["previous_expected"] = True
+        payload["gate_transition"] = "expected_to_unexpected"
+    return payload
+
+
+def emit_due_gate_events(
+    conn: sqlite3.Connection, now: Optional[int] = None,
+) -> int:
+    """Append at most one reminder/escalation event per configured deadline."""
+    now = int(time.time()) if now is None else int(now)
+    emitted = 0
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT id, block_metadata FROM tasks "
+            "WHERE status = 'blocked' AND block_metadata IS NOT NULL"
+        ).fetchall()
+        for row in rows:
+            try:
+                gate = json.loads(row["block_metadata"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(gate, dict) or not gate.get("expected"):
+                continue
+            block_event = conn.execute(
+                "SELECT id FROM task_events WHERE task_id = ? "
+                "AND kind IN ('blocked', 'block_loop_detected') "
+                "ORDER BY id DESC LIMIT 1",
+                (row["id"],),
+            ).fetchone()
+            if not block_event:
+                continue
+            for field, kind in (
+                ("reminder_at", "gate_reminder"),
+                ("escalation_at", "gate_escalation"),
+            ):
+                try:
+                    due = int(gate.get(field))
+                except (TypeError, ValueError):
+                    continue
+                if due > now:
+                    continue
+                seen = conn.execute(
+                    "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? "
+                    "AND id > ? LIMIT 1",
+                    (row["id"], kind, block_event["id"]),
+                ).fetchone()
+                if seen:
+                    continue
+                payload = dict(gate)
+                payload["gate"] = dict(gate)
+                payload["block_event_id"] = block_event["id"]
+                _append_event(conn, row["id"], kind, payload)
+                emitted += 1
+    return emitted
+
+
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     reason: Optional[str] = None,
     kind: Optional[str] = None,
+    expected: Any = None,
+    notify: Any = None,
+    waiting_for: Optional[str] = None,
+    wake_condition: Optional[str] = None,
+    reminder_at: Any = None,
+    escalation_at: Any = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
@@ -7574,6 +7786,23 @@ def block_task(
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
+    gate = normalize_block_gate_metadata(
+        expected=expected,
+        notify=notify,
+        waiting_for=waiting_for,
+        wake_condition=wake_condition,
+        reminder_at=reminder_at,
+        escalation_at=escalation_at,
+    )
+    expected_gate = bool(gate["expected"])
+    gate_configured = any(
+        value is not None
+        for value in (
+            expected, notify, waiting_for, wake_condition,
+            reminder_at, escalation_at,
+        )
+    )
+    gate_json = json.dumps(gate, separators=(",", ":")) if gate_configured else None
     normalized_kind = normalize_block_kind(kind, reason)
     if kind is not None and str(kind).strip() and normalized_kind is None:
         raise ValueError(
@@ -7582,7 +7811,8 @@ def block_task(
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, block_metadata "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
@@ -7601,12 +7831,27 @@ def block_task(
             and cur_row["block_recurrences"] is not None
             else 0
         )
+        previous_gate: dict[str, Any] = {}
+        raw_previous_gate = (
+            cur_row["block_metadata"]
+            if "block_metadata" in cur_row.keys()
+            else None
+        )
+        if raw_previous_gate:
+            try:
+                parsed_previous_gate = json.loads(raw_previous_gate)
+                if isinstance(parsed_previous_gate, dict):
+                    previous_gate = parsed_previous_gate
+            except (TypeError, ValueError):
+                pass
+        if not previous_gate:
+            previous_gate = _latest_gate_metadata(conn, task_id)
 
         # Dependency blocks never enter the human ``blocked`` bucket — they
         # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
-        if normalized_kind == "dependency":
+        if normalized_kind == "dependency" and not expected_gate:
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -7614,12 +7859,13 @@ def block_task(
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
-                       block_kind    = ?
+                       block_kind    = ?,
+                       block_metadata = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, task_id) if expected_run_id is None
-                else (kind, task_id, int(expected_run_id)),
+                (kind, gate_json, task_id) if expected_run_id is None
+                else (kind, gate_json, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -7658,7 +7904,10 @@ def block_task(
         # persisted block kind is the recurrence key, so aliases and typed
         # reason prefixes cannot make semantically identical blocks diverge.
         same_cause = prev_kind == normalized_kind
-        recurrences = prev_recurrences + 1 if same_cause else 1
+        recurrences = (
+            0 if expected_gate
+            else (prev_recurrences + 1 if same_cause else 1)
+        )
 
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
             # Loop detected — stop letting the unblocker spin this task. Route
@@ -7671,12 +7920,17 @@ def block_task(
                        claim_expires = NULL,
                        worker_pid    = NULL,
                        block_kind    = ?,
+                       block_metadata = ?,
                        block_recurrences = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (normalized_kind, recurrences, task_id) if expected_run_id is None
-                else (normalized_kind, recurrences, task_id, int(expected_run_id)),
+                (normalized_kind, gate_json, recurrences, task_id)
+                if expected_run_id is None
+                else (
+                    normalized_kind, gate_json, recurrences, task_id,
+                    int(expected_run_id),
+                ),
             )
             if cur.rowcount != 1:
                 return False
@@ -7689,17 +7943,18 @@ def block_task(
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
                 )
+            loop_payload = _block_event_payload(
+                reason=reason,
+                kind=normalized_kind,
+                cause=normalized_block_cause(normalized_kind, reason),
+                recurrences=recurrences,
+                source_status=source_status,
+                gate=gate,
+                previous_gate=previous_gate,
+            )
+            loop_payload["limit"] = BLOCK_RECURRENCE_LIMIT
             _append_event(
-                conn, task_id, "block_loop_detected",
-                {
-                    "reason": reason,
-                    "kind": normalized_kind,
-                    "cause": normalized_block_cause(normalized_kind, reason),
-                    "recurrences": recurrences,
-                    "limit": BLOCK_RECURRENCE_LIMIT,
-                    "source_status": source_status,
-                },
-                run_id=run_id,
+                conn, task_id, "block_loop_detected", loop_payload, run_id=run_id
             )
         else:
             if expected_run_id is None:
@@ -7711,11 +7966,12 @@ def block_task(
                            claim_expires = NULL,
                            worker_pid    = NULL,
                            block_kind    = ?,
+                           block_metadata = ?,
                            block_recurrences = ?
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                     """,
-                    (normalized_kind, recurrences, task_id),
+                    (normalized_kind, gate_json, recurrences, task_id),
                 )
             else:
                 cur = conn.execute(
@@ -7726,12 +7982,16 @@ def block_task(
                            claim_expires = NULL,
                            worker_pid    = NULL,
                            block_kind    = ?,
+                           block_metadata = ?,
                            block_recurrences = ?
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                        AND current_run_id = ?
                     """,
-                    (normalized_kind, recurrences, task_id, int(expected_run_id)),
+                    (
+                        normalized_kind, gate_json, recurrences, task_id,
+                        int(expected_run_id),
+                    ),
                 )
             if cur.rowcount != 1:
                 return False
@@ -7750,13 +8010,15 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "blocked",
-                {
-                    "reason": reason,
-                    "kind": normalized_kind,
-                    "cause": normalized_block_cause(normalized_kind, reason),
-                    "recurrences": recurrences,
-                    "source_status": source_status,
-                },
+                _block_event_payload(
+                    reason=reason,
+                    kind=normalized_kind,
+                    cause=normalized_block_cause(normalized_kind, reason),
+                    recurrences=recurrences,
+                    source_status=source_status,
+                    gate=gate,
+                    previous_gate=previous_gate,
+                ),
                 run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)
@@ -8219,6 +8481,10 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
+    Expected gates stay blocked until this explicit wake transition. The gate
+    metadata is cleared on release, while the unblocked event retains it for
+    notifier routing.
+
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
     is a no-op. If a future or external write left the pointer dangling,
@@ -8229,9 +8495,19 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         current = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, block_metadata FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        previous_gate: dict[str, Any] = {}
+        if current and current["block_metadata"]:
+            try:
+                parsed_gate = json.loads(current["block_metadata"])
+                if isinstance(parsed_gate, dict):
+                    previous_gate = parsed_gate
+            except (TypeError, ValueError):
+                pass
+        if not previous_gate:
+            previous_gate = _latest_gate_metadata(conn, task_id)
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if current and current["status"] == "blocked"
@@ -8260,19 +8536,25 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # start for the dispatcher's retry budget.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "block_metadata = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (new_status, task_id),
         )
         if cur.rowcount != 1:
             return False
+        unblocked_payload = (
+            {"status": new_status, "resume_status": resume_status}
+            if new_status != "ready" or resume_status != "ready"
+            else {}
+        )
+        if previous_gate.get("expected"):
+            unblocked_payload.update(previous_gate)
+            unblocked_payload["gate"] = dict(previous_gate)
+            unblocked_payload["gate_released"] = True
         _append_event(
             conn, task_id, "unblocked",
-            (
-                {"status": new_status, "resume_status": resume_status}
-                if new_status != "ready" or resume_status != "ready"
-                else None
-            ),
+            unblocked_payload or None,
         )
         return True
 

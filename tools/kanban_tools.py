@@ -529,6 +529,8 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "started_at": task.started_at,
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
+        "block_kind": task.block_kind,
+        "block_metadata": task.block_metadata,
         "model_override": task.model_override,
         "provider_override": task.provider_override,
         "version": task.version,
@@ -580,6 +582,8 @@ def _handle_show(args: dict, **kw) -> str:
                     "completed_at": t.completed_at,
                     "result": t.result,
                     "current_run_id": t.current_run_id,
+                    "block_kind": t.block_kind,
+                    "block_metadata": t.block_metadata,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
                     "version": t.version,
@@ -878,6 +882,16 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    expected, bool_error = _parse_bool_arg(args, "expected", default=None)
+    if bool_error:
+        return tool_error(bool_error)
+    notify, bool_error = _parse_bool_arg(args, "notify", default=None)
+    if bool_error:
+        return tool_error(bool_error)
+    waiting_for = args.get("waiting_for")
+    wake_condition = args.get("wake_condition")
+    reminder_at = args.get("reminder_at")
+    escalation_at = args.get("escalation_at")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -915,6 +929,12 @@ def _handle_block(args: dict, **kw) -> str:
                 conn, tid,
                 reason=reason,
                 kind=kind,
+                expected=expected,
+                notify=notify,
+                waiting_for=waiting_for,
+                wake_condition=wake_condition,
+                reminder_at=reminder_at,
+                escalation_at=escalation_at,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -930,7 +950,8 @@ def _handle_block(args: dict, **kw) -> str:
                 task_id=tid,
                 run_id=run.id if run else None,
                 status=landed.status if landed else "blocked",
-                block_kind=kind,
+                block_kind=landed.block_kind if landed else kind,
+                block_metadata=landed.block_metadata if landed else None,
             )
         finally:
             conn.close()
@@ -2005,6 +2026,30 @@ KANBAN_BLOCK_SCHEMA = {
                     "resumes automatically; the others surface to a human. "
                     "Omit only if none apply."
                 ),
+            },
+            "expected": {
+                "type": "boolean",
+                "description": "True for an intentional waiting/approval gate; it remains blocked until explicitly released.",
+            },
+            "notify": {
+                "type": "boolean",
+                "description": "Whether routine gate notifications should be delivered. Gate release and failure alerts are always delivered.",
+            },
+            "waiting_for": {
+                "type": "string",
+                "description": "Person, system, or decision this task is waiting for.",
+            },
+            "wake_condition": {
+                "type": "string",
+                "description": "Condition that releases the waiting gate.",
+            },
+            "reminder_at": {
+                "type": "integer",
+                "description": "Optional Unix timestamp for a waiting reminder.",
+            },
+            "escalation_at": {
+                "type": "integer",
+                "description": "Optional Unix timestamp for an escalation reminder.",
             },
             "board": _board_schema_prop(),
         },

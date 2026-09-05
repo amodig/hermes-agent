@@ -11948,9 +11948,10 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 # event behind an unclaimed row.
 _KANBAN_NOTIFY_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
-    "status", "archived", "unblocked",
+    "status", "archived", "unblocked", "claim_rejected",
+    "gate_reminder", "gate_escalation",
 )
-_KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
+_KANBAN_SILENT_KINDS = frozenset({"archived"})
 _KANBAN_POLL_SECONDS = 5.0
 _LOOP_POLL_SECONDS = 5.0
 
@@ -12057,14 +12058,19 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
     Returns None for kinds that are claimed but intentionally silent.
     """
     kind = getattr(ev, "kind", "")
+    payload = getattr(ev, "payload", None) or {}
+    gate = payload.get("gate") or payload.get("block_metadata")
+    if not isinstance(gate, dict):
+        gate = payload if "expected" in payload else {}
     if not kind or kind in _KANBAN_SILENT_KINDS:
+        return None
+    if kind == "unblocked" and not payload.get("gate_released"):
         return None
     task_id = sub.get("task_id", "")
     title = (getattr(task, "title", None) or task_id)[:120]
     board_tag = f"[{board_slug}] " if board_slug else ""
     who = getattr(task, "assignee", None) or ""
     tag = f"@{who} " if who else ""
-    payload = getattr(ev, "payload", None) or {}
     if kind == "completed":
         handoff = ""
         summary = payload.get("summary")
@@ -12077,7 +12083,37 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
         return f"✔ {board_tag}{tag}Kanban {task_id} done — {title}{handoff}"
     if kind == "blocked":
         reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
+        if payload.get("gate_transition") == "expected_to_unexpected":
+            return (
+                f"🚨 {board_tag}{tag}Kanban {task_id} "
+                f"expected gate failed unexpectedly{reason}"
+            )
+        if gate.get("expected"):
+            if not gate.get("notify", False):
+                return None
+            return (
+                f"⏳ {board_tag}{tag}Kanban {task_id} "
+                f"waiting as designed{reason}"
+            )
+        if "notify" in gate and not gate.get("notify"):
+            return None
         return f"⏸ {board_tag}{tag}Kanban {task_id} blocked{reason}"
+    if kind == "unblocked":
+        return (
+            f"▶ {board_tag}{tag}Kanban {task_id} "
+            "waiting gate released"
+        )
+    if kind == "claim_rejected":
+        if gate.get("expected") and payload.get("reason") == "sticky_blocked":
+            return (
+                f"🚨 {board_tag}{tag}Kanban {task_id} "
+                "expected gate claim/spawn rejected"
+            )
+        return None
+    if kind == "gate_reminder":
+        return f"⏰ {board_tag}{tag}Kanban {task_id} waiting gate reminder"
+    if kind == "gate_escalation":
+        return f"🚨 {board_tag}{tag}Kanban {task_id} waiting gate escalation"
     if kind == "gave_up":
         err = f"\n{str(payload.get('error'))[:200]}" if payload.get("error") else ""
         return f"✖ {board_tag}{tag}Kanban {task_id} gave up after repeated spawn failures{err}"
@@ -12159,6 +12195,10 @@ def _collect_kanban_notifications(session: dict) -> list:
             conn = _kb.connect(board=slug)
         except Exception:
             continue
+        try:
+            _kb.emit_due_gate_events(conn)
+        except Exception as exc:
+            logger.debug("TUI kanban gate deadline scan failed: %s", exc)
         try:
             try:
                 subs = _kb.list_notify_subs(conn)
