@@ -251,10 +251,30 @@ def _goal_judge_available() -> bool:
     return client is not None and bool(model)
 
 
-def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
+def _goal_mode_handoff_rejection(
+    task, evidence: str, metadata: Optional[dict] = None
+) -> Optional[str]:
     """Return a rejection reason when a goal-mode terminal handoff is premature."""
     if not task or not task.goal_mode or not _goal_judge_available():
         return None
+    if isinstance(metadata, dict):
+        handoff = {
+            key: metadata[key]
+            for key in (
+                "base_sha",
+                "head_sha",
+                "branch_name",
+                "workspace_path",
+                "changed_files",
+                "dirty_state",
+            )
+            if key in metadata
+        }
+        if handoff:
+            evidence = (
+                f"{evidence}\n\nImmutable handoff metadata: "
+                f"{json.dumps(handoff, sort_keys=True)}"
+            )
     verdict = "done"
     reason = ""
     try:
@@ -733,10 +753,6 @@ def _handle_complete(args: dict, **kw) -> str:
                 metadata["artifacts"] = merged
             else:
                 metadata["artifacts"] = artifacts
-    if not (summary or result):
-        return tool_error(
-            "provide at least one of: summary (preferred), result"
-        )
     if metadata is not None and not isinstance(metadata, dict):
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
@@ -755,6 +771,7 @@ def _handle_complete(args: dict, **kw) -> str:
             rejection = _goal_mode_handoff_rejection(
                 task,
                 (summary or result or "").strip(),
+                metadata=metadata,
             )
             if rejection is not None:
                 return tool_error(
@@ -771,6 +788,12 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                )
+            except kb.HandoffValidationError as handoff_err:
+                return tool_error(
+                    f"kanban_complete blocked: {handoff_err}. "
+                    "No task state changed; commit the task branch, record "
+                    "base_sha/head_sha, and retry with the exact clean handoff."
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -937,7 +960,7 @@ def _handle_request_review(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(task, summary)
+            rejection = _goal_mode_handoff_rejection(task, summary, metadata=metadata)
             if rejection is not None:
                 return tool_error(
                     f"Goal review handoff rejected by judge: {rejection}. "
@@ -1798,10 +1821,11 @@ KANBAN_COMPLETE_SCHEMA = {
             "metadata": {
                 "type": "object",
                 "description": (
-                    "Free-form dict of structured facts about this "
-                    "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
-                    "\"findings\": [...]}. Surfaced to downstream "
-                    "workers alongside ``summary``."
+                    "Structured facts about this attempt. Implementations "
+                    "with reviewer/tester dependents must include "
+                    "base_sha, head_sha, changed_files, branch_name, and "
+                    "dirty_state; tests_run, decisions, and findings are "
+                    "also surfaced downstream."
                 ),
             },
             "result": {
