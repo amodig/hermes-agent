@@ -138,7 +138,7 @@ def test_claim_rejects_parent_head_movement_with_explicit_event(kanban_home, tmp
         )
         (repo / "src" / "changed.py").write_text("value = 2\n", encoding="utf-8")
         _git(repo, "add", "src/changed.py")
-        _git(repo, "commit", "post-approval change")
+        _git(repo, "commit", "-m", "post-approval change")
         assert kb.claim_task(conn, child) is None
         row = conn.execute(
             "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'handoff_head_moved' "
