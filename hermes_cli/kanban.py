@@ -1856,6 +1856,17 @@ def _cmd_show(args: argparse.Namespace) -> int:
         # looking like a no-op when the worker actually did real work.
         latest_summary = kb.latest_summary(conn, args.task_id)
         effective_goal = kb.get_effective_goal(conn, args.task_id)
+        display_title = (
+            effective_goal.get("title")
+            if isinstance(effective_goal, dict)
+            and isinstance(effective_goal.get("title"), str)
+            else task.title
+        )
+        display_body = (
+            effective_goal.get("body")
+            if isinstance(effective_goal, dict)
+            else task.body
+        )
         if not getattr(args, "json", False):
             graph = kb.task_graph_context(conn, task.id)
 
@@ -1899,7 +1910,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
 
-    print(f"Task {task.id}: {task.title}")
+    print(f"Task {task.id}: {display_title}")
     print(f"  version:   {task.version}")
     if effective_goal:
         print(
@@ -1974,10 +1985,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  parents:   {', '.join(parents)}")
     if children:
         print(f"  children:  {', '.join(children)}")
-    if task.body:
+    if display_body:
         print()
         print("Body:")
-        print(task.body)
+        print(display_body)
     if task.result:
         print()
         print("Result:")
@@ -2418,7 +2429,12 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
-def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Optional[str]:
+def _goal_mode_handoff_rejection(
+    task: Optional[kb.Task],
+    evidence: str,
+    *,
+    effective_goal: Optional[dict] = None,
+) -> Optional[str]:
     """Apply the goal judge to every terminal worker handoff, including review."""
     if task is None or not task.goal_mode:
         return None
@@ -2431,13 +2447,17 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Opti
     if client is None or not model:
         return None
 
-    from hermes_cli.goals import judge_goal
+    from hermes_cli.goals import judge_goal, render_effective_goal
 
     verdict = "done"
     reason = ""
     try:
         verdict, reason, _, _, _ = judge_goal(
-            goal=f"{task.title}\n\n{task.body or ''}".strip(),
+            goal=render_effective_goal(
+                effective_goal,
+                fallback_title=task.title,
+                fallback_body=task.body,
+            ),
             last_response=evidence.strip(),
         )
     except Exception as judge_exc:
@@ -2486,9 +2506,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             # to every terminal handoff so request-review cannot bypass the
             # acceptance contract that protects complete.
             task = kb.get_task(conn, tid)
+            effective_goal = kb.get_effective_goal(conn, tid)
             rejection = _goal_mode_handoff_rejection(
                 task,
                 (summary or args.result or "").strip(),
+                effective_goal=effective_goal,
             )
             if rejection is not None:
                 print(
@@ -2499,13 +2521,19 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                completed = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except (kb.CompletionContractError, kb.HandoffValidationError) as exc:
+                failed.append(tid)
+                print(f"cannot complete {tid}: {exc}", file=sys.stderr)
+                continue
+            if not completed:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:

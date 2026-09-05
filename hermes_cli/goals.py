@@ -1164,6 +1164,55 @@ def _render_background_block(background_processes: Optional[List[Dict[str, Any]]
     if not lines:
         return ""
     return JUDGE_BACKGROUND_BLOCK_TEMPLATE.format(background_lines="\n".join(lines))
+def render_effective_goal(
+    goal: Optional[Dict[str, Any]],
+    *,
+    fallback_title: str = "",
+    fallback_body: Optional[str] = None,
+) -> str:
+    """Render the persisted Kanban goal revision for judge prompts.
+
+    Goal revisions are the authoritative contract. Keeping the revision
+    metadata next to the title/body makes an explicit later authorization
+    visible to every judge caller instead of silently falling back to the
+    card's original opening post.
+    """
+    if not isinstance(goal, dict) or not isinstance(goal.get("title"), str):
+        title = fallback_title or ""
+        body = fallback_body or ""
+        return "\n\n".join(part for part in (title, body) if part).strip()
+
+    title = goal.get("title") or ""
+    body = goal.get("body") or ""
+    version = goal.get("version", goal.get("goal_version"))
+    author = goal.get("author") or "unknown"
+    timestamp = goal.get("timestamp", goal.get("created_at"))
+    reason = goal.get("reason") or "unspecified"
+    revision = (
+        f"Effective Kanban goal revision: v{version} (authoritative)"
+        f"\nRevision author: {author}"
+    )
+    if timestamp:
+        revision += f"\nRevision timestamp: {timestamp}"
+    revision += f"\nRevision reason (authoritative decision): {reason}"
+    parts = [revision]
+    if title:
+        parts.append(f"Goal title:\n{title}")
+    if body:
+        parts.append(f"Goal body:\n{body}")
+    return "\n\n".join(parts).strip()
+
+
+def _goal_text_for_loop(goal_text: str, goal_text_fn=None) -> str:
+    """Return the current goal, tolerating a transient DB read failure."""
+    if goal_text_fn is None:
+        return goal_text
+    try:
+        current = goal_text_fn()
+    except Exception:
+        return goal_text
+    return current.strip() if isinstance(current, str) and current.strip() else goal_text
+
 
 
 def judge_goal(
@@ -2175,8 +2224,14 @@ def run_kanban_goal_loop(
     max_turns: int = DEFAULT_MAX_TURNS,
     first_response: str = "",
     log=None,
+    goal_text_fn=None,
 ) -> Dict[str, Any]:
     """Drive a kanban worker through a Ralph-style goal loop.
+
+    The dispatcher may provide ``goal_text_fn`` when goal revisions can land
+    while the worker is running. Each judge call then reads the current
+    effective revision; the original ``goal_text`` remains the fallback for
+    older callers and transient board-read failures.
 
     The dispatcher spawns a goal-mode worker exactly like a normal worker
     (``hermes -p <profile> chat -q "work kanban task <id>"``). The worker's
@@ -2185,10 +2240,10 @@ def run_kanban_goal_loop(
 
     1. Check whether the worker already terminated the task (called
        ``kanban_complete`` / ``kanban_block``). If so, stop — nothing to do.
-    2. Otherwise judge the latest response against ``goal_text`` (the card's
-       title + body). ``continue`` → feed a continuation prompt and run
-       another turn IN THE SAME SESSION via ``run_turn``. ``done`` but the
-       task is still open → one explicit "call kanban_complete" nudge.
+    2. Otherwise judge the latest response against the effective card goal.
+       ``continue`` → feed a continuation prompt and run another turn IN THE
+       SAME SESSION via ``run_turn``. ``done`` but the task is still open →
+       one explicit "call kanban_complete" nudge.
     3. When the turn budget is exhausted and the worker still hasn't
        terminated the task, ``block_fn`` is invoked so the card lands in a
        sticky ``blocked`` state for human review (NOT a silent exit).
@@ -2253,7 +2308,10 @@ def run_kanban_goal_loop(
         # The kanban worker loop has no wait-barrier concept (workers finish
         # via kanban_complete / kanban_block, not by parking), so a WAIT
         # verdict is treated as CONTINUE here.
-        verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
+        current_goal = _goal_text_for_loop(goal_text, goal_text_fn)
+        verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(
+            current_goal, last_response
+        )
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
@@ -2322,5 +2380,6 @@ __all__ = [
     "clear_goal",
     "migrate_goal_to_session",
     "judge_goal",
+    "render_effective_goal",
     "run_kanban_goal_loop",
 ]

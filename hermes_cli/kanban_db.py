@@ -3857,6 +3857,20 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
 class TaskUpdateConflict(RuntimeError):
     """Raised when a task update loses its optimistic-concurrency race."""
 
+class GoalRevisionConflict(RuntimeError):
+    """Raised when triage output would overwrite a newer goal revision."""
+
+    def __init__(self, task_id: str, version: int, fields: Iterable[str]):
+        self.task_id = task_id
+        self.version = int(version)
+        self.fields = tuple(fields)
+        changed = ", ".join(self.fields) or "goal"
+        super().__init__(
+            f"task {task_id} has effective goal revision v{version}; "
+            f"specifier output would overwrite {changed}. Use kanban_update "
+            "with an explicit reason to create the next revision."
+        )
+
 
 _UPDATE_UNSET = object()
 
@@ -6151,6 +6165,52 @@ class HandoffValidationError(ValueError):
         self.reason = reason
         super().__init__(f"task {task_id} has no reviewable immutable handoff: {reason}")
 
+class CompletionContractError(ValueError):
+    """Raised when a plan-only goal has an implementation patch to review."""
+
+    def __init__(
+        self,
+        task_id: str,
+        reason: str,
+        *,
+        changed_files: Optional[Iterable[str]] = None,
+    ):
+        self.task_id = task_id
+        self.reason = reason
+        self.changed_files = list(changed_files or [])
+        super().__init__(f"task {task_id} violates its completion contract: {reason}")
+
+
+_PLAN_ONLY_GOAL_RE = re.compile(
+    r"\b(?:no\s+implementation|without\s+(?:an?\s+)?implementation|"
+    r"plan[\s-]?only|planning[\s-]?only|read[\s-]?only\s+plan|"
+    r"do\s+not\s+implement|don't\s+implement)\b",
+    re.IGNORECASE,
+)
+
+
+def _completion_contract_reason(
+    goal: Optional[dict],
+    changed_files: Optional[Iterable[str]],
+    dependent_children: Iterable[tuple[str, str]],
+) -> Optional[str]:
+    files = [str(path) for path in (changed_files or []) if str(path).strip()]
+    children = list(dependent_children)
+    if not files or not children or not isinstance(goal, dict):
+        return None
+    goal_text = "\n".join(
+        str(goal.get(key) or "") for key in ("title", "body")
+    )
+    if not _PLAN_ONLY_GOAL_RE.search(goal_text):
+        return None
+    revision = goal.get("version", goal.get("goal_version", 1))
+    roles = ", ".join(f"{task_id} ({role})" for task_id, role in children)
+    return (
+        f"effective goal revision v{revision} is plan-only/no implementation, "
+        f"but the handoff contains a non-empty patch ({', '.join(files)}) "
+        f"for dependent review task(s): {roles}"
+    )
+
 
 def _prepare_completion_handoff(
     conn: sqlite3.Connection,
@@ -6187,8 +6247,31 @@ def _prepare_completion_handoff(
     changed_files = supplied.get("changed_files")
     patch_artifact = supplied.get("patch_artifact")
     dependent_children = _handoff_child_rows(conn, task_id)
+    effective_goal = get_effective_goal(conn, task_id)
+    contract_reason = _completion_contract_reason(
+        effective_goal, changed_files, dependent_children
+    )
+    if contract_reason:
+        raise CompletionContractError(
+            task_id,
+            contract_reason,
+            changed_files=changed_files,
+        )
     requires_immutable = bool(dependent_children)
     snapshot = _git_snapshot(workspace, branch)
+    contract_reason = _completion_contract_reason(
+        effective_goal,
+        snapshot.get("dirty_files") if snapshot is not None else None,
+        dependent_children,
+    )
+    if contract_reason:
+        raise CompletionContractError(
+            task_id,
+            contract_reason,
+            changed_files=(
+                snapshot.get("dirty_files") if snapshot is not None else None
+            ),
+        )
 
     if requires_immutable and not base_sha:
         raise HandoffValidationError(task_id, "base_sha is required")
@@ -6274,6 +6357,15 @@ def _prepare_completion_handoff(
         dirty_state = "artifact"
     else:
         dirty_state = supplied.get("dirty_state")
+    contract_reason = _completion_contract_reason(
+        effective_goal, changed_files, dependent_children
+    )
+    if contract_reason:
+        raise CompletionContractError(
+            task_id,
+            contract_reason,
+            changed_files=changed_files,
+        )
 
     handoff: dict[str, Any] = {}
     if base_sha:
@@ -6609,6 +6701,18 @@ def complete_task(
     )
     try:
         metadata, handoff = _prepare_completion_handoff(conn, task_id, metadata)
+    except CompletionContractError as contract_err:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_contract",
+                {
+                    "reason": contract_err.reason,
+                    "changed_files": contract_err.changed_files,
+                },
+            )
+        raise
     except HandoffValidationError as handoff_err:
         with write_txn(conn):
             _append_event(
@@ -7720,6 +7824,18 @@ def request_review(
     summary = redact_review_value(summary)
     try:
         metadata, handoff = _prepare_completion_handoff(conn, task_id, metadata)
+    except CompletionContractError as contract_err:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_contract",
+                {
+                    "reason": contract_err.reason,
+                    "changed_files": contract_err.changed_files,
+                },
+            )
+        return _ret(False, str(contract_err))
     except HandoffValidationError as handoff_err:
         with write_txn(conn):
             _append_event(
@@ -8434,6 +8550,21 @@ def specify_triage_task(
         ).fetchone()
         if existing is None:
             return False
+        effective_goal = get_effective_goal(conn, task_id)
+        if effective_goal and int(effective_goal.get("version", 1)) > 1:
+            superseded_fields: list[str] = []
+            effective_title = effective_goal.get("title") or ""
+            effective_body = effective_goal.get("body") or ""
+            if title is not None and title.strip() != effective_title:
+                superseded_fields.append("title")
+            if body is not None and (body or "") != effective_body:
+                superseded_fields.append("body")
+            if superseded_fields:
+                raise GoalRevisionConflict(
+                    task_id,
+                    int(effective_goal["version"]),
+                    superseded_fields,
+                )
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []
@@ -12298,12 +12429,23 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             return s
         return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
 
+    effective_goal = get_effective_goal(conn, task_id)
+    goal_title = (
+        effective_goal.get("title")
+        if isinstance(effective_goal, dict)
+        and isinstance(effective_goal.get("title"), str)
+        else task.title
+    )
+    goal_body = (
+        effective_goal.get("body")
+        if isinstance(effective_goal, dict)
+        else task.body
+    )
     lines: list[str] = []
-    lines.append(f"# Kanban task {task.id}: {task.title}")
+    lines.append(f"# Kanban task {task.id}: {goal_title}")
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
     lines.append(f"Status:   {task.status}")
-    effective_goal = get_effective_goal(conn, task_id)
     if effective_goal:
         lines.append(
             f"Goal revision: v{effective_goal['version']} "
@@ -12327,9 +12469,9 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
 
-    if task.body and task.body.strip():
+    if goal_body and goal_body.strip():
         lines.append("## Body")
-        lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
+        lines.append(_cap(goal_body, _CTX_MAX_BODY_BYTES))
         lines.append("")
 
     # Attachments — files uploaded to this task (PDFs, source docs,
