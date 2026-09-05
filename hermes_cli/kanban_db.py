@@ -1224,6 +1224,18 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Monotonically increasing optimistic-concurrency token for supported
+    # task updates. ``revision`` is exposed as a compatibility alias below.
+    version: int = 1
+    # Pointer to the immutable row carrying the effective title/body/goal
+    # contract. Kept nullable for legacy rows while migrations backfill it.
+    goal_revision_id: Optional[int] = None
+
+    @property
+    def revision(self) -> int:
+        """Compatibility spelling for the task optimistic-concurrency token."""
+        return self.version
+
     # Transient parent handoff attached by the dispatcher before spawning a
     # dependent reviewer/tester. It is intentionally not persisted on tasks;
     # the source of truth remains the parent's completed run/event.
@@ -1321,6 +1333,16 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            version=(
+                int(row["version"])
+                if "version" in keys and row["version"] is not None
+                else 1
+            ),
+            goal_revision_id=(
+                int(row["goal_revision_id"])
+                if "goal_revision_id" in keys and row["goal_revision_id"] is not None
+                else None
             ),
         )
 
@@ -1509,8 +1531,27 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Optimistic concurrency token for orchestrator task corrections.
+    version              INTEGER NOT NULL DEFAULT 1,
+    -- Foreign-key-like pointer to the immutable effective goal revision.
+    goal_revision_id     INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS task_goal_revisions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id       TEXT NOT NULL,
+    version       INTEGER NOT NULL,
+    title         TEXT NOT NULL,
+    body          TEXT,
+    goal_mode     INTEGER NOT NULL DEFAULT 0,
+    author        TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    reason        TEXT NOT NULL,
+    prior_version INTEGER,
+    UNIQUE(task_id, version)
+);
+
 
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
@@ -1607,6 +1648,7 @@ CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_goal_revisions_task ON task_goal_revisions(task_id, version);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
@@ -2777,6 +2819,48 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "version" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "version", "version INTEGER NOT NULL DEFAULT 1"
+        )
+    if "goal_revision_id" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "goal_revision_id", "goal_revision_id INTEGER"
+        )
+
+    # A legacy task has no immutable goal row. Backfill one from its current
+    # fields so every task has a stable effective-goal read surface.
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_goal_revisions_task "
+        "ON task_goal_revisions(task_id, version)"
+    )
+    missing_goals = conn.execute(
+        "SELECT id, title, body, goal_mode, created_by, created_at, version "
+        "FROM tasks WHERE goal_revision_id IS NULL"
+    ).fetchall()
+    for row in missing_goals:
+        goal_version = 1
+        goal_author = (row["created_by"] or "system").strip() or "system"
+        goal_reason = "initial goal (legacy migration)"
+        goal_at = int(row["created_at"] or time.time())
+        cur = conn.execute(
+            """
+            INSERT INTO task_goal_revisions
+                (task_id, version, title, body, goal_mode, author,
+                 created_at, reason, prior_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                row["id"], goal_version, row["title"], row["body"],
+                int(bool(row["goal_mode"])), goal_author, goal_at, goal_reason,
+            ),
+        )
+        conn.execute(
+            "UPDATE tasks SET goal_revision_id = ? WHERE id = ?",
+            (int(cur.lastrowid), row["id"]),
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3624,6 +3708,25 @@ def create_task(
                         session_id,
                     ),
                 )
+                goal_author = str(created_by or "system").strip() or "system"
+                goal_cur = conn.execute(
+                    """
+                    INSERT INTO task_goal_revisions
+                        (task_id, version, title, body, goal_mode, author,
+                         created_at, reason, prior_version)
+                    VALUES (?, 1, ?, ?, ?, ?, ?, 'initial goal', NULL)
+                    """,
+                    (
+                        task_id, title.strip(), body, int(bool(goal_mode)),
+                        goal_author, now,
+                    ),
+                )
+                goal_revision_id = int(goal_cur.lastrowid)
+                conn.execute(
+                    "UPDATE tasks SET goal_revision_id = ? WHERE id = ?",
+                    (goal_revision_id, task_id),
+                )
+
                 for pid in parents:
                     conn.execute(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
@@ -3650,6 +3753,14 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "version": 1,
+                        "goal_revision": {
+                            "version": 1,
+                            "author": goal_author,
+                            "created_at": now,
+                            "reason": "initial goal",
+                            "prior_version": None,
+                        },
                     },
                 )
                 if initial_status == "blocked":
@@ -3741,6 +3852,335 @@ def _inherit_notify_subs(
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return Task.from_row(row) if row else None
+
+
+class TaskUpdateConflict(RuntimeError):
+    """Raised when a task update loses its optimistic-concurrency race."""
+
+
+_UPDATE_UNSET = object()
+
+
+def _goal_revision_dict(row: sqlite3.Row) -> dict[str, Any]:
+    created_at = int(row["created_at"])
+    version = int(row["version"])
+    return {
+        "id": int(row["id"]),
+        "task_id": row["task_id"],
+        "version": version,
+        "goal_version": version,
+        "title": row["title"],
+        "body": row["body"],
+        "goal_mode": bool(row["goal_mode"]),
+        "author": row["author"],
+        "created_at": created_at,
+        "timestamp": created_at,
+        "reason": row["reason"],
+        "prior_version": (
+            int(row["prior_version"])
+            if row["prior_version"] is not None else None
+        ),
+    }
+
+
+def get_effective_goal(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict[str, Any]]:
+    """Return the immutable goal revision currently effective for ``task_id``."""
+    row = conn.execute(
+        """
+        SELECT r.id, r.task_id, r.version, r.title, r.body, r.goal_mode,
+               r.author, r.created_at, r.reason, r.prior_version
+          FROM tasks t
+          LEFT JOIN task_goal_revisions r ON r.id = t.goal_revision_id
+         WHERE t.id = ?
+        """,
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    if row["id"] is None:
+        # A caller may be reading a task created by an older process between
+        # task insertion and the next migration pass. Keep the read API useful.
+        task = conn.execute(
+            "SELECT id, title, body, goal_mode, created_by, created_at "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task is None:
+            return None
+        created_at = int(task["created_at"] or time.time())
+        return {
+            "id": None,
+            "task_id": task["id"],
+            "version": 1,
+            "goal_version": 1,
+            "title": task["title"],
+            "body": task["body"],
+            "goal_mode": bool(task["goal_mode"]),
+            "author": (task["created_by"] or "system"),
+            "created_at": created_at,
+            "timestamp": created_at,
+            "reason": "initial goal",
+            "prior_version": None,
+        }
+    return _goal_revision_dict(row)
+
+
+def _update_actor(author: Optional[str]) -> str:
+    return (
+        str(author or os.environ.get("HERMES_PROFILE") or "orchestrator").strip()
+        or "orchestrator"
+    )
+
+
+def update_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_version: int,
+    reason: str,
+    title: Any = _UPDATE_UNSET,
+    body: Any = _UPDATE_UNSET,
+    assignee: Any = _UPDATE_UNSET,
+    model: Any = _UPDATE_UNSET,
+    provider: Any = _UPDATE_UNSET,
+    goal_mode: Any = _UPDATE_UNSET,
+    transition: Optional[str] = None,
+    author: Optional[str] = None,
+) -> bool:
+    """Atomically revise and optionally requeue one existing task.
+
+    ``transition`` intentionally supports only ``triage_to_ready``. A live
+    claim is rejected rather than cancelled so the prior run remains intact.
+    """
+    if isinstance(expected_version, bool) or not isinstance(expected_version, int):
+        raise ValueError("expected_version must be an integer")
+    if expected_version < 1:
+        raise ValueError("expected_version must be >= 1")
+    reason_text = str(reason or "").strip()
+    if not reason_text:
+        raise ValueError("reason is required")
+    transition_text = str(transition or "").strip() or None
+    if transition_text not in (None, "triage_to_ready"):
+        raise ValueError(
+            f"unsupported transition {transition_text!r}; "
+            "only 'triage_to_ready' is supported"
+        )
+    if goal_mode is not _UPDATE_UNSET and not isinstance(goal_mode, bool):
+        raise ValueError("goal_mode must be a boolean")
+
+    changed_fields: list[str] = []
+    actor = _update_actor(author)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        current_version = int(row["version"] or 1)
+        if current_version != expected_version:
+            raise TaskUpdateConflict(
+                f"task {task_id} update conflict: expected version "
+                f"{expected_version}, current version {current_version}"
+            )
+        if row["status"] == "archived":
+            raise RuntimeError(f"cannot update archived task {task_id}")
+        if (
+            row["status"] == "running"
+            or row["claim_lock"] is not None
+            or row["current_run_id"] is not None
+        ):
+            raise TaskUpdateConflict(
+                f"cannot update task {task_id}: currently claimed by a worker; "
+                "reclaim it before revising or requeuing"
+            )
+
+        goal_row = conn.execute(
+            "SELECT * FROM task_goal_revisions WHERE id = ?",
+            (row["goal_revision_id"],),
+        ).fetchone() if row["goal_revision_id"] is not None else None
+        if goal_row is None:
+            goal_row = conn.execute(
+                "SELECT * FROM task_goal_revisions "
+                "WHERE task_id = ? ORDER BY version DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        if goal_row is None:
+            now = int(time.time())
+            cur = conn.execute(
+                """
+                INSERT INTO task_goal_revisions
+                    (task_id, version, title, body, goal_mode, author,
+                     created_at, reason, prior_version)
+                VALUES (?, 1, ?, ?, ?, ?, ?, 'initial goal', NULL)
+                """,
+                (
+                    task_id, row["title"], row["body"], int(bool(row["goal_mode"])),
+                    row["created_by"] or "system", int(row["created_at"] or now),
+                ),
+            )
+            goal_row = conn.execute(
+                "SELECT * FROM task_goal_revisions WHERE id = ?",
+                (int(cur.lastrowid),),
+            ).fetchone()
+            conn.execute(
+                "UPDATE tasks SET goal_revision_id = ? WHERE id = ?",
+                (int(cur.lastrowid), task_id),
+            )
+
+        old_title = row["title"]
+        old_body = row["body"]
+        old_assignee = row["assignee"]
+        old_model = row["model_override"]
+        old_provider = row["provider_override"]
+        old_goal_mode = bool(row["goal_mode"])
+        new_title = old_title
+        new_body = old_body
+        new_assignee = old_assignee
+        new_model = old_model
+        new_provider = old_provider
+        new_goal_mode = old_goal_mode
+
+        if title is not _UPDATE_UNSET:
+            if title is None or not str(title).strip():
+                raise ValueError("title cannot be blank")
+            new_title = str(title).strip()
+        if body is not _UPDATE_UNSET:
+            new_body = None if body is None else str(body)
+        if assignee is not _UPDATE_UNSET:
+            new_assignee = _canonical_assignee(
+                None if assignee is None or not str(assignee).strip()
+                else str(assignee)
+            )
+        model_supplied = model is not _UPDATE_UNSET
+        provider_supplied = provider is not _UPDATE_UNSET
+        if model_supplied:
+            new_model = None if model is None else str(model).strip() or None
+            if provider_supplied:
+                new_provider = (
+                    None if provider is None else str(provider).strip() or None
+                )
+            if new_model is None:
+                new_provider = None
+        elif provider_supplied:
+            new_provider = (
+                None if provider is None else str(provider).strip() or None
+            )
+        if new_provider and not new_model:
+            raise ValueError("provider requires a model")
+        if goal_mode is not _UPDATE_UNSET:
+            new_goal_mode = bool(goal_mode)
+
+        new_status = row["status"]
+        if transition_text:
+            if row["status"] != "triage":
+                raise ValueError(
+                    "transition 'triage_to_ready' requires a task in "
+                    f"status 'triage' (current status {row['status']!r})"
+                )
+            new_status = "ready" if _parents_satisfied(conn, task_id) else "todo"
+
+        old_values = {
+            "title": old_title,
+            "body": old_body,
+            "assignee": old_assignee,
+            "model": old_model,
+            "provider": old_provider,
+            "goal_mode": old_goal_mode,
+            "status": row["status"],
+            "version": current_version,
+        }
+        new_values = {
+            "title": new_title,
+            "body": new_body,
+            "assignee": new_assignee,
+            "model": new_model,
+            "provider": new_provider,
+            "goal_mode": new_goal_mode,
+            "status": new_status,
+            "version": current_version + 1,
+        }
+        for key in ("title", "body", "assignee", "model", "provider", "goal_mode", "status"):
+            if old_values[key] != new_values[key]:
+                changed_fields.append(key)
+
+        goal_changed = any(
+            old_values[key] != new_values[key]
+            for key in ("title", "body", "goal_mode")
+        )
+        goal_revision_id = row["goal_revision_id"]
+        goal_revision = None
+        if goal_changed:
+            prior_goal_version = int(goal_row["version"])
+            goal_now = int(time.time())
+            goal_cur = conn.execute(
+                """
+                INSERT INTO task_goal_revisions
+                    (task_id, version, title, body, goal_mode, author,
+                     created_at, reason, prior_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id, prior_goal_version + 1, new_title, new_body,
+                    int(new_goal_mode), actor, goal_now, reason_text,
+                    prior_goal_version,
+                ),
+            )
+            goal_revision_id = int(goal_cur.lastrowid)
+            changed_fields.append("goal_revision")
+
+        sets = [
+            "version = ?",
+            "title = ?",
+            "body = ?",
+            "assignee = ?",
+            "model_override = ?",
+            "provider_override = ?",
+            "goal_mode = ?",
+            "status = ?",
+            "goal_revision_id = ?",
+        ]
+        params: list[Any] = [
+            current_version + 1, new_title, new_body, new_assignee,
+            new_model, new_provider, int(new_goal_mode), new_status,
+            goal_revision_id,
+            task_id, expected_version,
+        ]
+        cur = conn.execute(
+            f"UPDATE tasks SET {', '.join(sets)} "
+            "WHERE id = ? AND version = ?",
+            tuple(params),
+        )
+        if cur.rowcount != 1:
+            raise TaskUpdateConflict(
+                f"task {task_id} update conflict: version changed while updating"
+            )
+
+        if goal_changed:
+            goal_revision = get_effective_goal(conn, task_id)
+        payload = {
+            "actor": actor,
+            "author": actor,
+            "reason": reason_text,
+            "expected_version": expected_version,
+            "old": old_values,
+            "new": new_values,
+            "old_values": old_values,
+            "new_values": new_values,
+            "changed_fields": changed_fields,
+            "transition": transition_text,
+            "goal_revision": goal_revision,
+        }
+        _append_event(
+            conn,
+            task_id,
+            "goal_revised" if goal_changed else "updated",
+            payload,
+        )
+
+    notify_task_updated(conn, task_id, changed_fields or ["version"])
+    return True
 
 
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
@@ -8265,6 +8705,23 @@ def decompose_triage_task(
                     (author or "decomposer"),
                 ),
             )
+            child_goal_author = str(author or "decomposer").strip() or "decomposer"
+            child_goal_cur = conn.execute(
+                """
+                INSERT INTO task_goal_revisions
+                    (task_id, version, title, body, goal_mode, author,
+                     created_at, reason, prior_version)
+                VALUES (?, 1, ?, ?, 0, ?, ?, 'initial goal', NULL)
+                """,
+                (
+                    new_id, title, body if isinstance(body, str) else None,
+                    child_goal_author, now,
+                ),
+            )
+            conn.execute(
+                "UPDATE tasks SET goal_revision_id = ? WHERE id = ?",
+                (int(child_goal_cur.lastrowid), new_id),
+            )
             _append_event(
                 conn, new_id, "created",
                 {"by": author or "decomposer", "from_decompose_of": task_id},
@@ -11846,6 +12303,14 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
     lines.append(f"Status:   {task.status}")
+    effective_goal = get_effective_goal(conn, task_id)
+    if effective_goal:
+        lines.append(
+            f"Goal revision: v{effective_goal['version']} "
+            f"by {effective_goal['author']} "
+            f"({effective_goal['timestamp']})"
+        )
+        lines.append(f"Goal revision reason: {effective_goal['reason']}")
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")

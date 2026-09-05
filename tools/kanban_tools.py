@@ -523,6 +523,9 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
         "provider_override": task.provider_override,
+        "version": task.version,
+        "revision": task.revision,
+        "goal_revision_id": task.goal_revision_id,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -551,6 +554,8 @@ def _handle_show(args: dict, **kw) -> str:
                 return tool_error(f"task {tid} not found")
             comments = kb.list_comments(conn, tid)
             events = kb.list_events(conn, tid)
+            effective_goal = kb.get_effective_goal(conn, tid)
+
             runs = kb.list_runs(conn, tid)
             parents = kb.parent_ids(conn, tid)
             children = kb.child_ids(conn, tid)
@@ -569,6 +574,10 @@ def _handle_show(args: dict, **kw) -> str:
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
+                    "version": t.version,
+                    "revision": t.revision,
+                    "goal_revision_id": t.goal_revision_id,
+                    "goal_mode": t.goal_mode,
                 }
 
             def _run_dict(r):
@@ -582,6 +591,7 @@ def _handle_show(args: dict, **kw) -> str:
 
             return json.dumps({
                 "task": _task_dict(task),
+                "effective_goal": effective_goal,
                 "parents": parents,
                 "children": children,
                 "comments": [
@@ -1664,6 +1674,65 @@ def _handle_unblock(args: dict, **kw) -> str:
         return tool_error(f"kanban_unblock: {e}")
 
 
+def _handle_update(args: dict, **kw) -> str:
+    """Atomically revise a task and optionally requeue a triage card."""
+    delegated_err = _reject_delegated_child_mutation("kanban_update")
+    if delegated_err:
+        return delegated_err
+    guard = _require_orchestrator_tool("kanban_update")
+    if guard:
+        return guard
+    tid = args.get("task_id")
+    if not tid:
+        return tool_error("task_id is required")
+    expected_version = args.get("expected_version")
+    if isinstance(expected_version, bool):
+        return tool_error("expected_version must be an integer")
+    try:
+        expected_version = int(expected_version)
+    except (TypeError, ValueError):
+        return tool_error("expected_version must be an integer")
+    reason = str(args.get("reason") or "").strip()
+    if not reason:
+        return tool_error("reason is required")
+    kwargs = {
+        "expected_version": expected_version,
+        "reason": reason,
+        "author": os.environ.get("HERMES_PROFILE") or "orchestrator",
+    }
+    for name in ("title", "body", "assignee", "model", "provider", "transition"):
+        if name in args:
+            kwargs[name] = args[name]
+    if "goal_mode" in args:
+        goal_mode, bool_error = _parse_bool_arg(args, "goal_mode")
+        if bool_error:
+            return tool_error(bool_error)
+        kwargs["goal_mode"] = goal_mode
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            ok = kb.update_task(conn, str(tid), **kwargs)
+            if not ok:
+                return tool_error(f"task {tid} not found")
+            task = kb.get_task(conn, str(tid))
+            return _ok(
+                task_id=str(tid),
+                version=task.version if task else None,
+                status=task.status if task else None,
+                effective_goal=kb.get_effective_goal(conn, str(tid)),
+            )
+        finally:
+            conn.close()
+    except RuntimeError as e:
+        return tool_error(f"kanban_update: {e}")
+    except ValueError as e:
+        return tool_error(f"kanban_update: {e}")
+    except Exception as e:
+        logger.exception("kanban_update failed")
+        return tool_error(f"kanban_update: {e}")
+
+
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact."""
     delegated_err = _reject_delegated_child_mutation("kanban_link")
@@ -2354,6 +2423,58 @@ KANBAN_UNBLOCK_SCHEMA = {
     },
 }
 
+KANBAN_UPDATE_SCHEMA = {
+    "name": "kanban_update",
+    "description": (
+        "Correct an existing task atomically without recreating it. "
+        "Requires the current expected_version and a reason; stale versions "
+        "are rejected. Title/body/goal_mode changes create an immutable "
+        "effective-goal revision. The only supported transition is "
+        "'triage_to_ready', which lands in 'todo' while parents are open "
+        "and 'ready' once parent gating is satisfied. Orchestrator-only; "
+        "a currently claimed worker is never silently cancelled."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "Task to revise."},
+            "title": {"type": "string", "description": "Replacement title."},
+            "body": {"type": "string", "description": "Replacement goal/spec body."},
+            "assignee": {
+                "type": "string",
+                "description": "Replacement assignee; omit to leave unchanged, empty clears.",
+            },
+            "model": {
+                "type": "string",
+                "description": "Replacement model override; omit to leave unchanged, empty clears.",
+            },
+            "provider": {
+                "type": "string",
+                "description": "Provider for model; omit to leave unchanged.",
+            },
+            "goal_mode": {
+                "type": "boolean",
+                "description": "Enable or disable goal-mode execution.",
+            },
+            "expected_version": {
+                "type": "integer",
+                "description": "Current task version required for the CAS update.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Human-readable reason for the correction.",
+            },
+            "transition": {
+                "type": "string",
+                "enum": ["triage_to_ready"],
+                "description": "Optional triage requeue transition.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id", "expected_version", "reason"],
+    },
+}
+
 KANBAN_LINK_SCHEMA = {
     "name": "kanban_link",
     "description": (
@@ -2493,6 +2614,16 @@ registry.register(
     check_fn=_check_kanban_orchestrator_mode,
     emoji="▶",
 )
+
+registry.register(
+    name="kanban_update",
+    toolset="kanban",
+    schema=KANBAN_UPDATE_SCHEMA,
+    handler=_handle_update,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="✎",
+)
+
 
 registry.register(
     name="kanban_link",
