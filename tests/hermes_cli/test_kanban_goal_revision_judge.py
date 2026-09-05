@@ -161,7 +161,8 @@ def test_plan_only_completion_rejects_nonempty_patch_for_reviewer(
         )
         (repo / "changed.py").write_text("value = 1\n", encoding="utf-8")
         _git(repo, "add", "changed.py")
-        head = _git(repo, "commit", "-m", "implementation")
+        _git(repo, "commit", "-m", "implementation")
+        head = _git(repo, "rev-parse", "HEAD")
 
         with pytest.raises(kb.CompletionContractError, match="plan-only/no implementation"):
             kb.complete_task(
