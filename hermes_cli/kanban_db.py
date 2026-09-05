@@ -200,6 +200,23 @@ def normalized_block_cause(
 
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# Immutable implementation handoffs are carried in the per-run metadata and
+# repeated on the ``completed`` event so downstream workers can review the
+# exact state without consulting a moving checkout.
+HANDOFF_CHILD_ASSIGNEES = frozenset({"reviewer", "tester"})
+HANDOFF_BASE_KEYS = ("base_sha", "base_commit", "base")
+HANDOFF_HEAD_KEYS = (
+    "head_sha",
+    "task_head_sha",
+    "reviewed_head_sha",
+    "tested_head_sha",
+    "head",
+)
+HANDOFF_CHANGED_FILES_KEYS = ("changed_files",)
+HANDOFF_BRANCH_KEYS = ("branch_name", "branch")
+HANDOFF_WORKTREE_KEYS = ("workspace_path", "worktree_path", "worktree")
+HANDOFF_PATCH_KEYS = ("patch_artifact", "patch_artifact_path", "patch_file")
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -1207,6 +1224,10 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Transient parent handoff attached by the dispatcher before spawning a
+    # dependent reviewer/tester. It is intentionally not persisted on tasks;
+    # the source of truth remains the parent's completed run/event.
+    parent_handoff: Optional[dict] = field(default=None, repr=False)
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -4786,6 +4807,10 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        handoff_error = _parent_handoff_start_error(conn, task_id)
+        if handoff_error is not None:
+            _record_parent_handoff_start_error(conn, task_id, handoff_error)
+            return None
         if _is_sticky_blocked(conn, task_id):
             _append_event(
                 conn,
@@ -4939,6 +4964,10 @@ def claim_review_task(
                         "source_status": "review",
                     },
                 )
+            return None
+        handoff_error = _parent_handoff_start_error(conn, task_id)
+        if handoff_error is not None:
+            _record_parent_handoff_start_error(conn, task_id, handoff_error)
             return None
         cur = conn.execute(
             """
@@ -5378,6 +5407,473 @@ def reassign_task(
         return False
 
 
+def _metadata_value(metadata: Mapping[str, Any], keys: Iterable[str]) -> Any:
+    for key in keys:
+        value = metadata.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _normalise_changed_files(value: Any) -> Optional[list[str]]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text.casefold() in {"none", "null", "[]"}:
+            return []
+        values = [part.strip() for part in text.split(",")]
+    elif isinstance(value, (list, tuple, set)):
+        values = [str(part).strip() for part in value]
+    else:
+        return []
+    seen: set[str] = set()
+    return [item for item in values if item and not (item in seen or seen.add(item))]
+
+
+def _handoff_from_mapping(metadata: Any) -> dict[str, Any]:
+    """Extract the stable handoff fields from run/event metadata."""
+    if not isinstance(metadata, Mapping):
+        return {}
+    out: dict[str, Any] = {}
+    for target, keys in (
+        ("base_sha", HANDOFF_BASE_KEYS),
+        ("head_sha", HANDOFF_HEAD_KEYS),
+        ("branch_name", HANDOFF_BRANCH_KEYS),
+        ("workspace_path", HANDOFF_WORKTREE_KEYS),
+        ("patch_artifact", HANDOFF_PATCH_KEYS),
+    ):
+        value = _metadata_value(metadata, keys)
+        if value is not None:
+            text = str(value).strip()
+            if text:
+                out[target] = text
+    changed = _normalise_changed_files(
+        _metadata_value(metadata, HANDOFF_CHANGED_FILES_KEYS)
+    )
+    if changed is not None:
+        out["changed_files"] = changed
+    for key in ("dirty_state", "patch_sha256"):
+        value = metadata.get(key)
+        if value is not None and value != "":
+            out[key] = value
+    return out
+
+
+def latest_handoff(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+    """Return the latest durable handoff for ``task_id``.
+
+    Completion events repeat the canonical fields, but reading the run first
+    keeps this compatible with older boards where the event only carried a
+    summary. The event wins when both contain a field.
+    """
+    merged: dict[str, Any] = {}
+    run = conn.execute(
+        "SELECT metadata FROM task_runs "
+        "WHERE task_id = ? AND outcome IN ('completed', 'review_requested') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if run and run["metadata"]:
+        try:
+            parsed = json.loads(run["metadata"])
+        except (TypeError, json.JSONDecodeError):
+            parsed = {}
+        merged.update(_handoff_from_mapping(parsed))
+    event = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('completed', 'review_requested') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if event and event["payload"]:
+        try:
+            parsed = json.loads(event["payload"])
+        except (TypeError, json.JSONDecodeError):
+            parsed = {}
+        merged.update(_handoff_from_mapping(parsed))
+    return merged
+
+
+def _git_output(path: Path | str, *args: str) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout or ""
+
+
+def _git_snapshot(path: Optional[str], branch: Optional[str] = None) -> Optional[dict[str, Any]]:
+    if not path:
+        return None
+    workspace = Path(path).expanduser()
+    if not workspace.is_dir():
+        return None
+    if _git_output(workspace, "rev-parse", "--show-toplevel") is None:
+        return None
+    head = (_git_output(workspace, "rev-parse", "HEAD") or "").strip()
+    if not head:
+        return None
+    current_branch = (
+        _git_output(workspace, "symbolic-ref", "--quiet", "--short", "HEAD") or ""
+    ).strip() or None
+    status_raw = _git_output(
+        workspace, "status", "--porcelain=v1", "-z", "--untracked-files=all"
+    )
+    dirty_files: list[str] = []
+    status_available = status_raw is not None
+    if status_raw is not None:
+        for entry in status_raw.split("\0"):
+            if not entry:
+                continue
+            item = entry[3:] if len(entry) >= 3 else entry
+            if " -> " in item:
+                item = item.rsplit(" -> ", 1)[-1]
+            if item and item not in dirty_files:
+                dirty_files.append(item)
+    branch_head = None
+    if branch:
+        branch_head = (
+            _git_output(
+                workspace,
+                "rev-parse",
+                "--verify",
+                f"refs/heads/{branch}",
+            )
+            or ""
+        ).strip() or None
+    return {
+        "head": head,
+        "current_branch": current_branch,
+        "branch_head": branch_head,
+        "dirty_files": dirty_files,
+        "status_available": status_available,
+    }
+
+
+def _git_resolve_sha(path: Path | str, value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    resolved = _git_output(
+        path, "rev-parse", "--verify", f"{text}^{{commit}}"
+    )
+    return resolved.strip() if resolved and resolved.strip() else None
+
+
+def _git_changed_files(path: Path | str, base_sha: str, head_sha: str) -> list[str]:
+    raw = _git_output(path, "diff", "--name-only", "-z", base_sha, head_sha)
+    if raw is None:
+        return []
+    files: list[str] = []
+    for item in raw.split("\0"):
+        item = item.strip()
+        if item and item not in files:
+            files.append(item)
+    return files
+
+
+def _git_is_ancestor(path: Path | str, base_sha: str, head_sha: str) -> bool:
+    return _git_output(path, "merge-base", "--is-ancestor", base_sha, head_sha) is not None
+
+
+def _patch_changed_files(path: str) -> list[str]:
+    """Best-effort file manifest for a durable unified patch artifact."""
+    try:
+        text = Path(path).expanduser().read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return []
+    files: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("+++ b/"):
+            name = line[6:].strip()
+        elif line.startswith("--- a/"):
+            name = line[6:].strip()
+        else:
+            continue
+        if name != "/dev/null" and name not in files:
+            files.append(name)
+    return files
+
+
+def _handoff_child_rows(
+    conn: sqlite3.Connection, task_id: str
+) -> list[tuple[str, str]]:
+    rows = conn.execute(
+        "SELECT t.id, t.assignee FROM task_links l "
+        "JOIN tasks t ON t.id = l.child_id "
+        "WHERE l.parent_id = ? ORDER BY t.id",
+        (task_id,),
+    ).fetchall()
+    out: list[tuple[str, str]] = []
+    for row in rows:
+        assignee = str(row["assignee"] or "").strip().casefold()
+        if assignee in HANDOFF_CHILD_ASSIGNEES:
+            out.append((row["id"], assignee))
+    return out
+
+
+class HandoffValidationError(ValueError):
+    """Raised when an implementation cannot hand off immutable review state."""
+
+    def __init__(self, task_id: str, reason: str):
+        self.task_id = task_id
+        self.reason = reason
+        super().__init__(f"task {task_id} has no reviewable immutable handoff: {reason}")
+
+
+def _prepare_completion_handoff(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+) -> tuple[Optional[dict], dict[str, Any]]:
+    """Validate and canonicalise completion handoff fields.
+
+    Dependent reviewer/tester cards require a clean Git commit (or an explicit
+    patch artifact) and both commit identities. For every Git workspace we
+    compute the file manifest instead of trusting model-supplied prose.
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return metadata, {}
+    updated = dict(metadata) if isinstance(metadata, dict) else {}
+    supplied = _handoff_from_mapping(updated)
+    branch_from_metadata = supplied.get("branch_name")
+    branch_from_task = (task.branch_name or "").strip() or None
+    if (
+        branch_from_metadata
+        and branch_from_task
+        and branch_from_metadata != branch_from_task
+    ):
+        raise HandoffValidationError(
+            task_id,
+            f"metadata branch {branch_from_metadata!r} does not match "
+            f"task branch {branch_from_task!r}",
+        )
+    branch = branch_from_metadata or branch_from_task
+    workspace = supplied.get("workspace_path") or task.workspace_path
+    base_sha = supplied.get("base_sha")
+    head_sha = supplied.get("head_sha")
+    changed_files = supplied.get("changed_files")
+    patch_artifact = supplied.get("patch_artifact")
+    dependent_children = _handoff_child_rows(conn, task_id)
+    requires_immutable = bool(dependent_children)
+    snapshot = _git_snapshot(workspace, branch)
+
+    if requires_immutable and not base_sha:
+        raise HandoffValidationError(task_id, "base_sha is required")
+    if requires_immutable and not head_sha:
+        raise HandoffValidationError(task_id, "head_sha is required")
+
+    if snapshot is not None:
+        if requires_immutable and not snapshot["status_available"]:
+            raise HandoffValidationError(
+                task_id, "could not determine dirty state for the task worktree"
+            )
+        if (
+            requires_immutable
+            and snapshot["current_branch"]
+            and branch
+            and snapshot["current_branch"] != branch
+        ):
+            raise HandoffValidationError(
+                task_id,
+                f"worktree is on branch {snapshot['current_branch']!r}, "
+                f"not task branch {branch!r}",
+            )
+        if requires_immutable and snapshot["dirty_files"]:
+            raise HandoffValidationError(
+                task_id,
+                "worktree has dirty or untracked files "
+                f"({', '.join(snapshot['dirty_files'])}); commit them or "
+                "escalate unrelated dirty work before completing",
+            )
+        actual_head = snapshot["branch_head"] if branch else snapshot["head"]
+        if requires_immutable and not actual_head:
+            raise HandoffValidationError(
+                task_id, f"task branch {branch!r} does not resolve to a commit"
+            )
+        if head_sha:
+            resolved_head = _git_resolve_sha(workspace, head_sha)
+            if resolved_head is None:
+                raise HandoffValidationError(
+                    task_id, f"head_sha {head_sha!r} is not a commit in the worktree"
+                )
+            head_sha = resolved_head
+        elif not requires_immutable:
+            head_sha = actual_head
+        if requires_immutable and head_sha != actual_head:
+            raise HandoffValidationError(
+                task_id,
+                f"recorded head_sha {head_sha!r} does not match current "
+                f"task-branch head {actual_head!r}",
+            )
+        if base_sha:
+            resolved_base = _git_resolve_sha(workspace, base_sha)
+            if resolved_base is None:
+                raise HandoffValidationError(
+                    task_id, f"base_sha {base_sha!r} is not a commit in the worktree"
+                )
+            base_sha = resolved_base
+        if requires_immutable and not _git_is_ancestor(workspace, base_sha, head_sha):
+            raise HandoffValidationError(
+                task_id, "base_sha is not an ancestor of the recorded head_sha"
+            )
+        if base_sha and head_sha:
+            changed_files = _git_changed_files(workspace, base_sha, head_sha)
+        if snapshot["dirty_files"]:
+            changed_files = list(changed_files or [])
+            for path in snapshot["dirty_files"]:
+                if path not in changed_files:
+                    changed_files.append(path)
+        dirty_state = "dirty" if snapshot["dirty_files"] else "clean"
+    elif requires_immutable:
+        if not patch_artifact:
+            raise HandoffValidationError(
+                task_id,
+                f"worktree {workspace or '(unresolved)'!r} is not a Git "
+                "checkout and no patch_artifact was recorded",
+            )
+        artifact_path = Path(patch_artifact).expanduser()
+        if not artifact_path.is_file():
+            raise HandoffValidationError(
+                task_id, f"patch_artifact {patch_artifact!r} does not exist"
+            )
+        if changed_files is None or not changed_files:
+            changed_files = _patch_changed_files(str(artifact_path))
+        dirty_state = "artifact"
+    else:
+        dirty_state = supplied.get("dirty_state")
+
+    handoff: dict[str, Any] = {}
+    if base_sha:
+        handoff["base_sha"] = base_sha
+        updated["base_sha"] = base_sha
+    if head_sha:
+        handoff["head_sha"] = head_sha
+        updated["head_sha"] = head_sha
+    if changed_files is not None:
+        changed_files = _normalise_changed_files(changed_files) or []
+        handoff["changed_files"] = changed_files
+        updated["changed_files"] = changed_files
+    if branch:
+        handoff["branch_name"] = branch
+        updated["branch_name"] = branch
+    if workspace:
+        handoff["workspace_path"] = str(workspace)
+        updated["workspace_path"] = str(workspace)
+    if dirty_state:
+        handoff["dirty_state"] = dirty_state
+        updated["dirty_state"] = dirty_state
+    if patch_artifact:
+        handoff["patch_artifact"] = patch_artifact
+        updated["patch_artifact"] = patch_artifact
+    patch_sha256 = supplied.get("patch_sha256")
+    if patch_sha256:
+        handoff["patch_sha256"] = patch_sha256
+        updated["patch_sha256"] = patch_sha256
+    return (updated if isinstance(metadata, dict) or handoff else metadata), handoff
+
+
+def _parent_handoff_context(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[dict[str, Any]]:
+    for parent_id in parent_ids(conn, task_id):
+        parent = get_task(conn, parent_id)
+        if parent is None or parent.status not in {"done", "archived"}:
+            continue
+        handoff = latest_handoff(conn, parent_id)
+        if not handoff:
+            continue
+        handoff.setdefault("branch_name", parent.branch_name)
+        handoff.setdefault("workspace_path", parent.workspace_path)
+        handoff["parent_task_id"] = parent_id
+        return handoff
+    return None
+
+
+def _parent_handoff_start_error(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[dict[str, Any]]:
+    task = get_task(conn, task_id)
+    if task is None or (task.assignee or "").strip().casefold() not in HANDOFF_CHILD_ASSIGNEES:
+        return None
+    for parent_id in parent_ids(conn, task_id):
+        parent = get_task(conn, parent_id)
+        if parent is None or parent.status not in {"done", "archived"}:
+            continue
+        handoff = latest_handoff(conn, parent_id)
+        expected_head = handoff.get("head_sha") if handoff else None
+        if not expected_head:
+            return {
+                "kind": "handoff_unverifiable",
+                "parent_id": parent_id,
+                "reason": "parent completion has no head_sha",
+            }
+        branch = handoff.get("branch_name") or parent.branch_name
+        workspace = handoff.get("workspace_path") or parent.workspace_path
+        snapshot = _git_snapshot(workspace, branch)
+        actual_head = (
+            snapshot.get("branch_head") if snapshot and branch
+            else snapshot.get("head") if snapshot
+            else None
+        )
+        if actual_head is None:
+            return {
+                "kind": "handoff_unverifiable",
+                "parent_id": parent_id,
+                "expected_head_sha": expected_head,
+                "branch_name": branch,
+                "workspace_path": workspace,
+                "reason": "parent branch/worktree head is unavailable",
+            }
+        resolved_expected = _git_resolve_sha(workspace, expected_head)
+        if resolved_expected != actual_head:
+            return {
+                "kind": "handoff_head_moved",
+                "parent_id": parent_id,
+                "expected_head_sha": resolved_expected or expected_head,
+                "actual_head_sha": actual_head,
+                "base_sha": handoff.get("base_sha"),
+                "branch_name": branch,
+                "workspace_path": workspace,
+                "reason": "parent task branch moved after approval",
+            }
+    return None
+
+
+def _record_parent_handoff_start_error(
+    conn: sqlite3.Connection, task_id: str, error: dict[str, Any]
+) -> None:
+    kind = str(error.get("kind") or "handoff_unverifiable")
+    payload = dict(error)
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    previous = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, kind),
+    ).fetchone()
+    if previous and previous["payload"] == encoded:
+        return
+    _append_event(conn, task_id, kind, payload)
+    parent_id = error.get("parent_id")
+    if parent_id and parent_id != task_id:
+        parent_payload = dict(payload)
+        parent_payload["dependent_task_id"] = task_id
+        _append_event(conn, parent_id, kind, parent_payload)
+
 def _verify_created_cards(
     conn: sqlite3.Connection,
     completing_task_id: str,
@@ -5593,6 +6089,17 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    try:
+        metadata, handoff = _prepare_completion_handoff(conn, task_id, metadata)
+    except HandoffValidationError as handoff_err:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_handoff",
+                {"reason": handoff_err.reason},
+            )
+        raise
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
@@ -5693,6 +6200,8 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        if handoff:
+            completed_payload.update(handoff)
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -6691,7 +7200,17 @@ def request_review(
         return (ok, reason) if with_reason else ok
 
     summary = redact_review_value(summary)
-    metadata = redact_review_value(metadata)
+    try:
+        metadata, handoff = _prepare_completion_handoff(conn, task_id, metadata)
+    except HandoffValidationError as handoff_err:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_handoff",
+                {"reason": handoff_err.reason},
+            )
+        return _ret(False, str(handoff_err))
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
@@ -6804,15 +7323,17 @@ def request_review(
             )
         lines = (summary or "").strip().splitlines()
         event_summary = lines[0][:400] if lines else ""
+        review_payload = {
+            "summary": event_summary or None,
+            "implementer": implementer,
+            "reviewer": reviewer,
+        }
+        review_payload.update(handoff)
         _append_event(
             conn,
             task_id,
             "review_requested",
-            {
-                "summary": event_summary or None,
-                "implementer": implementer,
-                "reviewer": reviewer,
-            },
+            review_payload,
             run_id=run_id,
         )
     return _ret(True)
@@ -10477,6 +10998,7 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        claimed.parent_handoff = _parent_handoff_context(conn, claimed.id)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -10604,6 +11126,7 @@ def _dispatch_once_locked(
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        claimed.parent_handoff = _parent_handoff_context(conn, claimed.id)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -11034,6 +11557,22 @@ def _default_spawn(
         env["TERMINAL_CWD"] = workspace
     if task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
+    parent_handoff = task.parent_handoff
+    if isinstance(parent_handoff, dict):
+        for env_key, handoff_key in (
+            ("HERMES_KANBAN_PARENT_TASK_ID", "parent_task_id"),
+            ("HERMES_KANBAN_PARENT_BASE_SHA", "base_sha"),
+            ("HERMES_KANBAN_PARENT_HEAD_SHA", "head_sha"),
+            ("HERMES_KANBAN_PARENT_BRANCH", "branch_name"),
+            ("HERMES_KANBAN_PARENT_WORKTREE", "workspace_path"),
+        ):
+            value = parent_handoff.get(handoff_key)
+            if value:
+                env[env_key] = str(value)
+        if "changed_files" in parent_handoff:
+            env["HERMES_KANBAN_PARENT_CHANGED_FILES"] = json.dumps(
+                parent_handoff["changed_files"], ensure_ascii=False
+            )
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
@@ -11430,6 +11969,30 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                     body_lines.append(f"_metadata_: `{_cap(meta_str)}`")
                 except Exception:
                     pass
+            handoff = latest_handoff(conn, pid)
+            if handoff:
+                body_lines.append(
+                    "Immutable handoff (read-only; review this exact commit):"
+                )
+                for label, key in (
+                    ("Base SHA", "base_sha"),
+                    ("Head SHA", "head_sha"),
+                    ("Branch", "branch_name"),
+                    ("Worktree", "workspace_path"),
+                    ("Dirty state", "dirty_state"),
+                ):
+                    value = handoff.get(key)
+                    if value:
+                        body_lines.append(f"- {label}: `{value}`")
+                if "changed_files" in handoff:
+                    files = handoff["changed_files"] or []
+                    body_lines.append(
+                        "- Changed files: "
+                        + (", ".join(f"`{item}`" for item in files) or "none")
+                    )
+                body_lines.append(
+                    "Do not substitute a moving branch tip for the recorded head."
+                )
             lines.extend(body_lines)
             lines.append("")
 
