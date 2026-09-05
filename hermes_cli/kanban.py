@@ -81,6 +81,10 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "version": t.version,
+        "revision": t.revision,
+        "goal_revision_id": t.goal_revision_id,
+        "goal_mode": t.goal_mode,
     }
 
 
@@ -510,6 +514,50 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         metavar="VALUE",
         help="With --state-type: keep runs whose column equals this value",
     )
+
+    # --- update / revise / requeue ---
+    p_update = sub.add_parser(
+        "update",
+        help="Atomically revise a task with optimistic concurrency",
+    )
+    p_update.add_argument("task_id")
+    p_update.add_argument("--title", default=None)
+    p_update.add_argument("--body", default=None)
+    p_update.add_argument(
+        "--assignee", default=None,
+        help="New profile (or 'none' to clear; omit to leave unchanged)",
+    )
+    p_update.add_argument(
+        "--model", default=None,
+        help="New model override (or 'none' to clear; omit to leave unchanged)",
+    )
+    p_update.add_argument(
+        "--provider", default=None,
+        help="Provider for --model (or 'none' to clear)",
+    )
+    p_update.add_argument(
+        "--goal-mode", dest="goal_mode", action="store_true",
+        help="Enable goal-mode execution",
+    )
+    p_update.add_argument(
+        "--no-goal-mode", dest="goal_mode", action="store_false",
+        help="Disable goal-mode execution",
+    )
+    p_update.set_defaults(goal_mode=None)
+    p_update.add_argument(
+        "--expected-version", required=True, type=int,
+        help="Current task version; the update is rejected if it changed",
+    )
+    p_update.add_argument(
+        "--reason", required=True,
+        help="Why this correction/requeue is being made",
+    )
+    p_update.add_argument(
+        "--transition", choices=("triage_to_ready",), default=None,
+        help="Promote a triage task to todo/ready after applying the update",
+    )
+    p_update.add_argument("--author", default=None, help=argparse.SUPPRESS)
+    p_update.add_argument("--json", action="store_true")
 
     # --- assign ---
     p_assign = sub.add_parser("assign", help="Assign or reassign a task")
@@ -1150,6 +1198,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "list":     _cmd_list,
             "ls":       _cmd_list,
             "show":     _cmd_show,
+            "update":   _cmd_update,
             "assign":   _cmd_assign,
             "set-model": _cmd_set_model,
             "reclaim":  _cmd_reclaim,
@@ -1806,12 +1855,14 @@ def _cmd_show(args: argparse.Namespace) -> int:
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        effective_goal = kb.get_effective_goal(conn, args.task_id)
         if not getattr(args, "json", False):
             graph = kb.task_graph_context(conn, task.id)
 
     if getattr(args, "json", False):
         payload = {
             "task": _task_to_dict(task),
+            "effective_goal": effective_goal,
             "latest_summary": latest_summary,
             "parents": parents,
             "children": children,
@@ -1849,6 +1900,16 @@ def _cmd_show(args: argparse.Namespace) -> int:
         return 0
 
     print(f"Task {task.id}: {task.title}")
+    print(f"  version:   {task.version}")
+    if effective_goal:
+        print(
+            f"  goal:      v{effective_goal['version']} "
+            f"by {effective_goal['author']} "
+            f"({_fmt_ts(effective_goal['timestamp'])})"
+        )
+        print(f"  goal reason: {effective_goal['reason']}")
+        if effective_goal["prior_version"] is not None:
+            print(f"  goal prior:  v{effective_goal['prior_version']}")
     print(f"  status:    {task.status}")
     print(f"  assignee:  {task.assignee or '-'}")
     if task.tenant:
@@ -1952,9 +2013,55 @@ def _cmd_show(args: argparse.Namespace) -> int:
             print(f"  #{r.id:<3} {outcome:<12} @{r.profile or '-'}  {el}  "
                   f"{_fmt_ts(r.started_at)}")
             if r.summary:
+
                 print(f"        → {r.summary.splitlines()[0][:160]}")
             if r.error:
                 print(f"        ! {r.error.splitlines()[0][:160]}")
+    return 0
+
+def _cmd_update(args: argparse.Namespace) -> int:
+    """Revise a task through the same atomic path as ``kanban_update``."""
+    def _optional(value: Optional[str]):
+        if value is None:
+            return kb._UPDATE_UNSET
+        if value.lower() in {"none", "-", "null"}:
+            return None
+        return value
+
+    with kb.connect_closing() as conn:
+        ok = kb.update_task(
+            conn,
+            args.task_id,
+            title=_optional(args.title),
+            body=(kb._UPDATE_UNSET if args.body is None else args.body),
+            assignee=_optional(args.assignee),
+            model=_optional(args.model),
+            provider=_optional(args.provider),
+            goal_mode=(
+                kb._UPDATE_UNSET
+                if args.goal_mode is None else args.goal_mode
+            ),
+            expected_version=args.expected_version,
+            reason=args.reason,
+            transition=args.transition,
+            author=args.author or _profile_author(),
+        )
+        if not ok:
+            print(f"no such task: {args.task_id}", file=sys.stderr)
+            return 1
+        task = kb.get_task(conn, args.task_id)
+        effective_goal = kb.get_effective_goal(conn, args.task_id)
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "task": _task_to_dict(task),
+            "effective_goal": effective_goal,
+        }, indent=2, ensure_ascii=False))
+    else:
+        print(
+            f"Updated {args.task_id}: version={task.version}, "
+            f"status={task.status}"
+        )
     return 0
 
 
