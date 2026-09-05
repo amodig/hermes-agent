@@ -145,6 +145,9 @@ Registered when the agent is either (a) spawned by the kanban dispatcher (`HERME
 | `kanban_create` | Fan out child tasks from the current task. Used by orchestrators and follow-up-spawning workers. | `HERMES_KANBAN_TASK` or `kanban` toolset |
 | `kanban_link` | Link tasks with a parent → child dependency edge. | `HERMES_KANBAN_TASK` or `kanban` toolset |
 | `kanban_unblock` | Move a blocked task to `ready` when all parents are done, or `todo` while any parent remains open. Orchestrator-only; hidden from dispatcher-spawned task workers. | profile with `kanban` toolset |
+| `kanban_unlink` | Remove one invalid dependency edge with explicit board scope, optimistic versions, and an audit reason. Orchestrator-only. | profile with `kanban` toolset |
+| `kanban_archive` | Archive one detached, unclaimed invalid card without fabricating completion. Requires its current version and an audit reason. Orchestrator-only. | profile with `kanban` toolset |
+| `kanban_requeue_handoff` | Requeue a legacy completed implementation lacking `head_sha`, preserve its history, and gate dependents until immutable recommit. Orchestrator-only. | profile with `kanban` toolset |
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64). Stored as a real attachment under the task's attachments dir, capped at 25 MB. | `HERMES_KANBAN_TASK` or `kanban` toolset |
 | `kanban_attach_url` | Attach a file to a task by URL — Hermes downloads it server-side and stores it as a real attachment (capped at 25 MB). Only http/https URLs. | `HERMES_KANBAN_TASK` or `kanban` toolset |
 | `kanban_attachments` | List the files attached to a task: id, filename, content_type, size, uploader, and the absolute on-disk path. | `HERMES_KANBAN_TASK` or `kanban` toolset |

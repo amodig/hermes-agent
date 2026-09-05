@@ -509,3 +509,69 @@ KANBAN_LINK_SCHEMA = _schema(
     },
     ["parent_id", "child_id"],
 )
+
+
+KANBAN_UNLINK_SCHEMA = _schema(
+    "kanban_unlink",
+    (
+        "Repair an existing board by removing one invalid dependency edge. "
+        "Orchestrator-only; requires explicit board scope, current versions, and an audit reason."
+    ),
+    {
+        "board": _prop("string", "Explicit board slug."),
+        "parent_id": _prop("string", "Parent task id."),
+        "child_id": _prop("string", "Child task id."),
+        "expected_parent_version": _prop("integer", "Current parent version."),
+        "expected_child_version": _prop("integer", "Current child version."),
+        "reason": _prop("string", "Why this graph repair is required."),
+    },
+    [
+        "board",
+        "parent_id",
+        "child_id",
+        "expected_parent_version",
+        "expected_child_version",
+        "reason",
+    ],
+)
+
+KANBAN_ARCHIVE_SCHEMA = _schema(
+    "kanban_archive",
+    (
+        "Archive one detached invalid task without falsely completing it. "
+        "Orchestrator-only; requires explicit board scope, current version, and an audit reason."
+    ),
+    {
+        "board": _prop("string", "Explicit board slug."),
+        "task_id": _prop("string", "Detached task id."),
+        "expected_version": _prop("integer", "Current task version."),
+        "reason": _prop("string", "Why the task is being retired."),
+    },
+    ["board", "task_id", "expected_version", "reason"],
+)
+
+KANBAN_REQUEUE_HANDOFF_SCHEMA = _schema(
+    "kanban_requeue_handoff",
+    (
+        "Requeue a completed legacy implementation that lacks an immutable head_sha. "
+        "Preserves history and gates dependents until evidence-complete recompletion."
+    ),
+    {
+        "board": _prop("string", "Explicit board slug."),
+        "task_id": _prop("string", "Completed legacy task id."),
+        "expected_version": _prop("integer", "Current task version."),
+        "reason": _prop("string", "Why legacy recovery is required."),
+        "base_sha": _prop(
+            "string", "Historical base commit when not already recorded."
+        ),
+        "branch_name": _prop(
+            "string", "Historical task branch when not already recorded."
+        ),
+        "workspace_path": _prop(
+            "string", "Historical task worktree when not already recorded."
+        ),
+        "patch_artifact": _prop("string", "Historical patch path when available."),
+        "patch_sha256": _prop("string", "Expected SHA-256 for the historical patch."),
+    },
+    ["board", "task_id", "expected_version", "reason"],
+)

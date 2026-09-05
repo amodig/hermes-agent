@@ -20,11 +20,13 @@ from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
-    KANBAN_ATTACH_SCHEMA,
+    KANBAN_ARCHIVE_SCHEMA, KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
-    KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
+    KANBAN_REQUEUE_HANDOFF_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA,
+    KANBAN_UNLINK_SCHEMA,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -309,7 +311,7 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override".split())
+    "provider_override version".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
     "created_at started_at completed_at current_run_id model_override provider_override".split())
@@ -504,6 +506,7 @@ def _handle_show(args: dict, **kw) -> str:
             # Capped; full log via CLI.
             "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
             "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
+            "active_handoff": kb.latest_handoff(conn, tid),
             # Same string build_worker_context hands the dispatcher at spawn time.
             "worker_context": kb.build_worker_context(conn, tid)})
 
@@ -944,10 +947,92 @@ def _handle_link(args: dict, **kw) -> str:
         return _ok(parent_id=parent_id, child_id=child_id)
 
 
+def _repair_common(args: dict) -> tuple[str, str]:
+    board = str(args.get("board") or "").strip()
+    reason = str(args.get("reason") or "").strip()
+    _check(board, "board is required for recovery operations")
+    _check(reason, "reason is required")
+    return board, reason
+
+@_kanban_handler("kanban_unlink")
+def _handle_unlink(args: dict, **kw) -> str:
+    _require_orchestrator_tool("kanban_unlink")
+    board, reason = _repair_common(args)
+    parent_id = str(args.get("parent_id") or "").strip()
+    child_id = str(args.get("child_id") or "").strip()
+    _check(parent_id and child_id, "both parent_id and child_id are required")
+    with _board(board) as (kb, conn):
+        removed = kb.repair_unlink_tasks(
+            conn,
+            parent_id,
+            child_id,
+            expected_parent_version=int(args.get("expected_parent_version")),
+            expected_child_version=int(args.get("expected_child_version")),
+            reason=reason,
+            author=os.environ.get("HERMES_PROFILE") or "orchestrator",
+        )
+        return _ok(
+            parent_id=parent_id,
+            child_id=child_id,
+            removed=removed,
+            parent_version=kb.get_task(conn, parent_id).version,
+            child_version=kb.get_task(conn, child_id).version,
+            child_status=kb.get_task(conn, child_id).status,
+        )
+
+@_kanban_handler("kanban_archive")
+def _handle_archive(args: dict, **kw) -> str:
+    _require_orchestrator_tool("kanban_archive")
+    board, reason = _repair_common(args)
+    task_id = str(args.get("task_id") or "").strip()
+    _check(task_id, "task_id is required")
+    with _board(board) as (kb, conn):
+        archived = kb.repair_archive_task(
+            conn,
+            task_id,
+            expected_version=int(args.get("expected_version")),
+            reason=reason,
+            author=os.environ.get("HERMES_PROFILE") or "orchestrator",
+        )
+        task = kb.get_task(conn, task_id)
+        return _ok(
+            task_id=task_id, archived=archived, version=task.version, status=task.status
+        )
+
+@_kanban_handler("kanban_requeue_handoff")
+def _handle_requeue_handoff(args: dict, **kw) -> str:
+    _require_orchestrator_tool("kanban_requeue_handoff")
+    board, reason = _repair_common(args)
+    task_id = str(args.get("task_id") or "").strip()
+    _check(task_id, "task_id is required")
+    with _board(board) as (kb, conn):
+        kb.requeue_legacy_handoff(
+            conn,
+            task_id,
+            expected_version=int(args.get("expected_version")),
+            reason=reason,
+            base_sha=args.get("base_sha"),
+            branch_name=args.get("branch_name"),
+            workspace_path=args.get("workspace_path"),
+            patch_artifact=args.get("patch_artifact"),
+            patch_sha256=args.get("patch_sha256"),
+            author=os.environ.get("HERMES_PROFILE") or "orchestrator",
+        )
+        task = kb.get_task(conn, task_id)
+        return _ok(
+            task_id=task_id,
+            version=task.version,
+            status=task.status,
+            active_handoff=kb.latest_handoff(conn, task_id),
+        )
+
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
-_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock"})
+_ORCHESTRATOR_TOOLS = frozenset({
+    "kanban_list", "kanban_unblock", "kanban_unlink", "kanban_archive",
+    "kanban_requeue_handoff",
+})
 _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
@@ -962,7 +1047,10 @@ _TOOLS = (
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
-    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
+    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"),
+    ("kanban_unlink", KANBAN_UNLINK_SCHEMA, _handle_unlink, "🔗"),
+    ("kanban_archive", KANBAN_ARCHIVE_SCHEMA, _handle_archive, "📦"),
+    ("kanban_requeue_handoff", KANBAN_REQUEUE_HANDOFF_SCHEMA, _handle_requeue_handoff, "↩"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
     _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode

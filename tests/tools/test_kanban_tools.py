@@ -1161,3 +1161,130 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+def test_orchestrator_repairs_generated_subtree_through_tools(multi_board_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    with kbc.connect_closing(board="alt") as conn:
+        valid = kb.create_task(conn, title="valid implementation")
+        invalid = kb.create_task(conn, title="invalid generated prerequisite")
+        root = kb.create_task(
+            conn, title="original implementation", parents=[valid, invalid]
+        )
+        review = kb.create_task(
+            conn, title="review", assignee="reviewer", parents=[root]
+        )
+        test = kb.create_task(conn, title="test", assignee="tester", parents=[review])
+        generated_child = kb.create_task(
+            conn, title="invalid generated child", parents=[invalid]
+        )
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (valid,))
+        conn.commit()
+
+    first = json.loads(
+        kt._handle_unlink({
+            "board": "alt",
+            "parent_id": invalid,
+            "child_id": root,
+            "expected_parent_version": 1,
+            "expected_child_version": 1,
+            "reason": "remove legacy auto-decomposition edge",
+        })
+    )
+    assert first["ok"] and first["removed"] and first["child_status"] == "ready"
+
+    second = json.loads(
+        kt._handle_unlink({
+            "board": "alt",
+            "parent_id": invalid,
+            "child_id": generated_child,
+            "expected_parent_version": 2,
+            "expected_child_version": 1,
+            "reason": "detach invalid generated subtree",
+        })
+    )
+    assert second["ok"] and second["removed"]
+
+    for task_id, version in ((invalid, 3), (generated_child, 2)):
+        archived = json.loads(
+            kt._handle_archive({
+                "board": "alt",
+                "task_id": task_id,
+                "expected_version": version,
+                "reason": "retire detached generated card without fake completion",
+            })
+        )
+        assert (
+            archived["ok"] and archived["archived"] and archived["status"] == "archived"
+        )
+
+    with kbc.connect_closing(board="alt") as conn:
+        assert kb.parent_ids(conn, root) == [valid]
+        assert kb.parent_ids(conn, review) == [root]
+        assert kb.parent_ids(conn, test) == [review]
+        event = [
+            event for event in kb.list_events(conn, root) if event.kind == "unlinked"
+        ][-1]
+        assert event.payload["actor"] == "test-orchestrator"
+        assert event.payload["old_graph"]["child_parents"] == sorted([invalid, valid])
+        assert event.payload["new_graph"]["child_parents"] == [valid]
+
+    retry = json.loads(
+        kt._handle_unlink({
+            "board": "alt",
+            "parent_id": invalid,
+            "child_id": root,
+            "expected_parent_version": 1,
+            "expected_child_version": 1,
+            "reason": "idempotent retry",
+        })
+    )
+    assert retry["ok"] and retry["removed"] is False
+
+def test_graph_repair_rejects_stale_claimed_and_linked_tasks(multi_board_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    with kbc.connect_closing(board="alt") as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+
+    stale = json.loads(
+        kt._handle_unlink({
+            "board": "alt",
+            "parent_id": parent,
+            "child_id": child,
+            "expected_parent_version": 99,
+            "expected_child_version": 1,
+            "reason": "stale repair",
+        })
+    )
+    assert "update conflict" in stale["error"]
+
+    linked = json.loads(
+        kt._handle_archive({
+            "board": "alt",
+            "task_id": parent,
+            "expected_version": 1,
+            "reason": "unsafe linked archive",
+        })
+    )
+    assert "detach all dependency edges first" in linked["error"]
+
+    with kbc.connect_closing(board="alt") as conn:
+        kb.claim_task(conn, parent)
+    claimed = json.loads(
+        kt._handle_unlink({
+            "board": "alt",
+            "parent_id": parent,
+            "child_id": child,
+            "expected_parent_version": 1,
+            "expected_child_version": 1,
+            "reason": "unsafe concurrent repair",
+        })
+    )
+    assert "currently claimed" in claimed["error"]

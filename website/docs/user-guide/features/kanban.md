@@ -308,6 +308,9 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_create` | (Orchestrators) fan out into child tasks with an `assignee`, optional `parents`, `skills`, etc. | `title`, `assignee` |
 | `kanban_link` | (Orchestrators) add a `parent_id → child_id` dependency edge after the fact. | `parent_id`, `child_id` |
 | `kanban_unblock` | (Orchestrators) restore a blocked task to its source phase (`review` or `ready`), or `todo` while a parent remains open. | `task_id` |
+| `kanban_unlink` | (Orchestrators) remove an invalid dependency edge with optimistic versions and an audit reason. | `board`, both task ids and versions, `reason` |
+| `kanban_archive` | (Orchestrators) retire a detached invalid card without falsely completing it. | `board`, `task_id`, `expected_version`, `reason` |
+| `kanban_requeue_handoff` | (Orchestrators) recover a pre-enforcement completion lacking immutable `head_sha`. | `board`, `task_id`, `expected_version`, `reason`, historical evidence as needed |
 
 A typical worker turn looks like:
 
@@ -357,6 +360,21 @@ Three reasons:
 **Zero schema footprint on normal sessions.** A regular `hermes chat` session has zero `kanban_*` tools in its schema unless the active profile explicitly enables the `kanban` toolset for orchestrator work. Dispatcher-spawned task workers get task-scoped tools because `HERMES_KANBAN_TASK` is set; orchestrator profiles get the broader routing surface through config. No tool bloat for users who never touch kanban.
 
 The auto-injected kanban guidance teaches the model which tool to call when and in what order.
+
+### Graph and legacy-handoff recovery
+
+Use `kanban_unlink` only to remove a known-invalid edge, then `kanban_archive`
+only after the invalid card is detached. Both operations require explicit
+board scope, current task versions, and a reason; their events retain the old
+and new graph state. Never fake-complete generated cards to release a lane.
+
+Implementation cards with reviewer or tester dependents must complete from a
+clean task worktree with `base_sha` and `head_sha`. Reviewers and testers are
+gated if that exact branch head moves. For a card completed before this rule,
+use `kanban_requeue_handoff` with its recorded or historical base, branch,
+worktree, and optional patch hash. The original completion, runs, comments,
+and edges remain; dependents stay gated until the same parent is recommitted
+and completed with an immutable head.
 
 ### Recommended handoff evidence
 
