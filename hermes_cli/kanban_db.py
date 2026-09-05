@@ -4546,12 +4546,32 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    existing = conn.execute(
+        "SELECT metadata FROM task_runs "
+        "WHERE id = ? AND ended_at IS NULL",
+        (run_id,),
+    ).fetchone()
+    metadata_json = None
+    if metadata is None:
+        metadata_json = existing["metadata"] if existing else None
+    else:
+        merged: dict[str, Any] = {}
+        if existing and existing["metadata"]:
+            try:
+                prior = json.loads(existing["metadata"])
+                if isinstance(prior, dict):
+                    merged.update(prior)
+            except (TypeError, ValueError):
+                pass
+        if isinstance(metadata, dict):
+            merged.update(metadata)
+        metadata_json = json.dumps(merged, ensure_ascii=False) if merged else None
     conn.execute(
         """
         UPDATE task_runs
            SET status        = ?,
                outcome       = ?,
-               summary       = ?,
+               summary       = COALESCE(NULLIF(?, ''), summary),
                error         = ?,
                metadata      = ?,
                ended_at      = ?,
@@ -4566,7 +4586,7 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            metadata_json,
             now,
             run_id,
         ),
@@ -4575,6 +4595,65 @@ def _end_run(
         "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
     )
     return run_id
+
+
+def _cap_run_field(value: Optional[str]) -> Optional[str]:
+    """Bound diagnostic text stored on a run."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if len(text) <= _CTX_MAX_FIELD_BYTES:
+        return text
+    omitted = len(text) - _CTX_MAX_FIELD_BYTES
+    return text[:_CTX_MAX_FIELD_BYTES] + f"… [truncated, {omitted} chars omitted]"
+
+
+def record_protocol_violation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: Optional[int],
+    metadata: Optional[dict] = None,
+    summary: Optional[str] = None,
+) -> bool:
+    """Persist worker-side evidence before the dispatcher reclaims a run."""
+    if run_id is None:
+        return False
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT t.current_run_id, r.metadata, r.ended_at "
+            "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            not row
+            or row["current_run_id"] != int(run_id)
+            or row["ended_at"] is not None
+        ):
+            return False
+        merged: dict[str, Any] = {}
+        if row["metadata"]:
+            try:
+                prior = json.loads(row["metadata"])
+                if isinstance(prior, dict):
+                    merged.update(prior)
+            except (TypeError, ValueError):
+                pass
+        if isinstance(metadata, dict):
+            merged.update(metadata)
+        merged["protocol_violation"] = True
+        conn.execute(
+            "UPDATE task_runs SET summary = COALESCE(NULLIF(summary, ''), ?), "
+            "metadata = ? WHERE id = ? AND ended_at IS NULL",
+            (
+                _cap_run_field(summary),
+                json.dumps(merged, ensure_ascii=False) if merged else None,
+                int(run_id),
+            ),
+        )
+    return True
+
 
 
 def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
@@ -4643,11 +4722,12 @@ def _is_sticky_blocked(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return True when the latest block/unblock event leaves a task blocked."""
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN "
+        "('blocked', 'gave_up', 'unblocked', 'promoted_manual', 'retry') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return bool(row) and row["kind"] in {"blocked", "gave_up"}
 
 
 # Existing internal callers use this name; keep one implementation.
@@ -4697,15 +4777,13 @@ def recompute_ready(
     blocked purely by a parent dependency unblocks itself when the
     parent completes), *except* in two cases:
 
-    1. The most recent block event was a worker-initiated
-       ``kanban_block`` — those stay blocked until an explicit
-       ``kanban_unblock`` (#28712).
+    1. The most recent recovery event is an explicit ``kanban_block`` or
+       ``gave_up`` exhaustion — those stay blocked until an explicit
+       ``kanban_unblock`` / operator retry transition.
 
     2. The task's ``consecutive_failures`` has reached the effective
-       failure limit.  This prevents infinite retry loops when a task
-       repeatedly exhausts its iteration budget: without this guard the
-       counter would reset on every recovery cycle and the circuit
-       breaker could never trip (#35072).
+       failure limit.  This legacy guard prevents infinite retry loops when a
+       task repeatedly exhausts its iteration budget.
 
     The effective failure limit resolves in the same order as the
     circuit breaker in ``_record_task_failure`` so the two never
@@ -9620,10 +9698,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
     When the reap registry shows the worker exited cleanly (rc=0) but
     the task was still ``running`` in the DB, treat it as a protocol
-    violation (worker answered conversationally without calling
-    ``kanban_complete`` / ``kanban_block``) and trip the circuit breaker
-    on the first occurrence — retrying a worker whose CLI keeps
-    returning 0 without a terminal transition just loops forever.
+    violation (worker answered conversationally without calling a terminal
+    kanban tool). Count the violation streak atomically with run reclamation
+    and block once its bounded retry budget is exhausted.
+
 
     When the reap registry shows the worker exited with the rate-limit
     sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
@@ -9636,17 +9714,17 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
-    # Per-crash details collected inside the main txn, used after it
-    # closes to run ``_record_task_failure`` (which needs its own
-    # write_txn so can't nest). ``protocol_violation`` flags the
-    # clean-exit-but-still-running case, which is accounted against its
-    # own bounded violation streak instead of the unified failure
-    # counter (see the post-txn loop below).
+    # Per-crash details collected inside the main txn, used after it closes
+    # to run ``_record_task_failure`` for non-protocol crashes (which needs
+    # its own write transaction). Protocol violations are accounted in this
+    # transaction so their run, streak, counter, and terminal event cannot
+    # be split across reconciliation cycles.
     crash_details: list[tuple[str, int, str, bool, str]] = []
     # (task_id, pid, claimer, protocol_violation, error_text)
     # Worker-exit observer payloads (RFC #58548), collected inside the main
     # txn and fired only after every reclaim/accounting txn has committed.
     exited_hook_payloads: list[dict] = []
+    auto_blocked: list[str] = []
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at, assignee "
@@ -9675,29 +9753,26 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             rate_limited_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
-                # ``running`` in the DB — it exited without calling
-                # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
-                # work itself succeeded and only the paperwork was skipped, so
-                # a retry usually completes; the corrective sentence below is
+                # ``running`` in the DB — it exited without calling a
+                # terminal kanban tool. Overwhelmingly the work itself
+                # succeeded and only the paperwork was skipped, so a retry
+                # usually completes; the corrective sentence below is
                 # surfaced to the retry worker via the prior-attempt error in
                 # ``build_worker_context`` (guidance approach from #61817).
                 protocol_violation = True
                 error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation. "
-                    "If the prior run already did the work, verify it and "
-                    "report the result via kanban_complete; a run that ends "
-                    "without a terminal kanban call counts as failed no "
-                    "matter what it did."
+                    "worker exited cleanly (rc=0) without calling a terminal "
+                    "kanban tool — protocol violation. If the prior run "
+                    "already did the work, verify it and report the result "
+                    "via kanban_complete, kanban_request_changes, or "
+                    "kanban_block; a run that ends without a terminal kanban "
+                    "call counts as failed no matter what it did."
                 )
                 event_kind = "protocol_violation"
                 event_payload = {
                     "pid": pid,
                     "claimer": row["claim_lock"],
                     "exit_code": code,
-                    # Durable marker for _protocol_violation_streak: _end_run
-                    # copies this payload into the run metadata, which is how
-                    # the violation-only retry budget is derived later.
                     "protocol_violation": True,
                 }
             elif kind == "rate_limited":
@@ -9734,6 +9809,28 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
+            violation_streak = None
+            violation_limit = None
+            if protocol_violation:
+                prior_streak = _protocol_violation_streak(conn, row["id"])
+                trow = conn.execute(
+                    "SELECT max_retries FROM tasks WHERE id = ?", (row["id"],),
+                ).fetchone()
+                task_override = (
+                    trow["max_retries"]
+                    if trow is not None and "max_retries" in trow.keys()
+                    else None
+                )
+                violation_limit = (
+                    int(task_override)
+                    if task_override is not None
+                    else _PROTOCOL_VIOLATION_FAILURE_LIMIT
+                )
+                violation_streak = prior_streak + 1
+                event_payload.update({
+                    "protocol_violations": violation_streak,
+                    "protocol_violation_limit": violation_limit,
+                })
             retry_status = _retry_status_for_run(conn, row["id"])
             event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -9754,6 +9851,27 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     error=error_text,
                     metadata=dict(event_payload),
                 )
+                if (
+                    protocol_violation
+                    and violation_streak is not None
+                    and violation_limit is not None
+                    and violation_streak >= violation_limit
+                ):
+                    if _record_task_failure_txn(
+                        conn, row["id"], error_text,
+                        outcome="crashed",
+                        failure_limit=violation_limit,
+                        force_trip=True,
+                        release_claim=False,
+                        end_run=False,
+                        event_payload_extra={
+                            "pid": pid,
+                            "claimer": row["claim_lock"],
+                            "protocol_violations": violation_streak,
+                            "protocol_violation_limit": violation_limit,
+                        },
+                    ):
+                        auto_blocked.append(row["id"])
                 _append_event(
                     conn, row["id"], event_kind,
                     event_payload,
@@ -9782,92 +9900,27 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     rate_limited.append(row["id"])
                 else:
                     if protocol_violation:
-                        # Stamp the failure error now: a below-budget
-                        # violation never reaches ``_record_task_failure``
-                        # (which stamps this column for every other failure
-                        # kind), yet the board UI and the retry worker's
-                        # context still need the violation message + the
-                        # corrective guidance it carries.
+                        # Stamp the failure error for below-budget retries;
+                        # threshold accounting already happened in this txn.
                         conn.execute(
                             "UPDATE tasks SET last_failure_error = ? "
                             "WHERE id = ?",
                             (error_text[:500], row["id"]),
                         )
                     crashed.append(row["id"])
-                    crash_details.append(
-                        (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
-                    )
-    # Outside the main txn: account each crashed task and maybe trip the
-    # breaker (the retried task transitions to blocked with a ``gave_up`` event
-    # on top of the event we already emitted).
-    #
-    # Protocol-violation crashes (clean exit, no terminal tool call) get a
-    # BOUNDED retry, not an immediate trip: empirically ~96% of these tasks
-    # complete on a later run (a goal-mode finalize nudge, or the model simply
-    # emitting kanban_complete/kanban_block next time), so blocking on the first
-    # occurrence just churned them through the respawn cycle. The retry budget
-    # is a violation-only streak (``_protocol_violation_streak``): earlier
-    # timeouts / nonzero exits neither consume nor extend it, and a
-    # below-budget violation does not tick the unified
-    # ``consecutive_failures`` counter, so the two budgets stay independent.
-    # A per-task ``max_retries`` overrides the violation bound with the same
-    # top precedence it has for every other failure kind. Systemic same-error
-    # crashes still trip immediately.
-    auto_blocked: list[str] = []
+                    if not protocol_violation:
+                        crash_details.append(
+                            (row["id"], pid, row["claim_lock"],
+                             False, error_text)
+                        )
+    # Non-protocol crashes need the unified failure counter after the
+    # reclaim transaction; protocol violations were fully accounted above.
     if crash_details:
-        # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
         for _, _, _, _, err_text in crash_details:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
-            if protocol_violation:
-                streak = _protocol_violation_streak(conn, tid)
-                trow = conn.execute(
-                    "SELECT max_retries FROM tasks WHERE id = ?", (tid,),
-                ).fetchone()
-                if trow is None:
-                    continue  # task deleted mid-loop
-                task_override = (
-                    trow["max_retries"] if "max_retries" in trow.keys() else None
-                )
-                violation_limit = (
-                    int(task_override)
-                    if task_override is not None
-                    else _PROTOCOL_VIOLATION_FAILURE_LIMIT
-                )
-                if streak < violation_limit:
-                    # Below budget: the task is already back at ``ready``
-                    # (respawn allowed) with ``last_failure_error`` stamped.
-                    # Deliberately no ``_record_task_failure`` call — a
-                    # below-budget violation must not consume the unified
-                    # failure budget, just as other failure kinds don't
-                    # consume this one.
-                    continue
-                # Streak reached the bound: trip the breaker. ``force_trip``
-                # skips the threshold resolution inside
-                # ``_record_task_failure`` because the decision — including
-                # the per-task ``max_retries`` override — was already made
-                # against the violation streak above.
-                tripped = _record_task_failure(
-                    conn, tid,
-                    error=error_text,
-                    outcome="crashed",
-                    failure_limit=violation_limit,
-                    force_trip=True,
-                    release_claim=False,
-                    end_run=False,
-                    event_payload_extra={
-                        "pid": pid,
-                        "claimer": claimer,
-                        "protocol_violations": streak,
-                        "protocol_violation_limit": violation_limit,
-                    },
-                )
-                if tripped:
-                    auto_blocked.append(tid)
-                continue
+        for tid, pid, claimer, _, error_text in crash_details:
             fp = _error_fingerprint(error_text)
             is_systemic = _fp_counts.get(fp, 0) >= 3
             tripped = _record_task_failure(
@@ -9906,6 +9959,117 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     return crashed
 
 
+def _record_task_failure_txn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    error: str,
+    *,
+    outcome: str,
+    failure_limit: int = None,
+    force_trip: bool = False,
+    release_claim: bool = False,
+    end_run: bool = False,
+    event_payload_extra: Optional[dict] = None,
+) -> bool:
+    """Record a failure while the caller already owns the write transaction."""
+    if failure_limit is None:
+        failure_limit = DEFAULT_FAILURE_LIMIT
+    row = conn.execute(
+        "SELECT consecutive_failures, status, max_retries, current_run_id "
+        "FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    retry_status = (
+        _retry_status_for_run(conn, task_id, row["current_run_id"])
+        if release_claim
+        else ("review" if row["status"] == "review" else "ready")
+    )
+    failures = int(row["consecutive_failures"] or 0) + 1
+    task_override = row["max_retries"] if "max_retries" in row.keys() else None
+    if task_override is not None:
+        effective_limit = int(task_override)
+        limit_source = "task"
+    else:
+        effective_limit = int(failure_limit)
+        limit_source = "dispatcher"
+
+    if force_trip or failures >= effective_limit:
+        if release_claim:
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, "
+                "consecutive_failures = ?, last_failure_error = ? "
+                "WHERE id = ? AND status IN ('running', 'ready', 'review')",
+                (failures, error[:500], task_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', "
+                "consecutive_failures = ?, last_failure_error = ? "
+                "WHERE id = ? AND status IN ('ready', 'review', 'running')",
+                (failures, error[:500], task_id),
+            )
+        run_id = None
+        if end_run:
+            run_id = _end_run(
+                conn, task_id,
+                outcome="gave_up", status="gave_up",
+                error=error[:500],
+                metadata={
+                    "failures": failures,
+                    "trigger_outcome": outcome,
+                    "effective_limit": effective_limit,
+                    "limit_source": limit_source,
+                    "retry_status": retry_status,
+                },
+            )
+        payload = {
+            "failures": failures,
+            "effective_limit": effective_limit,
+            "limit_source": limit_source,
+            "error": error[:500],
+            "trigger_outcome": outcome,
+            "retry_status": retry_status,
+        }
+        if event_payload_extra:
+            payload.update(event_payload_extra)
+        _append_event(conn, task_id, "gave_up", payload, run_id=run_id)
+        return True
+
+    if release_claim:
+        conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, "
+            "consecutive_failures = ?, last_failure_error = ? "
+            "WHERE id = ? AND status = 'running'",
+            (retry_status, failures, error[:500], task_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures = ?, "
+            "last_failure_error = ? WHERE id = ?",
+            (failures, error[:500], task_id),
+        )
+    if end_run:
+        run_id = _end_run(
+            conn, task_id,
+            outcome=outcome, status=outcome,
+            error=error[:500],
+            metadata={"failures": failures, "retry_status": retry_status},
+        )
+        _append_event(
+            conn, task_id, outcome,
+            {
+                "error": error[:500],
+                "failures": failures,
+                "retry_status": retry_status,
+            },
+            run_id=run_id,
+        )
+    return False
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -9918,168 +10082,17 @@ def _record_task_failure(
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
 ) -> bool:
-    """Record a non-success outcome (spawn_failed / crashed / timed_out)
-    and maybe trip the circuit breaker.
-
-    Unified replacement for the old spawn-only ``_record_spawn_failure``.
-    Every path that ends a task with a non-success outcome funnels
-    through here so the ``consecutive_failures`` counter and the
-    auto-block threshold stay consistent.
-
-    Returns True when the task was auto-blocked (counter reached
-    ``failure_limit``), False when it was just updated in place.
-
-    Modes:
-
-    * ``release_claim=True, end_run=True`` — spawn-failure path.
-      Caller has a running task with an open run; this transitions
-      it back to its source phase (or ``blocked`` when the breaker trips),
-      releases the claim, and closes the run with ``outcome=<outcome>``.
-
-    * ``release_claim=False, end_run=False`` — timeout/crash path.
-      Caller has ALREADY restored the task's source phase and closed the
-      run with the appropriate outcome. This just increments the
-      counter; if the breaker trips, the task is re-transitioned
-      into ``blocked`` and a ``gave_up`` event is emitted.
-
-    ``event_payload_extra`` merges into the ``gave_up`` event payload
-    when the breaker trips, so callers can include outcome-specific
-    context (e.g. pid on crash, elapsed on timeout).
-
-    Resolution order for the effective threshold:
-      1. per-task ``max_retries`` if set (nothing else overrides)
-      2. caller-supplied ``failure_limit`` (gateway passes the config
-         value from ``kanban.failure_limit``; tests pass fixed values)
-      3. ``DEFAULT_FAILURE_LIMIT``
-
-    ``force_trip=True`` trips the breaker unconditionally, skipping the
-    counter-vs-threshold comparison (the resolution order above is then
-    only reported in the ``gave_up`` payload, not re-evaluated). Callers
-    use it when they have already applied their own bounded-retry policy
-    — e.g. the clean-exit protocol-violation streak in
-    ``detect_crashed_workers``, which resolves the per-task
-    ``max_retries`` override against the violation streak itself. The
-    failure is still counted into ``consecutive_failures``.
-    """
-    if failure_limit is None:
-        failure_limit = DEFAULT_FAILURE_LIMIT
-    blocked = False
+    """Atomically record a non-success outcome and maybe trip the breaker."""
     with write_txn(conn):
-        row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, current_run_id "
-            "FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
-        if row is None:
-            return False
-        retry_status = (
-            _retry_status_for_run(conn, task_id, row["current_run_id"])
-            if release_claim
-            else ("review" if row["status"] == "review" else "ready")
+        return _record_task_failure_txn(
+            conn, task_id, error,
+            outcome=outcome,
+            failure_limit=failure_limit,
+            force_trip=force_trip,
+            release_claim=release_claim,
+            end_run=end_run,
+            event_payload_extra=event_payload_extra,
         )
-        failures = int(row["consecutive_failures"]) + 1
-
-        # Per-task override wins over both caller-supplied and default
-        # thresholds. None (the common case) falls through.
-        task_override = (
-            row["max_retries"] if "max_retries" in row.keys() else None
-        )
-        if task_override is not None:
-            effective_limit = int(task_override)
-            limit_source = "task"
-        else:
-            effective_limit = int(failure_limit)
-            limit_source = "dispatcher"
-
-        if force_trip or failures >= effective_limit:
-            # Trip the breaker.
-            if release_claim:
-                # Spawn path: still running, also clear claim state.
-                conn.execute(
-                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-                    (failures, error[:500], task_id),
-                )
-            else:
-                # Timeout/crash path: source phase already restored with claim
-                # cleared; just flip to blocked + update
-                # counter fields.
-                conn.execute(
-                    "UPDATE tasks SET status = 'blocked', "
-                    "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'review', 'running')",
-                    (failures, error[:500], task_id),
-                )
-            run_id = None
-            if end_run:
-                # Only the spawn path has an open run to close.
-                run_id = _end_run(
-                    conn, task_id,
-                    outcome="gave_up", status="gave_up",
-                    error=error[:500],
-                    metadata={
-                        "failures": failures,
-                        "trigger_outcome": outcome,
-                        "effective_limit": effective_limit,
-                        "limit_source": limit_source,
-                        "retry_status": retry_status,
-                    },
-                )
-            payload = {
-                "failures": failures,
-                "effective_limit": effective_limit,
-                "limit_source": limit_source,
-                "error": error[:500],
-                "trigger_outcome": outcome,
-                "retry_status": retry_status,
-            }
-            if event_payload_extra:
-                payload.update(event_payload_extra)
-            _append_event(
-                conn, task_id, "gave_up", payload, run_id=run_id,
-            )
-            blocked = True
-        else:
-            # Below threshold.
-            if release_claim:
-                # Spawn path: restore the claimed source phase + clear claim.
-                conn.execute(
-                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status = 'running'",
-                    (retry_status, failures, error[:500], task_id),
-                )
-            else:
-                # Timeout/crash path: caller already restored the source phase.
-                conn.execute(
-                    "UPDATE tasks SET consecutive_failures = ?, "
-                    "last_failure_error = ? WHERE id = ?",
-                    (failures, error[:500], task_id),
-                )
-            if end_run:
-                # Spawn path: close the open run with outcome.
-                run_id = _end_run(
-                    conn, task_id,
-                    outcome=outcome, status=outcome,
-                    error=error[:500],
-                    metadata={
-                        "failures": failures,
-                        "retry_status": retry_status,
-                    },
-                )
-                _append_event(
-                    conn, task_id, outcome,
-                    {
-                        "error": error[:500],
-                        "failures": failures,
-                        "retry_status": retry_status,
-                    },
-                    run_id=run_id,
-                )
-            # Timeout/crash path's caller already emitted its own event.
-    return blocked
 
 
 # Backward-compat alias. Old name is referenced from tests and possibly
@@ -12573,6 +12586,25 @@ def unseen_events_for_sub(
     return max_id, out
 
 
+def _gave_up_incident_seen(
+    conn: sqlite3.Connection, task_id: str, event_id: int,
+) -> bool:
+    """Return whether this give-up follows one in the same block incident."""
+    row = conn.execute(
+        "SELECT 1 FROM task_events prior "
+        "WHERE prior.task_id = ? AND prior.kind = 'gave_up' "
+        "  AND prior.id < ? "
+        "  AND prior.id > COALESCE(("
+        "      SELECT MAX(reset.id) FROM task_events reset "
+        "      WHERE reset.task_id = ? "
+        "        AND reset.kind IN ('unblocked', 'promoted_manual', 'retry') "
+        "        AND reset.id < ?"
+        "  ), 0) LIMIT 1",
+        (task_id, int(event_id), task_id, int(event_id)),
+    ).fetchone()
+    return row is not None
+
+
 def claim_unseen_events_for_sub(
     conn: sqlite3.Connection,
     *,
@@ -12615,6 +12647,14 @@ def claim_unseen_events_for_sub(
         )
         if not events:
             return old_cursor, old_cursor, []
+        # Cursor advancement is the durable notification ledger. Consume
+        # duplicate give-up rows while retaining the first notification in
+        # each incident (an explicit unblock/manual retry starts a new one).
+        events = [
+            event for event in events
+            if event.kind != "gave_up"
+            or not _gave_up_incident_seen(conn, task_id, event.id)
+        ]
         conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "

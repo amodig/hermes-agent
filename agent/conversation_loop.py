@@ -8753,6 +8753,24 @@ def run_conversation(
                         getattr(agent, "session_id", None) or "none",
                         exc_info=True,
                     )
+                # Preserve the worker's own evidence before the dispatcher
+                # reclaims a cleanly exited, non-terminal run.
+                if os.environ.get("HERMES_KANBAN_TASK"):
+                    try:
+                        from agent.kanban_stop import (
+                            persist_kanban_protocol_violation,
+                        )
+                        persist_kanban_protocol_violation(
+                            messages=messages,
+                            final_output=final_response,
+                            session_id=getattr(agent, "session_id", None),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "kanban protocol-violation evidence persistence failed",
+                            exc_info=True,
+                        )
+
 
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
                 if not agent.quiet_mode:
