@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
 from agent.redact import redact_sensitive_text
-from hermes_cli.goals import judge_goal
+from hermes_cli.goals import judge_goal, render_effective_goal
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
@@ -24,8 +24,9 @@ from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
-    KANBAN_REQUEUE_HANDOFF_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA,
-    KANBAN_UNLINK_SCHEMA,
+    KANBAN_REQUEUE_HANDOFF_SCHEMA, KANBAN_REWORK_REVIEW_SCHEMA, KANBAN_SHOW_SCHEMA,
+    KANBAN_UNBLOCK_SCHEMA,
+    KANBAN_UNLINK_SCHEMA, KANBAN_UPDATE_SCHEMA,
 )
 
 logger = logging.getLogger(__name__)
@@ -311,10 +312,11 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override version".split())
+    "provider_override version revision goal_revision_id goal_mode".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
-    "created_at started_at completed_at current_run_id model_override provider_override".split())
+    "created_at started_at completed_at current_run_id model_override provider_override "
+    "version revision goal_revision_id goal_mode".split())
 _RUN_FIELDS = tuple("id profile status outcome summary error metadata started_at ended_at".split())
 _COMMENT_FIELDS = ("author", "body", "created_at")
 _EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")
@@ -373,19 +375,32 @@ _GOAL_GATE_MESSAGES = {
             "matching the card before requesting review.")}}
 
 
-def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
-    """Goal-mode pre-handoff judge gate: a worker must not complete / request
-    review before acceptance criteria are met. ``blocked`` gets its own
-    guidance; any other non-``done`` verdict gets the ``continue`` guidance.
-    A broken judge fails open (logged) so it cannot permanently wedge work."""
+def _goal_gate(
+    tool_name: str,
+    task,
+    tid: str,
+    evidence: str,
+    *,
+    effective_goal: Optional[dict] = None,
+) -> None:
+    """Goal-mode pre-handoff judge gate using the current effective goal."""
     if not task or not task.goal_mode or not _goal_judge_available():
         return
     try:
         verdict, reason, _, _, _ = judge_goal(
-            goal=f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip())
+            goal=render_effective_goal(
+                effective_goal,
+                fallback_title=task.title,
+                fallback_body=task.body,
+            ),
+            last_response=evidence.strip(),
+        )
     except Exception as judge_exc:
         logger.warning(
-            "goal judge check failed, allowing lifecycle handoff: %s", judge_exc, exc_info=True)
+            "goal judge check failed, allowing lifecycle handoff: %s",
+            judge_exc,
+            exc_info=True,
+        )
         return
     if verdict == "done":
         return
@@ -498,8 +513,10 @@ def _handle_show(args: dict, **kw) -> str:
     tid = _require_task_id(args)
     with _board(args.get("board")) as (kb, conn):
         task = _existing_task(kb, conn, tid)
+        effective_goal = kb.get_effective_goal(conn, tid)
         return json.dumps({
             "task": _fields(task, _TASK_FIELDS),
+            "effective_goal": effective_goal,
             "parents": kb.parent_ids(conn, tid),
             "children": kb.child_ids(conn, tid),
             "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
@@ -564,11 +581,19 @@ def _handle_complete(args: dict, **kw) -> str:
         # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
         task = kb.get_task(conn, tid)
-        _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
+        effective_goal = kb.get_effective_goal(conn, tid)
+        _goal_gate("kanban_complete", task, tid, (summary or result or "").strip(),
+                   effective_goal=effective_goal)
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
                 created_cards=created_cards, expected_run_id=_worker_run_id(tid))
+        except kb.CompletionContractError as contract_err:
+            return tool_error(
+                f"kanban_complete blocked: {contract_err}. "
+                "No task state changed; use kanban_update to revise the "
+                "goal or remove the implementation patch before retrying."
+            )
         except kb.ArtifactPreservationError as artifact_err:
             # Structured rejection — surface the phantom ids so the worker can retry with a corrected list
             # or drop the field. Audit event already landed in the DB. The task itself was NOT mutated (the
@@ -642,10 +667,20 @@ def _handle_request_review(args: dict, **kw) -> str:
     # Reviewer is model-supplied free text stored durably on the event payload.
     reviewer = _redact_opt(args.get("reviewer") or None)
     with _board(args.get("board")) as (kb, conn):
-        _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
-        ok, fail_reason = kb.request_review(
-            conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
-            expected_run_id=_worker_run_id(tid), with_reason=True)
+        task = kb.get_task(conn, tid)
+        effective_goal = kb.get_effective_goal(conn, tid)
+        _goal_gate("kanban_request_review", task, tid, summary,
+                   effective_goal=effective_goal)
+        try:
+            ok, fail_reason = kb.request_review(
+                conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
+                expected_run_id=_worker_run_id(tid), with_reason=True)
+        except kb.CompletionContractError as contract_err:
+            return tool_error(
+                f"kanban_request_review blocked: {contract_err}. "
+                "No task state changed; use kanban_update to revise the "
+                "goal or remove the implementation patch before retrying."
+            )
         _check(ok, f"could not request review for {tid}: "
                    f"{fail_reason or 'unknown id or not in running/ready'}")
         return _ok_landed(kb, conn, tid, "review")
@@ -935,6 +970,44 @@ def _handle_unblock(args: dict, **kw) -> str:
         return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)))
 
 
+@_kanban_handler("kanban_update")
+def _handle_update(args: dict, **kw) -> str:
+    """Atomically revise a task and optionally requeue a triage card."""
+    _reject_delegated_child_mutation("kanban_update")
+    _require_orchestrator_tool("kanban_update")
+    tid = str(args.get("task_id") or "").strip()
+    _check(tid, "task_id is required")
+    expected_version = args.get("expected_version")
+    _check(
+        not isinstance(expected_version, bool), "expected_version must be an integer"
+    )
+    try:
+        expected_version = int(expected_version)
+    except (TypeError, ValueError):
+        raise _Reject("expected_version must be an integer")
+    reason = str(args.get("reason") or "").strip()
+    _check(reason, "reason is required")
+    kwargs = {
+        "expected_version": expected_version,
+        "reason": reason,
+        "author": os.environ.get("HERMES_PROFILE") or "orchestrator",
+    }
+    for name in ("title", "body", "assignee", "model", "provider", "transition"):
+        if name in args:
+            kwargs[name] = args[name]
+    if "goal_mode" in args:
+        kwargs["goal_mode"] = _parse_bool_arg(args, "goal_mode")
+    with _board(args.get("board")) as (kb, conn):
+        _check(kb.update_task(conn, tid, **kwargs), f"task {tid} not found")
+        task = kb.get_task(conn, tid)
+        return _ok(
+            task_id=tid,
+            version=task.version if task else None,
+            revision=task.revision if task else None,
+            goal_revision_id=task.goal_revision_id if task else None,
+            status=task.status if task else None,
+            effective_goal=kb.get_effective_goal(conn, tid),
+        )
 @_kanban_handler("kanban_link")
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact (cycles/self-links → ValueError)."""
@@ -1026,12 +1099,44 @@ def _handle_requeue_handoff(args: dict, **kw) -> str:
             active_handoff=kb.latest_handoff(conn, task_id),
         )
 
+@_kanban_handler("kanban_rework_review")
+def _handle_rework_review(args: dict, **kw) -> str:
+    _require_orchestrator_tool("kanban_rework_review")
+    board, reason = _repair_common(args)
+    implementation_id = str(args.get("implementation_id") or "").strip()
+    reviewer_id = str(args.get("reviewer_id") or "").strip()
+    tester_id = str(args.get("tester_id") or "").strip()
+    _check(implementation_id, "implementation_id is required")
+    _check(reviewer_id, "reviewer_id is required")
+    _check(tester_id, "tester_id is required")
+    for name in (
+        "expected_implementation_version",
+        "expected_reviewer_version",
+        "expected_tester_version",
+    ):
+        _check(name in args and args[name] is not None, f"{name} is required")
+    with _board(board) as (kb, conn):
+        outcome = kb.rework_review_graph(
+            conn,
+            implementation_id,
+            reviewer_id,
+            tester_id,
+            expected_implementation_version=args["expected_implementation_version"],
+            expected_reviewer_version=args["expected_reviewer_version"],
+            expected_tester_version=args["expected_tester_version"],
+            reason=reason,
+            author=os.environ.get("HERMES_PROFILE") or "orchestrator",
+        )
+    return _ok(**outcome)
+
+
+
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
 _ORCHESTRATOR_TOOLS = frozenset({
-    "kanban_list", "kanban_unblock", "kanban_unlink", "kanban_archive",
-    "kanban_requeue_handoff",
+    "kanban_list", "kanban_unblock", "kanban_update", "kanban_unlink", "kanban_archive",
+    "kanban_requeue_handoff", "kanban_rework_review",
 })
 _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
@@ -1048,9 +1153,11 @@ _TOOLS = (
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
     ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"),
+    ("kanban_update", KANBAN_UPDATE_SCHEMA, _handle_update, "✎"),
     ("kanban_unlink", KANBAN_UNLINK_SCHEMA, _handle_unlink, "🔗"),
     ("kanban_archive", KANBAN_ARCHIVE_SCHEMA, _handle_archive, "📦"),
-    ("kanban_requeue_handoff", KANBAN_REQUEUE_HANDOFF_SCHEMA, _handle_requeue_handoff, "↩"))
+    ("kanban_requeue_handoff", KANBAN_REQUEUE_HANDOFF_SCHEMA, _handle_requeue_handoff, "↩"),
+    ("kanban_rework_review", KANBAN_REWORK_REVIEW_SCHEMA, _handle_rework_review, "↩"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
     _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode

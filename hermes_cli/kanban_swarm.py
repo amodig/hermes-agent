@@ -206,6 +206,10 @@ def _create_swarm_uncommitted(
         verifier_id = existing.get("verifier_id")
         synthesizer_id = existing.get("synthesizer_id")
         if worker_ids and verifier_id and synthesizer_id:
+            conn.executemany(
+                "UPDATE tasks SET workflow_template_id = 'kanban_swarm_v1' WHERE id = ?",
+                ((task_id,) for task_id in [root, *worker_ids, verifier_id, synthesizer_id]),
+            )
             return SwarmCreated(root, worker_ids, str(verifier_id), str(synthesizer_id))
 
     context_suffix = _swarm_context(root, goal)
@@ -254,6 +258,10 @@ def _create_swarm_uncommitted(
     )
 
     created = SwarmCreated(root, worker_ids, verifier, synthesizer)
+    conn.executemany(
+        "UPDATE tasks SET workflow_template_id = 'kanban_swarm_v1' WHERE id = ?",
+        ((task_id,) for task_id in [root, *worker_ids, verifier, synthesizer]),
+    )
     post_blackboard_update(conn, root, author=created_by, key="topology", value=created.as_dict() | {"goal": goal})
     return created
 

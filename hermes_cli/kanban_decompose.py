@@ -26,7 +26,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import profiles as profiles_mod
 from hermes_cli.kanban_specify import (
-    _call_aux, _extract_json_blob, _load_triage_task, _task_prompt_fields, _title_body,
+    _call_aux, _extract_json_blob, _load_triage_task, _task_prompt_fields, _title_body, _truncate,
 )
 from hermes_cli.kanban_specify import _profile_author as _specify_author
 
@@ -97,6 +97,10 @@ _USER_TEMPLATE = """Task id: {task_id}
 Title: {title}
 Body:
 {body}
+
+Prior task purpose and graph/history (authoritative; do not recreate work
+already represented here):
+{context}
 
 Available profiles (assignees you may pick from):
 {roster}
@@ -213,7 +217,15 @@ def _load_routing() -> _Routing:
     )
 
 
-def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -> DecomposeOutcome:
+def _apply_single(
+    task: kb.Task,
+    parsed: dict,
+    routing: _Routing,
+    author: str,
+    *,
+    expected_goal_revision_id: Optional[int],
+    expected_goal_revision_version: Optional[int],
+) -> DecomposeOutcome:
     """``fanout=false``: single-task spec promotion (same effect as specify)."""
     title_val, body_val = _title_body(parsed)
     assignee_val = None
@@ -223,10 +235,22 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
         )
     if title_val is None and body_val is None:
         return DecomposeOutcome(task.id, False, "decomposer returned fanout=false with no title/body")
-    with kbc.connect_closing() as conn:
-        ok = kb.specify_triage_task(
-            conn, task.id, title=title_val, body=body_val, assignee=assignee_val, author=author,
-        )
+    try:
+        with kbc.connect_closing() as conn:
+            ok = kb.specify_triage_task(
+                conn,
+                task.id,
+                title=title_val,
+                body=body_val,
+                assignee=assignee_val,
+                author=author,
+                expected_goal_revision_id=expected_goal_revision_id,
+                expected_goal_revision_version=expected_goal_revision_version,
+            )
+    except kb.GoalRevisionConflict as exc:
+        return DecomposeOutcome(task.id, False, str(exc))
+    except ValueError as exc:
+        return DecomposeOutcome(task.id, False, f"DB rejected task: {exc}")
     if not ok:
         return DecomposeOutcome(task.id, False, "task moved out of triage before promotion")
     return DecomposeOutcome(task.id, True, "single task (no fanout)", fanout=False, new_title=title_val)
@@ -266,7 +290,15 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
     return children, ""
 
 
-def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) -> DecomposeOutcome:
+def _apply_fanout(
+    task_id: str,
+    parsed: dict,
+    routing: _Routing,
+    author: str,
+    *,
+    expected_goal_revision_id: Optional[int],
+    expected_goal_revision_version: Optional[int],
+) -> DecomposeOutcome:
     raw_tasks = parsed.get("tasks") or []
     if not isinstance(raw_tasks, list) or not raw_tasks:
         return DecomposeOutcome(task_id, False, "decomposer returned fanout=true with empty tasks list")
@@ -275,6 +307,13 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
         return DecomposeOutcome(task_id, False, reason)
     try:
         with kbc.connect_closing() as conn:
+            prior_proposal = conn.execute(
+                "SELECT id FROM task_events "
+                "WHERE task_id = ? AND kind = 'decompose_proposed' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            prior_proposal_id = int(prior_proposal["id"]) if prior_proposal else 0
             child_ids = kb.decompose_triage_task(
                 conn,
                 task_id,
@@ -282,7 +321,27 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
                 children=children,
                 author=author,
                 auto_promote=routing.auto_promote,
+                expected_goal_revision_id=expected_goal_revision_id,
+                expected_goal_revision_version=expected_goal_revision_version,
             )
+            if child_ids is None:
+                proposals = [
+                    event
+                    for event in kb.list_events(conn, task_id)
+                    if event.kind == "decompose_proposed"
+                    and event.id > prior_proposal_id
+                ]
+                if proposals:
+                    payload = proposals[-1].payload or {}
+                    proposal_reason = payload.get("reason")
+                    if (
+                        payload.get("mutation") is False
+                        and isinstance(proposal_reason, str)
+                        and "goal revision" in proposal_reason.lower()
+                    ):
+                        return DecomposeOutcome(task_id, False, proposal_reason)
+    except kb.GoalRevisionConflict as exc:
+        return DecomposeOutcome(task_id, False, str(exc))
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
     except Exception as exc:
@@ -307,12 +366,42 @@ def decompose_task(
     task, reason = _load_triage_task(task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
+    with kbc.connect_closing() as conn:
+        context = kb.task_decomposition_context(conn, task_id)
+        effective_goal = kb.get_effective_goal(conn, task_id)
+    if context.get("latest_block_kind") == "capability":
+        return DecomposeOutcome(
+            task_id, False, "operational capability block is not a decomposition signal"
+        )
+    if context.get("nontrivial_graph"):
+        with kbc.connect_closing() as conn:
+            kb.record_decompose_proposal(
+                conn,
+                task_id,
+                author=author,
+                reason="existing implementation/review/test graph",
+            )
+        return DecomposeOutcome(
+            task_id, False, "existing task graph; proposal recorded without mutation"
+        )
+
+    prompt_fields = _task_prompt_fields(task)
+    if isinstance(effective_goal, dict):
+        prompt_fields["title"] = _truncate(str(effective_goal.get("title") or ""), 400)
+        prompt_fields["body"] = _truncate(
+            str(effective_goal.get("body") or "(no body)"), 4000
+        )
+    expected_goal_revision_id = context.get("goal_revision_id")
+    expected_goal_revision_version = context.get("goal_revision_version")
 
     routing = _load_routing()
     raw, reason = _call_aux(
         "decompose", task_id, aux_task="kanban_decomposer", system=_SYSTEM_PROMPT,
         user=_USER_TEMPLATE.format(
-            **_task_prompt_fields(task),
+            **prompt_fields,
+            context=_truncate(
+                json.dumps(context, ensure_ascii=False, sort_keys=True), 12000
+            ),
             roster=_format_roster(routing.roster),
             default_assignee=routing.default_assignee,
         ),
@@ -327,8 +416,22 @@ def decompose_task(
 
     audit_author = author or _profile_author()
     if not parsed.get("fanout"):
-        return _apply_single(task, parsed, routing, audit_author)
-    return _apply_fanout(task_id, parsed, routing, audit_author)
+        return _apply_single(
+            task,
+            parsed,
+            routing,
+            audit_author,
+            expected_goal_revision_id=expected_goal_revision_id,
+            expected_goal_revision_version=expected_goal_revision_version,
+        )
+    return _apply_fanout(
+        task_id,
+        parsed,
+        routing,
+        audit_author,
+        expected_goal_revision_id=expected_goal_revision_id,
+        expected_goal_revision_version=expected_goal_revision_version,
+    )
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:

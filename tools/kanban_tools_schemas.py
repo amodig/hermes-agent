@@ -482,6 +482,37 @@ KANBAN_CREATE_SCHEMA = _schema(
     ["title", "assignee"],
 )
 
+KANBAN_UPDATE_SCHEMA = _schema(
+    "kanban_update",
+    (
+        "Atomically revise an existing task with optimistic concurrency. "
+        "Requires the current expected_version and a reason; stale versions "
+        "are rejected without mutation. Title, body, or goal_mode changes "
+        "create an immutable effective-goal revision. The only supported "
+        "transition is 'triage_to_ready', which lands in 'todo' while "
+        "parents remain open and 'ready' once parent gating is satisfied. "
+        "Orchestrator-only; a claimed worker is never silently cancelled."
+    ),
+    {
+        "task_id": _prop("string", "Task to revise."),
+        "title": _prop("string", "Replacement title; omit to leave unchanged."),
+        "body": _prop("string", "Replacement goal/spec body; omit to leave unchanged."),
+        "assignee": _prop("string", "Replacement profile; empty clears the assignee."),
+        "model": _prop("string", "Replacement model override; empty clears it."),
+        "provider": _prop("string", "Provider for the model; empty clears it."),
+        "goal_mode": _prop("boolean", "Enable or disable goal-mode execution."),
+        "expected_version": _prop(
+            "integer", "Current task version required for the CAS update."
+        ),
+        "reason": _prop("string", "Human-readable reason for the correction."),
+        "transition": {
+            "type": "string",
+            "enum": ["triage_to_ready"],
+            "description": "Optional triage requeue transition.",
+        },
+    },
+    ["task_id", "expected_version", "reason"],
+)
 KANBAN_UNBLOCK_SCHEMA = _schema(
     "kanban_unblock",
     (
@@ -574,4 +605,37 @@ KANBAN_REQUEUE_HANDOFF_SCHEMA = _schema(
         "patch_sha256": _prop("string", "Expected SHA-256 for the historical patch."),
     },
     ["board", "task_id", "expected_version", "reason"],
+)
+
+
+KANBAN_REWORK_REVIEW_SCHEMA = _schema(
+    "kanban_rework_review",
+    (
+        "Atomically reopen an existing implementation -> reviewer -> tester chain "
+        "after the completed reviewer recorded REQUEST_CHANGES. Preserves all cards, "
+        "edges, runs, comments, goal history, and old handoffs while invalidating stale "
+        "review/validation scheduling. Orchestrator-only."
+    ),
+    {
+        "board": _prop("string", "Explicit board slug."),
+        "implementation_id": _prop("string", "Completed implementation task id."),
+        "reviewer_id": _prop("string", "Completed separate reviewer task id."),
+        "tester_id": _prop("string", "Blocked separate tester task id."),
+        "expected_implementation_version": _prop(
+            "integer", "Current implementation task version."
+        ),
+        "expected_reviewer_version": _prop("integer", "Current reviewer task version."),
+        "expected_tester_version": _prop("integer", "Current tester task version."),
+        "reason": _prop("string", "Concrete rework reason and verdict provenance."),
+    },
+    [
+        "board",
+        "implementation_id",
+        "reviewer_id",
+        "tester_id",
+        "expected_implementation_version",
+        "expected_reviewer_version",
+        "expected_tester_version",
+        "reason",
+    ],
 )
