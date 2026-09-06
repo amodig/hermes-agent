@@ -4154,10 +4154,6 @@ def rework_review_graph(
             preserve_sticky_block = (
                 row["status"] == "blocked"
                 and _has_sticky_block(conn, row["id"])
-                and (
-                    normalize_block_kind(row["block_kind"]) == "needs_input"
-                    or _latest_block_cause(conn, row["id"]) == "needs_input"
-                )
             )
             if preserve_sticky_block:
                 conn.execute(

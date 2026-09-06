@@ -87,6 +87,16 @@ def test_review_tools_redact_handoff_and_route_changes(
         )
 
 
+def test_kanban_link_remains_registered() -> None:
+    import tools.kanban_tools  # noqa: F401 - registers the tools
+    from tools.registry import registry
+
+    entry = registry.get_entry("kanban_link")
+    assert entry is not None
+    assert entry.schema["name"] == "kanban_link"
+    assert callable(entry.handler)
+
+
 def test_review_tools_are_gated_and_visible_to_kanban_workers(
     review_worker: str,
 ) -> None:

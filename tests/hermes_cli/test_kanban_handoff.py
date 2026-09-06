@@ -357,7 +357,10 @@ def test_rework_review_accepts_todo_tester_for_second_rejection(kanban_home, tmp
         assert first_head != second_head
 
 
-def test_rework_preserves_sticky_needs_input_descendant(kanban_home, tmp_path):
+@pytest.mark.parametrize("block_kind", ["needs_input", "capability"])
+def test_rework_preserves_sticky_blocked_descendant(
+    kanban_home, tmp_path, block_kind
+):
     repo, base, branch = _repo(tmp_path)
     with kbc.connect_closing() as conn:
         implementation, reviewer, tester, descendant, _head = _rework_graph(
@@ -365,7 +368,7 @@ def test_rework_preserves_sticky_needs_input_descendant(kanban_home, tmp_path):
         )
         sticky = kb.create_task(conn, title="owner approval", assignee="publisher")
         assert kb.block_task(
-            conn, sticky, reason="owner approval required", kind="needs_input"
+            conn, sticky, reason="owner approval required", kind=block_kind
         )
         kb.link_tasks(conn, tester, sticky)
         before = kb.get_task(conn, sticky)
@@ -388,7 +391,7 @@ def test_rework_preserves_sticky_needs_input_descendant(kanban_home, tmp_path):
         assert after is not None
         assert result["status"] == "ready"
         assert after.status == "blocked"
-        assert after.block_kind == "needs_input"
+        assert after.block_kind == block_kind
         assert after.block_recurrences == before.block_recurrences
         assert kb.get_task(conn, descendant).status == "todo"
         assert any(event.kind == "blocked" for event in kb.list_events(conn, sticky))

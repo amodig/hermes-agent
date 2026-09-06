@@ -1152,6 +1152,7 @@ _TOOLS = (
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
+    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"),
     ("kanban_update", KANBAN_UPDATE_SCHEMA, _handle_update, "✎"),
     ("kanban_unlink", KANBAN_UNLINK_SCHEMA, _handle_unlink, "🔗"),
     ("kanban_archive", KANBAN_ARCHIVE_SCHEMA, _handle_archive, "📦"),
