@@ -1579,6 +1579,11 @@ def create_task(
                 }
                 for pid in parents:
                     _link(conn, pid, task_id)
+                if task_status == "ready" and not _parents_satisfied(conn, task_id):
+                    task_status = "todo"
+                    conn.execute(
+                        "UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,)
+                    )
                 _append_event(
                     conn,
                     task_id,
@@ -2213,8 +2218,8 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
         _link(conn, parent_id, child_id)
-        # If child was ready but parent is not yet done, demote child to todo.
-        if _task_status(conn, parent_id) != "done":
+        # A child is ready only when every parent is terminal and accepted.
+        if not _parents_satisfied(conn, child_id):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'", (child_id,),
             )
@@ -2899,7 +2904,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return whether every direct parent is terminal and accepted."""
     parents = conn.execute(
-        "SELECT p.id, p.status FROM task_links l "
+        "SELECT p.id, p.status, p.assignee, p.workflow_template_id FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id WHERE l.child_id = ?",
         (task_id,),
     ).fetchall()
@@ -2915,7 +2920,13 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         metadata = _json_dict(_row_get(run, "metadata"))
         verdict = str(metadata.get("verdict") or "").strip().upper()
-        if verdict == "REQUEST_CHANGES":
+        is_separate_reviewer = (
+            str(parent["assignee"] or "").strip().casefold() == "reviewer"
+            and parent["workflow_template_id"] != "kanban_swarm_v1"
+        )
+        if is_separate_reviewer and verdict != "APPROVE":
+            return False
+        if not is_separate_reviewer and verdict == "REQUEST_CHANGES":
             return False
         if verdict == "APPROVE":
             reviewed_head = _nonblank_str(
@@ -4039,7 +4050,6 @@ def rework_review_graph(
         required_statuses = {
             implementation_id: "done",
             reviewer_id: "done",
-            tester_id: "blocked",
         }
         for task_id, version in expected.items():
             row = rows[task_id]
@@ -4048,9 +4058,15 @@ def rework_review_graph(
                     f"task {task_id} update conflict: expected version {version}, "
                     f"current version {row['version']}"
                 )
-            if row["status"] != required_statuses[task_id]:
+            if task_id == tester_id:
+                status_ok = row["status"] in {"blocked", "todo"}
+                expected_status = "'blocked' or 'todo'"
+            else:
+                status_ok = row["status"] == required_statuses[task_id]
+                expected_status = repr(required_statuses[task_id])
+            if not status_ok:
                 raise ValueError(
-                    f"task {task_id} must be {required_statuses[task_id]!r}, "
+                    f"task {task_id} must be {expected_status}, "
                     f"current {row['status']!r}"
                 )
             if row["status"] == "running" or row["claim_lock"] or row["current_run_id"] or row["worker_pid"]:
@@ -4099,7 +4115,8 @@ def rework_review_graph(
                 SELECT l.child_id FROM task_links l JOIN graph g ON g.id = l.parent_id
             )
             SELECT t.id, t.status, t.version, t.completed_at, t.result,
-                   t.claim_lock, t.current_run_id, t.worker_pid
+                   t.claim_lock, t.current_run_id, t.worker_pid,
+                   t.block_kind, t.block_recurrences
             FROM graph g JOIN tasks t ON t.id = g.id
             ORDER BY t.id
             """,
@@ -4134,13 +4151,30 @@ def rework_review_graph(
         for row in descendants:
             if row["status"] == "archived":
                 continue
-            conn.execute(
-                "UPDATE tasks SET status = 'todo', version = version + 1, "
-                "completed_at = NULL, result = NULL, current_run_id = NULL, "
-                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
-                "block_kind = NULL, block_recurrences = 0 WHERE id = ?",
-                (row["id"],),
+            preserve_sticky_block = (
+                row["status"] == "blocked"
+                and _has_sticky_block(conn, row["id"])
+                and (
+                    normalize_block_kind(row["block_kind"]) == "needs_input"
+                    or _latest_block_cause(conn, row["id"]) == "needs_input"
+                )
             )
+            if preserve_sticky_block:
+                conn.execute(
+                    "UPDATE tasks SET status = 'blocked', version = version + 1, "
+                    "completed_at = NULL, result = NULL, current_run_id = NULL, "
+                    "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                    "WHERE id = ?",
+                    (row["id"],),
+                )
+            else:
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo', version = version + 1, "
+                    "completed_at = NULL, result = NULL, current_run_id = NULL, "
+                    "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                    "block_kind = NULL, block_recurrences = 0 WHERE id = ?",
+                    (row["id"],),
+                )
             invalidated.append({
                 "id": row["id"],
                 "prior_status": row["status"],

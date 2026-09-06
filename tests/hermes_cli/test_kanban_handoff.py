@@ -183,7 +183,10 @@ def test_legacy_handoff_requeues_and_recompletes_same_lane(kanban_home, tmp_path
         review_run = kb.claim_task(conn, reviewer)
         assert review_run is not None
         assert kb.complete_task(
-            conn, reviewer, expected_run_id=review_run.current_run_id
+            conn,
+            reviewer,
+            expected_run_id=review_run.current_run_id,
+            metadata={"verdict": "APPROVE", "reviewed_head_sha": head},
         )
         assert kb.get_task(conn, tester).status == "ready"
         reviewed = kb.latest_handoff(conn, reviewer)
@@ -262,6 +265,137 @@ def _rework_graph(conn, repo: Path, base: str, branch: str) -> tuple[str, str, s
     )
     kb.add_comment(conn, implementation, "operator", "rework is required")
     return implementation, reviewer, tester, descendant, first_head
+
+
+def test_separate_reviewer_requires_explicit_approval(kanban_home, tmp_path):
+    repo, base, branch = _repo(tmp_path)
+    with kbc.connect_closing() as conn:
+        implementation = kb.create_task(
+            conn,
+            title="implementation",
+            assignee="implementer",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name=branch,
+        )
+        reviewer = kb.create_task(
+            conn, title="review", assignee="reviewer", parents=[implementation]
+        )
+        tester = kb.create_task(
+            conn, title="validation", assignee="tester", parents=[reviewer]
+        )
+        implementation_run = kb.claim_task(conn, implementation, claimer="implementer:1")
+        assert implementation_run is not None
+        head = _commit(repo, "src/approved.py")
+        assert kb.complete_task(
+            conn,
+            implementation,
+            expected_run_id=implementation_run.current_run_id,
+            metadata={"base_sha": base, "head_sha": head},
+        )
+        reviewer_run = kb.claim_task(conn, reviewer, claimer="reviewer:1")
+        assert reviewer_run is not None
+        assert kb.complete_task(
+            conn,
+            reviewer,
+            expected_run_id=reviewer_run.current_run_id,
+            metadata={"reviewed_head_sha": head},
+        )
+        assert kb.get_task(conn, tester).status == "todo"
+        assert kb.claim_task(conn, tester) is None
+
+
+def test_rework_review_accepts_todo_tester_for_second_rejection(kanban_home, tmp_path):
+    repo, base, branch = _repo(tmp_path)
+    with kbc.connect_closing() as conn:
+        implementation, reviewer, tester, _descendant, first_head = _rework_graph(
+            conn, repo, base, branch
+        )
+        ids = (implementation, reviewer, tester)
+        versions = tuple(kb.get_task(conn, task_id).version for task_id in ids)
+        kb.rework_review_graph(
+            conn,
+            *ids,
+            expected_implementation_version=versions[0],
+            expected_reviewer_version=versions[1],
+            expected_tester_version=versions[2],
+            reason="first repair",
+        )
+        assert kb.get_task(conn, tester).status == "todo"
+
+        implementation_run = kb.claim_task(conn, implementation, claimer="implementer:2")
+        assert implementation_run is not None
+        second_head = _commit(repo, "src/repaired.py")
+        assert kb.complete_task(
+            conn,
+            implementation,
+            expected_run_id=implementation_run.current_run_id,
+            metadata={"base_sha": base, "head_sha": second_head},
+        )
+        reviewer_run = kb.claim_task(conn, reviewer, claimer="reviewer:2")
+        assert reviewer_run is not None
+        assert kb.complete_task(
+            conn,
+            reviewer,
+            expected_run_id=reviewer_run.current_run_id,
+            metadata={
+                "verdict": "REQUEST_CHANGES",
+                "reviewed_head_sha": second_head,
+            },
+        )
+        versions = tuple(kb.get_task(conn, task_id).version for task_id in ids)
+        result = kb.rework_review_graph(
+            conn,
+            *ids,
+            expected_implementation_version=versions[0],
+            expected_reviewer_version=versions[1],
+            expected_tester_version=versions[2],
+            reason="second repair",
+        )
+        assert result["status"] == "ready"
+        assert kb.get_task(conn, tester).status == "todo"
+        assert first_head != second_head
+
+
+def test_rework_preserves_sticky_needs_input_descendant(kanban_home, tmp_path):
+    repo, base, branch = _repo(tmp_path)
+    with kbc.connect_closing() as conn:
+        implementation, reviewer, tester, descendant, _head = _rework_graph(
+            conn, repo, base, branch
+        )
+        sticky = kb.create_task(conn, title="owner approval", assignee="publisher")
+        assert kb.block_task(
+            conn, sticky, reason="owner approval required", kind="needs_input"
+        )
+        kb.link_tasks(conn, tester, sticky)
+        before = kb.get_task(conn, sticky)
+        assert before is not None
+        versions = tuple(
+            kb.get_task(conn, task_id).version
+            for task_id in (implementation, reviewer, tester)
+        )
+        result = kb.rework_review_graph(
+            conn,
+            implementation,
+            reviewer,
+            tester,
+            expected_implementation_version=versions[0],
+            expected_reviewer_version=versions[1],
+            expected_tester_version=versions[2],
+            reason="preserve owner gate",
+        )
+        after = kb.get_task(conn, sticky)
+        assert after is not None
+        assert result["status"] == "ready"
+        assert after.status == "blocked"
+        assert after.block_kind == "needs_input"
+        assert after.block_recurrences == before.block_recurrences
+        assert kb.get_task(conn, descendant).status == "todo"
+        assert any(event.kind == "blocked" for event in kb.list_events(conn, sticky))
+        assert any(
+            event.kind == "acceptance_invalidated"
+            for event in kb.list_events(conn, sticky)
+        )
 
 
 def test_rework_review_reuses_cards_and_requires_new_head_approval(
