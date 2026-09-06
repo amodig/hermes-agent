@@ -2863,12 +2863,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
                 continue
-            parents = conn.execute(
-                "SELECT t.status FROM tasks t "
-                "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?", (task_id,),
-            ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if _parents_satisfied(conn, task_id):
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # At the breaker limit, no auto-recovery (else block ->
@@ -2902,15 +2897,37 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
 # --- Claim / complete / block ---
 
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return whether every direct parent is terminal for dependency gating."""
-    return conn.execute(
-        # Check if this task has children that still need the workspace. If any child is not yet
-        # done/archived, defer cleanup so the child can read handoff artifacts from the workspace (#33774).
-        "SELECT 1 FROM task_links l "
-        "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1", (task_id,),
-    ).fetchone() is None
+    """Return whether every direct parent is terminal and accepted."""
+    parents = conn.execute(
+        "SELECT p.id, p.status FROM task_links l "
+        "JOIN tasks p ON p.id = l.parent_id WHERE l.child_id = ?",
+        (task_id,),
+    ).fetchall()
+    for parent in parents:
+        if parent["status"] == "archived":
+            continue
+        if parent["status"] != "done":
+            return False
+        run = conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+            "ORDER BY id DESC LIMIT 1",
+            (parent["id"],),
+        ).fetchone()
+        metadata = _json_dict(_row_get(run, "metadata"))
+        verdict = str(metadata.get("verdict") or "").strip().upper()
+        if verdict == "REQUEST_CHANGES":
+            return False
+        if verdict == "APPROVE":
+            reviewed_head = _nonblank_str(
+                metadata.get("reviewed_head_sha")
+                or metadata.get("head_ref_reverified")
+                or metadata.get("head_sha")
+            )
+            parent_handoff = _parent_handoff_context(conn, parent["id"])
+            expected_head = _nonblank_str((parent_handoff or {}).get("head_sha"))
+            if not reviewed_head or not expected_head or reviewed_head != expected_head:
+                return False
+    return True
 
 
 def _claim_and_open_run(
@@ -3968,6 +3985,223 @@ def requeue_legacy_handoff(
     for child_id in gated:
         notify_task_updated(conn, child_id, ("status", "version"))
     return True
+
+
+def rework_review_graph(
+    conn: sqlite3.Connection,
+    implementation_id: str,
+    reviewer_id: str,
+    tester_id: str,
+    *,
+    expected_implementation_version: int,
+    expected_reviewer_version: int,
+    expected_tester_version: int,
+    reason: str,
+    author: Optional[str] = None,
+) -> dict[str, Any]:
+    """Atomically requeue one rejected implementation/review/test chain.
+
+    The three cards and their direct edges are the durable identity of the
+    workflow.  Rework changes only their current scheduling state; runs,
+    comments, goal revisions, and completion events remain historical.
+    """
+    task_ids = (implementation_id, reviewer_id, tester_id)
+    if any(not isinstance(task_id, str) or not task_id.strip() for task_id in task_ids):
+        raise ValueError("implementation, reviewer, and tester ids are required")
+    if len(set(task_ids)) != 3:
+        raise ValueError("implementation, reviewer, and tester ids must be distinct")
+    expected = {
+        implementation_id: expected_implementation_version,
+        reviewer_id: expected_reviewer_version,
+        tester_id: expected_tester_version,
+    }
+    if any(
+        isinstance(version, bool) or not isinstance(version, int) or version < 1
+        for version in expected.values()
+    ):
+        raise ValueError("expected versions must be integers >= 1")
+    reason = str(reason or "").strip()
+    if not reason:
+        raise ValueError("reason is required")
+    actor = str(author or os.environ.get("HERMES_PROFILE") or "orchestrator")
+
+    with write_txn(conn):
+        rows = {
+            row["id"]: row
+            for row in conn.execute(
+                "SELECT id, status, version, claim_lock, current_run_id, worker_pid "
+                "FROM tasks WHERE id IN (?, ?, ?)",
+                task_ids,
+            ).fetchall()
+        }
+        if set(rows) != set(expected):
+            raise ValueError("implementation, reviewer, or tester task was not found")
+        required_statuses = {
+            implementation_id: "done",
+            reviewer_id: "done",
+            tester_id: "blocked",
+        }
+        for task_id, version in expected.items():
+            row = rows[task_id]
+            if int(row["version"] or 1) != version:
+                raise ValueError(
+                    f"task {task_id} update conflict: expected version {version}, "
+                    f"current version {row['version']}"
+                )
+            if row["status"] != required_statuses[task_id]:
+                raise ValueError(
+                    f"task {task_id} must be {required_statuses[task_id]!r}, "
+                    f"current {row['status']!r}"
+                )
+            if row["status"] == "running" or row["claim_lock"] or row["current_run_id"] or row["worker_pid"]:
+                raise ValueError(f"task {task_id} is currently claimed")
+
+        links = {
+            tuple(row)
+            for row in conn.execute(
+                "SELECT parent_id, child_id FROM task_links "
+                "WHERE (parent_id = ? AND child_id = ?) "
+                "OR (parent_id = ? AND child_id = ?)",
+                (implementation_id, reviewer_id, reviewer_id, tester_id),
+            ).fetchall()
+        }
+        if links != {
+            (implementation_id, reviewer_id),
+            (reviewer_id, tester_id),
+        }:
+            raise ValueError("tasks are not an implementation -> reviewer -> tester chain")
+
+        handoff = latest_handoff(conn, implementation_id)
+        head_sha = _nonblank_str(handoff.get("head_sha"))
+        if not head_sha:
+            raise HandoffValidationError(implementation_id, "immutable head_sha is required")
+        review_run = conn.execute(
+            "SELECT id, metadata FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+            "ORDER BY id DESC LIMIT 1",
+            (reviewer_id,),
+        ).fetchone()
+        review_metadata = _json_dict(_row_get(review_run, "metadata"))
+        if str(review_metadata.get("verdict") or "").strip().upper() != "REQUEST_CHANGES":
+            raise ValueError("reviewer's latest completed verdict is not REQUEST_CHANGES")
+        reviewed_head = _nonblank_str(
+            review_metadata.get("reviewed_head_sha")
+            or review_metadata.get("head_ref_reverified")
+            or review_metadata.get("head_sha")
+        )
+        if reviewed_head != head_sha:
+            raise ValueError("review verdict does not match the implementation head")
+
+        descendants = conn.execute(
+            """
+            WITH RECURSIVE graph(id) AS (
+                SELECT ?
+                UNION
+                SELECT l.child_id FROM task_links l JOIN graph g ON g.id = l.parent_id
+            )
+            SELECT t.id, t.status, t.version, t.completed_at, t.result,
+                   t.claim_lock, t.current_run_id, t.worker_pid
+            FROM graph g JOIN tasks t ON t.id = g.id
+            ORDER BY t.id
+            """,
+            (reviewer_id,),
+        ).fetchall()
+        for row in descendants:
+            if row["status"] == "running" or row["claim_lock"] or row["current_run_id"] or row["worker_pid"]:
+                raise ValueError(f"cannot rework graph while task {row['id']} is claimed")
+
+        completion = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND kind = 'completed' "
+            "ORDER BY id DESC LIMIT 1",
+            (implementation_id,),
+        ).fetchone()
+        if completion is None or review_run is None:
+            raise ValueError("completion or review verdict provenance is unavailable")
+        implementation_status = "ready" if _parents_satisfied(conn, implementation_id) else "todo"
+        implementation_update = conn.execute(
+            """
+            UPDATE tasks SET status = ?, version = version + 1, completed_at = NULL,
+                result = NULL, current_run_id = NULL, claim_lock = NULL,
+                claim_expires = NULL, worker_pid = NULL
+            WHERE id = ? AND version = ?
+            """,
+            (implementation_status, implementation_id, expected_implementation_version),
+        )
+        if implementation_update.rowcount != 1:
+            raise ValueError(
+                f"task {implementation_id} update conflict: version changed while reworking"
+            )
+        invalidated: list[dict[str, Any]] = []
+        for row in descendants:
+            if row["status"] == "archived":
+                continue
+            conn.execute(
+                "UPDATE tasks SET status = 'todo', version = version + 1, "
+                "completed_at = NULL, result = NULL, current_run_id = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "block_kind = NULL, block_recurrences = 0 WHERE id = ?",
+                (row["id"],),
+            )
+            invalidated.append({
+                "id": row["id"],
+                "prior_status": row["status"],
+                "prior_version": int(row["version"] or 1),
+                "prior_completed_at": row["completed_at"],
+                "prior_result": row["result"],
+            })
+            _append_event(
+                conn,
+                row["id"],
+                "acceptance_invalidated",
+                {
+                    "implementation": implementation_id,
+                    "reviewer": reviewer_id,
+                    "tester": tester_id,
+                    "reason": reason,
+                    "rejected_head_sha": head_sha,
+                    "review_run_id": int(review_run["id"]),
+                    "actor": actor,
+                    "prior_status": row["status"],
+                    "prior_version": int(row["version"] or 1),
+                    "prior_completed_at": row["completed_at"],
+                    "prior_result": row["result"],
+                },
+            )
+        _append_event(
+            conn,
+            implementation_id,
+            "review_rework_requested",
+            {
+                "actor": actor,
+                "reason": reason,
+                "reviewer": reviewer_id,
+                "tester": tester_id,
+                "rejected_head_sha": head_sha,
+                "review_run_id": int(review_run["id"]),
+                "supersedes_completion_event_id": int(completion["id"]),
+                "invalidated": invalidated,
+                "status": implementation_status,
+                "expected_versions": expected,
+            },
+        )
+
+    notify_task_updated(conn, implementation_id, ("status", "version", "completed_at", "result"))
+    for entry in invalidated:
+        notify_task_updated(conn, entry["id"], ("status", "version", "completed_at", "result"))
+    implementation = get_task(conn, implementation_id)
+    reviewer = get_task(conn, reviewer_id)
+    tester = get_task(conn, tester_id)
+    return {
+        "implementation_id": implementation_id,
+        "reviewer_id": reviewer_id,
+        "tester_id": tester_id,
+        "status": implementation_status,
+        "rejected_head_sha": head_sha,
+        "review_run_id": int(review_run["id"]),
+        "invalidated": invalidated,
+        "implementation_version": implementation.version if implementation else None,
+        "reviewer_version": reviewer.version if reviewer else None,
+        "tester_version": tester.version if tester else None,
+    }
 
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""

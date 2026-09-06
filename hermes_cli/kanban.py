@@ -215,7 +215,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "gc", "update",
+    "gc", "update", "rework-review",
 })
 
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
@@ -1074,6 +1074,34 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
         print(f"Requested changes for {tid}" + (f"; routed to {detail}" if detail else ""))
     return 0
 
+def _cmd_rework_review(args: argparse.Namespace) -> int:
+    board = str(getattr(args, "board", "") or "").strip()
+    if not board:
+        return _err("kanban rework-review requires an explicit --board <slug>", 2)
+    reason = " ".join(getattr(args, "reason", ()) or ())
+    reason = str(kb.redact_review_value(reason)).strip()
+    if not reason:
+        return _err("kanban rework-review requires a non-empty --reason", 2)
+    with kbc.connect_closing() as conn:
+        outcome = kb.rework_review_graph(
+            conn,
+            args.implementation_id,
+            args.reviewer_id,
+            args.tester_id,
+            expected_implementation_version=args.expected_implementation_version,
+            expected_reviewer_version=args.expected_reviewer_version,
+            expected_tester_version=args.expected_tester_version,
+            reason=reason,
+            author=_profile_author(),
+        )
+    if _json_out(args, outcome):
+        return 0
+    print(
+        f"Reworked {args.implementation_id} -> {outcome['status']} "
+        f"(invalidated {len(outcome['invalidated'])} dependent card(s))"
+    )
+    return 0
+
 
 def _cmd_reopen_review(args: argparse.Namespace) -> int:
     ids, rc = _require_ids(args)
@@ -1328,6 +1356,7 @@ _HANDLERS = {
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
+    "rework-review": _cmd_rework_review,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
@@ -1352,7 +1381,7 @@ Common subcommands:
   `comment <id> <msg>`  Append a comment
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
-  `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
+  `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer; `rework-review …` requeues a rejected separate-card chain
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards

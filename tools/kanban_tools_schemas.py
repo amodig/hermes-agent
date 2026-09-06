@@ -606,3 +606,36 @@ KANBAN_REQUEUE_HANDOFF_SCHEMA = _schema(
     },
     ["board", "task_id", "expected_version", "reason"],
 )
+
+
+KANBAN_REWORK_REVIEW_SCHEMA = _schema(
+    "kanban_rework_review",
+    (
+        "Atomically reopen an existing implementation -> reviewer -> tester chain "
+        "after the completed reviewer recorded REQUEST_CHANGES. Preserves all cards, "
+        "edges, runs, comments, goal history, and old handoffs while invalidating stale "
+        "review/validation scheduling. Orchestrator-only."
+    ),
+    {
+        "board": _prop("string", "Explicit board slug."),
+        "implementation_id": _prop("string", "Completed implementation task id."),
+        "reviewer_id": _prop("string", "Completed separate reviewer task id."),
+        "tester_id": _prop("string", "Blocked separate tester task id."),
+        "expected_implementation_version": _prop(
+            "integer", "Current implementation task version."
+        ),
+        "expected_reviewer_version": _prop("integer", "Current reviewer task version."),
+        "expected_tester_version": _prop("integer", "Current tester task version."),
+        "reason": _prop("string", "Concrete rework reason and verdict provenance."),
+    },
+    [
+        "board",
+        "implementation_id",
+        "reviewer_id",
+        "tester_id",
+        "expected_implementation_version",
+        "expected_reviewer_version",
+        "expected_tester_version",
+        "reason",
+    ],
+)

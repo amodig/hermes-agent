@@ -24,7 +24,8 @@ from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
-    KANBAN_REQUEUE_HANDOFF_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA,
+    KANBAN_REQUEUE_HANDOFF_SCHEMA, KANBAN_REWORK_REVIEW_SCHEMA, KANBAN_SHOW_SCHEMA,
+    KANBAN_UNBLOCK_SCHEMA,
     KANBAN_UNLINK_SCHEMA, KANBAN_UPDATE_SCHEMA,
 )
 
@@ -1098,12 +1099,44 @@ def _handle_requeue_handoff(args: dict, **kw) -> str:
             active_handoff=kb.latest_handoff(conn, task_id),
         )
 
+@_kanban_handler("kanban_rework_review")
+def _handle_rework_review(args: dict, **kw) -> str:
+    _require_orchestrator_tool("kanban_rework_review")
+    board, reason = _repair_common(args)
+    implementation_id = str(args.get("implementation_id") or "").strip()
+    reviewer_id = str(args.get("reviewer_id") or "").strip()
+    tester_id = str(args.get("tester_id") or "").strip()
+    _check(implementation_id, "implementation_id is required")
+    _check(reviewer_id, "reviewer_id is required")
+    _check(tester_id, "tester_id is required")
+    for name in (
+        "expected_implementation_version",
+        "expected_reviewer_version",
+        "expected_tester_version",
+    ):
+        _check(name in args and args[name] is not None, f"{name} is required")
+    with _board(board) as (kb, conn):
+        outcome = kb.rework_review_graph(
+            conn,
+            implementation_id,
+            reviewer_id,
+            tester_id,
+            expected_implementation_version=args["expected_implementation_version"],
+            expected_reviewer_version=args["expected_reviewer_version"],
+            expected_tester_version=args["expected_tester_version"],
+            reason=reason,
+            author=os.environ.get("HERMES_PROFILE") or "orchestrator",
+        )
+    return _ok(**outcome)
+
+
+
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
 _ORCHESTRATOR_TOOLS = frozenset({
     "kanban_list", "kanban_unblock", "kanban_update", "kanban_unlink", "kanban_archive",
-    "kanban_requeue_handoff",
+    "kanban_requeue_handoff", "kanban_rework_review",
 })
 _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
@@ -1122,7 +1155,8 @@ _TOOLS = (
     ("kanban_update", KANBAN_UPDATE_SCHEMA, _handle_update, "✎"),
     ("kanban_unlink", KANBAN_UNLINK_SCHEMA, _handle_unlink, "🔗"),
     ("kanban_archive", KANBAN_ARCHIVE_SCHEMA, _handle_archive, "📦"),
-    ("kanban_requeue_handoff", KANBAN_REQUEUE_HANDOFF_SCHEMA, _handle_requeue_handoff, "↩"))
+    ("kanban_requeue_handoff", KANBAN_REQUEUE_HANDOFF_SCHEMA, _handle_requeue_handoff, "↩"),
+    ("kanban_rework_review", KANBAN_REWORK_REVIEW_SCHEMA, _handle_rework_review, "↩"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
     _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode

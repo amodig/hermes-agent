@@ -215,3 +215,149 @@ def test_legacy_requeue_rejects_tampered_or_missing_patch(kanban_home, tmp_path)
         patch.unlink()
         with pytest.raises(kb.HandoffValidationError, match="does not exist"):
             kb.requeue_legacy_handoff(conn, parent, expected_version=1, reason="repair")
+
+
+def _rework_graph(conn, repo: Path, base: str, branch: str) -> tuple[str, str, str, str, str]:
+    implementation = kb.create_task(
+        conn,
+        title="implementation",
+        assignee="implementer",
+        workspace_kind="worktree",
+        workspace_path=str(repo),
+        branch_name=branch,
+    )
+    reviewer = kb.create_task(
+        conn, title="review", assignee="reviewer", parents=[implementation]
+    )
+    tester = kb.create_task(
+        conn,
+        title="validation",
+        assignee="tester",
+        parents=[reviewer],
+        initial_status="blocked",
+    )
+    descendant = kb.create_task(
+        conn, title="publish", assignee="publisher", parents=[tester]
+    )
+
+    implementation_run = kb.claim_task(conn, implementation, claimer="implementer:1")
+    assert implementation_run is not None
+    first_head = _commit(repo, "src/rejected.py")
+    assert kb.complete_task(
+        conn,
+        implementation,
+        expected_run_id=implementation_run.current_run_id,
+        metadata={"base_sha": base, "head_sha": first_head},
+    )
+    reviewer_run = kb.claim_task(conn, reviewer, claimer="reviewer:1")
+    assert reviewer_run is not None
+    assert kb.complete_task(
+        conn,
+        reviewer,
+        expected_run_id=reviewer_run.current_run_id,
+        metadata={
+            "verdict": "REQUEST_CHANGES",
+            "reviewed_head_sha": first_head,
+        },
+    )
+    kb.add_comment(conn, implementation, "operator", "rework is required")
+    return implementation, reviewer, tester, descendant, first_head
+
+
+def test_rework_review_reuses_cards_and_requires_new_head_approval(
+    kanban_home, tmp_path
+):
+    """A rejected separate-card review is reworked in place, never duplicated."""
+    repo, base, branch = _repo(tmp_path)
+    kb.create_board("rework")
+    with kb.scoped_current_board("rework"), kbc.connect_closing() as conn:
+        implementation, reviewer, tester, descendant, first_head = _rework_graph(
+            conn, repo, base, branch
+        )
+        assert kb.get_task(conn, tester).status == "blocked"
+
+        ids = (implementation, reviewer, tester)
+        versions = tuple(kb.get_task(conn, task_id).version for task_id in ids)
+        before_runs = {
+            task_id: len(kb.list_runs(conn, task_id)) for task_id in ids
+        }
+        result = kb.rework_review_graph(
+            conn,
+            *ids,
+            expected_implementation_version=versions[0],
+            expected_reviewer_version=versions[1],
+            expected_tester_version=versions[2],
+            reason="repair the rejected candidate",
+            author="operator",
+        )
+        assert result["rejected_head_sha"] == first_head
+        assert result["status"] == "ready"
+        assert {entry["id"] for entry in result["invalidated"]} == {
+            reviewer,
+            tester,
+            descendant,
+        }
+        assert kb.parent_ids(conn, reviewer) == [implementation]
+        assert kb.parent_ids(conn, tester) == [reviewer]
+        assert kb.parent_ids(conn, descendant) == [tester]
+        assert kb.get_task(conn, implementation).workspace_path == str(repo)
+        assert kb.get_task(conn, implementation).status == "ready"
+        assert kb.get_task(conn, reviewer).status == "todo"
+        assert kb.get_task(conn, tester).status == "todo"
+        assert kb.get_task(conn, descendant).status == "todo"
+        assert {
+            task_id: len(kb.list_runs(conn, task_id)) for task_id in ids
+        } == before_runs
+        assert len(kb.list_comments(conn, implementation)) == 1
+        assert len(
+            [event for event in kb.list_events(conn, implementation)
+             if event.kind == "review_rework_requested"]
+        ) == 1
+
+        # A lost response may be retried, but the original CAS versions are
+        # stale and must not append a second rework event.
+        with pytest.raises(ValueError, match="update conflict"):
+            kb.rework_review_graph(
+                conn,
+                *ids,
+                expected_implementation_version=versions[0],
+                expected_reviewer_version=versions[1],
+                expected_tester_version=versions[2],
+                reason="retry",
+            )
+        assert len(
+            [event for event in kb.list_events(conn, implementation)
+             if event.kind == "review_rework_requested"]
+        ) == 1
+
+        implementation_run = kb.claim_task(
+            conn, implementation, claimer="implementer:2"
+        )
+        assert implementation_run is not None
+        second_head = _commit(repo, "src/repaired.py")
+        assert kb.complete_task(
+            conn,
+            implementation,
+            expected_run_id=implementation_run.current_run_id,
+            metadata={"base_sha": base, "head_sha": second_head},
+        )
+        reviewer_run = kb.claim_task(conn, reviewer, claimer="reviewer:2")
+        assert reviewer_run is not None
+        assert kb.complete_task(
+            conn,
+            reviewer,
+            expected_run_id=reviewer_run.current_run_id,
+            metadata={
+                "verdict": "APPROVE",
+                "reviewed_head_sha": second_head,
+            },
+        )
+        assert kb.get_task(conn, tester).status == "ready"
+        tester_run = kb.claim_task(conn, tester, claimer="tester:1")
+        assert tester_run is not None
+        assert kb.complete_task(
+            conn, tester, expected_run_id=tester_run.current_run_id, summary="validated"
+        )
+        assert kb.get_task(conn, tester).status == "done"
+        assert kb.latest_handoff(conn, implementation)["head_sha"] == second_head
+        assert first_head != second_head
