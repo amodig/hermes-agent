@@ -296,14 +296,30 @@ def _read_board_metadata(path: Path) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+def _is_same_card_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    status: str,
+    contract: Optional[dict],
+) -> bool:
+    return bool(
+        contract
+        and contract.get("kind") == "code"
+        and contract.get("review_mode") == "same_card"
+        and (
+            status == "review"
+            or (
+                status == "blocked"
+                and kb._resume_status_from_events(conn, task_id) == "review"
+            )
+        )
+    )
+
+
 def _candidate_handoff_ids(conn: sqlite3.Connection, row: sqlite3.Row) -> list[str]:
     contract = kb.safe_decode_contract(row["lifecycle_contract"])
     kind = contract.get("kind") if contract else None
-    same_card = (
-        kind == "code"
-        and contract.get("review_mode") == "same_card"
-        and row["status"] == "review"
-    )
+    same_card = _is_same_card_review(conn, row["id"], row["status"], contract)
     is_role = kind in {"review", "validation"} or (
         not contract
         and str(row["assignee"] or "").strip().casefold() in kb.HANDOFF_CHILD_ASSIGNEES
@@ -338,7 +354,12 @@ def _requeue_imported_candidate(
         candidate is None
         or not contract
         or contract.get("kind") != "code"
-        or candidate.status not in {"done", "review"}
+        or (
+            candidate.status not in {"done", "review"}
+            and not _is_same_card_review(
+                conn, candidate.id, candidate.status, contract,
+            )
+        )
     ):
         return [], []
 
@@ -456,7 +477,12 @@ def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[s
                     candidate is not None
                     and contract
                     and contract.get("kind") == "code"
-                    and candidate.status in {"done", "review"}
+                    and (
+                        candidate.status in {"done", "review"}
+                        or _is_same_card_review(
+                            conn, candidate.id, candidate.status, contract,
+                        )
+                    )
                 ):
                     candidate_roots.add(candidate_id)
 

@@ -98,6 +98,7 @@ def _completion_mode_code(
         else None
     )
     claimed_source = _kb._json_dict(_kb._row_get(claimed_event, "payload")).get("source_status")
+    resumed_review = _kb._resume_status_from_events(conn, task_id) == "review"
     completed_review = (
         task_before.status == "done"
         and task_before.lifecycle_contract.get("review_mode") == "same_card"
@@ -105,7 +106,12 @@ def _completion_mode_code(
     )
     typed_phase = (
         "review"
-        if task_before.status == "review" or claimed_source == "review" or completed_review
+        if (
+            task_before.status == "review"
+            or claimed_source == "review"
+            or completed_review
+            or resumed_review
+        )
         else "implementation"
     )
     if typed_phase == "review":

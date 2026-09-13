@@ -11,6 +11,7 @@ These tests cover the two review models that must coexist:
 
 from __future__ import annotations
 
+import subprocess
 import time
 from pathlib import Path
 
@@ -37,6 +38,14 @@ def _event(events, kind: str):
 
 def _run(runs, outcome: str):
     return [run for run in runs if run.outcome == outcome][-1]
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
 
 def _claimed_review(
@@ -422,6 +431,97 @@ def test_review_escalation_unblocks_back_to_review(conn) -> None:
     resumed = kb.get_task(conn, task_id)
     assert resumed is not None
     assert resumed.status == "review"
+
+
+def test_blocked_same_card_review_accepts_verdict(conn, tmp_path: Path) -> None:
+    repo = tmp_path / "review-repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "review@example.invalid")
+    _git(repo, "config", "user.name", "Review Test")
+    (repo / "README").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "README")
+    _git(repo, "commit", "-qm", "base")
+    head_sha = _git(repo, "rev-parse", "HEAD")
+
+    task_id = kb.create_task(
+        conn,
+        title="Blocked same-card review",
+        assignee="builder",
+        initial_status="blocked",
+        workspace_kind="dir",
+        workspace_path=str(repo),
+        lifecycle_contract={
+            "kind": "code",
+            "review_mode": "same_card",
+            "reviewer": "reviewer",
+            "validation_required": False,
+        },
+    )
+    with kb.write_txn(conn):
+        implementation_run_id = kb._synthesize_ended_run(
+            conn,
+            task_id,
+            outcome="review_requested",
+            summary="ready for review",
+            metadata={
+                "base_sha": head_sha,
+                "head_sha": head_sha,
+                "workspace_path": str(repo),
+            },
+        )
+        review_run_id = kb._synthesize_ended_run(
+            conn,
+            task_id,
+            outcome="blocked",
+            summary="maintainer input required",
+        )
+        conn.execute(
+            "UPDATE tasks SET assignee = 'reviewer', candidate_run_id = ? WHERE id = ?",
+            (implementation_run_id, task_id),
+        )
+        kb._append_event(
+            conn,
+            task_id,
+            "review_requested",
+            {
+                "summary": "ready for review",
+                "implementer": "builder",
+                "reviewer": "reviewer",
+            },
+            run_id=implementation_run_id,
+        )
+        kb._append_event(
+            conn,
+            task_id,
+            "claimed",
+            {"source_status": "review"},
+            run_id=review_run_id,
+        )
+        kb._append_event(
+            conn,
+            task_id,
+            "blocked",
+            {
+                "reason": "maintainer input required",
+                "kind": "needs_input",
+                "source_status": "review",
+            },
+            run_id=review_run_id,
+        )
+
+    blocked = kb.get_task(conn, task_id)
+    assert blocked is not None
+    assert blocked.status == "blocked"
+    assert kb.complete_task(
+        conn,
+        task_id,
+        summary="approved after escalation",
+        verdict="APPROVE",
+    )
+    completed = kb.get_task(conn, task_id)
+    assert completed is not None
+    assert completed.status == "done"
 
 
 def test_review_dependency_wait_reenters_review_after_parent_finishes(conn) -> None:
