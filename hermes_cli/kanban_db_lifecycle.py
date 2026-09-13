@@ -1169,6 +1169,10 @@ def claim_review_task(
     lock = claimer or _kb._claimer_id()
     expires = now + _kb._resolve_claim_ttl_seconds(ttl_seconds)
     with _kb.write_txn(conn):
+        handoff_error = _parent_handoff_start_error(conn, task_id)
+        if handoff_error is not None:
+            _record_parent_handoff_start_error(conn, task_id, handoff_error)
+            return None
         dependencies = evaluate_dependencies(conn, task_id)
         if not dependencies["satisfied"]:
             demoted = conn.execute(
@@ -1533,6 +1537,10 @@ def _prepare_completion_handoff(
         not task_contract
         and str(task.assignee or "").strip().casefold() == "reviewer"
     )
+    if phase in {"review", "validation"}:
+        handoff_error = _parent_handoff_start_error(conn, task_id, phase=phase)
+        if handoff_error is not None:
+            raise _kb.HandoffValidationError(task_id, handoff_error["reason"])
     # A reviewer handing off to a tester reviews the implementation's exact
     # commit; do not require a second commit in the reviewer's scratch workspace.
     if (
@@ -1701,6 +1709,8 @@ def _prepare_completion_handoff(
 def _parent_handoff_start_error(
     conn: sqlite3.Connection,
     task_id: str,
+    *,
+    phase: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     task = _kb.get_task(conn, task_id)
     if task is None or task.workflow_template_id == "kanban_swarm_v1":
@@ -1709,11 +1719,19 @@ def _parent_handoff_start_error(
     is_role_card = contract.get("kind") in {"review", "validation"} or (
         not contract and str(task.assignee or "").strip().casefold() in _kb.HANDOFF_CHILD_ASSIGNEES
     )
-    if not is_role_card:
+    same_card_review = (
+        contract.get("kind") == "code"
+        and contract.get("review_mode") == "same_card"
+        and (task.status == "review" or phase == "review")
+    )
+    if not is_role_card and not same_card_review:
         return None
-    for parent_id in _kb.parent_ids(conn, task_id):
-        parent = _kb.get_task(conn, parent_id)
-        if parent is None or parent.status not in {"done", "archived"}:
+    parent_ids = [task_id] if same_card_review else _kb.parent_ids(conn, task_id)
+    for parent_id in parent_ids:
+        parent = task if same_card_review else _kb.get_task(conn, parent_id)
+        if parent is None or (
+            not same_card_review and parent.status not in {"done", "archived"}
+        ):
             continue
         handoff = _kb.latest_handoff(conn, parent_id)
         expected = handoff.get("head_sha")
