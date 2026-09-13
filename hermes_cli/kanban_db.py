@@ -1354,11 +1354,13 @@ def _validate_lifecycle_role_identity(
     task_id: Optional[str] = None,
 ) -> None:
     """Keep implementation, review, and validation identities independent."""
-    if not contract or not assignee:
+    if not contract:
         return
-    actor = _canonical_assignee(assignee)
+    actor = _canonical_assignee(assignee) if assignee else None
     kind = contract.get("kind")
     if kind == "code":
+        if not actor:
+            return
         if actor == _canonical_assignee(contract.get("reviewer")):
             raise LifecycleContractError("reviewer must differ from the implementation assignee")
         if task_id is None:
@@ -1407,12 +1409,18 @@ def _validate_lifecycle_role_identity(
     declared_reviewer = _canonical_assignee(candidate_contract.get("reviewer"))
 
     if kind == "review":
+        if not actor:
+            raise LifecycleContractError(
+                "review cards require an assignee matching the declared reviewer"
+            )
         if actor != declared_reviewer:
             raise LifecycleContractError(
                 "reviewer must match the implementation's declared reviewer"
             )
         return
 
+    if not actor:
+        return
     if actor in {candidate_assignee, declared_reviewer}:
         raise LifecycleContractError(
             "validator must differ from both the implementation and reviewer"
@@ -6966,6 +6974,28 @@ def repair_archive_task(
     _cleanup_workspace(conn, task_id)
     return True
 
+def _assert_no_lifecycle_role_references(
+    conn: sqlite3.Connection, task_id: str,
+) -> None:
+    role_ids: list[str] = []
+    for row in conn.execute(
+        "SELECT id, lifecycle_contract FROM tasks "
+        "WHERE id != ? AND lifecycle_contract IS NOT NULL",
+        (task_id,),
+    ):
+        contract = safe_decode_contract(row["lifecycle_contract"])
+        if (
+            contract
+            and contract.get("kind") in {"review", "validation"}
+            and contract.get("candidate_task_id") == task_id
+        ):
+            role_ids.append(str(row["id"]))
+    if role_ids:
+        raise LifecycleContractError(
+            f"cannot delete candidate task {task_id}: lifecycle role card(s) still reference it "
+            f"({', '.join(sorted(role_ids))})"
+        )
+
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
@@ -6979,6 +7009,8 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         if _task_status(conn, task_id) != "archived":
             return False
+        _assert_no_lifecycle_role_references(conn, task_id)
+
         _delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
@@ -6987,6 +7019,9 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete a task and its related rows in one txn; False when not found."""
     with write_txn(conn):
+        if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
+            return False
+        _assert_no_lifecycle_role_references(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False

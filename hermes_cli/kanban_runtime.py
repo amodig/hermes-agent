@@ -215,11 +215,16 @@ def assert_runtime_import_root(
     module_root: Optional[os.PathLike[str] | str] = None,
     *,
     expected: RuntimeIdentity | Mapping[str, Any] | None = None,
+    identity: RuntimeIdentity | Mapping[str, Any] | None = None,
 ) -> RuntimeIdentity:
-    """Reject mixed checkout imports before a worker can touch the board."""
+    """Reject mixed checkout imports before a worker can touch the board.
+
+    Callers that already fingerprinted the same root may pass ``identity`` to
+    reuse it while retaining the import-root check.
+    """
     root = _module_root(module_root)
-    identity = runtime_identity(root, pid=os.getpid(), start_time=process_start_time())
-    if expected is not None and not same_code_identity(expected, identity):
+    observed = identity or runtime_identity(root, pid=os.getpid(), start_time=process_start_time())
+    if expected is not None and not same_code_identity(expected, observed):
         raise RuntimeIdentityError("runtime code changed during startup")
     prefixes = ("hermes_cli", "gateway", "tools", "agent")
     mixed: list[str] = []
@@ -237,7 +242,7 @@ def assert_runtime_import_root(
         raise RuntimeIdentityError(
             "mixed runtime import roots: " + ", ".join(sorted(mixed)[:8])
         )
-    return identity
+    return observed
 
 def prospective_identity(module_root: Optional[os.PathLike[str] | str] = None) -> RuntimeIdentity:
     """Return the frozen code identity with the caller's live process marker."""
