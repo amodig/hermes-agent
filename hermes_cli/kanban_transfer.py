@@ -68,10 +68,20 @@ def _snapshot_db(source: Path, target: Path) -> None:
 
 
 def _scrub_local_state(conn: sqlite3.Connection) -> None:
-    """Strip machine-local runtime state (claims, PIDs, and above all the
-    gateway chat ids subscribed to task events). Caller owns the transaction.
-    Run on export and again on import (an archive is untrusted input)."""
+    """Strip machine-local runtime state from an exported or imported board."""
     conn.execute("DELETE FROM kanban_notify_subs")
+    running = conn.execute(
+        "SELECT id, current_run_id FROM tasks WHERE status = 'running' ORDER BY id"
+    ).fetchall()
+    for row in running:
+        retry_status = kb._retry_status_for_run(conn, row["id"], row["current_run_id"])
+        conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, current_run_id = NULL, last_heartbeat_at = NULL, "
+            "session_id = NULL, project_id = NULL, consecutive_failures = 0, "
+            "last_failure_error = NULL WHERE id = ? AND status = 'running'",
+            (retry_status, row["id"]),
+        )
     conn.execute(
         """
         UPDATE tasks
@@ -84,11 +94,9 @@ def _scrub_local_state(conn: sqlite3.Connection) -> None:
                project_id           = NULL,
                consecutive_failures = 0,
                last_failure_error   = NULL
+         WHERE status != 'running'
         """
     )
-    # A task caught mid-run is not running anywhere the importer can see.
-    # Send it back to the queue rather than shipping a phantom claim.
-    conn.execute("UPDATE tasks SET status = 'ready' WHERE status = 'running'")
     conn.execute(
         """
         UPDATE task_runs

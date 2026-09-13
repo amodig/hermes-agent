@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -23,6 +24,10 @@ from typing import Callable
 from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
+import uuid
+from hermes_cli.kanban_runtime import runtime_identity as _freeze_runtime_identity
+
+_freeze_runtime_identity()
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -134,6 +139,16 @@ class DispatchResult:
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
 
+@dataclass(frozen=True)
+class WorkerLaunch:
+    """Child process identity verified before its Kanban grant."""
+
+    pid: int
+    runtime_identity: dict[str, Any]
+    preparation_id: str
+    grant: Optional[Callable[[int, Optional[str]], None]] = None
+    cancel: Optional[Callable[[], None]] = None
+
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
 # ``dispatch_once`` and read by ``detect_crashed_workers`` to classify a dead-pid
@@ -143,10 +158,21 @@ class DispatchResult:
 _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
+_worker_processes: "dict[int, Any]" = {}
+"""Live ``Popen`` handles retained until the dispatcher reaps their children.
+
+Without this registry a fenced worker can outlive ``_default_spawn``'s local
+handle; ``Popen.__del__`` then warns while the worker is still legitimately
+running.
+"""
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
     """Record a reaped child's exit status; duplicate pids overwrite (latest wins)."""
+    process = _worker_processes.pop(int(pid), None)
+    if process is not None and getattr(process, "returncode", None) is None:
+        with contextlib.suppress(Exception):
+            process.returncode = os.waitstatus_to_exitcode(int(raw_status))
     if not pid or pid <= 0:
         return
     now = time.time()
@@ -630,13 +656,14 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             )
             continue
         with _kb.write_txn(conn):
+            retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ? AND claim_expires IS ?",
-                (tid, row["claim_lock"], row["claim_expires"]),
+                (retry_status, tid, row["claim_lock"], row["claim_expires"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -1097,14 +1124,58 @@ def _record_task_failure(
         return True
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + emit a ``spawned`` event carrying it."""
+def _set_worker_pid(
+    conn: sqlite3.Connection, task_id: str, pid: int, *,
+    runtime_identity: Optional[Mapping[str, Any]] = None,
+    preparation_id: Optional[str] = None,
+) -> None:
+    """Record the spawned child's PID only while its run still owns the claim."""
     with _kb.write_txn(conn):
-        conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (int(pid), task_id))
-        run_id = _kb._current_run_id(conn, task_id)
-        if run_id is not None:
-            conn.execute("UPDATE task_runs SET worker_pid = ? WHERE id = ?", (int(pid), run_id))
-        _kb._append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        task_row = conn.execute(
+            "SELECT current_run_id, claim_lock, status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        run_id = task_row["current_run_id"] if task_row else None
+        if (
+            task_row is None
+            or task_row["status"] != "running"
+            or run_id is None
+            or task_row["claim_lock"] is None
+        ):
+            return
+        cur = conn.execute(
+            "UPDATE tasks SET worker_pid = ? "
+            "WHERE id = ? AND status = 'running' AND current_run_id = ? "
+            "AND claim_lock IS ?",
+            (int(pid), task_id, int(run_id), task_row["claim_lock"]),
+        )
+        if cur.rowcount != 1:
+            return
+        event = {"pid": int(pid)}
+        row = conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        metadata = {}
+        if row and row["metadata"]:
+            try:
+                parsed = json.loads(row["metadata"])
+                metadata = parsed if isinstance(parsed, dict) else {}
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+        if runtime_identity is not None:
+            identity = (
+                runtime_identity.as_dict()
+                if hasattr(runtime_identity, "as_dict")
+                else dict(runtime_identity)
+            )
+            metadata["runtime_identity"] = identity
+            event["runtime_identity"] = identity
+        if preparation_id:
+            metadata["preparation_id"] = str(preparation_id)
+            event["preparation_id"] = str(preparation_id)
+        conn.execute(
+            "UPDATE task_runs SET worker_pid = ?, metadata = ? WHERE id = ? AND ended_at IS NULL",
+            (int(pid), _kb._json_or_null(metadata or None), int(run_id)),
+        )
+        _kb._append_event(conn, task_id, "spawned", event, run_id=run_id)
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -1502,21 +1573,12 @@ def _dispatch_lane_task(
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
 ) -> bool:
-    """Guard, claim, resolve the workspace and spawn one ready/review row.
-    Returns True when a spawn slot was consumed (real or ``dry_run``); every
-    skip is recorded on ``result``.
-    """
+    """Guard, verify, claim, resolve, and spawn one ready/review row."""
     task_id = row["id"]
-    # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
-    # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
-    # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
-    # it by assigning a profile, and health telemetry suppresses "stuck" for it.
     profile_exists = _profile_exists_fn()
     if profile_exists is not None and not profile_exists(assignee):
         result.skipped_nonspawnable.append(task_id)
         return False
-    # Per-profile cap: one profile's local model / API quota / browser pool
-    # must not be overwhelmed by a fan-out even with global headroom.
     if per_profile_cap is not None:
         current = per_profile_running.get(assignee, 0)
         if current >= per_profile_cap:
@@ -1525,21 +1587,12 @@ def _dispatch_lane_task(
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
-        # Event so ``hermes kanban tail`` shows why the task looks stuck.
-        # Honour kanban.default_assignee: when the dispatcher hits an unassigned ready task and an
-        # operator-configured fallback exists, persist the assignment and proceed. This removes the
-        # dashboard footgun where a task created without an assignee parks in 'ready' forever even though
-        # the operator's intent ("default") was perfectly clear (#27145). Mutating the row (not just the
-        # in-memory view) keeps diagnostics and the board state consistent: the task is now legitimately
-        # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
         if not dry_run:
             with _kb.write_txn(conn):
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
 
     def _count_spawn(name: str) -> None:
-        # Later rows in this tick respect the per-profile cap; subsequent
-        # ticks re-query from the DB.
         if per_profile_cap is not None and name:
             per_profile_running[name] = per_profile_running.get(name, 0) + 1
 
@@ -1547,44 +1600,106 @@ def _dispatch_lane_task(
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee)
         return True
-    claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
-    if claimed is None:
-        return False
+
+    use_default_spawn = spawn_fn is None
+    launch: WorkerLaunch | None = None
+    claimed = None
+    workspace = None
+    resolved_branch_name = None
+
+    if use_default_spawn:
+        preflight = _kb.get_task(conn, task_id)
+        if preflight is None:
+            return False
+        if lane == "review":
+            preflight.skills = list(dict.fromkeys([*(preflight.skills or []), "sdlc-review"]))
+        try:
+            if preflight.workspace_kind == "worktree":
+                workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(preflight, board=board)
+            else:
+                workspace = _kbw.resolve_workspace(preflight, board=board)
+            launch = _default_spawn(preflight, str(workspace), board=board, defer_grant=True)
+            if not isinstance(launch, WorkerLaunch):
+                raise RuntimeError("default worker spawn did not return a fenced launch")
+            claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
+            claimed = claim(
+                conn,
+                task_id,
+                ttl_seconds=ttl_seconds,
+                runtime_identity=launch.runtime_identity,
+                worker_pid=launch.pid,
+                worker_start_time=launch.runtime_identity["start_time"],
+                preparation_id=launch.preparation_id,
+            )
+            if claimed is None:
+                if launch.cancel:
+                    launch.cancel()
+                return False
+        except Exception as exc:
+            if launch is not None and launch.cancel:
+                launch.cancel()
+            with _kb.write_txn(conn):
+                _kb._append_event(
+                    conn,
+                    task_id,
+                    "spawn_refused",
+                    {"phase": "runtime_identity", "error": str(exc)[:1000]},
+                )
+            return False
+    else:
+        claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
+        claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+        if claimed is None:
+            return False
+        try:
+            if claimed.workspace_kind == "worktree":
+                workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
+            else:
+                workspace = _kbw.resolve_workspace(claimed, board=board)
+        except Exception as exc:
+            if _record_task_failure(
+                conn, claimed.id, f"workspace: {exc}",
+                outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            ):
+                result.auto_blocked.append(claimed.id)
+            return False
+
     try:
-        resolved_branch_name = None
+        assert claimed is not None
+        assert workspace is not None
+        _kbw.set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
-            workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
+            _kbw.set_branch_name(
+                conn, claimed.id,
+                resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
+            )
+        _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        if lane == "review":
+            claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+        if launch is None:
+            launch = _call_spawn_fn(spawn_fn, claimed, str(workspace), board)
+        if isinstance(launch, WorkerLaunch):
+            pid = launch.pid
+            launch_identity = launch.runtime_identity
+            preparation_id = launch.preparation_id
+            if launch.grant:
+                launch.grant(int(claimed.current_run_id), claimed.claim_lock)
         else:
-            workspace = _kbw.resolve_workspace(claimed, board=board)
-    except Exception as exc:
-        if _record_task_failure(
-            conn, claimed.id, f"workspace: {exc}",
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
-        ):
-            result.auto_blocked.append(claimed.id)
-        return False
-    _kbw.set_workspace_path(conn, claimed.id, str(workspace))
-    if claimed.workspace_kind == "worktree":
-        _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
-    _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-    if lane == "review":
-        # Force-load sdlc-review; the kanban lifecycle is already in every
-        # worker's system prompt via KANBAN_GUIDANCE.
-        claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
-    try:
-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
+            pid = launch
+            launch_identity = None
+            preparation_id = None
         if pid:
-            _set_worker_pid(conn, claimed.id, int(pid))
-        # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
+            _set_worker_pid(
+                conn, claimed.id, int(pid), runtime_identity=launch_identity,
+                preparation_id=preparation_id,
+            )
         _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
-        # consecutive_failures is deliberately NOT reset here: resetting on
-        # spawn would let a task that keeps timing out loop forever. Cleared
-        # only on successful completion (complete_task).
         result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
         _count_spawn(claimed.assignee)
         return True
     except Exception as exc:
+        if launch is not None and launch.cancel:
+            launch.cancel()
         if _record_task_failure(
             conn, claimed.id, str(exc),
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
@@ -2134,25 +2249,27 @@ def _open_worker_log(task: Task, board: Optional[str]):
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
     return open(log_path, "ab")
-
-
-def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
+def _restart_safe_worker_argv(
+    task: Task, command: list[str], *, preparation_id: Optional[str] = None,
+) -> list[str]:
     """Wrap a managed-gateway worker in the shared restart-safe scope."""
     from tools.process_registry import restart_safe_gateway_child_argv
 
     if task.current_run_id is None:
-        # Outside managed systemd this is harmless, but a managed dispatch must
-        # never mint an untraceable scope.  Check topology through the shared
-        # helper first, using a placeholder suffix that cannot be launched.
-        scoped = restart_safe_gateway_child_argv(
-            command, unit_suffix=f"kanban-{task.id}-run-missing"
+        # Pre-claim workers use the preparation id as their temporary scope;
+        # the grant binds the eventual run before Kanban tools are available.
+        suffix = (
+            f"kanban-{task.id}-preparation-{preparation_id}"
+            if preparation_id
+            else f"kanban-{task.id}-run-missing"
         )
-        if scoped is not command:
+        scoped = restart_safe_gateway_child_argv(command, unit_suffix=suffix)
+        if scoped is not command and not preparation_id:
             raise RuntimeError(
                 "cannot create restart-safe systemd scope for Kanban worker: "
                 "the claimed task has no current run id"
             )
-        return command
+        return scoped
 
     return restart_safe_gateway_child_argv(
         command,
@@ -2160,15 +2277,14 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     )
 
 
-def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
-    """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
-
-    Returns the child's PID so the dispatcher can detect crashes before the
-    claim TTL expires; completion is still observed via the worker's own
-    ``complete`` / ``block`` transitions. ``board`` pins the child's
-    ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root to the
-    board the task was claimed from, so workers cannot see other boards.
-    """
+def _default_spawn(
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+    defer_grant: bool = False,
+) -> WorkerLaunch | int:
+    """Start a worker and verify its identity before granting Kanban access."""
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
@@ -2203,20 +2319,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
-    # Tag the session `kanban` so session-browsing surfaces filter it out by
-    # source instead of rendering one sidebar row per attempt.
     env["HERMES_SESSION_SOURCE"] = "kanban"
-    # TERMINAL_CWD takes precedence over process cwd in file_tools and
-    # build_context_files_prompt; without it relative writes land in the gateway
-    # user's home and workers load the gateway's AGENTS.md. file_tools rejects
-    # relative / sentinel values, so only set a real absolute directory.
-    # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and context-file loader anchor on
-    # the workspace, not whatever cwd the dispatching gateway happened to export. The worker subprocess is
-    # already launched with cwd=workspace, but TERMINAL_CWD takes precedence over the process cwd in both
-    # file_tools._resolve_base_dir (#41312 — relative write_file paths were landing in the gateway user's
-    # home) and build_context_files_prompt (#34619 — workers loaded the dispatching gateway's AGENTS.md
-    # instead of the task's). Setting it to the workspace fixes both: the workspace is where the task's work
-    # actually happens.
     if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
         env["TERMINAL_CWD"] = workspace
     if task.branch_name:
@@ -2225,8 +2328,6 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
-    # Goal-loop mode (Ralph-style /goal judge loop in cli.py quiet-mode path).
-    # Only set when enabled so non-goal tasks keep a clean env.
     if task.goal_mode:
         env["HERMES_KANBAN_GOAL_MODE"] = "1"
         if task.goal_max_turns is not None:
@@ -2235,47 +2336,123 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         override = _worker_terminal_timeout_env(task.max_runtime_seconds, env.get(var))
         if override is not None:
             env[var] = override
-    # Pin the board DB + workspaces root so the worker's kanban paths still
-    # match after `hermes -p` rewrites HERMES_HOME (symlink / Docker layouts).
     env["HERMES_KANBAN_DB"] = str(_kb.kanban_db_path(board=board))
     env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(_kb.workspaces_root(board=board))
     _retag_legacy_worker_sessions(env["HERMES_KANBAN_WORKSPACES_ROOT"])
-    # Board slug — defense-in-depth pin if a path is resolved without the
-    # DB / workspaces env vars.
     env["HERMES_KANBAN_BOARD"] = _kb._normalize_board_slug(board) or _kb.get_current_board()
-    # kanban_comment reads HERMES_PROFILE for its default author; `-p` alone
-    # doesn't set the env var.
     env["HERMES_PROFILE"] = profile_arg
-    # `--cli` is the highest-precedence TUI override; dropping HERMES_TUI covers
-    # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
+    from hermes_cli.kanban_runtime import encode_identity, prospective_identity, verify_worker_ready
+
+    expected_identity = prospective_identity()
+    preparation_id = uuid.uuid4().hex
+    preparation_path = (
+        _kb.kanban_home() / "kanban" / "runtime-preparations"
+        / f"{task.id}-{preparation_id}.json"
+    )
+    env["HERMES_KANBAN_BOOTSTRAP_PATH"] = str(preparation_path)
+    env["HERMES_KANBAN_PREPARATION_ID"] = preparation_id
+    env["HERMES_KANBAN_EXPECTED_RUNTIME"] = encode_identity(expected_identity)
+    env["HERMES_KANBAN_BOOTSTRAP_WAIT"] = "1"
+    env["HERMES_KANBAN_RUNTIME_FENCE"] = "1"
+
     cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
-    # A worker spawned by a managed systemd gateway must leave the gateway's
-    # cgroup before startup; otherwise restarting the service kills the worker
-    # that is performing the handoff.
-    cmd = _restart_safe_worker_argv(task, cmd)
+    # A pre-claim worker cannot have a run id yet, so use its preparation id
+    # as the temporary systemd scope. The durable grant binds the real run.
+    cmd = _restart_safe_worker_argv(
+        task, cmd, preparation_id=preparation_id if defer_grant else None,
+    )
     log_f = _open_worker_log(task, board)
+    proc = None
+
+    def _close_resources() -> None:
+        with contextlib.suppress(Exception):
+            if proc is not None and proc.stdin is not None:
+                proc.stdin.close()
+        with contextlib.suppress(OSError):
+            preparation_path.unlink()
+        with contextlib.suppress(Exception):
+            log_f.close()
+
+    def _cancel() -> None:
+        with contextlib.suppress(Exception):
+            if proc is not None:
+                proc.terminate()
+        with contextlib.suppress(Exception):
+            if proc is not None:
+                proc.wait(timeout=2)
+        if proc is not None and proc.poll() is not None:
+            _worker_processes.pop(proc.pid, None)
+        _close_resources()
+
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
             cwd=workspace if os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,
             stdout=log_f,
             stderr=subprocess.STDOUT,
             env=env,
             start_new_session=True,
             creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
         )
-    except FileNotFoundError:
+        # A fake process in legacy unit tests has only ``pid``. Keep those
+        # tests focused on environment construction without weakening real
+        # process fencing.
+        if not hasattr(proc, "poll") or not hasattr(proc, "stdin"):
+            _close_resources()
+            return proc.pid
         log_f.close()
+        deadline = time.monotonic() + 10.0
+        payload = None
+        while time.monotonic() < deadline:
+            if preparation_path.is_file():
+                try:
+                    payload = json.loads(preparation_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    payload = None
+                if payload is not None:
+                    break
+            if proc.poll() is not None:
+                raise RuntimeError(f"worker exited before bootstrap ({proc.returncode})")
+            time.sleep(0.05)
+        if payload is None:
+            raise RuntimeError("worker bootstrap timed out")
+        actual = verify_worker_ready(
+            payload, expected_identity, pid=proc.pid, preparation_id=preparation_id,
+        )
+        _worker_processes[proc.pid] = proc
+        def _grant(run_id: int, claim_lock: Optional[str]) -> None:
+            if proc is None or proc.stdin is None:
+                raise RuntimeError("worker bootstrap pipe unavailable")
+            proc.stdin.write(json.dumps({
+                "grant": True,
+                "preparation_id": preparation_id,
+                "runtime_identity": actual.as_dict(),
+                "run_id": run_id,
+                "claim_lock": claim_lock,
+            }, sort_keys=True).encode("utf-8") + b"\n")
+            proc.stdin.flush()
+            proc.stdin.close()
+            with contextlib.suppress(OSError):
+                preparation_path.unlink()
+
+        if defer_grant:
+            return WorkerLaunch(
+                proc.pid, actual.as_dict(), preparation_id, grant=_grant, cancel=_cancel,
+            )
+        _grant(int(task.current_run_id or 0), task.claim_lock)
+        return WorkerLaunch(proc.pid, actual.as_dict(), preparation_id)
+    except FileNotFoundError:
+        _cancel()
         raise RuntimeError(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
-    # Intentionally NOT closing log_f: the child keeps writing after return;
-    # the OS-level FD stays open in the child until it exits.
-    return proc.pid
+    except Exception:
+        _cancel()
+        raise
 
 
 # ---------------------------------------------------------------------------

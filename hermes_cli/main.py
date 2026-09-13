@@ -33,6 +33,29 @@ import sys
 _bootstrap_root = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pardir))
 if _bootstrap_root not in sys.path:
     sys.path.insert(0, _bootstrap_root)
+
+from hermes_cli.kanban_runtime import (
+    assert_runtime_import_root as _assert_runtime_import_root,
+    runtime_identity as _runtime_identity,
+)
+_preimport_runtime_identity = _runtime_identity(_bootstrap_root)
+_assert_runtime_import_root(_bootstrap_root, expected=_preimport_runtime_identity)
+
+_early_runtime_argv = sys.argv[1:]
+if _early_runtime_argv in (["runtime-identity"], ["runtime-identity", "--json"], ["--runtime-identity"]):
+    from hermes_cli.kanban_runtime import runtime_identity_json
+
+    print(runtime_identity_json())
+    raise SystemExit(0)
+if os.environ.get("HERMES_KANBAN_BOOTSTRAP_PATH"):
+    try:
+        from hermes_cli.kanban_runtime import worker_bootstrap_from_env
+
+        worker_bootstrap_from_env()
+        os.environ["HERMES_KANBAN_BOOTSTRAP_DONE"] = "1"
+    except Exception as exc:
+        print(f"worker bootstrap refused: {exc}", file=sys.stderr)
+        raise SystemExit(78) from exc
 from hermes_cli import _startup_fast  # noqa: E402
 
 # Early venv self-heal — MUST run before any third-party import below. A prior
@@ -3141,6 +3164,8 @@ def _register_plugin_cli_commands(subparsers) -> None:
         logging.getLogger(__name__).debug("Plugin CLI discovery failed: %s", _exc)
 
 
+_assert_runtime_import_root(_bootstrap_root, expected=_preimport_runtime_identity)
+
 def _cmd_sessions_lazy(args, **kwargs):
     """``hermes sessions`` handler; sessions_cmd imports only when the subcommand runs."""
     from hermes_cli.sessions_cmd import cmd_sessions
@@ -3306,6 +3331,20 @@ def _default_to_chat(args) -> None:
 
 def main():
     """Main entry point for hermes CLI."""
+    early_argv = sys.argv[1:]
+    if early_argv in (["runtime-identity"], ["runtime-identity", "--json"], ["--runtime-identity"]):
+        from hermes_cli.kanban_runtime import runtime_identity_json
+
+        print(runtime_identity_json())
+        return
+    if os.environ.get("HERMES_KANBAN_BOOTSTRAP_PATH") and not os.environ.get("HERMES_KANBAN_BOOTSTRAP_DONE"):
+        try:
+            from hermes_cli.kanban_runtime import worker_bootstrap_from_env
+
+            worker_bootstrap_from_env()
+        except Exception as exc:
+            print(f"worker bootstrap refused: {exc}", file=sys.stderr)
+            sys.exit(78)
     _set_process_title()
     _advertise_agent_env()
 

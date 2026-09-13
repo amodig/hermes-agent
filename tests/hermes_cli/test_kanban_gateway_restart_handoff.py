@@ -154,6 +154,8 @@ def test_real_user_systemd_scope_preserves_worker_context(
     receipt = workspace / "worker-receipt.json"
     script = (
         "import json, os, pathlib, sys, time; "
+        "from hermes_cli.kanban_runtime import worker_bootstrap_from_env; "
+        "worker_bootstrap_from_env(); "
         "pathlib.Path(sys.argv[1]).write_text(json.dumps({"
         "'pid': os.getpid(), 'cwd': os.getcwd(), "
         "'task': os.environ.get('HERMES_KANBAN_TASK'), "
@@ -163,8 +165,10 @@ def test_real_user_systemd_scope_preserves_worker_context(
     monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: [sys.executable, "-c", script, str(receipt)])
     monkeypatch.setenv("INVOCATION_ID", "managed-gateway-test")
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
+    monkeypatch.setenv("PYTHONPATH", str(Path(kbd.__file__).resolve().parents[1]))
 
-    pid = kbd._default_spawn(task, str(workspace))
+    launch = kbd._default_spawn(task, str(workspace))
+    pid = launch.pid if isinstance(launch, kbd.WorkerLaunch) else launch
     deadline = time.monotonic() + 5
     while not receipt.exists() and time.monotonic() < deadline:
         time.sleep(0.05)
@@ -176,4 +180,8 @@ def test_real_user_systemd_scope_preserves_worker_context(
     assert payload["task"] == task.id
     assert payload["run"] == "23"
     assert ".scope" in payload["cgroup"]
+    deadline = time.monotonic() + 5
+    while kbd._pid_alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    kbd.reap_worker_zombies()
     assert "hermes-gateway.service" not in payload["cgroup"]

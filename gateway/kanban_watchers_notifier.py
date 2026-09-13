@@ -28,10 +28,17 @@ def _kbn():
 # "status" covers dashboard drag-drop and `_set_status_direct()`.
 # ``review_requested`` wakes the origin like a block but is not one;
 # the task is not archived so later review cycles keep notifying.
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+TERMINAL_KINDS = (
+    "completed", "blocked", "gave_up", "crashed", "timed_out", "status",
+    "archived", "unblocked", "block_loop_detected", "review_requested",
+    "changes_requested", "acceptance_changed",
+)
 # Kinds that hand a decision back to the origin, which must take a turn.
-# status/archived/unblocked are bookkeeping.
-_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
+# status/archived/unblocked/acceptance_changed are bookkeeping notifications.
+_WAKE_KINDS = (
+    "completed", "gave_up", "crashed", "timed_out", "blocked",
+    "review_requested", "changes_requested", "block_loop_detected",
+)
 # Consecutive send failures (adapter raised OR reported SendResult(success=False))
 # before a sub is dropped as a dead chat. 12 ≈ 60s at the 5s cadence: a transient
 # API outage must not permanently unsubscribe a live review-gate channel.
@@ -294,6 +301,12 @@ def _fmt_changes_requested(ev, n) -> tuple:
     return msg, None, reason_text
 
 
+def _fmt_acceptance_changed(ev, n) -> tuple:
+    phase = _safe_review_reason(_payload(ev, "phase"), 32) or "lifecycle"
+    result = _safe_review_reason(_payload(ev, "result"), 80) or "evidence updated"
+    return f"ℹ️ {n.head} {phase} result: {result}", None, None
+
+
 # archived / unblocked are claimed (so the cursor advances past them) but
 # intentionally silent (no formatter), and excluded from _WAKE_KINDS so they
 # never wake the creator.
@@ -308,6 +321,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
         f"⏱ {n.head} timed out (max_runtime={int(_payload(ev, 'limit_seconds') or 0)}s); will retry", None, None,
     ),
     "status": lambda ev, n: (f"🔄 {n.head} → {_payload(ev, 'status') or ''}", None, None),
+    "acceptance_changed": _fmt_acceptance_changed,
     "review_requested": _fmt_review_requested,
     "changes_requested": _fmt_changes_requested,
     # Re-blocked for the same cause past the limit and routed to `triage` for a

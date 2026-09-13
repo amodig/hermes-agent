@@ -41,17 +41,22 @@ def _none_profile(value: str) -> Optional[str]:
     return None if value.lower() in {"none", "-", "null"} else value
 
 
-def _parse_metadata_flag(raw: Optional[str]) -> tuple[Optional[dict], int]:
-    """Parse ``--metadata`` JSON; returns ``(dict|None, rc)`` with rc=2 on error."""
+def _parse_object_flag(raw: Optional[str], name: str) -> tuple[Optional[dict], int]:
+    """Parse one JSON object flag; returns ``(dict|None, rc)``."""
     if not raw:
         return None, 0
     try:
-        metadata = json.loads(raw)
-        if not isinstance(metadata, dict):
+        value = json.loads(raw)
+        if not isinstance(value, dict):
             raise ValueError("must be a JSON object")
     except (ValueError, json.JSONDecodeError) as exc:
-        return None, _err(f"kanban: --metadata: {exc}", 2)
-    return metadata, 0
+        return None, _err(f"kanban: {name}: {exc}", 2)
+    return value, 0
+
+
+def _parse_metadata_flag(raw: Optional[str]) -> tuple[Optional[dict], int]:
+    """Parse ``--metadata`` JSON; returns ``(dict|None, rc)`` with rc=2 on error."""
+    return _parse_object_flag(raw, "--metadata")
 
 
 def _run_state_kwargs(args: argparse.Namespace, cmd: str) -> tuple[Optional[dict[str, str]], int]:
@@ -352,6 +357,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
         max_runtime = _parse_duration(getattr(args, "max_runtime", None))
     except ValueError as exc:
         return _err(f"kanban: --max-runtime: {exc}", 2)
+    lifecycle_contract, rc = _parse_object_flag(
+        getattr(args, "lifecycle_contract", None), "--lifecycle-contract",
+    )
+    if rc:
+        return rc
     max_retries = getattr(args, "max_retries", None)
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
@@ -370,6 +380,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            lifecycle_contract=lifecycle_contract,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -482,6 +493,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         # Workers hand off via task_runs.summary; tasks.result stays NULL unless set.
         latest_summary = kb.latest_summary(conn, args.task_id)
         effective_goal = kb.get_effective_goal(conn, args.task_id)
+        lifecycle = kb.get_lifecycle_state(conn, args.task_id)
         display_title = (
             effective_goal.get("title")
             if isinstance(effective_goal, dict)
@@ -493,9 +505,6 @@ def _cmd_show(args: argparse.Namespace) -> int:
             if isinstance(effective_goal, dict)
             else task.body
         )
-        if not want_json:
-            graph = kb.task_graph_context(conn, task.id)
-
     if want_json:
         task_payload = _task_to_dict(task)
         task_payload.update({
@@ -505,8 +514,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "goal_mode": task.goal_mode,
         })
         _print_json({
-            "task": task_payload, "effective_goal": effective_goal,
-            "latest_summary": latest_summary, "parents": parents, "children": children,
+            "task": task_payload,
+            "effective_goal": effective_goal,
+            "lifecycle": lifecycle,
+            "latest_summary": latest_summary,
+            "parents": parents,
+            "children": children,
             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
@@ -525,6 +538,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
               f"v{effective_goal.get('version', effective_goal.get('goal_version', '?'))} "
               f"by {effective_goal.get('author') or '-'}")
         field("goal-reason", effective_goal.get("reason") or "-")
+    field("acceptance", lifecycle.get("acceptance", "unclassified"))
+    field("lifecycle", lifecycle)
     field("status", task.status)
     field("assignee", task.assignee or "-")
     if task.tenant:
@@ -602,6 +617,13 @@ def _cmd_update(args: argparse.Namespace) -> int:
         return value
 
     goal_mode = getattr(args, "goal_mode", None)
+    lifecycle_contract = kb._UPDATE_UNSET
+    if getattr(args, "lifecycle_contract", None) is not None:
+        lifecycle_contract, rc = _parse_object_flag(
+            args.lifecycle_contract, "--lifecycle-contract",
+        )
+        if rc:
+            return rc
     with kbc.connect_closing() as conn:
         ok = kb.update_task(
             conn,
@@ -615,6 +637,7 @@ def _cmd_update(args: argparse.Namespace) -> int:
             provider=optional(getattr(args, "provider", None)),
             goal_mode=kb._UPDATE_UNSET if goal_mode is None else goal_mode,
             transition=getattr(args, "transition", None),
+            lifecycle_contract=lifecycle_contract,
             author=getattr(args, "author", None) or _profile_author(),
         )
         if not ok:
@@ -763,10 +786,22 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
 
 def _cmd_link(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
-        kb.link_tasks(conn, args.parent_id, args.child_id)
-    print(f"Linked {args.parent_id} -> {args.child_id}")
+        kb.link_tasks(
+            conn,
+            args.parent_id,
+            args.child_id,
+            requirement=getattr(args, "requirement", None),
+            expected_parent_version=getattr(args, "expected_parent_version", None),
+            expected_child_version=getattr(args, "expected_child_version", None),
+            reason=getattr(args, "reason", None),
+            author=_profile_author(),
+        )
+        edge = conn.execute(
+            "SELECT requirement FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (args.parent_id, args.child_id),
+        ).fetchone()
+    print(f"Linked {args.parent_id} -> {args.child_id} ({edge['requirement'] if edge else 'unknown'})")
     return 0
-
 
 def _cmd_unlink(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
@@ -928,7 +963,6 @@ def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint: 
         return f"kanban: goal {handoff} of {tid} rejected by judge: {rejection}. {continue_hint}"
     return None
 
-
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids, rc = _require_ids(args)
@@ -936,33 +970,43 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         return rc
     summary = getattr(args, "summary", None)
     raw_meta = getattr(args, "metadata", None)
-    # Handoff fields are per-run; refuse to copy them across N runs.
-    if len(ids) > 1 and (summary or raw_meta):
-        return _err("kanban: --summary / --metadata are per-task and can't be used "
-                    "with multiple ids (would apply the same handoff to every task). "
-                    "Complete tasks one at a time, or drop the flags for the bulk close.", 2)
+    verdict = getattr(args, "verdict", None)
+    if len(ids) > 1 and (summary or raw_meta or verdict):
+        return _err("kanban: --summary / --metadata / --verdict are per-task and can't be used "
+                    "with multiple ids. Complete tasks one at a time.", 2)
     metadata, rc = _parse_metadata_flag(raw_meta)
     if rc:
         return rc
     fail_msg: dict[str, str] = {}
     with kbc.connect_closing() as conn:
         def op(tid):
+            evidence = (summary or args.result or str(verdict or "")).strip()
             gate_err = _goal_gate_error(
-                conn, tid, (summary or args.result or "").strip(), "completion",
+                conn, tid, evidence, "completion",
                 "Re-scope with kanban edit, or record the block with kanban block instead of completing.",
                 "Provide evidence matching the task's acceptance criteria.")
             if gate_err:
                 fail_msg[tid] = gate_err
                 return False
             try:
-                return kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
-                                        expected_run_id=_worker_run_id_for(tid))
+                return kb.complete_task(
+                    conn,
+                    tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                    verdict=verdict,
+                )
             except kb.CompletionContractError as exc:
                 fail_msg[tid] = (
                     f"kanban: completion of {tid} blocked: {exc}. "
                     "No task state changed; use kanban update to revise the "
                     "goal or remove the implementation patch before retrying."
                 )
+                return False
+            except kb.LifecycleEvidenceError as exc:
+                fail_msg[tid] = f"kanban: lifecycle completion of {tid} blocked: {exc}"
                 return False
 
         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
@@ -1048,8 +1092,15 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             return _err(gate_err)
         try:
             ok, reason = kb.request_review(
-                conn, tid, summary=summary, metadata=metadata, reviewer=getattr(args, "reviewer", None),
-                expected_run_id=_worker_run_id_for(tid), force=bool(getattr(args, "force", False)), with_reason=True)
+                conn,
+                tid,
+                summary=summary,
+                metadata=metadata,
+                reviewer=getattr(args, "reviewer", None),
+                expected_run_id=_worker_run_id_for(tid),
+                force=bool(getattr(args, "force", False)),
+                with_reason=True,
+            )
         except kb.CompletionContractError as exc:
             return _err(
                 f"kanban: review handoff for {tid} blocked: {exc}. "
@@ -1067,8 +1118,17 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
 def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason = " ".join(args.reason).strip()
+    metadata, rc = _parse_metadata_flag(getattr(args, "metadata", None))
+    if rc:
+        return rc
     with kbc.connect_closing() as conn:
-        ok, detail = kb.request_changes(conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid))
+        ok, detail = kb.request_changes(
+            conn,
+            tid,
+            reason=reason,
+            metadata=metadata,
+            expected_run_id=_worker_run_id_for(tid),
+        )
         if not ok:
             return _err(f"cannot request changes for {tid}: {detail or 'invalid review state'}")
         print(f"Requested changes for {tid}" + (f"; routed to {detail}" if detail else ""))
@@ -1083,17 +1143,20 @@ def _cmd_rework_review(args: argparse.Namespace) -> int:
     if not reason:
         return _err("kanban rework-review requires a non-empty --reason", 2)
     with kbc.connect_closing() as conn:
-        outcome = kb.rework_review_graph(
-            conn,
-            args.implementation_id,
-            args.reviewer_id,
-            args.tester_id,
-            expected_implementation_version=args.expected_implementation_version,
-            expected_reviewer_version=args.expected_reviewer_version,
-            expected_tester_version=args.expected_tester_version,
-            reason=reason,
-            author=_profile_author(),
-        )
+        try:
+            outcome = kb.rework_review_graph(
+                conn,
+                args.implementation_id,
+                getattr(args, "reviewer_id", None),
+                getattr(args, "tester_id", None),
+                expected_implementation_version=args.expected_implementation_version,
+                expected_reviewer_version=getattr(args, "expected_reviewer_version", None),
+                expected_tester_version=getattr(args, "expected_tester_version", None),
+                reason=reason,
+                author=_profile_author(),
+            )
+        except (ValueError, kb.LifecycleEvidenceError) as exc:
+            return _err(f"kanban: rework-review: {exc}")
     if _json_out(args, outcome):
         return 0
     print(

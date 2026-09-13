@@ -26,8 +26,20 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.kanban_lifecycle import (
+    LifecycleContractError,
+    LifecycleEvidenceError,
+    _latest_head,
+    decode_contract,
+    encode_contract,
+    evaluate_dependencies,
+    get_lifecycle_state,
+    infer_edge_requirement,
+    lifecycle_metadata,
+    safe_decode_contract,
+    validate_edge,
+)
 from typing import Any, Iterable, Mapping, Optional
-
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -523,6 +535,7 @@ def board_dir(board: Optional[str] = None) -> Path:
     return boards_root() / _slug_or_default(board)
 
 
+
 def board_exists(board: Optional[str] = None) -> bool:
     """Board has ``board.json`` or ``kanban.db`` on disk; ``default`` always exists."""
     slug = _slug_or_default(board)
@@ -759,6 +772,10 @@ class Task:
     version: int = 1
     # Pointer to the immutable effective goal revision.
     goal_revision_id: Optional[int] = None
+    # Typed lifecycle classification. NULL is intentionally historical and
+    # fails closed until an operator binds it.
+    lifecycle_contract: Optional[dict] = None
+    candidate_run_id: Optional[int] = None
     # Column semantics: see SCHEMA_SQL.
     consecutive_failures: int = 0
     worker_pid: Optional[int] = None
@@ -797,6 +814,7 @@ class Task:
             **{col: row[col] for col in _TASK_REQUIRED_COLUMNS},
             **{col: g(col) for col in _TASK_OPTIONAL_COLUMNS},
             **{col: g(col) or None for col in _TASK_EMPTY_IS_NULL_COLUMNS},
+            lifecycle_contract=safe_decode_contract(g("lifecycle_contract")),
             # Pre-migration fallbacks (spawn_failures / last_spawn_error) are only
             # reachable on a DB never opened since the rename migration landed.
             consecutive_failures=g("consecutive_failures", g("spawn_failures", 0)),
@@ -805,9 +823,6 @@ class Task:
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
         )
-
-
-
 # Columns every schema version has (KeyError if the SELECT omitted them).
 _TASK_REQUIRED_COLUMNS = (
     "id", "title", "body", "assignee", "status", "priority", "created_by", "created_at",
@@ -818,12 +833,12 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "version", "goal_revision_id",
+    "candidate_run_id",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
     "model_override", "provider_override", "reasoning_effort", "goal_max_turns", "block_kind",
 )
-
 
 @dataclass
 class Run:
@@ -1017,7 +1032,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     block_recurrences    INTEGER NOT NULL DEFAULT 0,
     version              INTEGER NOT NULL DEFAULT 1,
     -- Foreign-key-like pointer to the immutable effective goal revision.
-    goal_revision_id     INTEGER
+    goal_revision_id     INTEGER,
+    -- JSON lifecycle contract. NULL means a historical unclassified task.
+    lifecycle_contract   TEXT,
+    -- Implementation run referenced by typed review/validation handoffs.
+    candidate_run_id     INTEGER
 );
 CREATE TABLE IF NOT EXISTS task_goal_revisions (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1036,8 +1055,9 @@ CREATE TABLE IF NOT EXISTS task_goal_revisions (
 CREATE INDEX IF NOT EXISTS idx_goal_revisions_task
     ON task_goal_revisions(task_id, version);
 CREATE TABLE IF NOT EXISTS task_links (
-    parent_id  TEXT NOT NULL,
-    child_id   TEXT NOT NULL,
+    parent_id   TEXT NOT NULL,
+    child_id    TEXT NOT NULL,
+    requirement TEXT,
     PRIMARY KEY (parent_id, child_id)
 );
 
@@ -1152,6 +1172,28 @@ CREATE TABLE IF NOT EXISTS task_goal_revisions (
 """
 
 
+def _ensure_lifecycle_schema(conn: sqlite3.Connection) -> None:
+    """Add lifecycle columns without classifying historical rows."""
+    tables = {
+        row["name"]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    if "tasks" in tables:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+        if "lifecycle_contract" not in cols:
+            _add_column_if_missing(conn, "tasks", "lifecycle_contract", "lifecycle_contract TEXT")
+        if "candidate_run_id" not in cols:
+            _add_column_if_missing(conn, "tasks", "candidate_run_id", "candidate_run_id INTEGER")
+    if "task_links" in tables:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_links)")}
+        if "requirement" not in cols:
+            _add_column_if_missing(conn, "task_links", "requirement", "requirement TEXT")
+    if "tasks" in tables:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_candidate_run ON tasks(candidate_run_id)")
+    if "task_links" in tables:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_links_requirement ON task_links(requirement)")
+
+
 def _ensure_goal_revision_schema(conn: sqlite3.Connection) -> None:
     """Add goal-revision columns/table and backfill legacy tasks idempotently."""
     conn.execute(_GOAL_REVISION_TABLE_SQL)
@@ -1239,6 +1281,7 @@ def _ensure_goal_revision_schema(conn: sqlite3.Connection) -> None:
             "UPDATE tasks SET goal_revision_id = ? WHERE id = ? AND goal_revision_id IS NULL",
             (revision_id, row["id"]),
         )
+    _ensure_lifecycle_schema(conn)
 
 
 def _install_goal_revision_migration_hook() -> None:
@@ -1302,6 +1345,61 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
 
     return normalize_profile_name(assignee)
 
+
+def _validate_lifecycle_role_identity(
+    conn: sqlite3.Connection,
+    contract: Optional[dict],
+    assignee: Optional[str],
+) -> None:
+    """Keep implementation, review, and validation identities independent."""
+    if not contract or not assignee:
+        return
+    actor = _canonical_assignee(assignee)
+    kind = contract.get("kind")
+    if kind == "code" and actor == _canonical_assignee(contract.get("reviewer")):
+        raise LifecycleContractError("reviewer must differ from the implementation assignee")
+    if kind not in {"review", "validation"}:
+        return
+
+    candidate_id = contract.get("candidate_task_id")
+    candidate = conn.execute(
+        "SELECT assignee, lifecycle_contract FROM tasks WHERE id = ?",
+        (candidate_id,),
+    ).fetchone()
+    candidate_contract = safe_decode_contract(
+        _row_get(candidate, "lifecycle_contract")
+    ) if candidate is not None else None
+    if candidate is None or not candidate_contract or candidate_contract.get("kind") != "code":
+        raise LifecycleContractError("typed role card requires a classified code candidate")
+    candidate_assignee = _canonical_assignee(candidate["assignee"])
+    declared_reviewer = _canonical_assignee(candidate_contract.get("reviewer"))
+
+    if kind == "review":
+        if actor != declared_reviewer:
+            raise LifecycleContractError(
+                "reviewer must match the implementation's declared reviewer"
+            )
+        return
+
+    if actor in {candidate_assignee, declared_reviewer}:
+        raise LifecycleContractError(
+            "validator must differ from both the implementation and reviewer"
+        )
+    review_rows = conn.execute(
+        "SELECT t.assignee, t.lifecycle_contract "
+        "FROM task_links l JOIN tasks t ON t.id = l.child_id "
+        "WHERE l.parent_id = ? ORDER BY t.id",
+        (candidate_id,),
+    ).fetchall()
+    for row in review_rows:
+        review_contract = safe_decode_contract(row["lifecycle_contract"])
+        if (
+            review_contract
+            and review_contract.get("kind") == "review"
+            and review_contract.get("candidate_task_id") == candidate_id
+            and actor == _canonical_assignee(row["assignee"])
+        ):
+            raise LifecycleContractError("validator must differ from the reviewer")
 
 def _resolve_project_link(
     conn: sqlite3.Connection, project_id: Optional[str], project_source_task_id: Optional[str],
@@ -1441,22 +1539,26 @@ def create_task(
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    lifecycle_contract: Optional[dict] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
-    Status: ``ready`` unless a parent is not ``done`` (``todo``); ``triage=True``
-    forces ``triage``; ``initial_status="blocked"`` parks it for human ops.
-    ``idempotency_key``: an existing non-archived task with the key is returned
-    instead of a duplicate. ``max_runtime_seconds``: cap before the dispatcher
-    SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
-    worker model (provider requires model); ``reasoning_effort`` is independent.
-    ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
-    in the active profile's projects.db — see ``_resolve_project_link``.
+    New tasks always carry an explicit general contract when no contract is
+    supplied.  Historical rows with NULL contracts are never backfilled.
     """
     _ensure_goal_revision_schema(conn)
+    lifecycle_json = encode_contract(lifecycle_contract, default_on_none=True)
+    normalized_lifecycle = decode_contract(lifecycle_json)
+    candidate_id = (
+        normalized_lifecycle.get("candidate_task_id")
+        if normalized_lifecycle and normalized_lifecycle.get("kind") in {"review", "validation"}
+        else None
+    )
+    if candidate_id and not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (candidate_id,)).fetchone():
+        raise LifecycleContractError(f"candidate task {candidate_id} does not exist")
+    _validate_lifecycle_role_identity(conn, normalized_lifecycle, assignee)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
-    assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -1513,6 +1615,8 @@ def create_task(
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
                 task_status = _initial_task_status(conn, parents, initial_status, triage)
+                if task_status == "ready" and normalized_lifecycle and normalized_lifecycle.get("kind") == "review":
+                    task_status = "review"
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
                 if project_obj is not None and workspace_kind == "worktree":
@@ -1530,8 +1634,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        lifecycle_contract, candidate_run_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1541,6 +1646,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id,
+                        lifecycle_json, None,
                     ),
                 )
                 goal_author = str(created_by or os.environ.get("HERMES_PROFILE") or "system").strip() or "system"
@@ -1578,7 +1684,8 @@ def create_task(
                     "prior_version": None,
                 }
                 for pid in parents:
-                    _link(conn, pid, task_id)
+                    requirement = infer_edge_requirement(conn, pid, task_id)
+                    _link(conn, pid, task_id, requirement=requirement)
                 if task_status == "ready" and not _parents_satisfied(conn, task_id):
                     task_status = "todo"
                     conn.execute(
@@ -1595,6 +1702,7 @@ def create_task(
                         "tenant": tenant,
                         "workspace_kind": workspace_kind,
                         "workspace_path": workspace_path,
+                        "lifecycle_contract": normalized_lifecycle,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
@@ -1649,10 +1757,12 @@ def _project_branch_name(project_obj: Any, task_id: str, title: Optional[str]) -
         return None
 
 
-def _link(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+def _link(
+    conn: sqlite3.Connection, parent_id: str, child_id: str, *, requirement: str = "phase_finished",
+) -> None:
     conn.execute(
-        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
-        (parent_id, child_id),
+        "INSERT OR IGNORE INTO task_links (parent_id, child_id, requirement) VALUES (?, ?, ?)",
+        (parent_id, child_id, requirement),
     )
 
 
@@ -1832,6 +1942,7 @@ def update_task(
     model: Any = _UPDATE_UNSET,
     provider: Any = _UPDATE_UNSET,
     goal_mode: Any = _UPDATE_UNSET,
+    lifecycle_contract: Any = _UPDATE_UNSET,
     transition: Optional[str] = None,
     author: Optional[str] = None,
 ) -> bool:
@@ -1852,9 +1963,26 @@ def update_task(
     if goal_mode is not _UPDATE_UNSET and not isinstance(goal_mode, bool):
         raise ValueError("goal_mode must be a boolean")
     _ensure_goal_revision_schema(conn)
+    lifecycle_json = _UPDATE_UNSET
+    normalized_lifecycle = _UPDATE_UNSET
+    if lifecycle_contract is not _UPDATE_UNSET:
+        if lifecycle_contract is None:
+            raise LifecycleContractError("lifecycle_contract cannot be cleared; bind an explicit contract")
+        lifecycle_json = encode_contract(lifecycle_contract, default_on_none=False)
+        normalized_lifecycle = decode_contract(lifecycle_json)
+        candidate_id = (
+            normalized_lifecycle.get("candidate_task_id")
+            if normalized_lifecycle and normalized_lifecycle.get("kind") in {"review", "validation"}
+            else None
+        )
+        if candidate_id and not conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?", (candidate_id,)
+        ).fetchone():
+            raise LifecycleContractError(f"candidate task {candidate_id} does not exist")
 
     changed_fields: list[str] = []
     actor = _update_actor(author)
+    acceptance_before = _capture_acceptance(conn, task_id)
     with write_txn(conn):
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if row is None:
@@ -1931,12 +2059,17 @@ def update_task(
         old_model = _row_get(row, "model_override")
         old_provider = _row_get(row, "provider_override")
         old_goal_mode = bool(_row_get(row, "goal_mode"))
+        try:
+            old_lifecycle = decode_contract(_row_get(row, "lifecycle_contract"))
+        except LifecycleContractError:
+            old_lifecycle = None
         new_title = old_title
         new_body = old_body
         new_assignee = old_assignee
         new_model = old_model
         new_provider = old_provider
         new_goal_mode = old_goal_mode
+        new_lifecycle = old_lifecycle
 
         if title is not _UPDATE_UNSET:
             if title is None or not str(title).strip():
@@ -1964,7 +2097,30 @@ def update_task(
             raise ValueError("provider requires a model")
         if goal_mode is not _UPDATE_UNSET:
             new_goal_mode = bool(goal_mode)
+        if lifecycle_contract is not _UPDATE_UNSET:
+            new_lifecycle = normalized_lifecycle
 
+        _validate_lifecycle_role_identity(conn, new_lifecycle, new_assignee)
+        lifecycle_changed = (
+            lifecycle_contract is not _UPDATE_UNSET and new_lifecycle != old_lifecycle
+        )
+        if lifecycle_changed and old_lifecycle is not None:
+            raise LifecycleContractError(
+                "lifecycle_contract is immutable after classification; repair only historical NULL contracts"
+            )
+        if lifecycle_changed:
+            # Let edge and ready-lane validation observe the prospective
+            # contract; rollback restores the historical NULL on failure.
+            conn.execute(
+                "UPDATE tasks SET lifecycle_contract = ? WHERE id = ?",
+                (encode_contract(new_lifecycle, default_on_none=False), task_id),
+            )
+            for edge in conn.execute(
+                "SELECT parent_id, child_id, requirement FROM task_links "
+                "WHERE parent_id = ? OR child_id = ? ORDER BY parent_id, child_id",
+                (task_id, task_id),
+            ).fetchall():
+                validate_edge(conn, edge["parent_id"], edge["child_id"], edge["requirement"])
         new_status = row["status"]
         if transition_text:
             if row["status"] != "triage":
@@ -1972,7 +2128,12 @@ def update_task(
                     "transition 'triage_to_ready' requires a task in "
                     f"status 'triage' (current status {row['status']!r})"
                 )
-            new_status = "ready" if _parents_satisfied(conn, task_id) else "todo"
+            new_status = _lifecycle_ready_status(conn, task_id) if _parents_satisfied(conn, task_id) else "todo"
+        elif lifecycle_changed:
+            if new_lifecycle and new_lifecycle.get("kind") != "general":
+                new_status = _lifecycle_ready_status(conn, task_id) if _parents_satisfied(conn, task_id) else "todo"
+            elif new_lifecycle and new_lifecycle.get("kind") == "general":
+                new_status = "done" if row["status"] == "done" else "ready"
 
         old_values = {
             "title": old_title,
@@ -1981,6 +2142,7 @@ def update_task(
             "model": old_model,
             "provider": old_provider,
             "goal_mode": old_goal_mode,
+            "lifecycle_contract": old_lifecycle,
             "status": row["status"],
             "version": current_version,
         }
@@ -1991,6 +2153,7 @@ def update_task(
             "model": new_model,
             "provider": new_provider,
             "goal_mode": new_goal_mode,
+            "lifecycle_contract": new_lifecycle,
             "status": new_status,
             "version": current_version + 1,
         }
@@ -2001,6 +2164,7 @@ def update_task(
             "model",
             "provider",
             "goal_mode",
+            "lifecycle_contract",
             "status",
         ):
             if old_values[key] != new_values[key]:
@@ -2034,12 +2198,19 @@ def update_task(
             goal_revision_id = int(goal_cur.lastrowid)
             changed_fields.append("goal_revision")
 
+        candidate_run_id = None if lifecycle_changed else _row_get(row, "candidate_run_id")
+        stored_lifecycle = (
+            lifecycle_json
+            if lifecycle_contract is not _UPDATE_UNSET
+            else _row_get(row, "lifecycle_contract")
+        )
         cur = conn.execute(
             """
             UPDATE tasks SET
                 version = ?, title = ?, body = ?, assignee = ?,
                 model_override = ?, provider_override = ?, goal_mode = ?,
-                status = ?, goal_revision_id = ?
+                status = ?, goal_revision_id = ?, lifecycle_contract = ?,
+                candidate_run_id = ?
             WHERE id = ? AND version = ?
             """,
             (
@@ -2052,6 +2223,8 @@ def update_task(
                 int(new_goal_mode),
                 new_status,
                 goal_revision_id,
+                stored_lifecycle,
+                candidate_run_id,
                 task_id,
                 expected_version,
             ),
@@ -2079,12 +2252,39 @@ def update_task(
         _append_event(
             conn,
             task_id,
-            "goal_revised" if goal_changed else "updated",
+            "lifecycle_bound" if lifecycle_changed else "goal_revised" if goal_changed else "updated",
             payload,
         )
     notify_task_updated(conn, task_id, changed_fields or ["version"])
+    _emit_acceptance_changes(conn, acceptance_before, source_task_id=task_id)
     return True
 
+
+def bind_lifecycle_contract(
+    conn: sqlite3.Connection,
+    task_id: str,
+    lifecycle_contract: dict,
+    *,
+    expected_version: int,
+    reason: str,
+    author: Optional[str] = None,
+) -> bool:
+    """Classify one historical NULL-contract task with an auditable CAS."""
+    task = get_task(conn, task_id)
+    if task is None:
+        return False
+    if task.lifecycle_contract is not None:
+        raise LifecycleContractError(
+            "lifecycle binding only applies to historical NULL-contract tasks"
+        )
+    return update_task(
+        conn,
+        task_id,
+        expected_version=expected_version,
+        reason=reason,
+        lifecycle_contract=lifecycle_contract,
+        author=author,
+    )
 
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
@@ -2138,10 +2338,13 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, claim_lock, assignee, lifecycle_contract FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if not row:
             return False
+        _validate_lifecycle_role_identity(
+            conn, safe_decode_contract(_row_get(row, "lifecycle_contract")), profile,
+        )
         if row["claim_lock"] is not None and row["status"] == "running":
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
@@ -2208,25 +2411,92 @@ def set_reasoning_effort(conn: sqlite3.Connection, task_id: str, effort: Optiona
 
 # --- Links ---
 
-def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+def link_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    requirement: Optional[str] = None,
+    expected_parent_version: Optional[int] = None,
+    expected_child_version: Optional[int] = None,
+    reason: Optional[str] = None,
+    author: Optional[str] = None,
+) -> None:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
+    acceptance_before = _capture_acceptance(conn, child_id)
     with write_txn(conn):
         missing = _missing_task_ids(conn, [parent_id, child_id])
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
-        _link(conn, parent_id, child_id)
-        # A child is ready only when every parent is terminal and accepted.
+        requested = infer_edge_requirement(conn, parent_id, child_id) if requirement is None else validate_edge(
+            conn, parent_id, child_id, requirement)
+        existing = conn.execute(
+            "SELECT requirement FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (parent_id, child_id),
+        ).fetchone()
+        if existing is not None:
+            current = existing["requirement"]
+            if current == requested:
+                return
+            if expected_parent_version is None or expected_child_version is None or not str(reason or "").strip():
+                raise LifecycleContractError(
+                    "rebinding an existing dependency requires both expected versions and a reason"
+                )
+            versions = conn.execute(
+                "SELECT id, version, status, claim_lock, current_run_id FROM tasks "
+                "WHERE id IN (?, ?)", (parent_id, child_id),
+            ).fetchall()
+            by_id = {row["id"]: row for row in versions}
+            for task_id, expected_version in (
+                (parent_id, expected_parent_version), (child_id, expected_child_version),
+            ):
+                row = by_id[task_id]
+                if int(row["version"] or 1) != int(expected_version):
+                    raise TaskUpdateConflict(
+                        f"task {task_id} update conflict: expected version {expected_version}, "
+                        f"current version {row['version']}"
+                    )
+                if row["status"] == "running" or row["claim_lock"] or row["current_run_id"]:
+                    raise TaskUpdateConflict(f"cannot rebind edge while task {task_id} is claimed")
+            conn.execute(
+                "UPDATE task_links SET requirement = ? WHERE parent_id = ? AND child_id = ?",
+                (requested, parent_id, child_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET version = version + 1 WHERE id IN (?, ?)",
+                (parent_id, child_id),
+            )
+            _append_event(
+                conn,
+                child_id,
+                "link_rebound",
+                {
+                    "parent": parent_id,
+                    "child": child_id,
+                    "old_requirement": current,
+                    "requirement": requested,
+                    "reason": str(reason).strip(),
+                    "author": str(author or os.environ.get("HERMES_PROFILE") or "orchestrator"),
+                    "expected_parent_version": int(expected_parent_version),
+                    "expected_child_version": int(expected_child_version),
+                },
+            )
+        else:
+            _link(conn, parent_id, child_id, requirement=requested)
+            _append_event(
+                conn, child_id, "linked",
+                {"parent": parent_id, "child": child_id, "requirement": requested},
+            )
+            _inherit_notify_subs(conn, child_id, (parent_id,))
+        # A child is ready only when every typed parent requirement is satisfied.
         if not _parents_satisfied(conn, child_id):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'", (child_id,),
             )
-        _append_event(
-            conn, child_id, "linked", {"parent": parent_id, "child": child_id},
-        )
-        _inherit_notify_subs(conn, child_id, (parent_id,))
+    _emit_acceptance_changes(conn, acceptance_before, source_task_id=child_id)
 
 
 def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
@@ -2347,8 +2617,8 @@ def repair_unlink_tasks(
         )
         if _parents_satisfied(conn, child_id):
             conn.execute(
-                "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
-                (child_id,),
+                "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
+                (_lifecycle_ready_status(conn, child_id), child_id),
             )
         _append_event(
             conn,
@@ -2677,6 +2947,17 @@ def _end_run(
     run_id = _current_run_id(conn, task_id)
     if run_id is None:
         return None
+    open_row = conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+    open_metadata = _json_dict(_row_get(open_row, "metadata"))
+    incoming_routing = metadata.get("lifecycle_routing") if isinstance(metadata, dict) else None
+    open_routing = open_metadata.get("lifecycle_routing")
+    if open_routing is not None and incoming_routing is not None and incoming_routing != open_routing:
+        raise LifecycleEvidenceError("implementation lifecycle routing is immutable")
+    merged_metadata = dict(open_metadata)
+    if isinstance(metadata, dict):
+        merged_metadata.update(metadata)
+    elif metadata:
+        merged_metadata = metadata
     conn.execute(
         """
         UPDATE task_runs
@@ -2692,7 +2973,15 @@ def _end_run(
          WHERE id = ?
            AND ended_at IS NULL
         """,
-        (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
+        (
+            status or outcome,
+            outcome,
+            summary,
+            error,
+            _json_or_null(merged_metadata),
+            now,
+            run_id,
+        ),
     )
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
     return run_id
@@ -2870,6 +3159,8 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
                 continue
             if _parents_satisfied(conn, task_id):
                 resume_status = _resume_status_from_events(conn, task_id)
+                if resume_status == "ready":
+                    resume_status = _lifecycle_ready_status(conn, task_id)
                 if cur_status == "blocked":
                     # At the breaker limit, no auto-recovery (else block ->
                     # recover -> respawn -> exhaust -> block forever). The
@@ -2902,48 +3193,47 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
 # --- Claim / complete / block ---
 
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return whether every direct parent is terminal and accepted."""
-    parents = conn.execute(
-        "SELECT p.id, p.status, p.assignee, p.workflow_template_id FROM task_links l "
-        "JOIN tasks p ON p.id = l.parent_id WHERE l.child_id = ?",
-        (task_id,),
-    ).fetchall()
-    for parent in parents:
-        if parent["status"] == "archived":
-            continue
-        if parent["status"] != "done":
-            return False
-        run = conn.execute(
-            "SELECT metadata FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
-            "ORDER BY id DESC LIMIT 1",
-            (parent["id"],),
-        ).fetchone()
-        metadata = _json_dict(_row_get(run, "metadata"))
-        verdict = str(metadata.get("verdict") or "").strip().upper()
-        is_separate_reviewer = (
-            str(parent["assignee"] or "").strip().casefold() == "reviewer"
-            and parent["workflow_template_id"] != "kanban_swarm_v1"
+    """Compatibility adapter for every dependency gate."""
+    return bool(evaluate_dependencies(conn, task_id).get("satisfied"))
+
+def _lifecycle_ready_status(conn: sqlite3.Connection, task_id: str) -> str:
+    """Return the scheduler lane for a dependency-satisfied typed task."""
+    row = conn.execute(
+        "SELECT lifecycle_contract FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    contract = safe_decode_contract(_row_get(row, "lifecycle_contract"))
+    return "review" if contract and contract.get("kind") == "review" else "ready"
+
+def _runtime_claim_metadata(
+    runtime_identity: Any = None,
+    worker_pid: Optional[int] = None,
+    worker_start_time: Optional[int] = None,
+    preparation_id: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    values = (runtime_identity, worker_pid, worker_start_time, preparation_id)
+    if not any(value is not None for value in values):
+        return None
+    if not all(value is not None for value in values):
+        raise LifecycleContractError(
+            "runtime identity, worker pid, worker start time, and preparation id are all required"
         )
-        if is_separate_reviewer and verdict != "APPROVE":
-            return False
-        if not is_separate_reviewer and verdict == "REQUEST_CHANGES":
-            return False
-        if verdict == "APPROVE":
-            reviewed_head = _nonblank_str(
-                metadata.get("reviewed_head_sha")
-                or metadata.get("head_ref_reverified")
-                or metadata.get("head_sha")
-            )
-            parent_handoff = _parent_handoff_context(conn, parent["id"])
-            expected_head = _nonblank_str((parent_handoff or {}).get("head_sha"))
-            if not reviewed_head or not expected_head or reviewed_head != expected_head:
-                return False
-    return True
+    from hermes_cli.kanban_runtime import decode_identity
+
+    value = runtime_identity.as_dict() if hasattr(runtime_identity, "as_dict") else runtime_identity
+    identity = decode_identity(value)
+    if identity.pid != int(worker_pid) or identity.start_time != int(worker_start_time):
+        raise LifecycleContractError("runtime identity does not match the worker pid/start time")
+    return {
+        "runtime_identity": identity.as_dict(),
+        "worker_pid": int(worker_pid),
+        "worker_start_time": int(worker_start_time),
+        "preparation_id": str(preparation_id),
+    }
 
 
 def _claim_and_open_run(
     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
-    *, event_extra: Optional[dict] = None,
+    *, event_extra: Optional[dict] = None, runtime_claim: Optional[dict[str, Any]] = None,
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
     when the CAS lost. Caller holds the txn."""
@@ -2953,30 +3243,54 @@ def _claim_and_open_run(
            SET status        = 'running',
                claim_lock    = ?,
                claim_expires = ?,
+               worker_pid    = ?,
                started_at    = COALESCE(started_at, ?)
          WHERE id = ?
            AND status = '{source_status}'
            AND claim_lock IS NULL
         """,
-        (lock, expires, now, task_id),
+        (
+            lock,
+            expires,
+            runtime_claim.get("worker_pid") if runtime_claim else None,
+            now,
+            task_id,
+        ),
     )
     if cur.rowcount != 1:
         return None
     trow = conn.execute(
-        "SELECT assignee, max_runtime_seconds, current_step_key "
-        "FROM tasks WHERE id = ?", (task_id,),
+        "SELECT assignee, max_runtime_seconds, current_step_key, workspace_path, "
+        "branch_name, lifecycle_contract FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
+    run_metadata = dict(runtime_claim or {})
+    contract = safe_decode_contract(_row_get(trow, "lifecycle_contract"))
+    if source_status == "ready" and contract and contract.get("kind") == "code":
+        run_metadata["lifecycle_routing"] = {
+            "implementer": trow["assignee"],
+            "reviewer": contract.get("reviewer"),
+            "workspace_path": trow["workspace_path"],
+            "branch_name": trow["branch_name"],
+        }
+        conn.execute("UPDATE tasks SET candidate_run_id = NULL WHERE id = ?", (task_id,))
     run_cur = conn.execute(
         """
         INSERT INTO task_runs (
-            task_id, profile, step_key, status,
-            claim_lock, claim_expires, max_runtime_seconds,
+            task_id, profile, step_key, status, metadata,
+            claim_lock, claim_expires, worker_pid, max_runtime_seconds,
             started_at
-        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)
         """,
         (
-            task_id, trow["assignee"] if trow else None, trow["current_step_key"] if trow else None,
-            lock, expires, trow["max_runtime_seconds"] if trow else None, now,
+            task_id,
+            trow["assignee"] if trow else None,
+            trow["current_step_key"] if trow else None,
+            _json_or_null(run_metadata or None),
+            lock,
+            expires,
+            runtime_claim.get("worker_pid") if runtime_claim else None,
+            trow["max_runtime_seconds"] if trow else None,
+            now,
         ),
     )
     run_id = run_cur.lastrowid
@@ -2990,13 +3304,18 @@ def _claim_and_open_run(
 
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, runtime_identity: Any = None,
+    worker_pid: Optional[int] = None, worker_start_time: Optional[int] = None,
+    preparation_id: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    runtime_claim = _runtime_claim_metadata(
+        runtime_identity, worker_pid, worker_start_time, preparation_id,
+    )
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -3008,18 +3327,26 @@ def claim_task(
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
-        if not _parents_satisfied(conn, task_id):
+        dependencies = evaluate_dependencies(conn, task_id)
+        if not dependencies["satisfied"]:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'", (task_id,),
             )
-            _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
+            _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {"reason": "dependencies_unsatisfied", "blockers": dependencies["blockers"]},
+            )
             return None
         # Close a leaked prior run so the CAS below doesn't strand it.
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
         )
-        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
+        run_id = _claim_and_open_run(
+            conn, task_id, "ready", lock, expires, now, runtime_claim=runtime_claim,
+        )
         if run_id is None:
             return None
         claimed = get_task(conn, task_id)
@@ -3029,40 +3356,59 @@ def claim_task(
 
 def claim_review_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, runtime_identity: Any = None,
+    worker_pid: Optional[int] = None, worker_start_time: Optional[int] = None,
+    preparation_id: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomic ``review -> running`` (None when lost). Parents are re-checked
     (one may have reopened meanwhile) and a NEW run tracks the reviewer
     separately from the implementer."""
+    runtime_claim = _runtime_claim_metadata(
+        runtime_identity, worker_pid, worker_start_time, preparation_id,
+    )
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
-        if not _parents_satisfied(conn, task_id):
+        dependencies = evaluate_dependencies(conn, task_id)
+        if not dependencies["satisfied"]:
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'review' AND claim_lock IS NULL", (task_id,),
             )
             if demoted.rowcount == 1:
                 _append_event(
-                    conn, task_id, "dependency_wait",
-                    {"reason": "parent_reopened", "source_status": "review"},
+                    conn,
+                    task_id,
+                    "dependency_wait",
+                    {
+                        "reason": "dependencies_unsatisfied",
+                        "blockers": dependencies["blockers"],
+                        "source_status": "review",
+                    },
                 )
             return None
         run_id = _claim_and_open_run(
-            conn, task_id, "review", lock, expires, now, event_extra={"source_status": "review"},
+            conn, task_id, "review", lock, expires, now,
+            event_extra={"source_status": "review"}, runtime_claim=runtime_claim,
         )
         if run_id is None:
             return None
         return get_task(conn, task_id)
 
 
+
+
+
+
+
+
 def _retry_status_for_run(
     conn: sqlite3.Connection, task_id: str, run_id: Optional[int] = None,
 ) -> str:
-    """``review`` when the run's ``claimed`` event says ``source_status=review``,
-    else ``ready`` — one place, so crash/timeout/reclaim can't silently turn a
-    reviewer run into an implementation run."""
+    """Return the run's resumable phase, never bypassing lifecycle blockers."""
+    if not _parents_satisfied(conn, task_id):
+        return "todo"
     if run_id is None:
         run_id = _current_run_id(conn, task_id)
     if run_id is None:
@@ -3285,6 +3631,10 @@ def reclaim_task(
     termination = _terminate_reclaimed_worker(row["worker_pid"], prev_lock, signal_fn=signal_fn)
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
+        dependencies = evaluate_dependencies(conn, task_id)
+        blockers = dependencies["blockers"]
+        if not dependencies["satisfied"]:
+            retry_status = "todo"
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
@@ -3294,9 +3644,17 @@ def reclaim_task(
         if cur.rowcount != 1:
             return False
         _record_reclaim(
-            conn, task_id, termination,
+            conn,
+            task_id,
+            termination,
             error=f"manual_reclaim: {reason}" if reason else f"manual_reclaim lock={prev_lock}",
-            payload={"manual": True, "reason": reason, "prev_lock": prev_lock, "retry_status": retry_status},
+            payload={
+                "manual": True,
+                "reason": reason,
+                "prev_lock": prev_lock,
+                "retry_status": retry_status,
+                "blockers": blockers,
+            },
         )
     # Operator intervention = fresh retry budget (own txn, runs after commit).
     _clear_failure_counter(conn, task_id)
@@ -3480,6 +3838,181 @@ def latest_handoff(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
     if event:
         merged.update(_handoff_fields(_json_dict(event["payload"])))
     return merged
+
+def _latest_lifecycle_run_id(
+    conn: sqlite3.Connection, task_id: str, phase: str,
+) -> Optional[int]:
+    pointer = conn.execute(
+        "SELECT candidate_run_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if pointer is not None and pointer["candidate_run_id"] is not None:
+        run_id = int(pointer["candidate_run_id"])
+        row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ? AND task_id = ?",
+            (run_id, task_id),
+        ).fetchone()
+        lifecycle = _json_dict(_row_get(row, "metadata")).get("lifecycle")
+        if isinstance(lifecycle, dict) and lifecycle.get("phase") == phase:
+            return run_id
+        return None
+    return None
+
+
+def _stamp_lifecycle_metadata(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+    *,
+    phase: str,
+    run_id: Optional[int],
+    verdict: Optional[str],
+) -> Optional[dict]:
+    """Build typed evidence from the task/run snapshot being committed."""
+    task = get_task(conn, task_id)
+    contract = task.lifecycle_contract if task else None
+    if not contract:
+        if verdict is not None:
+            raise LifecycleEvidenceError("unclassified tasks cannot record typed verdicts")
+        return metadata
+    updated = dict(metadata) if isinstance(metadata, dict) else {}
+    candidate_task_id = (
+        task_id
+        if phase == "implementation"
+        or (
+            phase == "review"
+            and contract.get("kind") == "code"
+            and contract.get("review_mode") == "same_card"
+        )
+        else contract.get("candidate_task_id")
+    )
+    if not candidate_task_id:
+        raise LifecycleEvidenceError("typed lifecycle evidence requires a candidate task")
+    candidate_task_id = str(candidate_task_id)
+    candidate_run_id = (
+        run_id
+        if phase == "implementation"
+        else _latest_lifecycle_run_id(conn, candidate_task_id, "implementation")
+    )
+
+    if candidate_run_id is None:
+        candidate_run_id = _row_get(
+            conn.execute(
+                "SELECT candidate_run_id FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone(),
+            "candidate_run_id",
+        )
+    supplied_head = (
+        updated.get("head_sha")
+        or updated.get("reviewed_head_sha")
+        or _handoff_fields(updated).get("head_sha")
+    )
+    current_head = _latest_head(conn, candidate_task_id)
+    if phase == "implementation":
+        prior_rework = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? "
+            "AND kind IN ('review_rework_requested', 'changes_requested') "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        prior_payload = _json_dict(_row_get(prior_rework, "payload"))
+        prior_lifecycle = prior_payload.get("lifecycle")
+        if not isinstance(prior_lifecycle, dict):
+            prior_lifecycle = {}
+        rejected_head = (
+            prior_payload.get("rejected_head_sha")
+            or prior_lifecycle.get("head_sha")
+        )
+        if rejected_head and (supplied_head or current_head) == rejected_head:
+            raise LifecycleEvidenceError("rework requires a new implementation head")
+    if phase != "implementation" and current_head and supplied_head and supplied_head != current_head:
+        raise LifecycleEvidenceError("lifecycle evidence head_sha does not match the candidate head")
+    head_sha = supplied_head or current_head or latest_handoff(conn, candidate_task_id).get("head_sha")
+    envelope = lifecycle_metadata(
+        conn,
+        task_id,
+        phase=phase,
+        run_id=candidate_run_id,
+        verdict=verdict,
+        candidate_task_id=candidate_task_id,
+        head_sha=head_sha,
+    )
+    existing = updated.get("lifecycle")
+    if existing is not None and existing != envelope:
+        raise LifecycleEvidenceError("lifecycle evidence conflicts with the current candidate snapshot")
+    updated["lifecycle"] = envelope
+    return updated
+
+def _implementation_routing(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+    rows = conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        routing = _json_dict(row["metadata"]).get("lifecycle_routing")
+        if isinstance(routing, dict):
+            return routing
+    return {}
+
+def _lifecycle_observed_tasks(conn: sqlite3.Connection, task_id: str) -> tuple[str, ...]:
+    task = get_task(conn, task_id)
+    if task is None or not task.lifecycle_contract:
+        return ()
+    contract = task.lifecycle_contract
+    if contract.get("kind") == "code":
+        return (task_id,)
+    candidate = contract.get("candidate_task_id")
+    return (str(candidate),) if candidate else ()
+
+
+def _capture_acceptance(conn: sqlite3.Connection, task_id: str) -> dict[str, str]:
+    return {
+        observed_id: get_lifecycle_state(conn, observed_id).get("acceptance", "unclassified")
+        for observed_id in _lifecycle_observed_tasks(conn, task_id)
+    }
+
+
+def _emit_acceptance_changes(
+    conn: sqlite3.Connection,
+    before: dict[str, str],
+    *,
+    source_task_id: Optional[str] = None,
+) -> None:
+    if not before:
+        return
+    changes: list[tuple[str, str, str, str, Any]] = []
+    for task_id, old in before.items():
+        projection = get_lifecycle_state(conn, task_id)
+        new = projection.get("acceptance", "unclassified")
+        if new != old:
+            phase = (
+                "validation"
+                if projection.get("validation_verdict") is not None
+                else "review"
+                if projection.get("review_verdict") is not None
+                else "implementation"
+            )
+            result = (
+                projection.get("validation_verdict")
+                or projection.get("review_verdict")
+                or projection.get("execution_outcome")
+            )
+            changes.append((task_id, old, new, phase, result))
+    if not changes:
+        return
+    with write_txn(conn):
+        for task_id, old, new, phase, result in changes:
+            _append_event(
+                conn,
+                task_id,
+                "acceptance_changed",
+                {
+                    "old": old,
+                    "new": new,
+                    "phase": phase,
+                    "result": result,
+                    "source_task_id": source_task_id,
+                },
+            )
 
 def _git_snapshot(
     workspace: Optional[str], branch: Optional[str]
@@ -3839,6 +4372,10 @@ def requeue_legacy_handoff(
     task = get_task(conn, task_id)
     if task is None:
         raise ValueError(f"unknown task: {task_id}")
+    if not task.lifecycle_contract:
+        raise LifecycleContractError(
+            "legacy handoff is lifecycle-unclassified; bind an explicit general or typed contract first"
+        )
     if task.status != "done":
         raise ValueError(
             f"legacy handoff requeue requires status 'done' (current {task.status!r})"
@@ -3997,16 +4534,276 @@ def requeue_legacy_handoff(
         notify_task_updated(conn, child_id, ("status", "version"))
     return True
 
+def _rework_fingerprint(
+    implementation_id: str,
+    reviewer_id: Optional[str],
+    tester_id: Optional[str],
+    expected: dict[str, Optional[int]],
+    reason: str,
+    author: str,
+) -> str:
+    import hashlib
+
+    payload = {
+        "implementation_id": implementation_id,
+        "reviewer_id": reviewer_id,
+        "tester_id": tester_id,
+        "expected_versions": expected,
+        "reason": reason,
+        "author": author,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+
+
+def _typed_rework_graph(
+    conn: sqlite3.Connection,
+    implementation_id: str,
+    reviewer_id: Optional[str],
+    tester_id: Optional[str],
+    *,
+    expected_implementation_version: int,
+    expected_reviewer_version: Optional[int],
+    expected_tester_version: Optional[int],
+    reason: str,
+    author: str,
+) -> dict[str, Any]:
+    implementation = get_task(conn, implementation_id)
+    contract = implementation.lifecycle_contract if implementation else None
+    if not implementation or not contract or contract.get("kind") != "code":
+        raise ValueError("typed rework requires a classified code implementation task")
+    expected_values = (
+        ("expected_implementation_version", expected_implementation_version),
+        ("expected_reviewer_version", expected_reviewer_version),
+        ("expected_tester_version", expected_tester_version),
+    )
+    for name, value in expected_values:
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+        ):
+            raise ValueError(f"{name} must be an integer >= 1")
+    same_card = contract.get("review_mode") == "same_card"
+    if same_card and bool(reviewer_id) != bool(tester_id):
+        raise ValueError("same-card rework reviewer_id and tester_id must be supplied together")
+    if not same_card and not reviewer_id:
+        raise ValueError("separate-card rework requires reviewer_id")
+    if same_card and reviewer_id and str(reviewer_id) != implementation_id:
+        raise ValueError("same-card reviewer_id must identify the implementation card")
+
+    def _child(parent_id: str, kind: str) -> Optional[str]:
+        rows = conn.execute(
+            "SELECT t.id, t.lifecycle_contract FROM task_links l JOIN tasks t ON t.id = l.child_id "
+            "WHERE l.parent_id = ? ORDER BY t.id",
+            (parent_id,),
+        ).fetchall()
+        for row in rows:
+            child = safe_decode_contract(row["lifecycle_contract"])
+            if (
+                child
+                and child.get("kind") == kind
+                and child.get("candidate_task_id") == implementation_id
+            ):
+                return row["id"]
+        return None
+
+    validation_id = _child(implementation_id if same_card else str(reviewer_id), "validation")
+    if contract.get("validation_required"):
+        if validation_id is None:
+            raise ValueError("typed rework requires the declared validation card")
+        if not same_card and tester_id is None:
+            raise ValueError("separate-card rework requires tester_id")
+    elif tester_id is not None:
+        raise ValueError("tester_id is only valid when validation_required is true")
+    if tester_id is not None and str(tester_id) != validation_id:
+        raise ValueError("tester_id does not identify the declared validation card")
+    if expected_reviewer_version is not None and same_card:
+        raise ValueError("same-card rework uses expected_implementation_version only for review")
+    if not same_card and expected_reviewer_version is None:
+        raise ValueError("expected_reviewer_version is required for separate-card rework")
+    if validation_id is not None and expected_tester_version is None:
+        raise ValueError("expected_tester_version is required for typed validation rework")
+
+    actual_reviewer_id = implementation_id if same_card else str(reviewer_id)
+    actual_tester_id = validation_id
+    expected: dict[str, Optional[int]] = {implementation_id: expected_implementation_version}
+    if not same_card:
+        expected[actual_reviewer_id] = expected_reviewer_version
+    if actual_tester_id:
+        expected[actual_tester_id] = expected_tester_version
+    fingerprint = _rework_fingerprint(
+        implementation_id, reviewer_id, tester_id, expected, reason, author
+    )
+    previous_rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_rework_requested' "
+        "ORDER BY id DESC",
+        (implementation_id,),
+    ).fetchall()
+    for previous in previous_rows:
+        prior_payload = _json_dict(previous["payload"])
+        if prior_payload.get("fingerprint") != fingerprint:
+            continue
+        prior_result = prior_payload.get("result")
+        if isinstance(prior_result, dict):
+            return prior_result
+        raise ValueError("rework_fingerprint_conflict: stored result is malformed")
+
+    acceptance_before = _capture_acceptance(conn, implementation_id)
+    review_state = get_lifecycle_state(conn, actual_reviewer_id)
+    validation_state = (
+        get_lifecycle_state(conn, actual_tester_id) if actual_tester_id else None
+    )
+    if review_state.get("review_verdict") != "REQUEST_CHANGES" and not (
+        validation_state and validation_state.get("validation_verdict") == "FAIL"
+    ):
+        raise ValueError("typed rework requires REQUEST_CHANGES or FAIL evidence")
+    if (
+        review_state.get("diagnostics")
+        and not (same_card and review_state.get("review_verdict") == "REQUEST_CHANGES")
+    ) or (validation_state and validation_state.get("diagnostics")):
+        raise ValueError("typed rework evidence is stale or malformed")
+    rejected_head = None
+    for evidence in conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC",
+        (implementation_id,),
+    ).fetchall():
+        lifecycle = _json_dict(evidence["metadata"]).get("lifecycle")
+        if isinstance(lifecycle, dict) and lifecycle.get("head_sha"):
+            rejected_head = str(lifecycle["head_sha"]).strip()
+            break
+    if not rejected_head:
+        raise ValueError("typed rework requires an immutable rejected implementation head")
+
+    reset_ids = [implementation_id]
+    if not same_card:
+        reset_ids.append(actual_reviewer_id)
+    if actual_tester_id:
+        reset_ids.append(actual_tester_id)
+    with write_txn(conn):
+        rows = {
+            row["id"]: row
+            for row in conn.execute(
+                "SELECT id, status, version, claim_lock, current_run_id, worker_pid, "
+                "completed_at, result, block_kind, block_recurrences "
+                "FROM tasks WHERE id IN (" + ",".join("?" for _ in reset_ids) + ")",
+                tuple(reset_ids),
+            ).fetchall()
+        }
+        for task_id, expected_version in expected.items():
+            row = rows.get(task_id)
+            if row is None:
+                raise ValueError(f"typed rework task {task_id} was not found")
+            if int(row["version"] or 1) != int(expected_version):
+                raise ValueError(
+                    f"task {task_id} update conflict: expected version {expected_version}, "
+                    f"current version {row['version']}"
+                )
+        descendants = conn.execute(
+            """
+            WITH RECURSIVE graph(id) AS (
+                SELECT child_id FROM task_links WHERE parent_id = ?
+                UNION
+                SELECT l.child_id FROM task_links l JOIN graph g ON g.id = l.parent_id
+            )
+            SELECT t.id, t.status, t.version, t.claim_lock, t.current_run_id,
+                   t.worker_pid, t.completed_at, t.result, t.block_kind
+            FROM graph JOIN tasks t ON t.id = graph.id ORDER BY t.id
+            """,
+            (implementation_id,),
+        ).fetchall()
+        for row in descendants:
+            if row["status"] == "running" or row["claim_lock"] or row["current_run_id"] or row["worker_pid"]:
+                raise ValueError(f"cannot rework graph while task {row['id']} is claimed")
+        for row in [rows[task_id] for task_id in reset_ids]:
+            if row["status"] == "archived":
+                raise ValueError(f"cannot rework archived task {row['id']}")
+        implementation_status = "ready" if _parents_satisfied(conn, implementation_id) else "todo"
+        invalidated: list[dict[str, Any]] = []
+        reset_set = set(reset_ids)
+        all_rows = [rows[task_id] for task_id in reset_ids]
+        all_rows.extend(row for row in descendants if row["id"] not in reset_set)
+        for row in all_rows:
+            if row["status"] == "archived":
+                continue
+            new_status = implementation_status if row["id"] == implementation_id else "todo"
+            if row["status"] == "blocked" and _has_sticky_block(conn, row["id"]):
+                new_status = "blocked"
+            conn.execute(
+                "UPDATE tasks SET status = ?, version = version + 1, completed_at = NULL, "
+                "result = NULL, current_run_id = NULL, claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL, candidate_run_id = NULL, "
+                "block_kind = CASE WHEN ? = 'blocked' THEN block_kind ELSE NULL END, "
+                "block_recurrences = CASE WHEN ? = 'blocked' THEN block_recurrences ELSE 0 END "
+                "WHERE id = ?",
+                (new_status, new_status, new_status, row["id"]),
+            )
+            entry = {
+                "id": row["id"],
+                "prior_status": row["status"],
+                "new_status": new_status,
+                "prior_version": int(row["version"] or 1),
+                "prior_completed_at": row["completed_at"],
+                "prior_result": row["result"],
+            }
+            invalidated.append(entry)
+            _append_event(
+                conn,
+                row["id"],
+                "acceptance_invalidated",
+                {
+                    "implementation": implementation_id,
+                    "reviewer": None if same_card else actual_reviewer_id,
+                    "tester": actual_tester_id,
+                    "reason": reason,
+                    "rejected_head_sha": rejected_head,
+                    "actor": author,
+                    **entry,
+                },
+            )
+        result = {
+            "implementation_id": implementation_id,
+            "reviewer_id": None if same_card else actual_reviewer_id,
+            "tester_id": actual_tester_id,
+            "status": implementation_status,
+            "rejected_head_sha": rejected_head,
+            "invalidated": invalidated,
+            "implementation_version": int(rows[implementation_id]["version"]) + 1,
+            "reviewer_version": (
+                int(rows[actual_reviewer_id]["version"]) + 1 if not same_card else None
+            ),
+            "tester_version": (
+                int(rows[actual_tester_id]["version"]) + 1 if actual_tester_id else None
+            ),
+        }
+        _append_event(
+            conn,
+            implementation_id,
+            "review_rework_requested",
+            {
+                "actor": author,
+                "reason": reason,
+                "reviewer": None if same_card else actual_reviewer_id,
+                "tester": actual_tester_id,
+                "rejected_head_sha": rejected_head,
+                "fingerprint": fingerprint,
+                "result": result,
+            },
+        )
+    _emit_acceptance_changes(conn, acceptance_before, source_task_id=implementation_id)
+    for entry in invalidated:
+        notify_task_updated(conn, entry["id"], ("status", "version", "completed_at", "result"))
+    return result
+
 
 def rework_review_graph(
     conn: sqlite3.Connection,
     implementation_id: str,
-    reviewer_id: str,
-    tester_id: str,
+    reviewer_id: Optional[str] = None,
+    tester_id: Optional[str] = None,
     *,
     expected_implementation_version: int,
-    expected_reviewer_version: int,
-    expected_tester_version: int,
+    expected_reviewer_version: Optional[int] = None,
+    expected_tester_version: Optional[int] = None,
     reason: str,
     author: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -4016,6 +4813,23 @@ def rework_review_graph(
     workflow.  Rework changes only their current scheduling state; runs,
     comments, goal revisions, and completion events remain historical.
     """
+    typed_impl = get_task(conn, implementation_id)
+    if typed_impl and typed_impl.lifecycle_contract and typed_impl.lifecycle_contract.get("kind") == "code":
+        typed_reason = str(reason or "").strip()
+        if not typed_reason:
+            raise ValueError("reason is required")
+        typed_actor = str(author or os.environ.get("HERMES_PROFILE") or "orchestrator").strip() or "orchestrator"
+        return _typed_rework_graph(
+            conn,
+            implementation_id,
+            reviewer_id,
+            tester_id,
+            expected_implementation_version=expected_implementation_version,
+            expected_reviewer_version=expected_reviewer_version,
+            expected_tester_version=expected_tester_version,
+            reason=typed_reason,
+            author=typed_actor,
+        )
     task_ids = (implementation_id, reviewer_id, tester_id)
     if any(not isinstance(task_id, str) or not task_id.strip() for task_id in task_ids):
         raise ValueError("implementation, reviewer, and tester ids are required")
@@ -4241,6 +5055,7 @@ def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
+    verdict: Optional[str] = None,
     fire_lifecycle_hook: bool = True,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
@@ -4253,6 +5068,92 @@ def complete_task(
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
     """
+    task_before = get_task(conn, task_id)
+    typed_phase: Optional[str] = None
+    if task_before and task_before.lifecycle_contract:
+        kind = task_before.lifecycle_contract.get("kind")
+        if kind == "general":
+            if verdict is not None:
+                raise LifecycleEvidenceError("general tasks cannot carry a lifecycle verdict")
+        elif kind == "review":
+            typed_phase = "review"
+            if verdict is None:
+                raise LifecycleEvidenceError("review completion requires verdict=APPROVE or REQUEST_CHANGES")
+            if str(verdict).strip().upper() not in {"APPROVE", "REQUEST_CHANGES"}:
+                raise LifecycleEvidenceError("review completion verdict must be APPROVE or REQUEST_CHANGES")
+        elif kind == "validation":
+            typed_phase = "validation"
+            if verdict is None:
+                raise LifecycleEvidenceError("validation completion requires verdict=PASS or FAIL")
+            if str(verdict).strip().upper() not in {"PASS", "FAIL"}:
+                raise LifecycleEvidenceError("validation completion verdict must be PASS or FAIL")
+        elif kind == "code":
+            claimed_event = (
+                _latest_event(conn, task_id, "claimed", task_before.current_run_id)
+                if task_before and task_before.current_run_id
+                else None
+            )
+            claimed_source = _json_dict(_row_get(claimed_event, "payload")).get("source_status")
+            completed_review = (
+                task_before.status == "done"
+                and task_before.lifecycle_contract.get("review_mode") == "same_card"
+                and get_lifecycle_state(conn, task_id).get("review_verdict") is not None
+            )
+            typed_phase = (
+                "review"
+                if task_before.status == "review" or claimed_source == "review" or completed_review
+                else "implementation"
+            )
+            if typed_phase == "review":
+                if verdict is None:
+                    raise LifecycleEvidenceError("same-card review completion requires a verdict")
+                if str(verdict).strip().upper() not in {"APPROVE", "REQUEST_CHANGES"}:
+                    raise LifecycleEvidenceError("same-card review verdict must be APPROVE or REQUEST_CHANGES")
+            elif verdict is not None:
+                raise LifecycleEvidenceError("implementation completion cannot carry a review verdict")
+        else:
+            if verdict is not None:
+                raise LifecycleEvidenceError("unknown lifecycle contract cannot carry a verdict")
+    elif verdict is not None:
+        raise LifecycleEvidenceError("unclassified/general tasks cannot carry a lifecycle verdict")
+    same_card_handoff = bool(
+        task_before
+        and task_before.lifecycle_contract
+        and task_before.lifecycle_contract.get("kind") == "code"
+        and task_before.lifecycle_contract.get("review_mode") == "same_card"
+        and typed_phase == "implementation"
+    )
+    same_card_changes = bool(
+        task_before
+        and task_before.lifecycle_contract
+        and task_before.lifecycle_contract.get("kind") == "code"
+        and task_before.lifecycle_contract.get("review_mode") == "same_card"
+        and typed_phase == "review"
+        and str(verdict or "").strip().upper() == "REQUEST_CHANGES"
+    )
+    if task_before and task_before.status == "done" and typed_phase is not None:
+        projection = get_lifecycle_state(conn, task_id)
+        existing_verdict = (
+            projection.get("review_verdict")
+            if typed_phase == "review"
+            else projection.get("validation_verdict")
+            if typed_phase == "validation"
+            else None
+        )
+        if typed_phase in {"review", "validation"}:
+            normalized = str(verdict or "").strip().upper()
+            if normalized == existing_verdict:
+                return True
+            raise LifecycleEvidenceError("verdict_conflict: terminal lifecycle verdict differs from stored evidence")
+        supplied_head = (
+            metadata.get("head_sha")
+            if isinstance(metadata, dict)
+            else None
+        )
+        if supplied_head and projection.get("head_sha") and supplied_head != projection["head_sha"]:
+            raise LifecycleEvidenceError("verdict_conflict: terminal implementation head differs from stored evidence")
+        return True
+    acceptance_before = _capture_acceptance(conn, task_id)
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -4281,6 +5182,26 @@ def complete_task(
                 {"reason": error.reason}, run_id=expected_run_id,
             )
         raise
+    if typed_phase is not None:
+        try:
+            metadata = _stamp_lifecycle_metadata(
+                conn,
+                task_id,
+                metadata,
+                phase=typed_phase,
+                run_id=expected_run_id or (task_before.current_run_id if task_before else None),
+                verdict=verdict,
+            )
+        except LifecycleEvidenceError as error:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked_lifecycle",
+                    {"reason": str(error)},
+                    run_id=expected_run_id,
+                )
+            raise
     handoff_summary = summary if summary is not None else result
     contract_err: Optional[CompletionContractError] = None
     run_id: Optional[int] = None
@@ -4295,15 +5216,34 @@ def complete_task(
                 "effective goal revision or dependent review/test graph changed while preparing completion",
             )
             _append_event(
-                conn, task_id, "completion_blocked_contract",
+                conn,
+                task_id,
+                "completion_blocked_contract",
                 {"reason": contract_err.reason, "changed_files": contract_err.changed_files},
                 run_id=expected_run_id,
             )
         else:
             prior_status = _task_status(conn, task_id)
+            implementation_routing = _implementation_routing(conn, task_id)
+            target_status = (
+                _landing_status_after_parents(conn, task_id)
+                if same_card_changes
+                else "review"
+                if same_card_handoff
+                else "done"
+            )
+            completed_at = None if target_status != "done" else now
+            reviewer_profile = (
+                task_before.lifecycle_contract.get("reviewer")
+                if same_card_handoff and task_before and task_before.lifecycle_contract
+                else implementation_routing.get("implementer")
+                if same_card_changes
+                else None
+            )
+            assignee_sql = ", assignee = ?" if reviewer_profile else ""
             sql = """
                     UPDATE tasks
-                       SET status       = 'done',
+                       SET status       = ?,
                            result       = ?,
                            completed_at = ?,
                            claim_lock   = NULL,
@@ -4311,19 +5251,49 @@ def complete_task(
                            worker_pid   = NULL,
                            block_kind   = NULL,
                            block_recurrences = 0
+                """ + assignee_sql + """
                      WHERE id = ?
                        AND status IN ('running', 'ready', 'blocked', 'review')
                     """
-            params: tuple = (result, now, task_id)
+            params: tuple = (
+                target_status,
+                result,
+                completed_at,
+                *((reviewer_profile,) if reviewer_profile else ()),
+                task_id,
+            )
             if expected_run_id is not None:
                 sql += " AND current_run_id = ?"
                 params = (*params, int(expected_run_id))
             if conn.execute(sql, params).rowcount != 1:
                 return False
+            if same_card_changes:
+                conn.execute("UPDATE tasks SET candidate_run_id = NULL WHERE id = ?", (task_id,))
+            if (
+                typed_phase == "implementation"
+                and isinstance(metadata, dict)
+                and isinstance(metadata.get("lifecycle"), dict)
+            ):
+                lifecycle = metadata["lifecycle"]
+                conn.execute(
+                    "UPDATE tasks SET candidate_run_id = ? WHERE id = ?",
+                    (lifecycle.get("candidate_run_id"), task_id),
+                )
             if isinstance(metadata, dict):
                 _stage_completion_artifacts(conn, task_id, metadata, now)
+            run_outcome = (
+                "review_requested"
+                if same_card_handoff
+                else "changes_requested"
+                if same_card_changes
+                else "completed"
+            )
             run_id = _end_run(
-                conn, task_id, outcome="completed", status="done", summary=handoff_summary,
+                conn,
+                task_id,
+                outcome=run_outcome,
+                status=target_status,
+                summary=handoff_summary,
                 metadata=metadata,
             )
             # Never-claimed task: synthesize a run so the handoff fields survive.
@@ -4333,25 +5303,69 @@ def complete_task(
                     synth_summary = _REVIEW_APPROVED_NOTE
                     synth_metadata = {"source_status": "review", "approval": "manual"}
                 run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="completed", summary=synth_summary, metadata=synth_metadata,
+                    conn,
+                    task_id,
+                    outcome=run_outcome,
+                    summary=synth_summary,
+                    metadata=synth_metadata,
                 )
             event_summary = handoff_summary
             if prior_status == "review" and not event_summary:
                 event_summary = _REVIEW_APPROVED_NOTE
-            _append_event(
-                conn, task_id, "completed",
-                _completed_event_payload(result, event_summary, verified_cards, metadata),
-                run_id=run_id,
-            )
+            if same_card_changes:
+                _append_event(
+                    conn,
+                    task_id,
+                    "changes_requested",
+                    {
+                        "reason": handoff_summary,
+                        "implementer": reviewer_profile,
+                        "reviewer": task_before.assignee if task_before else None,
+                        "status": target_status,
+                        "lifecycle": (
+                            metadata.get("lifecycle")
+                            if isinstance(metadata, dict)
+                            else None
+                        ),
+                    },
+                    run_id=run_id,
+                )
+            elif same_card_handoff:
+                _append_event(
+                    conn,
+                    task_id,
+                    "review_requested",
+                    {
+                        "summary": _first_line(event_summary, 400) or None,
+                        "implementer": task_before.assignee if task_before else None,
+                        "reviewer": reviewer_profile,
+                        "lifecycle": (
+                            metadata.get("lifecycle")
+                            if isinstance(metadata, dict)
+                            else None
+                        ),
+                    },
+                    run_id=run_id,
+                )
+            else:
+                _append_event(
+                    conn,
+                    task_id,
+                    "completed",
+                    _completed_event_payload(result, event_summary, verified_cards, metadata),
+                    run_id=run_id,
+                )
     if contract_err is not None:
         raise contract_err
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
     # Success wipes the breaker counter (history stays on the event log).
     _clear_failure_counter(conn, task_id)
     recompute_ready(conn)  # separate txn so children see ``done``
-    _cleanup_workspace(conn, task_id)
+    _emit_acceptance_changes(conn, acceptance_before, source_task_id=task_id)
     _done_task = get_task(conn, task_id)
-    if fire_lifecycle_hook:
+    if _done_task and _done_task.status == "done":
+        _cleanup_workspace(conn, task_id)
+    if fire_lifecycle_hook and _done_task and _done_task.status == "done":
         _fire_task_hook("kanban_task_completed", _done_task, task_id, run_id, summary=handoff_summary)
     return True
 
@@ -4418,6 +5432,8 @@ def _completed_event_payload(
             if cleaned:
                 payload["artifacts"] = cleaned
         payload.update(_handoff_fields(metadata))
+        if isinstance(metadata.get("lifecycle"), dict):
+            payload["lifecycle"] = dict(metadata["lifecycle"])
     return payload
 
 
@@ -4605,6 +5621,10 @@ def edit_completed_task_result(
     metadata: Optional[dict] = None,
 ) -> bool:
     """Backfill the user-visible result for an already completed task."""
+    if isinstance(metadata, dict) and (
+        "lifecycle" in metadata or "lifecycle_routing" in metadata
+    ):
+        raise LifecycleEvidenceError("completed result edits cannot change lifecycle evidence or routing")
     handoff_summary = summary if summary is not None else result
     with write_txn(conn):
         if _task_status(conn, task_id) != "done":
@@ -4612,7 +5632,7 @@ def edit_completed_task_result(
         conn.execute("UPDATE tasks SET result = ? WHERE id = ?", (result, task_id))
         run = conn.execute(
             """
-            SELECT id FROM task_runs
+            SELECT id, metadata FROM task_runs
              WHERE task_id = ?
                AND outcome = 'completed'
              ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC
@@ -4628,9 +5648,11 @@ def edit_completed_task_result(
             run_id = int(run["id"])
             conn.execute("UPDATE task_runs SET summary = ? WHERE id = ?", (handoff_summary, run_id))
             if metadata is not None:
+                merged_metadata = _json_dict(_row_get(run, "metadata"))
+                merged_metadata.update(metadata)
                 conn.execute(
                     "UPDATE task_runs SET metadata = ? WHERE id = ?",
-                    (json.dumps(metadata, ensure_ascii=False), run_id),
+                    (json.dumps(merged_metadata, ensure_ascii=False), run_id),
                 )
         _append_event(
             conn, task_id, "edited",
@@ -4664,7 +5686,17 @@ def block_task(
         previous_kind = normalize_block_kind(_row_get(cur_row, "block_kind"))
         if previous_kind is None and previous_recurrences > 0:
             previous_kind = _latest_block_cause(conn, task_id)
-        source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
+        source_status = "ready"
+        if cur_row["status"] == "running":
+            current_run = _current_run_id(conn, task_id)
+            claimed_payload = _json_dict(
+                _row_get(_latest_event(conn, task_id, "claimed", current_run), "payload")
+            )
+            source_status = (
+                "review"
+                if claimed_payload.get("source_status") == "review"
+                else _retry_status_for_run(conn, task_id)
+            )
         new_status, event_kind, set_sql, params, payload = _route_block(
             normalized_kind,
             reason,
@@ -4772,6 +5804,27 @@ def request_review(
 
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
+    task_before = get_task(conn, task_id)
+    typed_code = (
+        task_before.lifecycle_contract
+        if task_before and task_before.lifecycle_contract and task_before.lifecycle_contract.get("kind") == "code"
+        else None
+    )
+    if (
+        task_before
+        and task_before.lifecycle_contract
+        and task_before.lifecycle_contract.get("kind") in {"review", "validation"}
+    ):
+        return _ret(False, "typed review/validation cards complete with an explicit verdict")
+    if typed_code and typed_code.get("review_mode") == "separate_card":
+        return _ret(False, "separate-card code tasks complete implementation before dispatching the review card")
+    if typed_code and reviewer is not None:
+        requested_reviewer = _canonical_assignee(reviewer)
+        if requested_reviewer != typed_code.get("reviewer"):
+            return _ret(False, "reviewer does not match the declared lifecycle reviewer")
+    if typed_code:
+        reviewer = typed_code.get("reviewer")
+    acceptance_before = _capture_acceptance(conn, task_id)
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
@@ -4796,55 +5849,76 @@ def request_review(
                 {"reason": error.reason},
             )
         return _ret(False, str(error))
+    if typed_code:
+        try:
+            metadata = _stamp_lifecycle_metadata(
+                conn,
+                task_id,
+                metadata,
+                phase="implementation",
+                run_id=expected_run_id or (task_before.current_run_id if task_before else None),
+                verdict=None,
+            )
+        except LifecycleEvidenceError as error:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_blocked_lifecycle", {"reason": str(error)},
+                    run_id=expected_run_id,
+                )
+            return _ret(False, str(error))
     contract_err: Optional[CompletionContractError] = None
     with write_txn(conn):
-        if not _parents_satisfied(conn, task_id):
-            return _ret(False, "parent dependencies are not satisfied")
-        trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id "
-            "FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
-        if trow is None:
-            return _ret(False, "task not found")
-        # Refuse to clear a live worker's claim without proof of ownership
-        # (expected_run_id) or an explicit human override (force=True).
-        if (
-            expected_run_id is None
-            and not force
-            and trow["status"] == "running"
-            and trow["claim_lock"] is not None
-        ):
-            return _ret(
-                False, "task is running under a live claim; pass expected_run_id "
-                "(worker ownership) or force=True (explicit operator "
-                "override) instead of clearing the live run's claim",
-            )
-        implementer = trow["assignee"]
-        if reviewer is None:
-            reviewer = _prior_reviewer(conn, task_id)
-            if reviewer is False:
-                return _ret(
-                    False, "re-review has no durable reviewer provenance (the "
-                    "latest changes_requested event is missing or "
-                    "malformed); pass reviewer= explicitly",
-                )
-        reviewer = _canonical_assignee(reviewer)
-        assignee_sql = ", assignee = ?" if reviewer is not None else ""
-        run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
-        params: tuple[Any, ...] = (
-            *(() if reviewer is None else (reviewer,)), task_id,
-            *(() if expected_run_id is None else (int(expected_run_id),)),
-        )
         if _completion_contract_snapshot(conn, task_id) != preflight_contract:
             contract_err = CompletionContractError(
                 task_id,
                 "effective goal revision or dependent review/test graph changed while preparing review",
             )
             _append_event(
-                conn, task_id, "completion_blocked_contract",
+                conn,
+                task_id,
+                "completion_blocked_contract",
                 {"reason": contract_err.reason, "changed_files": contract_err.changed_files},
+                run_id=expected_run_id,
             )
         else:
+            if not _parents_satisfied(conn, task_id):
+                return _ret(False, "parent dependencies are not satisfied")
+            trow = conn.execute(
+                "SELECT assignee, status, claim_lock, current_run_id "
+                "FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            if trow is None:
+                return _ret(False, "task not found")
+            # Refuse to clear a live worker's claim without proof of ownership
+            # (expected_run_id) or an explicit human override (force=True).
+            if (
+                expected_run_id is None
+                and not force
+                and trow["status"] == "running"
+                and trow["claim_lock"] is not None
+            ):
+                return _ret(
+                    False, "task is running under a live claim; pass expected_run_id "
+                    "(worker ownership) or force=True (explicit operator "
+                    "override) instead of clearing the live run's claim",
+                )
+            implementer = trow["assignee"]
+            if reviewer is None:
+                reviewer = _prior_reviewer(conn, task_id)
+                if reviewer is False:
+                    return _ret(
+                        False, "re-review has no durable reviewer provenance (the "
+                        "latest changes_requested event is missing or "
+                        "malformed); pass reviewer= explicitly",
+                    )
+            reviewer = _canonical_assignee(reviewer)
+            assignee_sql = ", assignee = ?" if reviewer is not None else ""
+            run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
+            params: tuple[Any, ...] = (
+                *(() if reviewer is None else (reviewer,)),
+                task_id,
+                *((int(expected_run_id),) if expected_run_id is not None else ()),
+            )
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -4866,6 +5940,12 @@ def request_review(
                 conn, task_id, outcome="review_requested", status="review",
                 summary=summary, metadata=metadata, synthesize=bool(summary or metadata),
             )
+            lifecycle = metadata.get("lifecycle") if isinstance(metadata, dict) else None
+            if isinstance(lifecycle, dict):
+                conn.execute(
+                    "UPDATE tasks SET candidate_run_id = ? WHERE id = ?",
+                    (lifecycle.get("candidate_run_id"), task_id),
+                )
             _append_event(
                 conn,
                 task_id,
@@ -4874,11 +5954,13 @@ def request_review(
                     "summary": _first_line(summary, 400) or None,
                     "implementer": implementer,
                     "reviewer": reviewer,
+                    "lifecycle": lifecycle,
                 },
                 run_id=run_id,
             )
     if contract_err is not None:
         raise contract_err
+    _emit_acceptance_changes(conn, acceptance_before, source_task_id=task_id)
     return _ret(True)
 
 
@@ -4903,7 +5985,12 @@ def _nonblank_str(value: Any) -> Optional[str]:
 
 
 def request_changes(
-    conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    metadata: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
     """Close an active reviewer run (claimed from ``review``) and hand the task
     back to the implementer from the latest ``review_requested`` event, parent
@@ -4911,6 +5998,18 @@ def request_changes(
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
+    metadata = redact_review_value(metadata)
+    task_before = get_task(conn, task_id)
+    contract_kind = (
+        task_before.lifecycle_contract.get("kind")
+        if task_before and task_before.lifecycle_contract
+        else None
+    )
+    if contract_kind == "review":
+        return False, "complete the review card with REQUEST_CHANGES, then rework the lifecycle graph"
+    if contract_kind == "validation":
+        return False, "complete the validation card with FAIL, then rework the lifecycle graph"
+    acceptance_before = _capture_acceptance(conn, task_id)
 
     with write_txn(conn):
         task_row = conn.execute(
@@ -4936,6 +6035,24 @@ def request_changes(
         if implementer is None:
             return False, "review handoff has no valid implementer provenance"
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
+        lifecycle_for_run = None
+        task_obj = get_task(conn, task_id)
+        if (
+            task_obj
+            and task_obj.lifecycle_contract
+            and task_obj.lifecycle_contract.get("kind") == "code"
+        ):
+            try:
+                lifecycle_for_run = _stamp_lifecycle_metadata(
+                    conn,
+                    task_id,
+                    metadata,
+                    phase="review",
+                    run_id=int(current_run_id),
+                    verdict="REQUEST_CHANGES",
+                )
+            except LifecycleEvidenceError as error:
+                return False, str(error)
 
         new_status = _landing_status_after_parents(conn, task_id)
         # consecutive_failures deliberately PRESERVED: a review transition is
@@ -4956,7 +6073,10 @@ def request_changes(
             return False, "task changed during review handoff"
         run_id = _end_run(
             conn, task_id, outcome="changes_requested", status=new_status, summary=reason,
+            metadata=lifecycle_for_run,
         )
+        if contract_kind == "code":
+            conn.execute("UPDATE tasks SET candidate_run_id = NULL WHERE id = ?", (task_id,))
         _append_event(
             conn,
             task_id,
@@ -4966,9 +6086,15 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                "lifecycle": (
+                    lifecycle_for_run.get("lifecycle")
+                    if isinstance(lifecycle_for_run, dict)
+                    else None
+                ),
             },
             run_id=run_id,
         )
+    _emit_acceptance_changes(conn, acceptance_before, source_task_id=task_id)
     return True, implementer
 
 
@@ -4989,26 +6115,22 @@ def promote_task(
             f"'todo' or 'blocked'"
         )
 
-    if not force:
-        parents = conn.execute(
-            "SELECT t.id, t.status FROM tasks t "
-            "JOIN task_links l ON l.parent_id = t.id "
-            "WHERE l.child_id = ?", (task_id,),
-        ).fetchall()
-        unsatisfied = [p["id"] for p in parents if p["status"] not in ("done", "archived")]
-        if unsatisfied:
-            return False, (
-                f"unsatisfied parent dependencies: "
-                f"{', '.join(unsatisfied)} (use --force to override)"
-            )
+    dependency = evaluate_dependencies(conn, task_id)
+    if not dependency["satisfied"]:
+        blockers = dependency.get("blockers") or []
+        detail = "; ".join(
+            f"{item.get('parent_id')}: {item.get('code')}" for item in blockers
+        )
+        return False, f"unsatisfied lifecycle dependencies: {detail or 'unknown blocker'}"
 
     if dry_run:
         return True, None
+    promoted_status = _lifecycle_ready_status(conn, task_id)
 
     with write_txn(conn):
         upd = conn.execute(
-            "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')", (task_id,),
+            "UPDATE tasks SET status = ? "
+            "WHERE id = ? AND status IN ('todo', 'blocked')", (promoted_status, task_id),
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
@@ -5046,7 +6168,7 @@ def _reclaim_dangling_run(
 def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str:
     """``ready`` if every parent is terminal else ``todo`` — the re-gate shared by
     unblock/reopen so neither can spawn a child whose upstream is unfinished."""
-    return "ready" if _parents_satisfied(conn, task_id) else "todo"
+    return _lifecycle_ready_status(conn, task_id) if _parents_satisfied(conn, task_id) else "todo"
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -5098,6 +6220,11 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     comments; restores the implementer from the ``review_requested`` event.
     Preserves ``consecutive_failures`` and the block loop counter (review is
     not a block; only :func:`complete_task` clears them)."""
+    task = get_task(conn, task_id)
+    if task and task.lifecycle_contract and task.lifecycle_contract.get("kind") != "general":
+        raise LifecycleContractError(
+            "typed lifecycle review must be completed or reworked through its declared evidence path"
+        )
     now = int(time.time())
     with write_txn(conn):
         _reclaim_dangling_run(
@@ -5527,20 +6654,35 @@ def decompose_triage_task(
                 },
             )
             return None
-        child_ids = [
-            _insert_decomposed_child(conn, task_id, root_row, child, author, now)
-            for child in children
-        ]
+        child_ids = [_new_task_id() for _ in children]
+        for idx, child in enumerate(children):
+            _insert_decomposed_child(
+                conn, task_id, root_row, child, author, now,
+                new_id=child_ids[idx], child_ids=child_ids,
+            )
+        for child_id, child in zip(child_ids, children):
+            child_contract = decode_contract(
+                conn.execute(
+                    "SELECT lifecycle_contract FROM tasks WHERE id = ?",
+                    (child_id,),
+                ).fetchone()["lifecycle_contract"]
+            )
+            _validate_lifecycle_role_identity(conn, child_contract, child.get("assignee"))
         # Sibling edges within the decomposed graph.
         for idx, child in enumerate(children):
             for p_idx in child.get("parents") or []:
                 parent_id, child_id = child_ids[p_idx], child_ids[idx]
-                _link(conn, parent_id, child_id)
-                _append_event(conn, child_id, "linked", {"parent": parent_id, "child": child_id})
+                requirement = infer_edge_requirement(conn, parent_id, child_id)
+                _link(conn, parent_id, child_id, requirement=requirement)
+                _append_event(
+                    conn, child_id, "linked",
+                    {"parent": parent_id, "child": child_id, "requirement": requirement},
+                )
         # Root waits for the whole graph: link it under EVERY child (simpler
         # than computing leaves; cycle-free since the root is only ever a child).
         for cid in child_ids:
-            _link(conn, cid, task_id)
+            requirement = infer_edge_requirement(conn, cid, task_id)
+            _link(conn, cid, task_id, requirement=requirement)
         # Flip the root triage -> todo, assignee -> orchestrator.
         sets = ["status = 'todo'"]
         params: list[Any] = []
@@ -5573,18 +6715,11 @@ def decompose_triage_task(
 
 def _insert_decomposed_child(
     conn: sqlite3.Connection, root_id: str, root_row: sqlite3.Row, child: dict,
-    author: Optional[str], now: int,
+    author: Optional[str], now: int, *,
+    new_id: Optional[str] = None, child_ids: Optional[list[str]] = None,
 ) -> str:
-    """Insert one decomposed child as ``todo`` (linked under the root later so
-    the dispatcher only ever sees a coherent graph); returns its id.
-
-    Workspace: per-child override wins, else inherit the root's kind. Path
-    inherits only when kinds match (a 'dir' child must not point at the
-    root's worktree) and NEVER for worktrees — siblings dispatch concurrently
-    and one shared checkout would put them all on the first sibling's branch
-    with no lock; leaving it unset makes dispatch materialize a fresh
-    ``<repo>/.worktrees/<child-id>`` per child from the board anchor.
-    """
+    """Insert one decomposed child as ``todo``; links are added after all
+    sibling ids exist so typed role contracts can reference any sibling."""
     root_ws_kind = root_row["workspace_kind"] or "scratch"
     child_ws_kind = child.get("workspace_kind") or root_ws_kind
     if child.get("workspace_path"):
@@ -5595,17 +6730,37 @@ def _insert_decomposed_child(
         child_ws_path = root_row["workspace_path"]
     else:
         child_ws_path = None
-    new_id = _new_task_id()
+    new_id = new_id or _new_task_id()
     body = child.get("body")
+    raw_contract = child.get("lifecycle_contract")
+    if raw_contract is None:
+        lifecycle_json = encode_contract(None, default_on_none=True)
+    else:
+        contract = dict(raw_contract)
+        kind = str(contract.get("kind") or "").strip().casefold()
+        if kind in {"review", "validation"}:
+            candidate_index = contract.pop("candidate_task_index", None)
+            if (
+                child_ids is None
+                or isinstance(candidate_index, bool)
+                or not isinstance(candidate_index, int)
+                or not 0 <= candidate_index < len(child_ids)
+            ):
+                raise LifecycleContractError(
+                    "decomposed role child has an invalid candidate_task_index"
+                )
+            contract["candidate_task_id"] = child_ids[candidate_index]
+        lifecycle_json = encode_contract(contract, default_on_none=False)
+    normalized_lifecycle = decode_contract(lifecycle_json)
     conn.execute(
         "INSERT INTO tasks "
         "(id, title, body, assignee, status, workspace_kind, "
-        " workspace_path, tenant, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+        " workspace_path, tenant, created_at, created_by, lifecycle_contract) "
+        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
         (
             new_id, child["title"].strip(), body if isinstance(body, str) else None,
             _canonical_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
-            root_row["tenant"], now, (author or "decomposer"),
+            root_row["tenant"], now, (author or "decomposer"), lifecycle_json,
         ),
     )
     child_goal_author = str(author or "decomposer").strip() or "decomposer"
@@ -5626,7 +6781,14 @@ def _insert_decomposed_child(
         (int(child_goal_cur.lastrowid), new_id),
     )
     _append_event(
-        conn, new_id, "created", {"by": author or "decomposer", "from_decompose_of": root_id},
+        conn,
+        new_id,
+        "created",
+        {
+            "by": author or "decomposer",
+            "from_decompose_of": root_id,
+            "lifecycle_contract": normalized_lifecycle,
+        },
     )
     _inherit_notify_subs(conn, new_id, (root_id,), created_at=now)
     return new_id
@@ -5797,9 +6959,28 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     now = int(time.time())
     lines: list[str] = []
     effective_goal = get_effective_goal(conn, task_id)
-    _ctx_header(lines, task, effective_goal=effective_goal)
+    lifecycle = get_lifecycle_state(conn, task_id)
+    dependency = evaluate_dependencies(conn, task_id)
+    routing_task_id = (
+        lifecycle.get("candidate_task_id")
+        if task.lifecycle_contract
+        and task.lifecycle_contract.get("kind") in {"review", "validation"}
+        else task_id
+    )
+    snapshot = {
+        "contract": task.lifecycle_contract,
+        "state": lifecycle,
+        "dependencies": dependency,
+        "routing": _implementation_routing(conn, str(routing_task_id)),
+    }
+    lines.append("## Lifecycle snapshot (read before prose)")
+    lines.append("```json")
+    lines.append(json.dumps(snapshot, ensure_ascii=False, sort_keys=True))
+    lines.append("```")
+    lines.append("")
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
+    _ctx_header(lines, task, effective_goal=effective_goal)
     _ctx_parent_results(lines, conn, task_id, now)
     _ctx_role_history(lines, conn, task, now)
     _ctx_comments(lines, list_comments(conn, task_id), now)
