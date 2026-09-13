@@ -189,6 +189,11 @@ def _task_dict(
     if conn is not None:
         d["lifecycle"] = kanban_db.get_lifecycle_state(conn, task.id)
         d["dependencies"] = kanban_db.evaluate_dependencies(conn, task.id)
+        d["active_lifecycle_phase"] = (
+            kanban_db._retry_status_for_run(conn, task.id, task.current_run_id)
+            if task.status == "running" and task.current_run_id
+            else None
+        )
     return d
 
 
@@ -590,10 +595,26 @@ def _apply_status(conn, task_id: str, s: str, p, unknown_detail: str) -> bool:
         current = kanban_db.get_task(conn, task_id)
         contract = (current.lifecycle_contract or {}) if current else {}
         metadata = p.metadata if isinstance(p.metadata, dict) else {}
+        active_same_card_review = bool(
+            current
+            and contract.get("kind") == "code"
+            and contract.get("review_mode") == "same_card"
+            and (
+                current.status == "review"
+                or (
+                    current.status == "running"
+                    and current.current_run_id
+                    and kanban_db._retry_status_for_run(
+                        conn, task_id, current.current_run_id,
+                    ) == "review"
+                )
+            )
+        )
         if (
             current
-            and current.status not in {"review", "done"}
+            and current.status != "done"
             and contract.get("kind") == "code"
+            and not active_same_card_review
             and (not metadata.get("base_sha") or not metadata.get("head_sha"))
         ):
             raise _StatusRejected(

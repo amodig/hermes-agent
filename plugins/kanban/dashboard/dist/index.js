@@ -197,12 +197,20 @@
   function dialogLabelForCount(count, t) {
     return count && count > 1 ? tx(t, "selectedTasks", "{n} selected tasks", { n: count }) : tx(t, "thisTask", "this task");
   }
+  function isActiveSameCardReview(task) {
+    const contract = task && task.lifecycle_contract;
+    return Boolean(
+      contract
+      && contract.kind === "code"
+      && contract.review_mode === "same_card"
+      && (task.status === "review" || task.active_lifecycle_phase === "review")
+    );
+  }
+
   function promptLifecycleVerdict(task, label) {
     const contract = task && task.lifecycle_contract;
     const kind = contract && contract.kind;
-    const sameCardReview = kind === "code"
-      && contract.review_mode === "same_card"
-      && task.status === "review";
+    const sameCardReview = isActiveSameCardReview(task);
     const phase = sameCardReview ? "review" : kind;
     if (phase !== "review" && phase !== "validation") {
       return { confirmed: true, verdict: null };
@@ -982,13 +990,7 @@
     const lifecycleCompletionTask = useCallback(function (ids) {
       const tasks = Array.from(ids).map(findBoardTask);
       const phaseForTask = function (task) {
-        const contract = task && task.lifecycle_contract;
-        if (
-          contract
-          && contract.kind === "code"
-          && contract.review_mode === "same_card"
-          && task.status === "review"
-        ) {
+        if (isActiveSameCardReview(task)) {
           return "review";
         }
         return (contract && contract.kind) || "general";
