@@ -148,6 +148,7 @@ class WorkerLaunch:
     preparation_id: str
     grant: Optional[Callable[[int, Optional[str]], None]] = None
     cancel: Optional[Callable[[], None]] = None
+    launcher_pid: Optional[int] = None
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -158,6 +159,8 @@ class WorkerLaunch:
 _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
+_worker_pid_aliases: "dict[int, int]" = {}
+"""Map retained launcher PIDs to the verified Hermes worker PID."""
 _worker_processes: "dict[int, Any]" = {}
 """Live ``Popen`` handles retained until the dispatcher reaps their children.
 
@@ -168,15 +171,17 @@ running.
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
-    """Record a reaped child's exit status; duplicate pids overwrite (latest wins)."""
-    process = _worker_processes.pop(int(pid), None)
+    """Record a reaped worker exit under its verified Hermes PID."""
+    launcher_pid = int(pid)
+    worker_pid = _worker_pid_aliases.pop(launcher_pid, launcher_pid)
+    process = _worker_processes.pop(launcher_pid, None)
     if process is not None and getattr(process, "returncode", None) is None:
         with contextlib.suppress(Exception):
             process.returncode = os.waitstatus_to_exitcode(int(raw_status))
-    if not pid or pid <= 0:
+    if worker_pid <= 0:
         return
     now = time.time()
-    _recent_worker_exits[int(pid)] = (int(raw_status), now)
+    _recent_worker_exits[worker_pid] = (int(raw_status), now)
     if len(_recent_worker_exits) > _RECENT_WORKER_EXITS_MAX // 2:
         cutoff = now - _RECENT_WORKER_EXIT_TTL_SECONDS
         for _pid in [p for p, (_s, t) in _recent_worker_exits.items() if t < cutoff]:
@@ -2416,6 +2421,7 @@ def _default_spawn(
             if proc is not None:
                 proc.wait(timeout=2)
         if proc is not None and proc.poll() is not None:
+            _worker_pid_aliases.pop(proc.pid, None)
             _worker_processes.pop(proc.pid, None)
         _close_resources()
 
@@ -2458,6 +2464,7 @@ def _default_spawn(
             payload, expected_identity, pid=ready_pid, preparation_id=preparation_id,
         )
         _worker_processes[proc.pid] = proc
+        _worker_pid_aliases[proc.pid] = actual.pid
         def _grant(run_id: int, claim_lock: Optional[str]) -> None:
             if proc is None or proc.stdin is None:
                 raise RuntimeError("worker bootstrap pipe unavailable")
@@ -2475,10 +2482,13 @@ def _default_spawn(
 
         if defer_grant:
             return WorkerLaunch(
-                proc.pid, actual.as_dict(), preparation_id, grant=_grant, cancel=_cancel,
+                actual.pid, actual.as_dict(), preparation_id, grant=_grant, cancel=_cancel,
+                launcher_pid=proc.pid,
             )
         _grant(int(task.current_run_id or 0), task.claim_lock)
-        return WorkerLaunch(proc.pid, actual.as_dict(), preparation_id)
+        return WorkerLaunch(
+            actual.pid, actual.as_dict(), preparation_id, launcher_pid=proc.pid,
+        )
     except FileNotFoundError:
         _cancel()
         raise RuntimeError(

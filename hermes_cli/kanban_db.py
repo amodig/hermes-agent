@@ -1610,8 +1610,14 @@ def create_task(
         if normalized_lifecycle and normalized_lifecycle.get("kind") in {"review", "validation"}
         else None
     )
-    if candidate_id and not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (candidate_id,)).fetchone():
-        raise LifecycleContractError(f"candidate task {candidate_id} does not exist")
+    candidate_contract = None
+    if candidate_id:
+        candidate_row = conn.execute(
+            "SELECT lifecycle_contract FROM tasks WHERE id = ?", (candidate_id,),
+        ).fetchone()
+        if not candidate_row:
+            raise LifecycleContractError(f"candidate task {candidate_id} does not exist")
+        candidate_contract = safe_decode_contract(candidate_row["lifecycle_contract"])
     assignee = _canonical_assignee(assignee)
     _validate_lifecycle_role_identity(conn, normalized_lifecycle, assignee)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
@@ -1642,7 +1648,33 @@ def create_task(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
     )
     parents = tuple(p for p in parents if p)
-    role_missing_candidate_edge = bool(candidate_id and candidate_id not in parents)
+    role_missing_candidate_edge = False
+    if candidate_id:
+        role_kind = normalized_lifecycle["kind"]
+        candidate_is_same_card = (
+            candidate_contract is not None
+            and candidate_contract.get("kind") == "code"
+            and candidate_contract.get("review_mode") == "same_card"
+        )
+        if role_kind == "review" or (role_kind == "validation" and candidate_is_same_card):
+            role_missing_candidate_edge = candidate_id not in parents
+        elif role_kind == "validation":
+            role_missing_candidate_edge = True
+            for parent_id in parents:
+                parent_row = conn.execute(
+                    "SELECT lifecycle_contract FROM tasks WHERE id = ?", (parent_id,),
+                ).fetchone()
+                parent_contract = (
+                    safe_decode_contract(parent_row["lifecycle_contract"])
+                    if parent_row else None
+                )
+                if (
+                    parent_contract
+                    and parent_contract.get("kind") == "review"
+                    and parent_contract.get("candidate_task_id") == candidate_id
+                ):
+                    role_missing_candidate_edge = False
+                    break
     skills_list = _normalize_task_skills(skills)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create

@@ -626,16 +626,52 @@ def evaluate_dependencies(conn: sqlite3.Connection, task_id: str) -> dict[str, A
     contract = _row_contract(task)
     if contract and contract.get("kind") in {"review", "validation"}:
         candidate_id = str(contract.get("candidate_task_id") or "")
+        candidate = _task_row(conn, candidate_id)
+        candidate_contract = _row_contract(candidate)
+        same_card_validation = (
+            contract.get("kind") == "validation"
+            and candidate_contract is not None
+            and candidate_contract.get("kind") == "code"
+            and candidate_contract.get("review_mode") == "same_card"
+        )
+        requires_candidate_edge = (
+            contract.get("kind") == "review" or same_card_validation
+        )
         candidate_edge = conn.execute(
             "SELECT requirement FROM task_links WHERE parent_id = ? AND child_id = ?",
             (candidate_id, task_id),
         ).fetchone()
-        if candidate_id and candidate_edge is None:
+        review_edge = None
+        if contract.get("kind") == "validation" and not requires_candidate_edge:
+            review_rows = conn.execute(
+                """
+                SELECT l.requirement, p.lifecycle_contract
+                FROM task_links l
+                JOIN tasks p ON p.id = l.parent_id
+                WHERE l.child_id = ?
+                ORDER BY p.id
+                """,
+                (task_id,),
+            ).fetchall()
+            for row in review_rows:
+                parent_contract = decode_contract(row["lifecycle_contract"])
+                if (
+                    parent_contract
+                    and parent_contract.get("kind") == "review"
+                    and parent_contract.get("candidate_task_id") == candidate_id
+                ):
+                    review_edge = row
+                    break
+        if candidate_id and (
+            (requires_candidate_edge and candidate_edge is None)
+            or (not requires_candidate_edge and review_edge is None)
+        ):
+            dependency = "candidate task" if requires_candidate_edge else "its review card"
             blockers.append({
                 "parent_id": candidate_id,
                 "requirement": None,
                 "code": "candidate_edge_missing",
-                "message": "role card must depend directly on its candidate task",
+                "message": f"role card must depend directly on {dependency}",
             })
 
 
