@@ -1627,6 +1627,14 @@ def _dispatch_lane_task(
         if preflight is None:
             return False
         spawn_task = preflight
+        handoff_error = _kb._parent_handoff_start_error(
+            conn, task_id, phase=lane,
+        )
+        if handoff_error is not None:
+            _kb._record_parent_handoff_start_error(
+                conn, task_id, handoff_error,
+            )
+            return False
         if lane == "review":
             spawn_task = replace(
                 preflight,

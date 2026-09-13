@@ -812,6 +812,45 @@ class KanbanLifecycleConformance(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(event)
 
+    def test_default_dispatch_rejects_invalid_handoff_before_spawn(self) -> None:
+        task_id = kb.create_task(
+            self.conn,
+            title="reject review without handoff",
+            assignee="builder",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "same_card",
+                "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        )
+        with kb.write_txn(self.conn):
+            self.conn.execute(
+                "UPDATE tasks SET status = 'review', assignee = 'reviewer' WHERE id = ?",
+                (task_id,),
+            )
+        with patch.object(kbd, "_profile_exists_fn", return_value=None), patch.object(
+            kbd,
+            "_default_spawn",
+            side_effect=AssertionError("invalid handoff must be rejected before spawn"),
+        ):
+            result = kbd.dispatch_once(
+                self.conn,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+
+        self.assertEqual(result.spawned, [])
+        self.assertEqual(self._task(task_id).status, "review")
+        self.assertTrue(
+            any(
+                event.kind == "handoff_unverifiable"
+                for event in kb.list_events(self.conn, task_id)
+            )
+        )
+
+
     def test_preclaim_spawn_failures_trip_the_dispatcher_breaker(self) -> None:
         task_id = kb.create_task(
             self.conn,

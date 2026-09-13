@@ -190,11 +190,12 @@ def _task_dict(
     if conn is not None:
         d["lifecycle"] = kanban_db.get_lifecycle_state(conn, task.id)
         d["dependencies"] = kanban_db.evaluate_dependencies(conn, task.id)
-        active_lifecycle_phase = (
-            kanban_db._retry_status_for_run(conn, task.id, task.current_run_id)
-            if task.status == "running" and task.current_run_id
-            else None
-        )
+        if task.status == "running" and task.current_run_id:
+            active_lifecycle_phase = kanban_db._retry_status_for_run(
+                conn, task.id, task.current_run_id,
+            )
+        elif task.status == "blocked":
+            active_lifecycle_phase = kanban_db._resume_status_from_events(conn, task.id)
     if active_lifecycle_phase is not None:
         d["active_lifecycle_phase"] = active_lifecycle_phase
     return d
@@ -208,8 +209,16 @@ def _active_lifecycle_phases(
         for task in tasks
         if task.status == "running" and task.current_run_id
     }
+    phases: dict[str, str] = {
+        task.id: "review"
+        for task in tasks
+        if (
+            task.status == "blocked"
+            and kanban_db._resume_status_from_events(conn, task.id) == "review"
+        )
+    }
     if not current:
-        return {}
+        return phases
     ids = list(current)
     run_ids = list(current.values())
     rows = conn.execute(
@@ -219,7 +228,6 @@ def _active_lifecycle_phases(
         "AND kind = 'claimed' ORDER BY id DESC",
         (*ids, *run_ids),
     ).fetchall()
-    phases: dict[str, str] = {}
     for row in rows:
         task_id = row["task_id"]
         if task_id in phases or int(row["run_id"] or 0) != current.get(task_id):
@@ -642,7 +650,11 @@ def _apply_status(conn, task_id: str, s: str, p, unknown_detail: str) -> bool:
                         conn, task_id, current.current_run_id,
                     ) == "review"
                 )
-            )
+                or (
+                    current.status == "blocked"
+                    and kanban_db._resume_status_from_events(conn, task_id) == "review"
+                )
+        )
         )
         if (
             current

@@ -456,6 +456,92 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
         assert grandchild is not None and grandchild.status == "todo"
 
 
+def test_dashboard_blocked_same_card_review_uses_review_phase(client, tmp_path):
+    repo = tmp_path / "review-repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "dashboard@example.invalid")
+    git("config", "user.name", "Dashboard Test")
+    (repo / "README").write_text("base\n", encoding="utf-8")
+    git("add", "README")
+    git("commit", "-qm", "base")
+    head_sha = git("rev-parse", "HEAD")
+
+    with kbc.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="blocked dashboard review",
+            assignee="builder",
+            initial_status="blocked",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "same_card",
+                "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        )
+        with kb.write_txn(conn):
+            implementation_run_id = kb._synthesize_ended_run(
+                conn,
+                task_id,
+                outcome="review_requested",
+                summary="ready for review",
+                metadata={
+                    "base_sha": head_sha,
+                    "head_sha": head_sha,
+                    "workspace_path": str(repo),
+                },
+            )
+            conn.execute(
+                "UPDATE tasks SET assignee = 'reviewer', candidate_run_id = ? WHERE id = ?",
+                (implementation_run_id, task_id),
+            )
+            kb._append_event(
+                conn,
+                task_id,
+                "blocked",
+                {
+                    "reason": "maintainer input required",
+                    "kind": "needs_input",
+                    "source_status": "review",
+                },
+            )
+
+    board = client.get("/api/plugins/kanban/board").json()
+    blocked_card = next(
+        task
+        for column in board["columns"]
+        for task in column["tasks"]
+        if task["id"] == task_id
+    )
+    assert blocked_card["status"] == "blocked"
+    assert blocked_card["active_lifecycle_phase"] == "review"
+    detail = client.get(f"/api/plugins/kanban/tasks/{task_id}").json()["task"]
+    assert detail["active_lifecycle_phase"] == "review"
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={
+            "status": "done",
+            "summary": "approved after escalation",
+            "verdict": "APPROVE",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["task"]["status"] == "done"
+
+
 def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
     with kbc.connect() as conn:
         task_id = kb.create_task(conn, title="active review", assignee="reviewer")
