@@ -23,7 +23,13 @@ import uuid
 
 RUNTIME_IDENTITY_PROTOCOL = 1
 _BOOTSTRAP_TIMEOUT_SECONDS = 10.0
-_IDENTITY_ROOTS = ("hermes_cli", "tools", "agent", "gateway", "plugins")
+_IDENTITY_ROOTS = ("hermes_cli", "tools", "agent", "gateway", "plugins", "providers", "cron")
+_BOOTSTRAP_INPUT_ENV = (
+    "HERMES_KANBAN_BOOTSTRAP_PATH",
+    "HERMES_KANBAN_PREPARATION_ID",
+    "HERMES_KANBAN_EXPECTED_RUNTIME",
+    "HERMES_KANBAN_BOOTSTRAP_WAIT",
+)
 
 
 class RuntimeIdentityError(RuntimeError):
@@ -332,6 +338,8 @@ def worker_bootstrap_from_env() -> Optional[dict[str, Any]]:
         raise RuntimeIdentityError("worker runtime identity mismatch")
     if os.environ.get("HERMES_KANBAN_BOOTSTRAP_WAIT", "1").lower() in {"0", "false", "no", "off"}:
         os.environ["HERMES_KANBAN_RUNTIME_GRANTED"] = "1"
+        for key in _BOOTSTRAP_INPUT_ENV:
+            os.environ.pop(key, None)
         return payload
     grant_queue: queue.Queue[Optional[str]] = queue.Queue(maxsize=1)
 
@@ -361,6 +369,8 @@ def worker_bootstrap_from_env() -> Optional[dict[str, Any]]:
     if grant.get("claim_lock"):
         os.environ["HERMES_KANBAN_CLAIM_LOCK"] = str(grant["claim_lock"])
     os.environ["HERMES_KANBAN_RUNTIME_GRANTED"] = "1"
+    for key in _BOOTSTRAP_INPUT_ENV:
+        os.environ.pop(key, None)
     return payload
 
 

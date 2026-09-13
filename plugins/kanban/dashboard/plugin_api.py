@@ -675,7 +675,25 @@ def _patch_title_body(conn, task_id: str, payload: UpdateTaskBody, board: Option
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn):
-        _require_task(conn, task_id)
+        current = _require_task(conn, task_id)
+        sent = getattr(payload, "model_fields_set", getattr(payload, "__fields_set__", set()))
+        if "title" in sent and (payload.title is None or not payload.title.strip()):
+            raise HTTPException(status_code=400, detail="title cannot be empty")
+        if payload.status == "done":
+            contract = current.lifecycle_contract or {}
+            if contract.get("kind") in {"review", "validation"}:
+                goal_changed = (
+                    ("title" in sent and payload.title.strip() != current.title)
+                    or ("body" in sent and payload.body != current.body)
+                    or (
+                        "lifecycle_contract" in sent
+                        and payload.lifecycle_contract != current.lifecycle_contract
+                    )
+                )
+                if goal_changed:
+                    raise _conflict(
+                        "completion and typed role goal edits must be separate requests"
+                    )
         # For a combined assignee+review patch, request_review must capture the
         # current implementer before the task is routed to the reviewer.
         review_assignee_deferred = payload.status == "review" and payload.assignee is not None
@@ -691,7 +709,6 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 _require_ok(ok)
         if payload.priority is not None:
             _set_priority(conn, task_id, payload.priority, board)
-        sent = getattr(payload, "model_fields_set", getattr(payload, "__fields_set__", set()))
         if {"title", "body", "lifecycle_contract"} & set(sent):
             _patch_title_body(conn, task_id, payload, board)
         updated = kanban_db.get_task(conn, task_id)
