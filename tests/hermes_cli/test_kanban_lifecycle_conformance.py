@@ -789,6 +789,40 @@ class KanbanLifecycleConformance(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(event)
 
+    def test_preclaim_spawn_failures_trip_the_dispatcher_breaker(self) -> None:
+        task_id = kb.create_task(
+            self.conn,
+            title="retry failed bootstrap",
+            assignee="implementer",
+            initial_status="blocked",
+        )
+        self.assertTrue(kb.unblock_task(self.conn, task_id))
+        with patch.object(kbd, "_profile_exists_fn", return_value=None), patch.object(
+            kbd, "_default_spawn", side_effect=RuntimeError("bootstrap unavailable"),
+        ):
+            first = kbd.dispatch_once(
+                self.conn,
+                max_spawn=1,
+                failure_limit=2,
+                reconcile_orphans=False,
+            )
+            second = kbd.dispatch_once(
+                self.conn,
+                max_spawn=1,
+                failure_limit=2,
+                reconcile_orphans=False,
+            )
+
+        self.assertEqual(first.auto_blocked, [])
+        self.assertEqual(second.auto_blocked, [task_id])
+        current = self._task(task_id)
+        self.assertEqual(current.status, "blocked")
+        self.assertEqual(current.consecutive_failures, 2)
+        self.assertTrue(
+            any(event.kind == "gave_up" for event in kb.list_events(self.conn, task_id))
+        )
+
+
     def test_dispatcher_and_recovery_use_the_same_dependency_boundary(self) -> None:
         task_id = kb.create_task(
             self.conn,

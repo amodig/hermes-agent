@@ -1668,6 +1668,14 @@ def _dispatch_lane_task(
                     "spawn_refused",
                     {"phase": "runtime_identity", "error": str(exc)[:1000]},
                 )
+            if _record_task_failure(
+                conn,
+                task_id,
+                str(exc),
+                outcome="spawn_failed",
+                failure_limit=failure_limit,
+            ):
+                result.auto_blocked.append(task_id)
             return False
     else:
         claim = _kb.claim_review_task if lane == "review" else _kb.claim_task

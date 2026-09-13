@@ -3431,6 +3431,48 @@ def _validate_children_graph(children: list) -> None:
             if isinstance(contract, dict)
             else ""
         )
+        if kind == "code":
+            review_children = [
+                role_idx
+                for role_idx, role in enumerate(children)
+                if (
+                    isinstance(role.get("lifecycle_contract"), dict)
+                    and str(
+                        role["lifecycle_contract"].get("kind") or ""
+                    ).strip().casefold() == "review"
+                    and role["lifecycle_contract"].get("candidate_task_index") == idx
+                )
+            ]
+            review_mode = str(contract.get("review_mode") or "").strip().casefold()
+            if review_mode == "separate_card":
+                if len(review_children) != 1:
+                    raise ValueError(
+                        f"child[{idx}] separate-card code contract requires exactly one review child"
+                    )
+            elif review_children:
+                raise ValueError(
+                    f"child[{idx}] same-card code contract must not have a review child"
+                )
+            validation_children = [
+                role_idx
+                for role_idx, role in enumerate(children)
+                if (
+                    isinstance(role.get("lifecycle_contract"), dict)
+                    and str(
+                        role["lifecycle_contract"].get("kind") or ""
+                    ).strip().casefold() == "validation"
+                    and role["lifecycle_contract"].get("candidate_task_index") == idx
+                )
+            ]
+            if bool(contract.get("validation_required")):
+                if len(validation_children) != 1:
+                    raise ValueError(
+                        f"child[{idx}] code contract requires exactly one validation child"
+                    )
+            elif validation_children:
+                raise ValueError(
+                    f"child[{idx}] code contract must not have a validation child"
+                )
         if kind in {"review", "validation"}:
             candidate_idx = contract.get("candidate_task_index")
             if (

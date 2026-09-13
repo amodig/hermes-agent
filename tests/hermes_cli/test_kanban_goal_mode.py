@@ -146,7 +146,8 @@ class TestCLIJudgeGate:
     """
 
     def _run(self, monkeypatch, *, goal_mode=True, judge_available=True,
-             verdict="done", reason="", complete_ok=True, summary="done"):
+             verdict="done", reason="", complete_ok=True, complete_error=None,
+             summary="done"):
         import argparse
         import types
         from unittest.mock import MagicMock
@@ -169,6 +170,8 @@ class TestCLIJudgeGate:
 
         def fake_complete_task(conn, tid, **kw):
             complete_calls.append(tid)
+            if complete_error is not None:
+                raise complete_error
             return complete_ok
 
         monkeypatch.setattr("hermes_cli.kanban.kb.get_task", lambda conn, tid: fake_task)
@@ -224,3 +227,15 @@ class TestCLIJudgeGate:
         assert complete_calls == [], "an unachievable goal must never reach complete_task"
         assert "unachievable" in err.lower()
         assert "kanban block" in err.lower()
+
+    def test_handoff_validation_is_rendered_as_cli_error(self, monkeypatch, capsys):
+        rc, complete_calls = self._run(
+            monkeypatch,
+            goal_mode=False,
+            complete_error=kb.HandoffValidationError("t1", "head_sha is required"),
+        )
+        err = capsys.readouterr().err.lower()
+        assert rc != 0
+        assert complete_calls == ["t1"]
+        assert "immutable handoff" in err
+        assert "traceback" not in err

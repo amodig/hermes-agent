@@ -1006,7 +1006,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     "goal or remove the implementation patch before retrying."
                 )
                 return False
-            except kb.LifecycleEvidenceError as exc:
+            except (kb.HandoffValidationError, kb.LifecycleEvidenceError) as exc:
                 fail_msg[tid] = f"kanban: lifecycle completion of {tid} blocked: {exc}"
                 return False
 
