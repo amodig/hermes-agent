@@ -386,6 +386,8 @@ class KanbanLifecycleConformance(unittest.TestCase):
         self.assertTrue(promoted)
         self.assertIsNone(reason)
         self.assertEqual(self._task(child).status, "ready")
+        claimed = kb.claim_task(self.conn, child, claimer="operator")
+        self.assertIsNotNone(claimed)
 
 
     def test_deletion_protects_review_parent_of_validation(self) -> None:

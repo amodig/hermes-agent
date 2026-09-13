@@ -96,6 +96,17 @@ def _claim_rejected_for_snapshot(
     )
 
 
+def _forced_promotion_active(conn: sqlite3.Connection, task_id: str) -> bool:
+    row = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return bool(
+        row is not None
+        and _kb._row_get(row, "kind") == "promoted_manual"
+        and _kb._json_dict(_kb._row_get(row, "payload")).get("forced") is True
+    )
+
 def _claim_and_open_run(
     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
     *, event_extra: Optional[dict] = None, runtime_claim: Optional[dict[str, Any]] = None,
@@ -197,7 +208,7 @@ def claim_task(
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
         dependencies = evaluate_dependencies(conn, task_id)
-        if not dependencies["satisfied"]:
+        if not dependencies["satisfied"] and not _forced_promotion_active(conn, task_id):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'", (task_id,),
@@ -245,7 +256,7 @@ def claim_review_task(
             _record_parent_handoff_start_error(conn, task_id, handoff_error)
             return None
         dependencies = evaluate_dependencies(conn, task_id)
-        if not dependencies["satisfied"]:
+        if not dependencies["satisfied"] and not _forced_promotion_active(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'review' AND claim_lock IS NULL", (task_id,),
