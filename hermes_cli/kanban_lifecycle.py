@@ -507,12 +507,15 @@ def get_lifecycle_state(conn: sqlite3.Connection, task_id: str) -> dict[str, Any
         validation_id = None
     if role_conflict:
         state["diagnostics"].append("role_conflict")
+    review_accepted = False
     if review_id:
         if review_id == task_id:
             verdict, lifecycle, error = _verdict_for(conn, task_id, "review")
+            review_accepted = verdict == "APPROVE" and row["status"] == "done"
         else:
             review_state = get_lifecycle_state(conn, review_id)
             verdict, lifecycle, error = review_state["review_verdict"], None, None
+            review_accepted = review_state["acceptance"] == "accepted"
             if verdict:
                 rows = _evidence_rows(conn, review_id, "review")
                 lifecycle = rows[0][1] if rows else None
@@ -528,17 +531,19 @@ def get_lifecycle_state(conn: sqlite3.Connection, task_id: str) -> dict[str, Any
                 state["diagnostics"].append(reason)
                 if verdict == "APPROVE":
                     state["acceptance"] = "stale"
+                    review_accepted = False
+    validation_accepted = not contract.get("validation_required")
     if contract.get("validation_required"):
         if validation_id:
             validation_state = get_lifecycle_state(conn, validation_id)
             state["validation_verdict"] = validation_state["validation_verdict"]
             state["diagnostics"].extend(validation_state.get("diagnostics") or [])
+            validation_accepted = validation_state["acceptance"] == "accepted"
         else:
             state["diagnostics"].append("candidate_missing")
-    required_review_ok = state["review_verdict"] == "APPROVE"
-    required_validation_ok = (
-        not contract.get("validation_required") or state["validation_verdict"] == "PASS"
-    )
+            validation_accepted = False
+    required_review_ok = review_accepted
+    required_validation_ok = validation_accepted
     if row["status"] == "archived":
         state["acceptance"] = "stale"
     elif state["diagnostics"] and any(
