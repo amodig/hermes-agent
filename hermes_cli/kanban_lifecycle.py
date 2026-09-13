@@ -659,7 +659,7 @@ def evaluate_dependencies(conn: sqlite3.Connection, task_id: str) -> dict[str, A
                 (task_id,),
             ).fetchall()
             for row in review_rows:
-                parent_contract = decode_contract(row["lifecycle_contract"])
+                parent_contract = safe_decode_contract(row["lifecycle_contract"])
                 if (
                     parent_contract
                     and parent_contract.get("kind") == "review"
