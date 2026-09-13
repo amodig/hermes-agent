@@ -19,7 +19,6 @@ from hermes_cli.kanban_db_lifecycle_evidence import (
     _completion_contract_snapshot,
     _emit_acceptance_changes,
     _implementation_routing,
-    _stamp_lifecycle_metadata,
 )
 from hermes_cli.kanban_db_lifecycle_rework import _prior_reviewer
 from hermes_cli.kanban_lifecycle import LifecycleEvidenceError, get_lifecycle_state
@@ -27,6 +26,28 @@ from hermes_cli.kanban_lifecycle import LifecycleEvidenceError, get_lifecycle_st
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
+
+def _finish_synthetic_run(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    *,
+    outcome: str,
+    summary: Optional[str],
+    metadata: Optional[dict],
+) -> None:
+    conn.execute(
+        "UPDATE task_runs SET status = ?, outcome = ?, summary = ?, metadata = ? "
+        "WHERE id = ? AND task_id = ?",
+        (
+            outcome,
+            outcome,
+            summary,
+            _kb._json_or_null(metadata),
+            run_id,
+            task_id,
+        ),
+    )
 
 def _completion_modes(
     conn: sqlite3.Connection,
@@ -114,9 +135,11 @@ def _commit_completion(
     handoff_summary: Optional[str],
     summary: Optional[str],
     result: Optional[str],
+    verdict: Optional[str],
 ) -> tuple[bool, Optional[int], Optional[Exception]]:
     contract_err: Optional[_kb.CompletionContractError] = None
     run_id: Optional[int] = None
+    synthetic_run_id: Optional[int] = None
     with _kb.write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
@@ -152,6 +175,40 @@ def _commit_completion(
                     {"reason": error.reason}, run_id=expected_run_id,
                 )
                 return False, None, error
+            if typed_phase is not None:
+                stamp_run_id = expected_run_id or _kb._current_run_id(conn, task_id)
+                if stamp_run_id is None:
+                    synthetic_run_id = _kb._synthesize_ended_run(
+                        conn,
+                        task_id,
+                        outcome="review_requested" if same_card_handoff else "completed",
+                        summary=handoff_summary,
+                        metadata=metadata,
+                    )
+                    stamp_run_id = synthetic_run_id
+                try:
+                    metadata = _kb._stamp_lifecycle_metadata(
+                        conn,
+                        task_id,
+                        metadata,
+                        phase=typed_phase,
+                        run_id=stamp_run_id,
+                        verdict=verdict,
+                    )
+                except LifecycleEvidenceError as error:
+                    if synthetic_run_id is not None:
+                        conn.execute(
+                            "DELETE FROM task_runs WHERE id = ? AND task_id = ?",
+                            (synthetic_run_id, task_id),
+                        )
+                    _kb._append_event(
+                        conn,
+                        task_id,
+                        "completion_blocked_lifecycle",
+                        {"reason": str(error)},
+                        run_id=expected_run_id,
+                    )
+                    return False, None, error
             prior_status = _kb._task_status(conn, task_id)
             implementation_routing = _implementation_routing(conn, task_id)
             target_status = (
@@ -195,6 +252,11 @@ def _commit_completion(
                 sql += " AND current_run_id = ?"
                 params = (*params, int(expected_run_id))
             if conn.execute(sql, params).rowcount != 1:
+                if synthetic_run_id is not None:
+                    conn.execute(
+                        "DELETE FROM task_runs WHERE id = ? AND task_id = ?",
+                        (synthetic_run_id, task_id),
+                    )
                 return False, None, None
             if same_card_changes:
                 conn.execute("UPDATE tasks SET candidate_run_id = NULL WHERE id = ?", (task_id,))
@@ -225,8 +287,18 @@ def _commit_completion(
                 summary=handoff_summary,
                 metadata=metadata,
             )
+            if synthetic_run_id is not None:
+                run_id = synthetic_run_id
+                _finish_synthetic_run(
+                    conn,
+                    task_id,
+                    run_id,
+                    outcome=run_outcome,
+                    summary=handoff_summary,
+                    metadata=metadata,
+                )
             # Never-claimed task: synthesize a run so the handoff fields survive.
-            if run_id is None and (summary or metadata or result or prior_status == "review"):
+            elif run_id is None and (summary or metadata or result or prior_status == "review"):
                 synth_summary, synth_metadata = handoff_summary, metadata
                 if prior_status == "review" and not synth_summary and not synth_metadata:
                     synth_summary = _kb._REVIEW_APPROVED_NOTE
@@ -362,26 +434,6 @@ def complete_task(
                 {"reason": error.reason}, run_id=expected_run_id,
             )
         raise
-    if typed_phase is not None:
-        try:
-            metadata = _kb._stamp_lifecycle_metadata(
-                conn,
-                task_id,
-                metadata,
-                phase=typed_phase,
-                run_id=expected_run_id or (task_before.current_run_id if task_before else None),
-                verdict=verdict,
-            )
-        except LifecycleEvidenceError as error:
-            with _kb.write_txn(conn):
-                _kb._append_event(
-                    conn,
-                    task_id,
-                    "completion_blocked_lifecycle",
-                    {"reason": str(error)},
-                    run_id=expected_run_id,
-                )
-            raise
     handoff_summary = summary if summary is not None else result
     committed, run_id, boundary_error = _commit_completion(
         conn,
@@ -398,6 +450,7 @@ def complete_task(
         handoff_summary=handoff_summary,
         summary=summary,
         result=result,
+        verdict=verdict,
     )
     if boundary_error is not None:
         raise boundary_error
@@ -759,24 +812,8 @@ def request_review(
                 {"reason": error.reason},
             )
         return _ret(False, str(error))
-    if typed_code:
-        try:
-            metadata = _stamp_lifecycle_metadata(
-                conn,
-                task_id,
-                metadata,
-                phase="implementation",
-                run_id=expected_run_id or (task_before.current_run_id if task_before else None),
-                verdict=None,
-            )
-        except LifecycleEvidenceError as error:
-            with _kb.write_txn(conn):
-                _kb._append_event(
-                    conn, task_id, "completion_blocked_lifecycle", {"reason": str(error)},
-                    run_id=expected_run_id,
-                )
-            return _ret(False, str(error))
     contract_err: Optional[_kb.CompletionContractError] = None
+    synthetic_run_id: Optional[int] = None
     with _kb.write_txn(conn):
         if _completion_contract_snapshot(conn, task_id) != preflight_contract:
             contract_err = _kb.CompletionContractError(
@@ -822,6 +859,38 @@ def request_review(
                         "malformed); pass reviewer= explicitly",
                     )
             reviewer = _kb._canonical_assignee(reviewer)
+            if typed_code:
+                stamp_run_id = expected_run_id or trow["current_run_id"]
+                if stamp_run_id is None:
+                    synthetic_run_id = _kb._synthesize_ended_run(
+                        conn,
+                        task_id,
+                        outcome="review_requested",
+                        summary=summary,
+                        metadata=metadata,
+                    )
+                    stamp_run_id = synthetic_run_id
+                try:
+                    metadata = _kb._stamp_lifecycle_metadata(
+                        conn,
+                        task_id,
+                        metadata,
+                        phase="implementation",
+                        run_id=stamp_run_id,
+                        verdict=None,
+                    )
+                except LifecycleEvidenceError as error:
+                    if synthetic_run_id is not None:
+                        conn.execute(
+                            "DELETE FROM task_runs WHERE id = ? AND task_id = ?",
+                            (synthetic_run_id, task_id),
+                        )
+                    _kb._append_event(
+                        conn, task_id, "completion_blocked_lifecycle", {"reason": str(error)},
+                        run_id=expected_run_id,
+                    )
+                    return _ret(False, str(error))
+
             assignee_sql = ", assignee = ?" if reviewer is not None else ""
             run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
             params: tuple[Any, ...] = (
@@ -843,13 +912,29 @@ def request_review(
                 params,
             )
             if cur.rowcount != 1:
+                if synthetic_run_id is not None:
+                    conn.execute(
+                        "DELETE FROM task_runs WHERE id = ? AND task_id = ?",
+                        (synthetic_run_id, task_id),
+                    )
                 return _ret(
                     False, "task is not in running/ready (or expected_run_id did not match the current run)",
                 )
-            run_id = _kb._end_or_synthesize_run(
-                conn, task_id, outcome="review_requested", status="review",
-                summary=summary, metadata=metadata, synthesize=bool(summary or metadata),
-            )
+            if synthetic_run_id is not None:
+                run_id = synthetic_run_id
+                _finish_synthetic_run(
+                    conn,
+                    task_id,
+                    run_id,
+                    outcome="review_requested",
+                    summary=summary,
+                    metadata=metadata,
+                )
+            else:
+                run_id = _kb._end_or_synthesize_run(
+                    conn, task_id, outcome="review_requested", status="review",
+                    summary=summary, metadata=metadata, synthesize=bool(summary or metadata),
+                )
             lifecycle = metadata.get("lifecycle") if isinstance(metadata, dict) else None
             if isinstance(lifecycle, dict):
                 conn.execute(

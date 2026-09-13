@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import kanban_db as _kb
@@ -351,8 +352,22 @@ def _prepare_completion_handoff(
         raise _kb.HandoffValidationError(task_id, "base_sha is required")
     if not head:
         raise _kb.HandoffValidationError(task_id, "head_sha is required")
-    branch = str(supplied.get("branch_name") or task.branch_name or "").strip() or None
-    workspace = str(supplied.get("workspace_path") or task.workspace_path or "").strip()
+    assigned_branch = str(task.branch_name or "").strip() or None
+    branch = str(supplied.get("branch_name") or assigned_branch or "").strip() or None
+    assigned_workspace = str(task.workspace_path or "").strip()
+    workspace = str(supplied.get("workspace_path") or assigned_workspace).strip()
+    if assigned_branch and branch != assigned_branch:
+        raise _kb.HandoffValidationError(
+            task_id, f"handoff branch {branch!r} does not match task branch {assigned_branch!r}",
+        )
+    if assigned_workspace and (
+        Path(workspace).expanduser().resolve()
+        != Path(assigned_workspace).expanduser().resolve()
+    ):
+        raise _kb.HandoffValidationError(
+            task_id,
+            f"handoff workspace {workspace!r} does not match task workspace {assigned_workspace!r}",
+        )
     snapshot = _kb._git_snapshot(workspace, branch)
     if snapshot is None:
         raise _kb.HandoffValidationError(
