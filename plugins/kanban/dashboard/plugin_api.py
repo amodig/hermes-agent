@@ -745,6 +745,14 @@ def _patch_title_body(conn, task_id: str, payload: UpdateTaskBody, board: Option
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn):
         current = _require_task(conn, task_id)
+        if (
+            payload.expected_version is not None
+            and payload.expected_version != current.version
+        ):
+            raise _conflict(
+                f"task {task_id} update conflict: expected version "
+                f"{payload.expected_version}, current version {current.version}"
+            )
         sent = getattr(payload, "model_fields_set", getattr(payload, "__fields_set__", set()))
         if "title" in sent and (payload.title is None or not payload.title.strip()):
             raise HTTPException(status_code=400, detail="title cannot be empty")

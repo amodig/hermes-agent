@@ -97,10 +97,11 @@ def _claim_rejected_for_snapshot(
 
 
 def _forced_promotion_active(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Keep a forced promotion live across assignment bookkeeping only."""
+    """Keep a forced promotion live until a claim succeeds."""
     row = conn.execute(
         "SELECT kind, payload FROM task_events "
-        "WHERE task_id = ? AND kind != 'assigned' ORDER BY id DESC LIMIT 1",
+        "WHERE task_id = ? AND kind IN ('promoted_manual', 'claimed') "
+        "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     return bool(
@@ -108,6 +109,7 @@ def _forced_promotion_active(conn: sqlite3.Connection, task_id: str) -> bool:
         and _kb._row_get(row, "kind") == "promoted_manual"
         and _kb._json_dict(_kb._row_get(row, "payload")).get("forced") is True
     )
+
 
 def _claim_and_open_run(
     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,

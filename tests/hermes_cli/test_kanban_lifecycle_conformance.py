@@ -441,6 +441,29 @@ class KanbanLifecycleConformance(unittest.TestCase):
         self.assertIsNotNone(claimed)
 
 
+    def test_force_promotion_survives_preclaim_event(self) -> None:
+        parent = kb.create_task(
+            self.conn,
+            title="unfinished parent",
+            initial_status="blocked",
+        )
+        child = kb.create_task(
+            self.conn,
+            title="manually promoted child",
+            initial_status="blocked",
+            parents=(parent,),
+        )
+        promoted, reason = kb.promote_task(
+            self.conn, child, actor="operator", reason="override", force=True,
+        )
+        self.assertTrue(promoted)
+        self.assertIsNone(reason)
+        with kb.write_txn(self.conn):
+            kb._append_event(
+                self.conn, child, "respawn_guarded", {"reason": "recent_success"},
+            )
+        self.assertIsNotNone(kb.claim_task(self.conn, child, claimer="operator"))
+
     def test_deletion_protects_review_parent_of_validation(self) -> None:
         implementation = kb.create_task(
             self.conn,

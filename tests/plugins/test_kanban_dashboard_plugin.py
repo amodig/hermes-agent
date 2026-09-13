@@ -274,6 +274,33 @@ def test_patch_review_lifecycle_preserves_handoff_and_reopens(client):
         )
 
 
+def test_patch_expected_version_rejects_side_effects(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "before", "assignee": "old"},
+    ).json()["task"]
+    stale_version = task["version"]
+
+    refreshed = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"title": "fresh title"},
+    )
+    assert refreshed.status_code == 200, refreshed.text
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "expected_version": stale_version,
+            "assignee": "new",
+            "title": "stale title",
+        },
+    )
+    assert response.status_code == 409
+    current = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
+    assert current["assignee"] == "old"
+    assert current["title"] == "fresh title"
+
+
 def test_reopening_parent_demotes_ready_child(client):
     """Reopening a completed parent must invalidate ready children immediately.
 
