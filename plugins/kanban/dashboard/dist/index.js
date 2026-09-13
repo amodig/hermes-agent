@@ -197,6 +197,27 @@
   function dialogLabelForCount(count, t) {
     return count && count > 1 ? tx(t, "selectedTasks", "{n} selected tasks", { n: count }) : tx(t, "thisTask", "this task");
   }
+  function promptLifecycleVerdict(task, label) {
+    const kind = task && task.lifecycle_contract && task.lifecycle_contract.kind;
+    if (kind !== "review" && kind !== "validation") {
+      return { confirmed: true, verdict: null };
+    }
+    const choices = kind === "review"
+      ? ["APPROVE", "REQUEST_CHANGES"]
+      : ["PASS", "FAIL"];
+    const value = window.prompt(
+      `Lifecycle verdict for ${label} (${choices.join(" / ")}):`,
+      choices[0],
+    );
+    if (value === null) return { confirmed: false, verdict: null };
+    const verdict = value.trim().toUpperCase();
+    if (choices.indexOf(verdict) === -1) {
+      window.alert(`Use ${choices.join(" or ")}.`);
+      return { confirmed: false, verdict: null };
+    }
+    return { confirmed: true, verdict };
+  }
+
 
   /**
    * Hook owning the kanban plugin's modal dialog state. Returns
@@ -822,11 +843,15 @@
     //   taskId  — required when count <= 1 (single-task PATCH endpoint)
     //           — ignored when count >  1 (bulk endpoint uses selectedIds)
     //   summary — completion summary string, or null/undefined to skip
-    const performMoveTask = useCallback(function (taskId, newStatus, count, summary) {
+    //   verdict — typed review/validation verdict, or null/undefined to skip
+    const performMoveTask = useCallback(function (taskId, newStatus, count, summary, verdict) {
       const patch = { status: newStatus };
-      const finalPatch = summary
-        ? Object.assign({}, patch, { result: summary, summary: summary })
-        : patch;
+      const finalPatch = Object.assign(
+        {},
+        patch,
+        summary ? { result: summary, summary: summary } : {},
+        verdict ? { verdict: verdict } : {},
+      );
       if (count > 1) {
         // Bulk path: optimistic UI prepends all moved tasks to dest column.
         setBoardData(function (b) {
@@ -937,10 +962,51 @@
       }
       return Promise.resolve({ confirmed: true, summary: summary });
     }, [t]);
+    const findBoardTask = useCallback(function (taskId) {
+      for (const column of (boardData && boardData.columns) || []) {
+        const task = (column.tasks || []).find(function (item) { return item.id === taskId; });
+        if (task) return task;
+      }
+      return null;
+    }, [boardData]);
 
-    // Single-task card move. Drives confirmation + completion summary
-    // dialogs via the hook, then dispatches via performMoveTask.
+    const requestCompletionVerdict = useCallback(function (task, count) {
+      return Promise.resolve(promptLifecycleVerdict(task, dialogLabelForCount(count, t)));
+    }, [t]);
+
+    const lifecycleCompletionTask = useCallback(function (ids) {
+      const tasks = Array.from(ids).map(findBoardTask);
+      const kinds = new Set(tasks.map(function (task) {
+        return (task && task.lifecycle_contract && task.lifecycle_contract.kind) || "general";
+      }));
+      const verdictKinds = Array.from(kinds).filter(function (kind) {
+        return kind === "review" || kind === "validation";
+      });
+      if (verdictKinds.length && (verdictKinds.length !== 1 || kinds.size !== 1)) {
+        return { invalid: true, task: null };
+      }
+      const task = verdictKinds.length
+        ? tasks.find(function (item) {
+          return item && item.lifecycle_contract
+            && item.lifecycle_contract.kind === verdictKinds[0];
+        })
+        : null;
+      return { invalid: false, task };
+    }, [findBoardTask]);
+
+
+    // Single-task card move. Drives confirmation, completion summary, and
+    // typed lifecycle verdict dialogs before dispatching the PATCH.
     const moveTask = useCallback(function (taskId, newStatus) {
+      let completionTask = null;
+      if (newStatus === "done") {
+        const completion = lifecycleCompletionTask(new Set([taskId]));
+        if (completion.invalid) {
+          setError(tx(t, "mixedLifecycleBulk", "Complete review and validation cards separately."));
+          return;
+        }
+        completionTask = completion.task;
+      }
       requestMoveConfirm(newStatus, 1)
         .then(function (r1) {
           if (!r1.confirmed) return null;
@@ -950,11 +1016,21 @@
           }
           return requestCompletionSummary(1).then(function (r2) {
             if (!r2.confirmed) return null;
-            performMoveTask(taskId, newStatus, 1, r2.summary || null);
+            return requestCompletionVerdict(completionTask, 1).then(function (r3) {
+              if (!r3.confirmed) return null;
+              performMoveTask(taskId, newStatus, 1, r2.summary || null, r3.verdict || null);
+            });
           });
         })
         .catch(function () { /* dialog cancelled */ });
-    }, [requestMoveConfirm, requestCompletionSummary, performMoveTask]);
+    }, [
+      lifecycleCompletionTask,
+      requestMoveConfirm,
+      requestCompletionSummary,
+      requestCompletionVerdict,
+      performMoveTask,
+      t,
+    ]);
 
     const clearSelected = useCallback(function () {
       setSelectedIds(new Set());
@@ -965,6 +1041,15 @@
       if (selectedIds.size === 0) return;
       const count = selectedIds.size;
       const taskId = Array.from(selectedIds)[0]; // representative id for performMoveTask's single-task branch
+      let completionTask = null;
+      if (newStatus === "done") {
+        const completion = lifecycleCompletionTask(selectedIds);
+        if (completion.invalid) {
+          setError(tx(t, "mixedLifecycleBulk", "Complete review and validation cards separately."));
+          return;
+        }
+        completionTask = completion.task;
+      }
       requestMoveConfirm(newStatus, count)
         .then(function (r1) {
           if (!r1.confirmed) return null;
@@ -974,11 +1059,22 @@
           }
           return requestCompletionSummary(count).then(function (r2) {
             if (!r2.confirmed) return null;
-            performMoveTask(taskId, newStatus, count, r2.summary || null);
+            return requestCompletionVerdict(completionTask, count).then(function (r3) {
+              if (!r3.confirmed) return null;
+              performMoveTask(taskId, newStatus, count, r2.summary || null, r3.verdict || null);
+            });
           });
         })
         .catch(function () { /* dialog cancelled */ });
-    }, [selectedIds, requestMoveConfirm, requestCompletionSummary, performMoveTask]);
+    }, [
+      selectedIds,
+      lifecycleCompletionTask,
+      requestMoveConfirm,
+      requestCompletionSummary,
+      requestCompletionVerdict,
+      performMoveTask,
+      t,
+    ]);
 
     const createTask = useCallback(function (body) {
       return SDK.fetchJSON(withBoard(`${API}/tasks`, board), {
@@ -1076,8 +1172,17 @@
     const applyBulk = useCallback(function (patch, confirmMsg) {
       if (selectedIds.size === 0) return;
       const count = selectedIds.size;
-      const run = function () {
-        const finalPatch = patch;
+      let completionTask = null;
+      if (patch.status === "done") {
+        const completion = lifecycleCompletionTask(selectedIds);
+        if (completion.invalid) {
+          setError(tx(t, "mixedLifecycleBulk", "Complete review and validation cards separately."));
+          return;
+        }
+        completionTask = completion.task;
+      }
+      const run = function (verdict) {
+        const finalPatch = verdict ? Object.assign({}, patch, { verdict }) : patch;
         const body = Object.assign({ ids: Array.from(selectedIds) }, finalPatch);
         // Optimistic UI for status moves (same pattern as moveSelected).
         if (finalPatch.status) {
@@ -1122,8 +1227,17 @@
             loadBoard();
           });
       };
+      const runWithVerdict = function () {
+        if (!completionTask) {
+          run(null);
+          return;
+        }
+        requestCompletionVerdict(completionTask, count).then(function (r) {
+          if (r.confirmed) run(r.verdict || null);
+        });
+      };
       if (!confirmMsg) {
-        run();
+        runWithVerdict();
         return;
       }
       kanbanDialogs.request({
@@ -1133,9 +1247,17 @@
         confirmLabel: tx(t, "apply", "Apply"),
         destructive: false,
       }).then(function (r) {
-        if (r.confirmed) run();
+        if (r.confirmed) runWithVerdict();
       }).catch(function () { /* cancelled */ });
-    }, [selectedIds, loadBoard, board, t, kanbanDialogs]);
+    }, [
+      selectedIds,
+      loadBoard,
+      board,
+      t,
+      kanbanDialogs,
+      lifecycleCompletionTask,
+      requestCompletionVerdict,
+    ]);
 
     // --- board switching ----------------------------------------------------
     const switchBoard = useCallback(function (nextSlug) {
@@ -3545,8 +3667,9 @@
       }
     };
 
-    // Local completion-summary prompt used only by doPatch above.
-    // Documented carve-out — see the doPatch comment.
+    // Completion summary and typed lifecycle verdict prompts used by doPatch.
+    // Native prompts remain a documented carve-out until ConfirmDialog supports
+    // validation-state retention.
     function withCompletionSummary(patch) {
       if (!patch || patch.status !== "done") return patch;
       const value = window.prompt(
@@ -3561,7 +3684,16 @@
           "Completion summary is required before marking a task done."));
         return null;
       }
-      return Object.assign({}, patch, { result: summary, summary: summary });
+      const task = data && data.task;
+      const label = task && task.title ? task.title : tx(t, "thisTask", "this task");
+      const decision = promptLifecycleVerdict(task, label);
+      if (!decision.confirmed) return null;
+      return Object.assign(
+        {},
+        patch,
+        { result: summary, summary: summary },
+        decision.verdict ? { verdict: decision.verdict } : {},
+      );
     }
 
     // Triage specifier — calls the auxiliary LLM to flesh out a rough

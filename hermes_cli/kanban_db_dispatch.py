@@ -1732,7 +1732,21 @@ def _apply_default_assignee(
     if dry_run:
         return True
     try:
+        assignee = _kb._canonical_assignee(assignee)
+        if not assignee:
+            return False
         with _kb.write_txn(conn):
+            row = conn.execute(
+                "SELECT lifecycle_contract FROM tasks WHERE id = ? "
+                "AND (assignee IS NULL OR assignee = '')",
+                (task_id,),
+            ).fetchone()
+            _kb._validate_lifecycle_role_identity(
+                conn,
+                _kb.safe_decode_contract(_kb._row_get(row, "lifecycle_contract")),
+                assignee,
+                task_id=task_id,
+            )
             conn.execute(
                 "UPDATE tasks SET assignee = ? WHERE id = ? "
                 "AND (assignee IS NULL OR assignee = '')",
@@ -1745,7 +1759,9 @@ def _apply_default_assignee(
     except Exception:
         _kb._log.debug(
             "kanban dispatch: failed to apply default_assignee=%r to task %s",
-            assignee, task_id, exc_info=True,
+            assignee,
+            task_id,
+            exc_info=True,
         )
         return False
     return True
