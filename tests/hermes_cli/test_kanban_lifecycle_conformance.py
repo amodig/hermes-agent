@@ -319,6 +319,48 @@ class KanbanLifecycleConformance(unittest.TestCase):
             kbd.reap_worker_zombies()
 
 
+    def test_default_dispatch_rejects_changed_execution_snapshot(self) -> None:
+        task_id = kb.create_task(
+            self.conn,
+            title="reject changed worker configuration",
+            assignee="implementer",
+            initial_status="blocked",
+        )
+        self.assertTrue(kb.unblock_task(self.conn, task_id))
+        identity = runtime_identity(RUNTIME_ROOT)
+        cancelled: list[bool] = []
+
+        def fake_default_spawn(task, workspace, *, board=None, defer_grant=False):
+            self.assertTrue(defer_grant)
+            self.assertTrue(kb.assign_task(self.conn, task.id, "replacement"))
+            return kbd.WorkerLaunch(
+                identity.pid,
+                identity.as_dict(),
+                "race-preparation",
+                cancel=lambda: cancelled.append(True),
+            )
+
+        with patch.object(kbd, "_profile_exists_fn", return_value=None), patch.object(
+            kbd, "_default_spawn", side_effect=fake_default_spawn,
+        ):
+            result = kbd.dispatch_once(
+                self.conn,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+
+        current = self._task(task_id)
+        self.assertEqual(result.spawned, [])
+        self.assertEqual(current.status, "ready")
+        self.assertEqual(current.assignee, "replacement")
+        self.assertIsNone(current.current_run_id)
+        self.assertEqual(cancelled, [True])
+        rejected = [
+            event for event in kb.list_events(self.conn, task_id)
+            if event.kind == "claim_rejected"
+        ]
+        self.assertEqual(rejected[-1].payload["reason"], "dispatch_snapshot_changed")
+
     def test_default_dispatch_rejects_child_identity_mismatch(self) -> None:
         task_id = kb.create_task(
             self.conn,

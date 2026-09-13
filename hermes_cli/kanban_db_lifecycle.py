@@ -1034,12 +1034,66 @@ def _runtime_claim_metadata(
         "preparation_id": str(preparation_id),
     }
 
+
+_CLAIM_EXECUTION_FIELDS = (
+    "version",
+    "assignee",
+    "tenant",
+    "workspace_kind",
+    "workspace_path",
+    "branch_name",
+    "max_runtime_seconds",
+    "workflow_template_id",
+    "current_step_key",
+    "skills",
+    "model_override",
+    "provider_override",
+    "reasoning_effort",
+    "goal_mode",
+    "goal_max_turns",
+)
+
+
+def _claim_execution_snapshot(task: Any) -> tuple[Any, ...]:
+    return tuple(
+        tuple(getattr(task, field, None) or ())
+        if field == "skills"
+        else getattr(task, field, None)
+        for field in _CLAIM_EXECUTION_FIELDS
+    )
+
+
+def _claim_snapshot_matches(
+    conn: sqlite3.Connection, task_id: str, expected_task: Any,
+) -> bool:
+    current = _kb.get_task(conn, task_id)
+    return (
+        current is not None
+        and _claim_execution_snapshot(current) == _claim_execution_snapshot(expected_task)
+    )
+
+
+def _claim_rejected_for_snapshot(
+    conn: sqlite3.Connection, task_id: str,
+) -> None:
+    _kb._append_event(
+        conn,
+        task_id,
+        "claim_rejected",
+        {"reason": "dispatch_snapshot_changed"},
+    )
+
+
 def _claim_and_open_run(
     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
     *, event_extra: Optional[dict] = None, runtime_claim: Optional[dict[str, Any]] = None,
+    expected_task: Any = None,
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
     when the CAS lost. Caller holds the txn."""
+    if expected_task is not None and not _claim_snapshot_matches(conn, task_id, expected_task):
+        _claim_rejected_for_snapshot(conn, task_id)
+        return None
     cur = conn.execute(
         f"""
         UPDATE tasks
@@ -1109,6 +1163,7 @@ def claim_task(
     claimer: Optional[str] = None, runtime_identity: Any = None,
     worker_pid: Optional[int] = None, worker_start_time: Optional[int] = None,
     preparation_id: Optional[str] = None,
+    expected_task: Any = None,
 ) -> Optional[_kb.Task]:
     """Atomically transition ``ready -> running``.
 
@@ -1147,7 +1202,8 @@ def claim_task(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
         )
         run_id = _claim_and_open_run(
-            conn, task_id, "ready", lock, expires, now, runtime_claim=runtime_claim,
+            conn, task_id, "ready", lock, expires, now,
+            runtime_claim=runtime_claim, expected_task=expected_task,
         )
         if run_id is None:
             return None
@@ -1160,6 +1216,7 @@ def claim_review_task(
     claimer: Optional[str] = None, runtime_identity: Any = None,
     worker_pid: Optional[int] = None, worker_start_time: Optional[int] = None,
     preparation_id: Optional[str] = None,
+    expected_task: Any = None,
 ) -> Optional[_kb.Task]:
     """Atomic ``review -> running`` (None when lost). Parents are re-checked
     (one may have reopened meanwhile) and a NEW run tracks the reviewer
@@ -1195,7 +1252,8 @@ def claim_review_task(
             return None
         run_id = _claim_and_open_run(
             conn, task_id, "review", lock, expires, now,
-            event_extra={"source_status": "review"}, runtime_claim=runtime_claim,
+            event_extra={"source_status": "review"},
+            runtime_claim=runtime_claim, expected_task=expected_task,
         )
         if run_id is None:
             return None

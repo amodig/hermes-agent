@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from dataclasses import replace
 from dataclasses import field
 from pathlib import Path
 from typing import Any
@@ -1628,14 +1629,18 @@ def _dispatch_lane_task(
         preflight = _kb.get_task(conn, task_id)
         if preflight is None:
             return False
+        spawn_task = preflight
         if lane == "review":
-            preflight.skills = list(dict.fromkeys([*(preflight.skills or []), "sdlc-review"]))
+            spawn_task = replace(
+                preflight,
+                skills=list(dict.fromkeys([*(preflight.skills or []), "sdlc-review"])),
+            )
         try:
-            if preflight.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(preflight, board=board)
+            if spawn_task.workspace_kind == "worktree":
+                workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(spawn_task, board=board)
             else:
-                workspace = _kbw.resolve_workspace(preflight, board=board)
-            launch = _default_spawn(preflight, str(workspace), board=board, defer_grant=True)
+                workspace = _kbw.resolve_workspace(spawn_task, board=board)
+            launch = _default_spawn(spawn_task, str(workspace), board=board, defer_grant=True)
             if not isinstance(launch, WorkerLaunch):
                 raise RuntimeError("default worker spawn did not return a fenced launch")
             claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
@@ -1647,6 +1652,7 @@ def _dispatch_lane_task(
                 worker_pid=launch.pid,
                 worker_start_time=launch.runtime_identity["start_time"],
                 preparation_id=launch.preparation_id,
+                expected_task=preflight,
             )
             if claimed is None:
                 if launch.cancel:
