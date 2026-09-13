@@ -192,7 +192,7 @@ def _validate_review_edge(
             and child.get("candidate_task_id") == parent.get("candidate_task_id")
             and requirement == "review_approved"
         )
-        or (child_kind == "general" and requirement == "phase_finished")
+        or (child_kind == "general" and requirement == "review_approved")
     )
 
 
@@ -204,7 +204,7 @@ def _validate_validation_edge(
     child_kind: str,
     requirement: str,
 ) -> bool:
-    return requirement == ("phase_finished" if child_kind == "general" else "validation_passed")
+    return requirement == "validation_passed"
 
 
 _LIFECYCLE_EDGE_VALIDATORS = {
