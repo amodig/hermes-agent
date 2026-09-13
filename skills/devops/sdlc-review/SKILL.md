@@ -26,8 +26,9 @@ Use this skill when all of the following are true:
 - an implementer submitted a `review_requested` handoff;
 - the task needs an independent verdict before it can be completed.
 
-Do not use it for a separate downstream review card. A downstream card is ordinary implementation work with a review-oriented specification and completes through its own lifecycle.
-
+Typed separate-card review tasks use this skill too: complete them with an
+explicit `APPROVE` or `REQUEST_CHANGES` verdict. Do not treat a typed review
+card as ordinary implementation work.
 ## Prerequisites
 
 - A Kanban worker context with the current task and run identifiers.
@@ -48,11 +49,15 @@ This skill is loaded automatically by the review dispatcher. Start with `kanban_
 
 | Verdict | When | Final action |
 |---|---|---|
-| Approve | Acceptance criteria and verification pass | `kanban_complete` |
-| Request changes | Correctable implementation defects remain | `kanban_comment`, then `kanban_request_changes` |
+| Approve | Acceptance criteria and verification pass | `kanban_complete(verdict="APPROVE", ...)` |
+| Request changes | Correctable implementation defects remain | Typed card: `kanban_complete(verdict="REQUEST_CHANGES", ...)`; legacy card: `kanban_request_changes` |
 | Escalate | A human decision or external prerequisite is required | `kanban_block` |
 
-A requested-changes transition returns the task to its original implementer. When that implementer requests review again without naming a reviewer, the persisted reviewer provenance routes the re-review back to the same reviewer profile.
+A requested-changes transition returns the task to its original implementer.
+For a typed separate-card graph, the orchestrator reworks the lifecycle graph
+after the review card records `REQUEST_CHANGES`. When that implementer requests
+review again without naming a reviewer, persisted reviewer provenance routes
+the re-review back to the same reviewer profile.
 
 ## Review Lenses
 
@@ -112,6 +117,7 @@ Approve only when the acceptance criteria are satisfied and the evidence is suff
 
 ```text
 kanban_complete(
+    verdict="APPROVE",
     summary="Reviewed and approved. <what was verified>",
     metadata={"review_outcome": "approved", "reviewer_checks": [...]}
 )
@@ -130,7 +136,17 @@ kanban_comment(
 )
 ```
 
-Then return the same task to its implementer:
+For a typed review card, finish with the explicit lifecycle verdict:
+
+```text
+kanban_complete(
+    verdict="REQUEST_CHANGES",
+    summary="<concise summary of the required corrections>",
+    metadata={"review_outcome": "changes_requested"},
+)
+```
+
+For a legacy/untyped review run, return it to its implementer with:
 
 ```text
 kanban_request_changes(
@@ -138,7 +154,10 @@ kanban_request_changes(
 )
 ```
 
-State where the defect is, how it reproduces, why it violates the task, and what minimum outcome would resolve it. The transition does not use blocker recurrence accounting.
+Do not call `kanban_request_changes` for a typed review or validation card.
+Same-card typed code uses the typed `kanban_complete` action; a separate-card
+graph is reworked by the orchestrator after the review card is completed.
+State where the defect is, how it reproduces, why it violates the task, and the minimum outcome that would resolve it. The transition does not use blocker recurrence accounting.
 
 #### Escalate
 

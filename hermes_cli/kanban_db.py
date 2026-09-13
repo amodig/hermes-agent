@@ -2758,17 +2758,19 @@ def _handoff_fields(metadata: Any) -> dict[str, Any]:
     return handoff
 
 def latest_handoff(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
-    """Newest durable completion handoff, including recovery provenance."""
+    """Newest durable completion or review handoff, including recovery provenance."""
     merged: dict[str, Any] = {}
     run = conn.execute(
-        "SELECT metadata FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+        "SELECT metadata FROM task_runs WHERE task_id = ? "
+        "AND outcome IN ('completed', 'review_requested') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if run:
         merged.update(_handoff_fields(_json_dict(run["metadata"])))
     event = conn.execute(
-        "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'completed' "
+        "SELECT id, payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('completed', 'review_requested') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()

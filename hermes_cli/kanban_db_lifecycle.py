@@ -1502,6 +1502,8 @@ def _prepare_completion_handoff(
     conn: sqlite3.Connection,
     task_id: str,
     metadata: Optional[dict],
+    *,
+    phase: Optional[str] = None,
 ) -> tuple[Optional[dict], dict[str, Any]]:
     task = _kb.get_task(conn, task_id)
     if task is None:
@@ -1533,6 +1535,27 @@ def _prepare_completion_handoff(
     )
     # A reviewer handing off to a tester reviews the implementation's exact
     # commit; do not require a second commit in the reviewer's scratch workspace.
+    if (
+        phase == "review"
+        and task_contract.get("kind") == "code"
+        and task_contract.get("review_mode") == "same_card"
+    ):
+        implementation_handoff = _kb.latest_handoff(conn, task_id)
+        if not implementation_handoff.get("head_sha"):
+            raise _kb.HandoffValidationError(
+                task_id, "implementation handoff head_sha is required"
+            )
+        for key in _kb.HANDOFF_KEYS:
+            if (
+                supplied.get(key)
+                and implementation_handoff.get(key)
+                and supplied[key] != implementation_handoff[key]
+            ):
+                raise _kb.HandoffValidationError(
+                    task_id, f"{key} does not match the implementation handoff"
+                )
+        updated.update(implementation_handoff)
+        return updated, _kb._handoff_fields(updated)
     if dependent_children and is_review_card:
         parent_handoff = _parent_handoff_context(conn, task_id)
         if parent_handoff and parent_handoff.get("head_sha"):
@@ -2400,7 +2423,9 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     try:
-        metadata, _handoff = _prepare_completion_handoff(conn, task_id, metadata)
+        metadata, _handoff = _prepare_completion_handoff(
+            conn, task_id, metadata, phase=typed_phase,
+        )
     except _kb.CompletionContractError as error:
         with _kb.write_txn(conn):
             _kb._append_event(
