@@ -95,6 +95,51 @@ def test_decompose_rejects_role_without_candidate_parent_edge(kanban_home):
         assert len(kb.list_tasks(conn, include_archived=True)) == 1
 
 
+def test_decompose_allows_separate_card_validation_after_review(kanban_home):
+    with kbc.connect() as conn:
+        root = _create_triage(conn, title="separate card graph")
+        child_ids = kb.decompose_triage_task(
+            conn,
+            root,
+            root_assignee="orchestrator",
+            children=[
+                {
+                    "title": "implementation",
+                    "assignee": "implementer",
+                    "parents": [],
+                    "lifecycle_contract": {
+                        "kind": "code",
+                        "review_mode": "separate_card",
+                        "reviewer": "reviewer",
+                        "validation_required": True,
+                    },
+                },
+                {
+                    "title": "review",
+                    "assignee": "reviewer",
+                    "parents": [0],
+                    "lifecycle_contract": {
+                        "kind": "review",
+                        "candidate_task_index": 0,
+                    },
+                },
+                {
+                    "title": "validation",
+                    "assignee": "tester",
+                    "parents": [1],
+                    "lifecycle_contract": {
+                        "kind": "validation",
+                        "candidate_task_index": 0,
+                    },
+                },
+            ],
+            author="decomposer",
+        )
+        assert child_ids is not None
+        assert kb.parent_ids(conn, child_ids[1]) == [child_ids[0]]
+        assert kb.parent_ids(conn, child_ids[2]) == [child_ids[1]]
+
+
 def test_decompose_records_audit_comment_and_event(kanban_home):
     with kbc.connect() as conn:
         tid = _create_triage(conn)

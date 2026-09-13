@@ -3411,20 +3411,56 @@ def _validate_children_graph(children: list) -> None:
         parents_idx = child.get("parents") or []
         if not isinstance(parents_idx, list):
             raise ValueError(f"child[{idx}].parents must be a list")
-        contract = child.get("lifecycle_contract")
-        if (
-            isinstance(contract, dict)
-            and str(contract.get("kind") or "").strip().casefold() in {"review", "validation"}
-            and contract.get("candidate_task_index") not in parents_idx
-        ):
-            raise ValueError(
-                f"child[{idx}] role lifecycle contract must list candidate_task_index as a parent"
-            )
         for p in parents_idx:
             if not isinstance(p, int) or p < 0 or p >= len(children):
                 raise ValueError(f"child[{idx}].parents[{p}] is not a valid index into children")
             if p == idx:
                 raise ValueError(f"child[{idx}] cannot list itself as a parent")
+        contract = child.get("lifecycle_contract")
+        kind = (
+            str(contract.get("kind") or "").strip().casefold()
+            if isinstance(contract, dict)
+            else ""
+        )
+        if kind in {"review", "validation"}:
+            candidate_idx = contract.get("candidate_task_index")
+            if (
+                isinstance(candidate_idx, bool)
+                or not isinstance(candidate_idx, int)
+                or candidate_idx < 0
+                or candidate_idx >= len(children)
+                or candidate_idx == idx
+            ):
+                raise ValueError(f"child[{idx}] has an invalid candidate_task_index")
+            candidate_contract = children[candidate_idx].get("lifecycle_contract")
+            separate_validation = (
+                kind == "validation"
+                and isinstance(candidate_contract, dict)
+                and str(candidate_contract.get("kind") or "").strip().casefold() == "code"
+                and str(candidate_contract.get("review_mode") or "").strip().casefold()
+                == "separate_card"
+            )
+            if kind == "review" or not separate_validation:
+                if candidate_idx not in parents_idx:
+                    raise ValueError(
+                        f"child[{idx}] role lifecycle contract must list "
+                        "candidate_task_index as a parent"
+                    )
+            elif (
+                candidate_idx in parents_idx
+                or not any(
+                    isinstance(children[parent_idx].get("lifecycle_contract"), dict)
+                    and str(
+                        children[parent_idx]["lifecycle_contract"].get("kind") or ""
+                    ).strip().casefold() == "review"
+                    and children[parent_idx]["lifecycle_contract"].get("candidate_task_index")
+                    == candidate_idx
+                    for parent_idx in parents_idx
+                )
+            ):
+                raise ValueError(
+                    f"child[{idx}] separate-card validation must depend on its review parent"
+                )
 
     in_deg = [0] * len(children)
     adj: list[list[int]] = [[] for _ in children]
