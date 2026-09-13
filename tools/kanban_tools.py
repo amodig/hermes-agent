@@ -1182,8 +1182,8 @@ def _handle_rework_review(args: dict, **kw) -> str:
             reviewer_id,
             tester_id,
             expected_implementation_version=args["expected_implementation_version"],
-            expected_reviewer_version=args["expected_reviewer_version"],
-            expected_tester_version=args["expected_tester_version"],
+            expected_reviewer_version=args.get("expected_reviewer_version"),
+            expected_tester_version=args.get("expected_tester_version"),
             reason=reason,
             author=os.environ.get("HERMES_PROFILE") or "orchestrator",
         )

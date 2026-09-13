@@ -34,21 +34,11 @@ _bootstrap_root = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pa
 if _bootstrap_root not in sys.path:
     sys.path.insert(0, _bootstrap_root)
 
-from hermes_cli.kanban_runtime import (
-    assert_runtime_import_root as _assert_runtime_import_root,
-    runtime_identity as _runtime_identity,
-)
-_preimport_runtime_identity = _runtime_identity(_bootstrap_root)
-_assert_runtime_import_root(_bootstrap_root, expected=_preimport_runtime_identity)
-
 _early_runtime_argv = sys.argv[1:]
-if _early_runtime_argv in (["runtime-identity"], ["runtime-identity", "--json"], ["--runtime-identity"]):
-    from hermes_cli.kanban_runtime import runtime_identity_json
-
-    print(runtime_identity_json())
-    raise SystemExit(0)
 if os.environ.get("HERMES_KANBAN_BOOTSTRAP_PATH"):
     try:
+        # Worker bootstrap is the one narrow path allowed to import the
+        # runtime module before early recovery.
         from hermes_cli.kanban_runtime import worker_bootstrap_from_env
 
         worker_bootstrap_from_env()
@@ -74,6 +64,21 @@ try:
     _early_recovery_mod.recover_if_needed()
 except Exception:
     pass
+
+# Runtime verification follows early recovery so an interrupted update can
+# repair a missing or partial runtime module before the normal CLI imports it.
+from hermes_cli.kanban_runtime import (
+    assert_runtime_import_root as _assert_runtime_import_root,
+    runtime_identity as _runtime_identity,
+)
+_preimport_runtime_identity = _runtime_identity(_bootstrap_root)
+_assert_runtime_import_root(_bootstrap_root, expected=_preimport_runtime_identity)
+
+if _early_runtime_argv in (["runtime-identity"], ["runtime-identity", "--json"], ["--runtime-identity"]):
+    from hermes_cli.kanban_runtime import runtime_identity_json
+
+    print(runtime_identity_json())
+    raise SystemExit(0)
 
 
 # Startup-liveness watchdog: for gateway runs, arm BEFORE the heavy import

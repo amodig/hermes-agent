@@ -1492,6 +1492,7 @@ class GoalManager:
 # back at the lifecycle contract (it already has the full task body).
 KANBAN_GOAL_CONTINUATION_TEMPLATE = (
     "[Continuing toward this kanban task — judge says it is not done yet]\n"
+    "Judge feedback: {reason}\n\n"
     "Take the next concrete step toward completing the task. When the work "
     "is genuinely finished, call kanban_complete with a summary. For a typed "
     "review card, include verdict=APPROVE or REQUEST_CHANGES; for a typed "

@@ -1350,14 +1350,46 @@ def _validate_lifecycle_role_identity(
     conn: sqlite3.Connection,
     contract: Optional[dict],
     assignee: Optional[str],
+    *,
+    task_id: Optional[str] = None,
 ) -> None:
     """Keep implementation, review, and validation identities independent."""
     if not contract or not assignee:
         return
     actor = _canonical_assignee(assignee)
     kind = contract.get("kind")
-    if kind == "code" and actor == _canonical_assignee(contract.get("reviewer")):
-        raise LifecycleContractError("reviewer must differ from the implementation assignee")
+    if kind == "code":
+        if actor == _canonical_assignee(contract.get("reviewer")):
+            raise LifecycleContractError("reviewer must differ from the implementation assignee")
+        if task_id is None:
+            return
+        validation_rows = conn.execute(
+            """
+            WITH RECURSIVE descendants(id) AS (
+                SELECT child_id FROM task_links WHERE parent_id = ?
+                UNION
+                SELECT l.child_id
+                FROM task_links l
+                JOIN descendants d ON d.id = l.parent_id
+            )
+            SELECT t.assignee, t.lifecycle_contract
+            FROM tasks t
+            JOIN descendants d ON d.id = t.id
+            """,
+            (task_id,),
+        ).fetchall()
+        for row in validation_rows:
+            child_contract = safe_decode_contract(row["lifecycle_contract"])
+            if (
+                child_contract
+                and child_contract.get("kind") == "validation"
+                and child_contract.get("candidate_task_id") == task_id
+                and actor == _canonical_assignee(row["assignee"])
+            ):
+                raise LifecycleContractError(
+                    "validator must differ from the implementation and reviewer"
+                )
+        return
     if kind not in {"review", "validation"}:
         return
 
@@ -1556,6 +1588,7 @@ def create_task(
     )
     if candidate_id and not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (candidate_id,)).fetchone():
         raise LifecycleContractError(f"candidate task {candidate_id} does not exist")
+    assignee = _canonical_assignee(assignee)
     _validate_lifecycle_role_identity(conn, normalized_lifecycle, assignee)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
@@ -2100,7 +2133,9 @@ def update_task(
         if lifecycle_contract is not _UPDATE_UNSET:
             new_lifecycle = normalized_lifecycle
 
-        _validate_lifecycle_role_identity(conn, new_lifecycle, new_assignee)
+        _validate_lifecycle_role_identity(
+            conn, new_lifecycle, new_assignee, task_id=task_id,
+        )
         lifecycle_changed = (
             lifecycle_contract is not _UPDATE_UNSET and new_lifecycle != old_lifecycle
         )
@@ -2344,6 +2379,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             return False
         _validate_lifecycle_role_identity(
             conn, safe_decode_contract(_row_get(row, "lifecycle_contract")), profile,
+            task_id=task_id,
         )
         if row["claim_lock"] is not None and row["status"] == "running":
             raise RuntimeError(
