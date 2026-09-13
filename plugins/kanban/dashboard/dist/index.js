@@ -981,19 +981,28 @@
 
     const lifecycleCompletionTask = useCallback(function (ids) {
       const tasks = Array.from(ids).map(findBoardTask);
-      const kinds = new Set(tasks.map(function (task) {
-        return (task && task.lifecycle_contract && task.lifecycle_contract.kind) || "general";
-      }));
-      const verdictKinds = Array.from(kinds).filter(function (kind) {
-        return kind === "review" || kind === "validation";
+      const phaseForTask = function (task) {
+        const contract = task && task.lifecycle_contract;
+        if (
+          contract
+          && contract.kind === "code"
+          && contract.review_mode === "same_card"
+          && task.status === "review"
+        ) {
+          return "review";
+        }
+        return (contract && contract.kind) || "general";
+      };
+      const phases = new Set(tasks.map(phaseForTask));
+      const verdictPhases = Array.from(phases).filter(function (phase) {
+        return phase === "review" || phase === "validation";
       });
-      if (verdictKinds.length && (verdictKinds.length !== 1 || kinds.size !== 1)) {
+      if (verdictPhases.length && (verdictPhases.length !== 1 || phases.size !== 1)) {
         return { invalid: true, task: null };
       }
-      const task = verdictKinds.length
+      const task = verdictPhases.length
         ? tasks.find(function (item) {
-          return item && item.lifecycle_contract
-            && item.lifecycle_contract.kind === verdictKinds[0];
+          return phaseForTask(item) === verdictPhases[0];
         })
         : null;
       return { invalid: false, task };

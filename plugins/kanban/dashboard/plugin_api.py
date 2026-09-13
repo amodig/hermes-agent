@@ -818,7 +818,9 @@ class LinkBody(BaseModel):
 
 @router.post("/links")
 def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
-    with _board_conn(board) as (board, conn), _value_error_400():
+    with _board_conn(board) as (board, conn), _value_error_400(), _map_errors(
+        409, kanban_db.TaskUpdateConflict,
+    ):
         kanban_db.link_tasks(
             conn,
             payload.parent_id,

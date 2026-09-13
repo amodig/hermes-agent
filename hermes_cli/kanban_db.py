@@ -1358,11 +1358,23 @@ def _validate_lifecycle_role_identity(
         return
     actor = _canonical_assignee(assignee) if assignee else None
     kind = contract.get("kind")
+    task_status = None
+    if task_id is not None:
+        task_row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        task_status = _row_get(task_row, "status")
     if kind == "code":
+        if (
+            actor
+            and contract.get("review_mode") == "same_card"
+            and task_status in {"review", "done"}
+        ):
+            if actor != _canonical_assignee(contract.get("reviewer")):
+                raise LifecycleContractError(
+                    "same-card review assignee must match the declared reviewer"
+                )
+            return
         if not actor:
             return
-        if actor == _canonical_assignee(contract.get("reviewer")):
-            raise LifecycleContractError("reviewer must differ from the implementation assignee")
         if task_id is None:
             return
         validation_rows = conn.execute(
@@ -2024,6 +2036,8 @@ def update_task(
     changed_fields: list[str] = []
     actor = _update_actor(author)
     acceptance_before = _capture_acceptance(conn, task_id)
+    goal_invalidated: list[dict[str, Any]] = []
+    goal_terminations: list[tuple[Optional[int], Optional[str]]] = []
     with write_txn(conn):
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if row is None:
@@ -2141,9 +2155,10 @@ def update_task(
         if lifecycle_contract is not _UPDATE_UNSET:
             new_lifecycle = normalized_lifecycle
 
-        _validate_lifecycle_role_identity(
-            conn, new_lifecycle, new_assignee, task_id=task_id,
-        )
+        if assignee is not _UPDATE_UNSET or lifecycle_contract is not _UPDATE_UNSET:
+            _validate_lifecycle_role_identity(
+                conn, new_lifecycle, new_assignee, task_id=task_id,
+            )
         lifecycle_changed = (
             lifecycle_contract is not _UPDATE_UNSET and new_lifecycle != old_lifecycle
         )
@@ -2188,6 +2203,36 @@ def update_task(
                 new_status = _lifecycle_ready_status(conn, task_id) if _parents_satisfied(conn, task_id) else "todo"
             elif new_lifecycle and new_lifecycle.get("kind") == "general":
                 new_status = "done" if row["status"] == "done" else "ready"
+        goal_changed = (
+            old_title != new_title
+            or old_body != new_body
+            or old_goal_mode != new_goal_mode
+        )
+        goal_reopened = bool(
+            goal_changed
+            and new_lifecycle
+            and new_lifecycle.get("kind") == "code"
+            and (
+                _row_get(row, "candidate_run_id") is not None
+                or row["status"] in {"done", "review"}
+            )
+        )
+        if goal_reopened:
+            new_status = _landing_status_after_parents(conn, task_id)
+            if (
+                new_lifecycle.get("review_mode") == "same_card"
+                and row["status"] in {"review", "done"}
+            ):
+                routing = _implementation_routing(conn, task_id)
+                implementation_assignee = routing.get("implementer")
+                if not implementation_assignee:
+                    review_event = _latest_event(conn, task_id, "review_requested")
+                    implementation_assignee = _json_dict(
+                        _row_get(review_event, "payload")
+                    ).get("implementer")
+                if implementation_assignee:
+                    new_assignee = _canonical_assignee(str(implementation_assignee))
+
 
         old_values = {
             "title": old_title,
@@ -2224,9 +2269,6 @@ def update_task(
             if old_values[key] != new_values[key]:
                 changed_fields.append(key)
 
-        goal_changed = any(
-            old_values[key] != new_values[key] for key in ("title", "body", "goal_mode")
-        )
         goal_revision = None
         if goal_changed:
             prior_goal_version = int(goal_row["version"])
@@ -2251,8 +2293,19 @@ def update_task(
             )
             goal_revision_id = int(goal_cur.lastrowid)
             changed_fields.append("goal_revision")
+        if goal_reopened:
+            invalidation = invalidate_descendants_for_parent_reopen(
+                conn, task_id, author=actor,
+            )
+            goal_invalidated.extend(invalidation["invalidated"])
+            goal_terminations.extend(invalidation["terminations"])
 
-        candidate_run_id = None if lifecycle_changed else _row_get(row, "candidate_run_id")
+        candidate_run_id = (
+            None
+            if lifecycle_changed or goal_reopened
+            else _row_get(row, "candidate_run_id")
+        )
+
         stored_lifecycle = (
             lifecycle_json
             if lifecycle_contract is not _UPDATE_UNSET
@@ -2287,6 +2340,9 @@ def update_task(
             raise TaskUpdateConflict(
                 f"task {task_id} update conflict: version changed while updating"
             )
+        if goal_reopened:
+            conn.execute("UPDATE tasks SET completed_at = NULL WHERE id = ?", (task_id,))
+            changed_fields.append("completed_at")
 
         if goal_changed:
             goal_revision = get_effective_goal(conn, task_id)
@@ -2309,7 +2365,13 @@ def update_task(
             "lifecycle_bound" if lifecycle_changed else "goal_revised" if goal_changed else "updated",
             payload,
         )
+    for pid, claim_lock in goal_terminations:
+        _terminate_reclaimed_worker(pid, claim_lock)
     notify_task_updated(conn, task_id, changed_fields or ["version"])
+    for entry in goal_invalidated:
+        notify_task_updated(
+            conn, entry["id"], ("status", "version", "completed_at", "candidate_run_id"),
+        )
     _emit_acceptance_changes(conn, acceptance_before, source_task_id=task_id)
     return True
 
@@ -6403,7 +6465,7 @@ def invalidate_descendants_for_parent_reopen(
             conn.execute(
                 "UPDATE tasks SET status = 'todo', completed_at = NULL, "
                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
-                "current_run_id = NULL, consecutive_failures = 0 WHERE id = ?", (row["id"],),
+                "current_run_id = NULL, candidate_run_id = NULL, consecutive_failures = 0 WHERE id = ?", (row["id"],),
             )
             entry = {
                 "id": row["id"], "prior_status": previous_status,
