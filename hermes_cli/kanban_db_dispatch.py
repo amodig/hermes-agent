@@ -214,7 +214,7 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
 
 
 def reap_worker_zombies() -> "list[int]":
-    """Reap all zombie children without blocking; returns reaped PIDs. No-op on Windows."""
+    """Reap exited workers without blocking; poll retained handles on Windows."""
     reaped: "list[int]" = []
     if os.name != "nt":
         try:
@@ -229,6 +229,18 @@ def reap_worker_zombies() -> "list[int]":
                 reaped.append(pid)
         except Exception:
             pass
+    else:
+        for pid, process in list(_worker_processes.items()):
+            try:
+                returncode = process.poll()
+            except Exception:
+                continue
+            if returncode is None:
+                continue
+            returncode = int(returncode)
+            raw_status = returncode << 8 if returncode >= 0 else -returncode
+            _record_worker_exit(pid, raw_status)
+            reaped.append(pid)
     return reaped
 
 

@@ -2155,7 +2155,18 @@ def update_task(
                 "WHERE parent_id = ? OR child_id = ? ORDER BY parent_id, child_id",
                 (task_id, task_id),
             ).fetchall():
-                validate_edge(conn, edge["parent_id"], edge["child_id"], edge["requirement"])
+                requirement = edge["requirement"]
+                if not requirement:
+                    # Historical linked graphs may need both endpoint contracts
+                    # and edge requirements repaired in separate transactions.
+                    continue
+                endpoints = conn.execute(
+                    "SELECT lifecycle_contract FROM tasks WHERE id IN (?, ?)",
+                    (edge["parent_id"], edge["child_id"]),
+                ).fetchall()
+                if any(safe_decode_contract(row["lifecycle_contract"]) is None for row in endpoints):
+                    continue
+                validate_edge(conn, edge["parent_id"], edge["child_id"], requirement)
         new_status = row["status"]
         if transition_text:
             if row["status"] != "triage":

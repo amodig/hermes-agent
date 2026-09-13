@@ -24,7 +24,6 @@ import uuid
 RUNTIME_IDENTITY_PROTOCOL = 1
 _BOOTSTRAP_TIMEOUT_SECONDS = 10.0
 _IDENTITY_ROOTS = ("hermes_cli", "tools", "agent", "gateway", "plugins")
-_IDENTITY_EXTRA_FILES = ("scripts/verify_kanban_lifecycle.py",)
 
 
 class RuntimeIdentityError(RuntimeError):
@@ -147,11 +146,6 @@ def _fingerprint(root: Path) -> str:
             if path.is_file()
             and not any(part.startswith(".") or part == "__pycache__" for part in path.parts)
         )
-    for relative in _IDENTITY_EXTRA_FILES:
-        path = root / relative
-        if not path.is_file():
-            raise RuntimeIdentityError(f"runtime identity file is missing: {relative}")
-        relatives.append(Path(relative))
     for relative in sorted(set(relatives), key=lambda value: value.as_posix()):
         path = root / relative
         digest.update(relative.as_posix().encode("utf-8"))

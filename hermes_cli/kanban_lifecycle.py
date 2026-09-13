@@ -340,6 +340,20 @@ def _candidate_snapshot(conn: sqlite3.Connection, candidate_id: str) -> dict[str
         ),
         "goal_revision_id": _task_goal_revision_id(row),
     }
+def _execution_outcome(
+    conn: sqlite3.Connection, task_id: str, run_id: Optional[int],
+) -> Optional[str]:
+    if run_id is None:
+        return None
+    row = conn.execute(
+        "SELECT outcome FROM task_runs WHERE id = ? AND task_id = ?",
+        (run_id, task_id),
+    ).fetchone()
+    if row is None:
+        return None
+    outcome = str(row["outcome"] or "").strip()
+    return outcome or None
+
 
 
 def _freshness(
@@ -430,8 +444,12 @@ def get_lifecycle_state(conn: sqlite3.Connection, task_id: str) -> dict[str, Any
         state["candidate_task_id"] = candidate_id
         snapshot = _candidate_snapshot(conn, candidate_id)
         state["candidate_run_id"] = snapshot["run_id"]
+        state["execution_outcome"] = _execution_outcome(
+            conn, candidate_id, snapshot["run_id"],
+        )
         state["head_sha"] = snapshot["head_sha"]
         state["goal_revision_ids"] = {candidate_id: snapshot["goal_revision_id"]}
+
         phase = "review" if kind == "review" else "validation"
         verdict, lifecycle, error = _verdict_for(conn, task_id, phase)
         if kind == "review":
@@ -460,6 +478,10 @@ def get_lifecycle_state(conn: sqlite3.Connection, task_id: str) -> dict[str, Any
 
     # Code card: implementation evidence belongs to this task; review and
     # validation evidence may be same-card or typed child cards.
+    implementation_snapshot = _candidate_snapshot(conn, task_id)
+    state["execution_outcome"] = _execution_outcome(
+        conn, task_id, implementation_snapshot["run_id"],
+    )
     role_conflict = False
     if contract.get("review_mode") == "same_card":
         review_id = task_id
