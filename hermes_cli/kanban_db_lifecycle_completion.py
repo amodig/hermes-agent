@@ -19,7 +19,6 @@ from hermes_cli.kanban_db_lifecycle_evidence import (
     _completion_contract_snapshot,
     _emit_acceptance_changes,
     _implementation_routing,
-    _prepare_completion_handoff,
     _stamp_lifecycle_metadata,
 )
 from hermes_cli.kanban_lifecycle import LifecycleEvidenceError, get_lifecycle_state
@@ -152,7 +151,7 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     try:
-        metadata, _handoff = _prepare_completion_handoff(
+        metadata, _handoff = _kb._prepare_completion_handoff(
             conn, task_id, metadata, phase=typed_phase,
         )
     except _kb.CompletionContractError as error:
@@ -684,7 +683,7 @@ def request_review(
     metadata = _kb.redact_review_value(metadata)
     preflight_contract = _completion_contract_snapshot(conn, task_id)
     try:
-        metadata, _handoff = _prepare_completion_handoff(conn, task_id, metadata)
+        metadata, _handoff = _kb._prepare_completion_handoff(conn, task_id, metadata)
     except _kb.CompletionContractError as error:
         with _kb.write_txn(conn):
             _kb._append_event(
