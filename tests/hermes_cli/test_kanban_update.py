@@ -183,6 +183,25 @@ def test_triage_transition_recomputes_ready_or_todo_from_parents(kanban_home):
         assert kb.get_task(conn, ready_child).status == "ready"
 
 
+
+def test_binding_historical_null_contract_preserves_blocked_status(kanban_home):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn, title="historical blocked", assignee="coder", initial_status="blocked"
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET lifecycle_contract = NULL WHERE id = ?", (task_id,))
+
+        assert kb.update_task(
+            conn,
+            task_id,
+            expected_version=1,
+            reason="classify historical task",
+            goal_mode=False,
+            lifecycle_contract={"kind": "general"},
+        )
+        assert kb.get_task(conn, task_id).status == "blocked"
+
 def test_claimed_update_is_rejected_and_run_history_links_and_comments_survive(
     kanban_home,
 ):

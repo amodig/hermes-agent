@@ -615,7 +615,9 @@ def update_task(
                 )
             new_status = _kb._lifecycle_ready_status(conn, task_id) if _parents_satisfied(conn, task_id) else "todo"
         elif lifecycle_changed:
-            if new_lifecycle and new_lifecycle.get("kind") != "general":
+            if row["status"] in {"blocked", "scheduled", "triage"}:
+                new_status = row["status"]
+            elif new_lifecycle and new_lifecycle.get("kind") != "general":
                 new_status = _kb._lifecycle_ready_status(conn, task_id) if _parents_satisfied(conn, task_id) else "todo"
             elif new_lifecycle and new_lifecycle.get("kind") == "general":
                 new_status = "done" if row["status"] == "done" else "ready"

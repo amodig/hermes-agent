@@ -237,10 +237,10 @@ def assert_runtime_import_root(
     observed = identity or runtime_identity(root, pid=os.getpid(), start_time=process_start_time())
     if expected is not None and not same_code_identity(expected, observed):
         raise RuntimeIdentityError("runtime code changed during startup")
-    prefixes = ("hermes_cli", "gateway", "tools", "agent")
+    prefixes = _IDENTITY_ROOTS
     mixed: list[str] = []
     for name, module in tuple(sys.modules.items()):
-        if not name.startswith(prefixes):
+        if not any(name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes):
             continue
         location = getattr(module, "__file__", None)
         if not location:

@@ -206,13 +206,16 @@ class KanbanLifecycleConformance(unittest.TestCase):
         self.assertEqual(code_identity(identity), code_identity(identity.as_dict()))
         self.assertTrue(same_code_identity(identity, identity.as_dict()))
         self.assertEqual(process_start_time(identity.pid), identity.start_time)
-        mixed_name = "hermes_cli._conformance_mixed_root"
-        sys.modules[mixed_name] = SimpleNamespace(__file__="/tmp/mixed-hermes-runtime.py")
-        try:
-            with self.assertRaises(RuntimeIdentityError):
-                assert_runtime_import_root(RUNTIME_ROOT)
-        finally:
-            sys.modules.pop(mixed_name, None)
+        for mixed_name in (
+            "hermes_cli._conformance_mixed_root",
+            "providers._conformance_mixed_root",
+        ):
+            sys.modules[mixed_name] = SimpleNamespace(__file__="/tmp/mixed-hermes-runtime.py")
+            try:
+                with self.assertRaises(RuntimeIdentityError):
+                    assert_runtime_import_root(RUNTIME_ROOT)
+            finally:
+                sys.modules.pop(mixed_name, None)
 
         implementation = kb.create_task(
             self.conn,

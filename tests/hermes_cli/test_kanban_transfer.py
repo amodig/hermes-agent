@@ -239,6 +239,58 @@ def test_unresolvable_workspaces_are_parked_not_dispatched(kanban_root, tmp_path
     assert tasks["scratch task"]["status"] == "ready"
     assert tasks["scratch task"]["workspace_path"] is None
 
+def test_import_scrubs_typed_handoff_paths_and_parks_review_card(kanban_root, tmp_path):
+    kb.create_board("alpha", name="Alpha Board")
+    with kbc.connect_closing(board="alpha") as conn:
+        implementation = kb.create_task(
+            conn,
+            title="typed implementation",
+            assignee="implementer",
+            initial_status="blocked",
+            workspace_kind="scratch",
+            workspace_path="/exporter/repo",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "reviewer",
+                "validation_required": True,
+            },
+        )
+        review = kb.create_task(
+            conn,
+            title="typed review",
+            assignee="reviewer",
+            initial_status="blocked",
+            lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
+        )
+        kb.link_tasks(conn, implementation, review, requirement="phase_finished")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (implementation,))
+            conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (review,))
+            kb._append_event(
+                conn,
+                implementation,
+                "completed",
+                {
+                    "base_sha": "base",
+                    "head_sha": "head",
+                    "branch_name": "feature/x",
+                    "workspace_path": "/exporter/repo",
+                },
+            )
+
+    archive = kt.export_board("alpha", str(tmp_path / "alpha"))["archive"]
+    kanban_root("target")
+    result = kt.import_board(archive)
+    tasks = _tasks_by_title(result["board"])
+
+    assert tasks["typed review"]["status"] == "triage"
+    assert result["tasks_parked"] == 1
+    with kbc.connect_closing(board=result["board"]) as conn:
+        implementation_id = tasks["typed implementation"]["id"]
+        handoff = kb.latest_handoff(conn, implementation_id)
+    assert handoff == {"base_sha": "base", "head_sha": "head"}
+
 
 def test_board_metadata_loses_exporter_local_paths(kanban_root, tmp_path):
     kb.create_board("alpha", name="Alpha Board",

@@ -109,6 +109,59 @@ def _scrub_local_state(conn: sqlite3.Connection) -> None:
         (int(time.time()),),
     )
     conn.execute("UPDATE task_runs SET claim_lock = NULL, worker_pid = NULL")
+    _scrub_handoff_paths(conn)
+
+
+def _scrub_handoff_paths(conn: sqlite3.Connection) -> None:
+    """Remove exporter-local paths from durable handoff records."""
+    for row in conn.execute(
+        "SELECT id, metadata FROM task_runs WHERE metadata IS NOT NULL"
+    ).fetchall():
+        try:
+            payload = json.loads(row["metadata"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        changed = False
+        for key in ("branch_name", "workspace_path"):
+            if payload.pop(key, None) is not None:
+                changed = True
+        if changed:
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps(payload, ensure_ascii=False, sort_keys=True), row["id"]),
+            )
+    for row in conn.execute(
+        "SELECT id, kind, payload FROM task_events "
+        "WHERE kind IN ('completed', 'review_requested', 'handoff_requeued') "
+        "AND payload IS NOT NULL"
+    ).fetchall():
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        changed = False
+        for key in ("branch_name", "workspace_path"):
+            if payload.pop(key, None) is not None:
+                changed = True
+        legacy = payload.get("legacy_handoff")
+        if isinstance(legacy, dict):
+            for key in ("branch_name", "workspace_path"):
+                if legacy.pop(key, None) is not None:
+                    changed = True
+        workspace = payload.get("workspace")
+        if isinstance(workspace, dict):
+            for key in ("branch", "path"):
+                if workspace.pop(key, None) is not None:
+                    changed = True
+        if changed:
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (json.dumps(payload, ensure_ascii=False, sort_keys=True), row["id"]),
+            )
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -238,6 +291,34 @@ def _read_board_metadata(path: Path) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+def _candidate_handoff_needs_rebind(conn: sqlite3.Connection, row: sqlite3.Row) -> bool:
+    """True when an imported review lane needs a local immutable handoff."""
+    contract = kb.safe_decode_contract(row["lifecycle_contract"])
+    kind = contract.get("kind") if contract else None
+    same_card = (
+        kind == "code"
+        and contract.get("review_mode") == "same_card"
+        and row["status"] == "review"
+    )
+    is_role = kind in {"review", "validation"} or (
+        not contract
+        and str(row["assignee"] or "").strip().casefold() in kb.HANDOFF_CHILD_ASSIGNEES
+    )
+    if not same_card and not is_role:
+        return False
+    candidate_ids = [row["id"], *kb.parent_ids(conn, row["id"])]
+    candidate_id = contract.get("candidate_task_id") if contract else None
+    if candidate_id:
+        candidate_ids.append(str(candidate_id))
+    seen: set[str] = set()
+    for candidate_id in candidate_ids:
+        if candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        if kb.latest_handoff(conn, candidate_id).get("head_sha"):
+            return True
+    return False
+
 def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[str, int], list[str]]:
     """Re-anchor an imported board's rows to this machine; returns ``(stats, warnings)``.
 
@@ -269,20 +350,36 @@ def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[s
         if dropped:
             warnings.append(f"{dropped} attachment record(s) dropped — the files were not in the archive")
 
-        parked = [
-            r["id"]
-            for r in conn.execute(
-                "SELECT id FROM tasks WHERE workspace_kind IN ('dir', 'worktree') "
-                f"AND status IN ({_placeholders(_DISPATCHABLE_STATUSES)})",
-                _DISPATCHABLE_STATUSES,
-            ).fetchall()
+        tasks = conn.execute(
+            "SELECT id, status, workspace_kind, assignee, lifecycle_contract FROM tasks"
+        ).fetchall()
+        workspace_parked = [
+            row["id"]
+            for row in tasks
+            if row["workspace_kind"] in {"dir", "worktree"}
+            and row["status"] in _DISPATCHABLE_STATUSES
         ]
+        workspace_parked_set = set(workspace_parked)
+        candidate_parked = [
+            row["id"]
+            for row in tasks
+            if row["id"] not in workspace_parked_set
+            and row["status"] in _DISPATCHABLE_STATUSES
+            and _candidate_handoff_needs_rebind(conn, row)
+        ]
+        parked = workspace_parked + candidate_parked
         conn.execute("UPDATE tasks SET workspace_path = NULL, branch_name = NULL")
         if parked:
             conn.execute(f"UPDATE tasks SET status = 'triage' WHERE id IN ({_placeholders(parked)})", parked)
+        if workspace_parked:
             warnings.append(
-                f"{len(parked)} task(s) moved to triage — their workspace was a directory or git "
+                f"{len(workspace_parked)} task(s) moved to triage — their workspace was a directory or git "
                 f"worktree on the exporting machine and needs to be pointed somewhere on this one"
+            )
+        if candidate_parked:
+            warnings.append(
+                f"{len(candidate_parked)} candidate task(s) moved to triage — their immutable handoff "
+                "needs a local workspace and branch rebind before review can resume"
             )
 
         for row in conn.execute("SELECT id FROM tasks").fetchall():
