@@ -2371,7 +2371,12 @@ def _default_spawn(
     env["HERMES_PROFILE"] = profile_arg
     env.pop("HERMES_TUI", None)
 
-    from hermes_cli.kanban_runtime import encode_identity, prospective_identity, verify_worker_ready
+    from hermes_cli.kanban_runtime import (
+        decode_identity,
+        encode_identity,
+        prospective_identity,
+        verify_worker_ready,
+    )
 
     expected_identity = prospective_identity()
     preparation_id = uuid.uuid4().hex
@@ -2447,8 +2452,10 @@ def _default_spawn(
             time.sleep(0.05)
         if payload is None:
             raise RuntimeError("worker bootstrap timed out")
+        # systemd-run is only the scope launcher; readiness reports Hermes's PID.
+        ready_pid = decode_identity(payload.get("runtime_identity")).pid
         actual = verify_worker_ready(
-            payload, expected_identity, pid=proc.pid, preparation_id=preparation_id,
+            payload, expected_identity, pid=ready_pid, preparation_id=preparation_id,
         )
         _worker_processes[proc.pid] = proc
         def _grant(run_id: int, claim_lock: Optional[str]) -> None:

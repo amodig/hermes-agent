@@ -1352,6 +1352,7 @@ def _validate_lifecycle_role_identity(
     assignee: Optional[str],
     *,
     task_id: Optional[str] = None,
+    phase: Optional[str] = None,
 ) -> None:
     """Keep implementation, review, and validation identities independent."""
     if not contract:
@@ -1366,6 +1367,7 @@ def _validate_lifecycle_role_identity(
         if (
             actor
             and contract.get("review_mode") == "same_card"
+            and phase != "implementation"
             and task_status in {"review", "done"}
         ):
             if actor != _canonical_assignee(contract.get("reviewer")):
@@ -1375,6 +1377,8 @@ def _validate_lifecycle_role_identity(
             return
         if not actor:
             return
+        if actor == _canonical_assignee(contract.get("reviewer")):
+            raise LifecycleContractError("reviewer must differ from the implementation assignee")
         if task_id is None:
             return
         validation_rows = conn.execute(
@@ -1638,6 +1642,7 @@ def create_task(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
     )
     parents = tuple(p for p in parents if p)
+    role_missing_candidate_edge = bool(candidate_id and candidate_id not in parents)
     skills_list = _normalize_task_skills(skills)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
@@ -1670,6 +1675,11 @@ def create_task(
                 task_status = _initial_task_status(conn, parents, initial_status, triage)
                 if task_status == "ready" and normalized_lifecycle and normalized_lifecycle.get("kind") == "review":
                     task_status = "review"
+                if (
+                    role_missing_candidate_edge
+                    and task_status not in {"blocked", "triage"}
+                ):
+                    task_status = "todo"
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
                 if project_obj is not None and workspace_kind == "worktree":
@@ -4805,7 +4815,11 @@ def _typed_rework_graph(
         if not implementation_assignee:
             raise ValueError("same-card rework requires original implementation routing")
         _validate_lifecycle_role_identity(
-            conn, contract, implementation_assignee, task_id=implementation_id,
+            conn,
+            contract,
+            implementation_assignee,
+            task_id=implementation_id,
+            phase="implementation",
         )
 
     reset_ids = [implementation_id]

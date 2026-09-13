@@ -623,6 +623,20 @@ def evaluate_dependencies(conn: sqlite3.Connection, task_id: str) -> dict[str, A
             }],
         }
     blockers: list[dict[str, Any]] = []
+    contract = _row_contract(task)
+    if contract and contract.get("kind") in {"review", "validation"}:
+        candidate_id = str(contract.get("candidate_task_id") or "")
+        candidate_edge = conn.execute(
+            "SELECT requirement FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (candidate_id, task_id),
+        ).fetchone()
+        if candidate_id and candidate_edge is None:
+            blockers.append({
+                "parent_id": candidate_id,
+                "requirement": None,
+                "code": "candidate_edge_missing",
+                "message": "role card must depend directly on its candidate task",
+            })
 
 
     rows = conn.execute(
