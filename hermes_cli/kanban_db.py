@@ -4350,6 +4350,12 @@ def _parent_handoff_start_error(
             continue
         handoff = latest_handoff(conn, parent_id)
         expected = handoff.get("head_sha")
+        if not expected and (
+            parent.lifecycle_contract
+            and parent.lifecycle_contract.get("kind") == "code"
+            and parent.lifecycle_contract.get("review_mode") == "same_card"
+        ):
+            expected = _latest_head(conn, parent_id)
         if not expected:
             return {
                 "kind": "handoff_unverifiable",
@@ -4721,6 +4727,17 @@ def _typed_rework_graph(
     if not rejected_head:
         raise ValueError("typed rework requires an immutable rejected implementation head")
 
+    implementation_assignee = None
+    if same_card:
+        implementation_assignee = _canonical_assignee(
+            _implementation_routing(conn, implementation_id).get("implementer")
+        )
+        if not implementation_assignee:
+            raise ValueError("same-card rework requires original implementation routing")
+        _validate_lifecycle_role_identity(
+            conn, contract, implementation_assignee, task_id=implementation_id,
+        )
+
     reset_ids = [implementation_id]
     if not same_card:
         reset_ids.append(actual_reviewer_id)
@@ -4730,7 +4747,7 @@ def _typed_rework_graph(
         rows = {
             row["id"]: row
             for row in conn.execute(
-                "SELECT id, status, version, claim_lock, current_run_id, worker_pid, "
+                "SELECT id, status, version, assignee, claim_lock, current_run_id, worker_pid, "
                 "completed_at, result, block_kind, block_recurrences "
                 "FROM tasks WHERE id IN (" + ",".join("?" for _ in reset_ids) + ")",
                 tuple(reset_ids),
@@ -4775,17 +4792,29 @@ def _typed_rework_graph(
             new_status = implementation_status if row["id"] == implementation_id else "todo"
             if row["status"] == "blocked" and _has_sticky_block(conn, row["id"]):
                 new_status = "blocked"
+            assign_implementation = same_card and row["id"] == implementation_id
+            new_assignee = (
+                implementation_assignee if assign_implementation else row["assignee"]
+            )
+            assignment_sql = ", assignee = ?" if assign_implementation else ""
+            params: list[Any] = [new_status]
+            if assign_implementation:
+                params.append(implementation_assignee)
+            params.extend((new_status, new_status, row["id"]))
             conn.execute(
-                "UPDATE tasks SET status = ?, version = version + 1, completed_at = NULL, "
-                "result = NULL, current_run_id = NULL, claim_lock = NULL, claim_expires = NULL, "
-                "worker_pid = NULL, candidate_run_id = NULL, "
+                "UPDATE tasks SET status = ?" + assignment_sql + ", version = version + 1, "
+                "completed_at = NULL, result = NULL, current_run_id = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "candidate_run_id = NULL, "
                 "block_kind = CASE WHEN ? = 'blocked' THEN block_kind ELSE NULL END, "
                 "block_recurrences = CASE WHEN ? = 'blocked' THEN block_recurrences ELSE 0 END "
                 "WHERE id = ?",
-                (new_status, new_status, new_status, row["id"]),
+                tuple(params),
             )
             entry = {
                 "id": row["id"],
+                "prior_assignee": row["assignee"],
+                "new_assignee": new_assignee,
                 "prior_status": row["status"],
                 "new_status": new_status,
                 "prior_version": int(row["version"] or 1),
@@ -4838,7 +4867,10 @@ def _typed_rework_graph(
         )
     _emit_acceptance_changes(conn, acceptance_before, source_task_id=implementation_id)
     for entry in invalidated:
-        notify_task_updated(conn, entry["id"], ("status", "version", "completed_at", "result"))
+        fields = ("status", "version", "completed_at", "result")
+        if entry["id"] == implementation_id and same_card:
+            fields += ("assignee",)
+        notify_task_updated(conn, entry["id"], fields)
     return result
 
 
