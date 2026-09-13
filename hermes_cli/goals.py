@@ -1498,8 +1498,10 @@ KANBAN_GOAL_CONTINUATION_TEMPLATE = (
     "review card, include verdict=APPROVE or REQUEST_CHANGES; for a typed "
     "validation card, include verdict=PASS or FAIL. A review handoff is not "
     "acceptance: the board computes acceptance from fresh execution, review, "
-    "and validation evidence. If you are blocked and need human input, call "
-    "kanban_block with a reason. Do not stop without calling one of them."
+    "and validation evidence. If this is a ``kind=code`` implementation "
+    "task, put direct ``base_sha`` and ``head_sha`` commit fields in "
+    "kanban_complete's ``metadata``. If you are blocked and need human input, "
+    "call kanban_block with a reason. Do not stop without calling one of them."
 )
 
 # Judge says done but the worker never called kanban_complete/kanban_block: one explicit nudge.
@@ -1508,7 +1510,9 @@ KANBAN_GOAL_FINALIZE_TEMPLATE = (
     "Reason: {reason}\n\n"
     "If this is implementation work, call kanban_complete with a short "
     "summary (or kanban_request_review for a same-card review handoff). "
-    "For typed review cards use verdict=APPROVE or REQUEST_CHANGES; for "
+    "For ``kind=code`` implementation work, put direct ``base_sha`` and "
+    "``head_sha`` commit fields in the handoff ``metadata``. For typed review "
+    "cards use verdict=APPROVE or REQUEST_CHANGES; for "
     "typed validation cards use verdict=PASS or FAIL. Acceptance is a "
     "computed projection, not a status toggle. If something still blocks "
     "completion, call kanban_block with the reason instead."

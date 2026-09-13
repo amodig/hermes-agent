@@ -27,6 +27,7 @@ from hermes_cli.kanban_lifecycle import get_lifecycle_state
 from hermes_cli.kanban_parser import build_parser
 from hermes_cli.kanban_runtime import (
     RuntimeIdentityError,
+    _fingerprint,
     assert_runtime_import_root,
     code_identity,
     process_start_time,
@@ -198,6 +199,99 @@ class KanbanLifecycleConformance(unittest.TestCase):
             self.assertEqual(acceptance["validation_verdict"], "PASS")
             trace.append("implementation:acceptance=pending->accepted")
             self.assertEqual(trace[-1], fixture["expected_trace"][-1])
+
+    def test_archived_negative_role_evidence_is_pending(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kanban-conformance-archive-") as raw_repo:
+            repo = Path(raw_repo)
+            _git(repo, "init", "-q")
+            _git(repo, "config", "user.email", "conformance@example.invalid")
+            _git(repo, "config", "user.name", "Kanban Conformance")
+            (repo / "README").write_text("base\n", encoding="utf-8")
+            _git(repo, "add", "README")
+            _git(repo, "commit", "-qm", "base")
+            base_sha = _git(repo, "rev-parse", "HEAD")
+            (repo / "lifecycle.py").write_text("print('proof')\n", encoding="utf-8")
+            _git(repo, "add", "lifecycle.py")
+            _git(repo, "commit", "-qm", "implementation")
+            head_sha = _git(repo, "rev-parse", "HEAD")
+
+            implementation = kb.create_task(
+                self.conn,
+                title="Archived negative verdict implementation",
+                assignee="implementer",
+                initial_status="blocked",
+                workspace_kind="dir",
+                workspace_path=str(repo),
+                lifecycle_contract={
+                    "kind": "code",
+                    "review_mode": "separate_card",
+                    "reviewer": "reviewer",
+                    "validation_required": False,
+                },
+            )
+            review = kb.create_task(
+                self.conn,
+                title="Archived negative verdict review",
+                assignee="reviewer",
+                initial_status="blocked",
+                lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
+            )
+            kb.link_tasks(self.conn, implementation, review, requirement="phase_finished")
+            self.assertTrue(kb.unblock_task(self.conn, implementation))
+            implementation_run = kb.claim_task(
+                self.conn, implementation, claimer="implementer:conformance"
+            )
+            self.assertIsNotNone(implementation_run)
+            self.assertTrue(
+                kb.complete_task(
+                    self.conn,
+                    implementation,
+                    expected_run_id=implementation_run.current_run_id,
+                    summary="Implementation evidence",
+                    metadata={
+                        "base_sha": base_sha,
+                        "head_sha": head_sha,
+                        "changed_files": ["lifecycle.py"],
+                    },
+                )
+            )
+
+            review_run = kb.claim_review_task(self.conn, review, claimer="reviewer:conformance")
+            self.assertIsNotNone(review_run)
+            self.assertTrue(
+                kb.complete_task(
+                    self.conn,
+                    review,
+                    expected_run_id=review_run.current_run_id,
+                    verdict="REQUEST_CHANGES",
+                    summary="Changes are required",
+                )
+            )
+            self.assertEqual(get_lifecycle_state(self.conn, review)["acceptance"], "rejected")
+            self.assertEqual(
+                get_lifecycle_state(self.conn, implementation)["acceptance"], "rejected"
+            )
+
+            self.assertTrue(kb.archive_task(self.conn, review))
+            self.assertEqual(get_lifecycle_state(self.conn, review)["acceptance"], "pending")
+            self.assertEqual(
+                get_lifecycle_state(self.conn, implementation)["acceptance"], "pending"
+            )
+
+    def test_runtime_identity_fingerprints_review_skill(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kanban-conformance-runtime-") as raw_root:
+            root = Path(raw_root)
+            for directory in ("hermes_cli", "tools", "agent", "gateway", "plugins", "providers", "cron"):
+                package = root / directory
+                package.mkdir(parents=True)
+                (package / "module.py").write_text("value = 1\n", encoding="utf-8")
+            skill = root / "skills" / "devops" / "sdlc-review" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text("review instructions v1\n", encoding="utf-8")
+
+            before = _fingerprint(root)
+            skill.write_text("review instructions v2\n", encoding="utf-8")
+            self.assertNotEqual(before, _fingerprint(root))
 
     def test_identity_claim_and_runtime_surfaces(self) -> None:
         identity = runtime_identity(RUNTIME_ROOT)

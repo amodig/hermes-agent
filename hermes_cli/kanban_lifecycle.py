@@ -497,7 +497,7 @@ def get_lifecycle_state(conn: sqlite3.Connection, task_id: str) -> dict[str, Any
                 state["diagnostics"].append(freshness_reason)
         if freshness_reason in {"candidate_head_mismatch", "goal_revision_stale"}:
             state["acceptance"] = "stale"
-        elif verdict in {"REQUEST_CHANGES", "FAIL"}:
+        elif verdict in {"REQUEST_CHANGES", "FAIL"} and row["status"] == "done":
             state["acceptance"] = "rejected"
         elif verdict in {"APPROVE", "PASS"} and row["status"] == "done":
             state["acceptance"] = "accepted"
@@ -537,14 +537,17 @@ def get_lifecycle_state(conn: sqlite3.Connection, task_id: str) -> dict[str, Any
     if role_conflict:
         state["diagnostics"].append("role_conflict")
     review_accepted = False
+    review_rejected = False
     if review_id:
         if review_id == task_id:
             verdict, lifecycle, error = _verdict_for(conn, task_id, "review")
             review_accepted = verdict == "APPROVE" and row["status"] == "done"
+            review_rejected = verdict == "REQUEST_CHANGES" and row["status"] == "done"
         else:
             review_state = get_lifecycle_state(conn, review_id)
             verdict, lifecycle, error = review_state["review_verdict"], None, None
             review_accepted = review_state["acceptance"] == "accepted"
+            review_rejected = review_state["acceptance"] == "rejected"
             if verdict:
                 rows = _evidence_rows(conn, review_id, "review")
                 lifecycle = rows[0][1] if rows else None
@@ -562,12 +565,14 @@ def get_lifecycle_state(conn: sqlite3.Connection, task_id: str) -> dict[str, Any
                     state["acceptance"] = "stale"
                     review_accepted = False
     validation_accepted = not contract.get("validation_required")
+    validation_rejected = False
     if contract.get("validation_required"):
         if validation_id:
             validation_state = get_lifecycle_state(conn, validation_id)
             state["validation_verdict"] = validation_state["validation_verdict"]
             state["diagnostics"].extend(validation_state.get("diagnostics") or [])
             validation_accepted = validation_state["acceptance"] == "accepted"
+            validation_rejected = validation_state["acceptance"] == "rejected"
         else:
             state["diagnostics"].append("candidate_missing")
             validation_accepted = False
@@ -580,7 +585,7 @@ def get_lifecycle_state(conn: sqlite3.Connection, task_id: str) -> dict[str, Any
         for d in state["diagnostics"]
     ):
         state["acceptance"] = "stale"
-    elif state["review_verdict"] == "REQUEST_CHANGES" or state["validation_verdict"] == "FAIL":
+    elif review_rejected or validation_rejected:
         state["acceptance"] = "rejected"
     elif required_review_ok and required_validation_ok and row["status"] == "done":
         state["acceptance"] = "accepted"

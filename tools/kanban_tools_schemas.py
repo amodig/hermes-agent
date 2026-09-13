@@ -123,8 +123,13 @@ KANBAN_COMPLETE_SCHEMA = _schema(
         "downstream workers and humans. Prefer ``summary`` for a "
         "human-readable 1-3 sentence description of what you did; put "
         "machine-readable facts in ``metadata`` (changed_files, "
-        "tests_run, decisions, findings, etc). At least one of "
-        "``summary`` or ``result`` is required. If you created new "
+        "tests_run, decisions, findings, etc). For a ``kind=code`` "
+        "implementation task, ``metadata`` MUST contain direct string "
+        "fields ``base_sha`` and ``head_sha`` for the immutable base and "
+        "resulting commits; the completion contract verifies them against "
+        "the assigned workspace. Include ``changed_files`` and other "
+        "machine-readable facts in the same metadata object. At least one "
+        "of ``summary`` or ``result`` is required. If you created new "
         "tasks via ``kanban_create`` during this run, list their ids "
         "in ``created_cards`` — the kernel verifies them so phantom "
         "references are caught before they leak into downstream "
@@ -142,12 +147,32 @@ KANBAN_COMPLETE_SCHEMA = _schema(
                 "Run History on the dashboard and in downstream "
                 "workers' context."
         )),
-        "metadata": _prop("object", (
-                "Free-form dict of structured facts about this "
-                "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
-                "\"findings\": [...]}. Surfaced to downstream "
-                "workers alongside ``summary``."
-        )),
+        "metadata": {
+            "type": "object",
+            "description": (
+                "Structured facts about this attempt, surfaced to "
+                "downstream workers alongside ``summary``. For code "
+                "implementation completion, put the immutable ``base_sha`` "
+                "and ``head_sha`` directly in this object; both are "
+                "required."
+            ),
+            "properties": {
+                "base_sha": {
+                    "type": "string",
+                    "description": "Immutable base commit for the implementation handoff.",
+                },
+                "head_sha": {
+                    "type": "string",
+                    "description": "Resulting commit at the assigned workspace branch tip.",
+                },
+                "changed_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Files changed between base_sha and head_sha.",
+                },
+            },
+            "additionalProperties": True,
+        },
         "result": _prop("string", (
                 "Short result log line (legacy field, maps to "
                 "task.result). Use ``summary`` instead when "
@@ -265,8 +290,20 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
             "type": "object",
             "description": (
                 "Optional structured handoff facts for the reviewer, such "
-                "as changed_files, tests_run, commit, or decisions."
+                "as changed_files, tests_run, commit, or decisions. For "
+                "``kind=code`` implementation work, put the immutable "
+                "``base_sha`` and ``head_sha`` directly in this object."
             ),
+            "properties": {
+                "base_sha": {
+                    "type": "string",
+                    "description": "Immutable base commit for the implementation handoff.",
+                },
+                "head_sha": {
+                    "type": "string",
+                    "description": "Resulting commit at the assigned workspace branch tip.",
+                },
+            },
             "additionalProperties": True,
         },
     },

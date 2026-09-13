@@ -24,6 +24,7 @@ import uuid
 RUNTIME_IDENTITY_PROTOCOL = 1
 _BOOTSTRAP_TIMEOUT_SECONDS = 10.0
 _IDENTITY_ROOTS = ("hermes_cli", "tools", "agent", "gateway", "plugins", "providers", "cron")
+_IDENTITY_ASSETS = ("skills/devops/sdlc-review/SKILL.md",)
 _BOOTSTRAP_INPUT_ENV = (
     "HERMES_KANBAN_BOOTSTRAP_PATH",
     "HERMES_KANBAN_PREPARATION_ID",
@@ -157,6 +158,11 @@ def _fingerprint(root: Path) -> str:
             if path.is_file()
             and not any(part.startswith(".") or part == "__pycache__" for part in path.parts)
         )
+    for asset in _IDENTITY_ASSETS:
+        path = root / asset
+        if not path.is_file():
+            raise RuntimeIdentityError(f"runtime identity asset is missing: {asset}")
+        relatives.append(Path(asset))
     for relative in sorted(set(relatives), key=lambda value: value.as_posix()):
         path = root / relative
         digest.update(relative.as_posix().encode("utf-8"))
