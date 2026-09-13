@@ -367,6 +367,34 @@ class KanbanLifecycleConformance(unittest.TestCase):
         with self.assertRaises(kb.LifecycleContractError):
             kb.assign_task(self.conn, implementation, "tester")
 
+    def test_malformed_parent_contract_is_dependency_blocker(self) -> None:
+        parent = kb.create_task(
+            self.conn,
+            title="malformed dependency parent",
+            initial_status="blocked",
+        )
+        child = kb.create_task(
+            self.conn,
+            title="malformed dependency child",
+            initial_status="blocked",
+            parents=(parent,),
+        )
+        unrelated = kb.create_task(
+            self.conn,
+            title="unrelated ready task",
+            initial_status="blocked",
+        )
+        with kb.write_txn(self.conn):
+            self.conn.execute(
+                "UPDATE tasks SET lifecycle_contract = ? WHERE id = ?",
+                ("{\"kind\": \"corrupt\"}", parent),
+            )
+        projection = kb.evaluate_dependencies(self.conn, child)
+        self.assertFalse(projection["satisfied"])
+        self.assertEqual(projection["blockers"][0]["code"], "lifecycle_unclassified")
+        self.assertEqual(kb.recompute_ready(self.conn), 1)
+        self.assertEqual(self._task(unrelated).status, "ready")
+
     def test_review_card_requires_separate_card_candidate(self) -> None:
         implementation = kb.create_task(
             self.conn,

@@ -273,11 +273,14 @@ def test_import_scrubs_typed_handoff_paths_and_requeues_candidate(kanban_root, t
                 metadata={
                     "workspace_path": "/exporter/repo",
                     "branch_name": "feature/x",
+                    "patch_artifact": "/exporter/repo/change.patch",
+                    "patch_sha256": "abc123",
                     "lifecycle_routing": {
                         "implementer": "implementer",
                         "reviewer": "reviewer",
                         "workspace_path": "/exporter/repo",
                         "branch_name": "feature/x",
+                        "patch_artifact": "/exporter/repo/change.patch",
                     },
                 },
             )
@@ -288,8 +291,14 @@ def test_import_scrubs_typed_handoff_paths_and_requeues_candidate(kanban_root, t
                 {
                     "base_sha": "base",
                     "head_sha": "head",
+                    "patch_artifact": "/exporter/repo/change.patch",
+                    "patch_sha256": "abc123",
                     "branch_name": "feature/x",
                     "workspace_path": "/exporter/repo",
+                    "legacy_handoff": {
+                        "patch_artifact": "/exporter/repo/change.patch",
+                        "patch_sha256": "abc123",
+                    },
                 },
             )
 
@@ -309,8 +318,11 @@ def test_import_scrubs_typed_handoff_paths_and_requeues_candidate(kanban_root, t
                 (implementation_id,),
             ).fetchone()["metadata"]
         )
-    assert handoff == {"base_sha": "base", "head_sha": "head"}
+    assert handoff == {
+        "base_sha": "base", "head_sha": "head", "patch_sha256": "abc123",
+    }
     assert run_metadata == {
+        "patch_sha256": "abc123",
         "lifecycle_routing": {"implementer": "implementer", "reviewer": "reviewer"},
     }
 

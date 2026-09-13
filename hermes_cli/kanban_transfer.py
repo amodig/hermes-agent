@@ -124,12 +124,12 @@ def _scrub_handoff_paths(conn: sqlite3.Connection) -> None:
         if not isinstance(payload, dict):
             continue
         changed = False
-        for key in ("branch_name", "workspace_path"):
+        for key in ("branch_name", "workspace_path", "patch_artifact"):
             if payload.pop(key, None) is not None:
                 changed = True
         routing = payload.get("lifecycle_routing")
         if isinstance(routing, dict):
-            for key in ("branch_name", "workspace_path"):
+            for key in ("branch_name", "workspace_path", "patch_artifact"):
                 if routing.pop(key, None) is not None:
                     changed = True
         if changed:
@@ -149,12 +149,12 @@ def _scrub_handoff_paths(conn: sqlite3.Connection) -> None:
         if not isinstance(payload, dict):
             continue
         changed = False
-        for key in ("branch_name", "workspace_path"):
+        for key in ("branch_name", "workspace_path", "patch_artifact"):
             if payload.pop(key, None) is not None:
                 changed = True
         legacy = payload.get("legacy_handoff")
         if isinstance(legacy, dict):
-            for key in ("branch_name", "workspace_path"):
+            for key in ("branch_name", "workspace_path", "patch_artifact"):
                 if legacy.pop(key, None) is not None:
                     changed = True
         workspace = payload.get("workspace")

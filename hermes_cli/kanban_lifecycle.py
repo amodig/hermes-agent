@@ -794,7 +794,7 @@ def evaluate_dependencies(conn: sqlite3.Connection, task_id: str) -> dict[str, A
         if requirement not in VALID_REQUIREMENTS:
             blockers.append({**base, "code": "lifecycle_unclassified", "message": "dependency edge has no lifecycle requirement"})
             continue
-        contract = decode_contract(row["lifecycle_contract"])
+        contract = safe_decode_contract(row["lifecycle_contract"])
         if contract is None:
             blockers.append({**base, "code": "lifecycle_unclassified", "message": "parent lifecycle contract is unclassified"})
             continue

@@ -97,8 +97,10 @@ def _claim_rejected_for_snapshot(
 
 
 def _forced_promotion_active(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Keep a forced promotion live across assignment bookkeeping only."""
     row = conn.execute(
-        "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND kind != 'assigned' ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     return bool(
