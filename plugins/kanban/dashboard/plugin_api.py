@@ -175,6 +175,7 @@ def _task_dict(
     *,
     latest_summary: Optional[str] = None,
     conn: Optional[sqlite3.Connection] = None,
+    active_lifecycle_phase: Optional[str] = None,
 ) -> dict[str, Any]:
     d = asdict(task)
     try:
@@ -189,12 +190,43 @@ def _task_dict(
     if conn is not None:
         d["lifecycle"] = kanban_db.get_lifecycle_state(conn, task.id)
         d["dependencies"] = kanban_db.evaluate_dependencies(conn, task.id)
-        d["active_lifecycle_phase"] = (
+        active_lifecycle_phase = (
             kanban_db._retry_status_for_run(conn, task.id, task.current_run_id)
             if task.status == "running" and task.current_run_id
             else None
         )
+    if active_lifecycle_phase is not None:
+        d["active_lifecycle_phase"] = active_lifecycle_phase
     return d
+
+
+def _active_lifecycle_phases(
+    conn: sqlite3.Connection, tasks: list[kanban_db.Task],
+) -> dict[str, str]:
+    current = {
+        task.id: int(task.current_run_id)
+        for task in tasks
+        if task.status == "running" and task.current_run_id
+    }
+    if not current:
+        return {}
+    ids = list(current)
+    run_ids = list(current.values())
+    rows = conn.execute(
+        "SELECT task_id, run_id, payload FROM task_events "
+        f"WHERE task_id IN ({_placeholders(ids)}) "
+        f"AND run_id IN ({_placeholders(run_ids)}) "
+        "AND kind = 'claimed' ORDER BY id DESC",
+        (*ids, *run_ids),
+    ).fetchall()
+    phases: dict[str, str] = {}
+    for row in rows:
+        task_id = row["task_id"]
+        if task_id in phases or int(row["run_id"] or 0) != current.get(task_id):
+            continue
+        if kanban_db._json_dict(row["payload"]).get("source_status") == "review":
+            phases[task_id] = "review"
+    return phases
 
 
 def _attachment_dict(a: kanban_db.Attachment) -> dict[str, Any]:
@@ -326,11 +358,13 @@ def get_board(
         # One window-function query for latest summaries (avoids N+1); cards get a
         # truncated preview, the full text comes from /tasks/:id.
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        active_lifecycle_phases = _active_lifecycle_phases(conn, tasks)
         for t in tasks:
             full = summary_map.get(t.id)
             d = _task_dict(
                 t,
                 latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None),
+                active_lifecycle_phase=active_lifecycle_phases.get(t.id),
             )
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)

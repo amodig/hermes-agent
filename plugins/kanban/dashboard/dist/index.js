@@ -990,6 +990,7 @@
     const lifecycleCompletionTask = useCallback(function (ids) {
       const tasks = Array.from(ids).map(findBoardTask);
       const phaseForTask = function (task) {
+        const contract = task && task.lifecycle_contract;
         if (isActiveSameCardReview(task)) {
           return "review";
         }
