@@ -91,7 +91,8 @@ def _probe_identity(runtime_root: Path, python: str) -> dict:
             env=env,
             capture_output=True,
             text=True,
-            timeout=20,
+            encoding="utf-8",
+            errors="replace",
         )
     if result.returncode != 0:
         raise RuntimeError(f"runtime identity probe failed: {result.stderr.strip()}")
@@ -193,7 +194,16 @@ def _run_suite(layer: str, runtime_root: Path, python: str, junit: Path | None) 
         command = [python, "-m", "unittest", "-v", TEST_MODULE]
         runner = "python -m unittest"
         cwd = runtime_root if layer == "installed" else REPO_ROOT
-    result = subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, timeout=300)
+    result = subprocess.run(
+        command,
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=300,
+    )
     return result.returncode, result.stdout + result.stderr, runner, env["PYTHONPATH"]
 
 def _run_scenario_probe(runtime_root: Path, python: str) -> tuple[int, str]:
@@ -216,6 +226,8 @@ def _run_scenario_probe(runtime_root: Path, python: str) -> tuple[int, str]:
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=300,
     )
     return result.returncode, result.stdout + result.stderr
