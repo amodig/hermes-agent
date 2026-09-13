@@ -140,9 +140,23 @@ def _version(root: Path) -> str:
     return text[start:end] if end > start else "unknown"
 
 
+
+def _identity_asset_path(root: Path, asset: str) -> Path:
+    path = root / asset
+    if path.is_file():
+        return path
+    if asset.startswith("skills/"):
+        bundled_root = os.environ.get("HERMES_BUNDLED_SKILLS")
+        if bundled_root:
+            path = Path(bundled_root) / Path(asset).relative_to("skills")
+            if path.is_file():
+                return path
+    raise RuntimeIdentityError(f"runtime identity asset is missing: {asset}")
+
 def _fingerprint(root: Path) -> str:
     digest = hashlib.sha256()
     relatives: list[Path] = []
+    asset_paths: dict[Path, Path] = {}
     relatives.extend(
         path.relative_to(root)
         for path in root.glob("*.py")
@@ -159,12 +173,11 @@ def _fingerprint(root: Path) -> str:
             and not any(part.startswith(".") or part == "__pycache__" for part in path.parts)
         )
     for asset in _IDENTITY_ASSETS:
-        path = root / asset
-        if not path.is_file():
-            raise RuntimeIdentityError(f"runtime identity asset is missing: {asset}")
-        relatives.append(Path(asset))
+        relative = Path(asset)
+        asset_paths[relative] = _identity_asset_path(root, asset)
+        relatives.append(relative)
     for relative in sorted(set(relatives), key=lambda value: value.as_posix()):
-        path = root / relative
+        path = asset_paths.get(relative, root / relative)
         digest.update(relative.as_posix().encode("utf-8"))
         digest.update(b"\0")
         digest.update(path.read_bytes())

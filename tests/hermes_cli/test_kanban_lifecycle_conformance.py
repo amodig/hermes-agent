@@ -416,6 +416,103 @@ class KanbanLifecycleConformance(unittest.TestCase):
             before = _fingerprint(root)
             skill.write_text("review instructions v2\n", encoding="utf-8")
             self.assertNotEqual(before, _fingerprint(root))
+            bundled_root = root / "packaged-skills"
+            bundled_skill = bundled_root / "devops" / "sdlc-review" / "SKILL.md"
+            bundled_skill.parent.mkdir(parents=True)
+            bundled_skill.write_text("packaged review instructions v1\n", encoding="utf-8")
+            skill.unlink()
+            with patch.dict(os.environ, {"HERMES_BUNDLED_SKILLS": str(bundled_root)}):
+                before = _fingerprint(root)
+                bundled_skill.write_text("packaged review instructions v2\n", encoding="utf-8")
+                self.assertNotEqual(before, _fingerprint(root))
+
+    def test_completion_rechecks_candidate_head_at_commit_boundary(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kanban-conformance-race-") as raw_repo:
+            repo = Path(raw_repo)
+            _git(repo, "init", "-q")
+            _git(repo, "config", "user.email", "conformance@example.invalid")
+            _git(repo, "config", "user.name", "Kanban Conformance")
+            (repo / "README").write_text("base\n", encoding="utf-8")
+            _git(repo, "add", "README")
+            _git(repo, "commit", "-qm", "base")
+            base_sha = _git(repo, "rev-parse", "HEAD")
+            (repo / "lifecycle.py").write_text("print('proof')\n", encoding="utf-8")
+            _git(repo, "add", "lifecycle.py")
+            _git(repo, "commit", "-qm", "implementation")
+            head_sha = _git(repo, "rev-parse", "HEAD")
+
+            implementation = kb.create_task(
+                self.conn,
+                title="Implement race fixture",
+                assignee="implementer",
+                initial_status="blocked",
+                workspace_kind="scratch",
+                workspace_path=str(repo),
+                lifecycle_contract={
+                    "kind": "code",
+                    "review_mode": "separate_card",
+                    "reviewer": "reviewer",
+                    "validation_required": False,
+                },
+            )
+            review = kb.create_task(
+                self.conn,
+                title="Review race fixture",
+                assignee="reviewer",
+                initial_status="blocked",
+                lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
+            )
+            kb.link_tasks(self.conn, implementation, review, requirement="phase_finished")
+            self.assertTrue(kb.unblock_task(self.conn, implementation))
+            implementation_run = kb.claim_task(self.conn, implementation, claimer="implementer:race")
+            self.assertIsNotNone(implementation_run)
+            self.assertTrue(
+                kb.complete_task(
+                    self.conn,
+                    implementation,
+                    expected_run_id=implementation_run.current_run_id,
+                    summary="Implementation evidence",
+                    metadata={
+                        "base_sha": base_sha,
+                        "head_sha": head_sha,
+                        "changed_files": ["lifecycle.py"],
+                    },
+                )
+            )
+            review_run = kb.claim_review_task(self.conn, review, claimer="reviewer:race")
+            self.assertIsNotNone(review_run)
+
+            original_stamp = kb._stamp_lifecycle_metadata
+            raced = False
+
+            def stamp(conn, task_id, metadata, *, phase, run_id, verdict):
+                nonlocal raced
+                prepared = original_stamp(
+                    conn,
+                    task_id,
+                    metadata,
+                    phase=phase,
+                    run_id=run_id,
+                    verdict=verdict,
+                )
+                if not raced:
+                    raced = True
+                    (repo / "race.py").write_text("print('moved')\n", encoding="utf-8")
+                    _git(repo, "add", "race.py")
+                    _git(repo, "commit", "-qm", "candidate advanced")
+                return prepared
+
+            with patch.object(kb, "_stamp_lifecycle_metadata", side_effect=stamp):
+                with self.assertRaises(kb.HandoffValidationError):
+                    kb.complete_task(
+                        self.conn,
+                        review,
+                        expected_run_id=review_run.current_run_id,
+                        verdict="APPROVE",
+                        summary="Reviewed exact implementation head",
+                        metadata={"reviewed_head_sha": head_sha},
+                    )
+            self.assertEqual(self._task(review).status, "running")
 
     def test_identity_claim_and_runtime_surfaces(self) -> None:
         identity = runtime_identity(RUNTIME_ROOT)

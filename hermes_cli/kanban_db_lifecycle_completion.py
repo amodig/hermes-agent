@@ -97,108 +97,30 @@ def _completion_modes(
     )
     return typed_phase, same_card_handoff, same_card_changes
 
-def complete_task(
-    conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
-    summary: Optional[str] = None, metadata: Optional[dict] = None,
-    created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
-    verdict: Optional[str] = None,
-    fire_lifecycle_hook: bool = True,
-) -> bool:
-    """``running|ready|blocked|review -> done``; records ``result``.
-
-    ``ready`` is accepted for manual CLI completion, ``review`` for human
-    approval; with no active run the handoff fields survive via
-    :func:`_synthesize_ended_run`. ``summary`` (defaults to ``result``) and
-    ``metadata`` land on the closing run for :func:`build_worker_context`.
-    ``created_cards`` are verified first — a phantom id raises
-    :class:`HallucinatedCardsError` after an auditable event; afterwards the
-    prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
-    """
-    task_before = _kb.get_task(conn, task_id)
-    typed_phase, same_card_handoff, same_card_changes = _completion_modes(
-        conn, task_before, task_id, verdict,
-    )
-    if task_before and task_before.status == "done" and typed_phase is not None:
-        projection = get_lifecycle_state(conn, task_id)
-        existing_verdict = (
-            projection.get("review_verdict")
-            if typed_phase == "review"
-            else projection.get("validation_verdict")
-            if typed_phase == "validation"
-            else None
-        )
-        if typed_phase in {"review", "validation"}:
-            normalized = str(verdict or "").strip().upper()
-            if normalized == existing_verdict:
-                return True
-            raise LifecycleEvidenceError("verdict_conflict: terminal lifecycle verdict differs from stored evidence")
-        supplied_head = (
-            metadata.get("head_sha")
-            if isinstance(metadata, dict)
-            else None
-        )
-        if supplied_head and projection.get("head_sha") and supplied_head != projection["head_sha"]:
-            raise LifecycleEvidenceError("verdict_conflict: terminal implementation head differs from stored evidence")
-        return True
-    acceptance_before = _capture_acceptance(conn, task_id)
-    now = int(time.time())
-    # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
-    if not _parents_satisfied(conn, task_id):
-        return False
-    preflight_contract = _completion_contract_snapshot(conn, task_id)
-    verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
-    metadata = _merge_completion_prose_artifacts(
-        conn, task_id, metadata, summary=summary, result=result,
-    )
-    try:
-        metadata, _handoff = _kb._prepare_completion_handoff(
-            conn, task_id, metadata, phase=typed_phase,
-        )
-    except _kb.CompletionContractError as error:
-        with _kb.write_txn(conn):
-            _kb._append_event(
-                conn,
-                task_id,
-                "completion_blocked_contract",
-                {"reason": error.reason, "changed_files": error.changed_files},
-                run_id=expected_run_id,
-            )
-        raise
-    except _kb.HandoffValidationError as error:
-        with _kb.write_txn(conn):
-            _kb._append_event(
-                conn, task_id, "completion_blocked_handoff",
-                {"reason": error.reason}, run_id=expected_run_id,
-            )
-        raise
-    if typed_phase is not None:
-        try:
-            metadata = _stamp_lifecycle_metadata(
-                conn,
-                task_id,
-                metadata,
-                phase=typed_phase,
-                run_id=expected_run_id or (task_before.current_run_id if task_before else None),
-                verdict=verdict,
-            )
-        except LifecycleEvidenceError as error:
-            with _kb.write_txn(conn):
-                _kb._append_event(
-                    conn,
-                    task_id,
-                    "completion_blocked_lifecycle",
-                    {"reason": str(error)},
-                    run_id=expected_run_id,
-                )
-            raise
-    handoff_summary = summary if summary is not None else result
+def _commit_completion(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    task_before: Any,
+    metadata: Optional[dict],
+    preflight_contract: tuple[Any, ...],
+    verified_cards: list[str],
+    typed_phase: Optional[str],
+    same_card_handoff: bool,
+    same_card_changes: bool,
+    expected_run_id: Optional[int],
+    now: int,
+    handoff_summary: Optional[str],
+    summary: Optional[str],
+    result: Optional[str],
+) -> tuple[bool, Optional[int], Optional[Exception]]:
     contract_err: Optional[_kb.CompletionContractError] = None
     run_id: Optional[int] = None
     with _kb.write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
-            return False
+            return False, None, None
         if _completion_contract_snapshot(conn, task_id) != preflight_contract:
             contract_err = _kb.CompletionContractError(
                 task_id,
@@ -212,6 +134,23 @@ def complete_task(
                 run_id=expected_run_id,
             )
         else:
+            try:
+                metadata, _handoff = _kb._prepare_completion_handoff(
+                    conn, task_id, metadata, phase=typed_phase,
+                )
+            except _kb.CompletionContractError as error:
+                _kb._append_event(
+                    conn, task_id, "completion_blocked_contract",
+                    {"reason": error.reason, "changed_files": error.changed_files},
+                    run_id=expected_run_id,
+                )
+                return False, None, error
+            except _kb.HandoffValidationError as error:
+                _kb._append_event(
+                    conn, task_id, "completion_blocked_handoff",
+                    {"reason": error.reason}, run_id=expected_run_id,
+                )
+                return False, None, error
             prior_status = _kb._task_status(conn, task_id)
             implementation_routing = _implementation_routing(conn, task_id)
             target_status = (
@@ -255,7 +194,7 @@ def complete_task(
                 sql += " AND current_run_id = ?"
                 params = (*params, int(expected_run_id))
             if conn.execute(sql, params).rowcount != 1:
-                return False
+                return False, None, None
             if same_card_changes:
                 conn.execute("UPDATE tasks SET candidate_run_id = NULL WHERE id = ?", (task_id,))
             if (
@@ -346,6 +285,123 @@ def complete_task(
                 )
     if contract_err is not None:
         raise contract_err
+    return True, run_id, None
+
+def complete_task(
+    conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
+    summary: Optional[str] = None, metadata: Optional[dict] = None,
+    created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
+    verdict: Optional[str] = None,
+    fire_lifecycle_hook: bool = True,
+) -> bool:
+    """``running|ready|blocked|review -> done``; records ``result``.
+
+    ``ready`` is accepted for manual CLI completion, ``review`` for human
+    approval; with no active run the handoff fields survive via
+    :func:`_synthesize_ended_run`. ``summary`` (defaults to ``result``) and
+    ``metadata`` land on the closing run for :func:`build_worker_context`.
+    ``created_cards`` are verified first — a phantom id raises
+    :class:`HallucinatedCardsError` after an auditable event; afterwards the
+    prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
+    """
+    task_before = _kb.get_task(conn, task_id)
+    typed_phase, same_card_handoff, same_card_changes = _completion_modes(
+        conn, task_before, task_id, verdict,
+    )
+    if task_before and task_before.status == "done" and typed_phase is not None:
+        projection = get_lifecycle_state(conn, task_id)
+        existing_verdict = (
+            projection.get("review_verdict")
+            if typed_phase == "review"
+            else projection.get("validation_verdict")
+            if typed_phase == "validation"
+            else None
+        )
+        if typed_phase in {"review", "validation"}:
+            normalized = str(verdict or "").strip().upper()
+            if normalized == existing_verdict:
+                return True
+            raise LifecycleEvidenceError("verdict_conflict: terminal lifecycle verdict differs from stored evidence")
+        supplied_head = (
+            metadata.get("head_sha")
+            if isinstance(metadata, dict)
+            else None
+        )
+        if supplied_head and projection.get("head_sha") and supplied_head != projection["head_sha"]:
+            raise LifecycleEvidenceError("verdict_conflict: terminal implementation head differs from stored evidence")
+        return True
+    acceptance_before = _capture_acceptance(conn, task_id)
+    now = int(time.time())
+    # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
+    if not _parents_satisfied(conn, task_id):
+        return False
+    preflight_contract = _completion_contract_snapshot(conn, task_id)
+    verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
+    metadata = _merge_completion_prose_artifacts(
+        conn, task_id, metadata, summary=summary, result=result,
+    )
+    try:
+        metadata, _handoff = _kb._prepare_completion_handoff(
+            conn, task_id, metadata, phase=typed_phase,
+        )
+    except _kb.CompletionContractError as error:
+        with _kb.write_txn(conn):
+            _kb._append_event(
+                conn,
+                task_id,
+                "completion_blocked_contract",
+                {"reason": error.reason, "changed_files": error.changed_files},
+                run_id=expected_run_id,
+            )
+        raise
+    except _kb.HandoffValidationError as error:
+        with _kb.write_txn(conn):
+            _kb._append_event(
+                conn, task_id, "completion_blocked_handoff",
+                {"reason": error.reason}, run_id=expected_run_id,
+            )
+        raise
+    if typed_phase is not None:
+        try:
+            metadata = _kb._stamp_lifecycle_metadata(
+                conn,
+                task_id,
+                metadata,
+                phase=typed_phase,
+                run_id=expected_run_id or (task_before.current_run_id if task_before else None),
+                verdict=verdict,
+            )
+        except LifecycleEvidenceError as error:
+            with _kb.write_txn(conn):
+                _kb._append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked_lifecycle",
+                    {"reason": str(error)},
+                    run_id=expected_run_id,
+                )
+            raise
+    handoff_summary = summary if summary is not None else result
+    committed, run_id, boundary_error = _commit_completion(
+        conn,
+        task_id,
+        task_before=task_before,
+        metadata=metadata,
+        preflight_contract=preflight_contract,
+        verified_cards=verified_cards,
+        typed_phase=typed_phase,
+        same_card_handoff=same_card_handoff,
+        same_card_changes=same_card_changes,
+        expected_run_id=expected_run_id,
+        now=now,
+        handoff_summary=handoff_summary,
+        summary=summary,
+        result=result,
+    )
+    if boundary_error is not None:
+        raise boundary_error
+    if not committed:
+        return False
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
     # Success wipes the breaker counter (history stays on the event log).
     _kb._clear_failure_counter(conn, task_id)
