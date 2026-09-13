@@ -278,6 +278,95 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 get_lifecycle_state(self.conn, implementation)["acceptance"], "pending"
             )
 
+    def test_separate_card_validator_preserves_implementer_identity(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kanban-conformance-identity-") as raw_repo:
+            repo = Path(raw_repo)
+            _git(repo, "init", "-q")
+            _git(repo, "config", "user.email", "conformance@example.invalid")
+            _git(repo, "config", "user.name", "Kanban Conformance")
+            (repo / "README").write_text("base\n", encoding="utf-8")
+            _git(repo, "add", "README")
+            _git(repo, "commit", "-qm", "base")
+            base_sha = _git(repo, "rev-parse", "HEAD")
+            (repo / "lifecycle.py").write_text("print('proof')\n", encoding="utf-8")
+            _git(repo, "add", "lifecycle.py")
+            _git(repo, "commit", "-qm", "implementation")
+            head_sha = _git(repo, "rev-parse", "HEAD")
+
+            implementation = kb.create_task(
+                self.conn,
+                title="reassigned implementation",
+                assignee="bob",
+                initial_status="blocked",
+                workspace_kind="dir",
+                workspace_path=str(repo),
+                lifecycle_contract={
+                    "kind": "code",
+                    "review_mode": "separate_card",
+                    "reviewer": "alice",
+                    "validation_required": True,
+                },
+            )
+            review = kb.create_task(
+                self.conn,
+                title="identity review",
+                assignee="alice",
+                initial_status="blocked",
+                lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
+            )
+            kb.link_tasks(self.conn, implementation, review, requirement="phase_finished")
+            self.assertTrue(kb.unblock_task(self.conn, implementation))
+            implementation_run = kb.claim_task(self.conn, implementation, claimer="bob")
+            self.assertIsNotNone(implementation_run)
+            self.assertTrue(
+                kb.complete_task(
+                    self.conn,
+                    implementation,
+                    expected_run_id=implementation_run.current_run_id,
+                    metadata={
+                        "base_sha": base_sha,
+                        "head_sha": head_sha,
+                        "changed_files": ["lifecycle.py"],
+                    },
+                )
+            )
+            self.assertTrue(kb.assign_task(self.conn, implementation, "charlie"))
+            with self.assertRaises(kb.LifecycleContractError):
+                kb.create_task(
+                    self.conn,
+                    title="identity validation",
+                    assignee="bob",
+                    initial_status="blocked",
+                    parents=(review,),
+                    lifecycle_contract={
+                        "kind": "validation",
+                        "candidate_task_id": implementation,
+                    },
+                )
+
+    def test_force_promotion_overrides_unfinished_parent(self) -> None:
+        parent = kb.create_task(
+            self.conn,
+            title="unfinished parent",
+            initial_status="blocked",
+        )
+        child = kb.create_task(
+            self.conn,
+            title="manually promoted child",
+            initial_status="blocked",
+            parents=(parent,),
+        )
+        refused, reason = kb.promote_task(self.conn, child, actor="operator")
+        self.assertFalse(refused)
+        self.assertIn("unsatisfied lifecycle dependencies", reason or "")
+        promoted, reason = kb.promote_task(
+            self.conn, child, actor="operator", reason="override", force=True,
+        )
+        self.assertTrue(promoted)
+        self.assertIsNone(reason)
+        self.assertEqual(self._task(child).status, "ready")
+
+
     def test_runtime_identity_fingerprints_review_skill(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-runtime-") as raw_root:
             root = Path(raw_root)

@@ -142,12 +142,11 @@ def _validate_lifecycle_role_identity(
     if not actor:
         return
     forbidden = {candidate_assignee, declared_reviewer}
-    if candidate_contract.get("review_mode") == "same_card":
-        original_implementer = _kb._canonical_assignee(
-            _implementation_routing(conn, candidate_id).get("implementer")
-        )
-        if original_implementer:
-            forbidden.add(original_implementer)
+    original_implementer = _kb._canonical_assignee(
+        _implementation_routing(conn, candidate_id).get("implementer")
+    )
+    if original_implementer:
+        forbidden.add(original_implementer)
     if actor in forbidden:
         raise LifecycleContractError(
             "validator must differ from the implementation and reviewer"
@@ -390,6 +389,9 @@ def create_task(
                         "version": 1,
                         "goal_revision": goal_revision,
                     },
+                )
+                _validate_lifecycle_role_identity(
+                    conn, normalized_lifecycle, assignee, task_id=task_id,
                 )
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 _kb._inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -1024,7 +1026,7 @@ def promote_task(
         )
 
     dependency = evaluate_dependencies(conn, task_id)
-    if not dependency["satisfied"]:
+    if not dependency["satisfied"] and not force:
         blockers = dependency.get("blockers") or []
         detail = "; ".join(
             f"{item.get('parent_id')}: {item.get('code')}" for item in blockers

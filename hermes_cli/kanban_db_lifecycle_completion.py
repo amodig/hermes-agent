@@ -27,24 +27,13 @@ from hermes_cli.kanban_lifecycle import LifecycleEvidenceError, get_lifecycle_st
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
-def complete_task(
-    conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
-    summary: Optional[str] = None, metadata: Optional[dict] = None,
-    created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
-    verdict: Optional[str] = None,
-    fire_lifecycle_hook: bool = True,
-) -> bool:
-    """``running|ready|blocked|review -> done``; records ``result``.
 
-    ``ready`` is accepted for manual CLI completion, ``review`` for human
-    approval; with no active run the handoff fields survive via
-    :func:`_synthesize_ended_run`. ``summary`` (defaults to ``result``) and
-    ``metadata`` land on the closing run for :func:`build_worker_context`.
-    ``created_cards`` are verified first — a phantom id raises
-    :class:`HallucinatedCardsError` after an auditable event; afterwards the
-    prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
-    """
-    task_before = _kb.get_task(conn, task_id)
+def _completion_modes(
+    conn: sqlite3.Connection,
+    task_before: Any,
+    task_id: str,
+    verdict: Optional[str],
+) -> tuple[Optional[str], bool, bool]:
     typed_phase: Optional[str] = None
     if task_before and task_before.lifecycle_contract:
         kind = task_before.lifecycle_contract.get("kind")
@@ -106,6 +95,29 @@ def complete_task(
         and task_before.lifecycle_contract.get("review_mode") == "same_card"
         and typed_phase == "review"
         and str(verdict or "").strip().upper() == "REQUEST_CHANGES"
+    )
+    return typed_phase, same_card_handoff, same_card_changes
+
+def complete_task(
+    conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
+    summary: Optional[str] = None, metadata: Optional[dict] = None,
+    created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
+    verdict: Optional[str] = None,
+    fire_lifecycle_hook: bool = True,
+) -> bool:
+    """``running|ready|blocked|review -> done``; records ``result``.
+
+    ``ready`` is accepted for manual CLI completion, ``review`` for human
+    approval; with no active run the handoff fields survive via
+    :func:`_synthesize_ended_run`. ``summary`` (defaults to ``result``) and
+    ``metadata`` land on the closing run for :func:`build_worker_context`.
+    ``created_cards`` are verified first — a phantom id raises
+    :class:`HallucinatedCardsError` after an auditable event; afterwards the
+    prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
+    """
+    task_before = _kb.get_task(conn, task_id)
+    typed_phase, same_card_handoff, same_card_changes = _completion_modes(
+        conn, task_before, task_id, verdict,
     )
     if task_before and task_before.status == "done" and typed_phase is not None:
         projection = get_lifecycle_state(conn, task_id)
