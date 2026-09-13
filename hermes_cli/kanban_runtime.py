@@ -136,6 +136,11 @@ def _version(root: Path) -> str:
 def _fingerprint(root: Path) -> str:
     digest = hashlib.sha256()
     relatives: list[Path] = []
+    relatives.extend(
+        path.relative_to(root)
+        for path in root.glob("*.py")
+        if path.is_file()
+    )
     for directory in _IDENTITY_ROOTS:
         base = root / directory
         if not base.is_dir():

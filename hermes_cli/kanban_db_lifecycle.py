@@ -624,6 +624,15 @@ def update_task(
             or old_body != new_body
             or old_goal_mode != new_goal_mode
         )
+        if (
+            goal_changed
+            and row["status"] in {"done", "archived"}
+            and new_lifecycle
+            and new_lifecycle.get("kind") in {"review", "validation"}
+        ):
+            raise LifecycleContractError(
+                "completed typed role cards cannot be edited; repair the lifecycle graph first"
+            )
         goal_reopened = bool(
             goal_changed
             and new_lifecycle
@@ -1512,15 +1521,15 @@ def _prepare_completion_handoff(
             contract_reason,
             changed_files=supplied.get("changed_files"),
         )
-    if task.workflow_template_id == "kanban_swarm_v1":
-        return metadata, supplied
     task_contract = task.lifecycle_contract or {}
-    is_review_card = (
-        task_contract.get("kind") == "review"
-        or (
-            not task_contract
-            and str(task.assignee or "").strip().casefold() == "reviewer"
-        )
+    if (
+        task.workflow_template_id == "kanban_swarm_v1"
+        and task_contract.get("kind") != "code"
+    ):
+        return metadata, supplied
+    is_review_card = task_contract.get("kind") == "review" or (
+        not task_contract
+        and str(task.assignee or "").strip().casefold() == "reviewer"
     )
     # A reviewer handing off to a tester reviews the implementation's exact
     # commit; do not require a second commit in the reviewer's scratch workspace.
@@ -1563,10 +1572,18 @@ def _prepare_completion_handoff(
                 )
             return updated, merged_handoff
 
-    requires_immutable = task.workspace_kind == "worktree" or any(
-        supplied.get(key) for key in ("base_sha", "head_sha", "changed_files", "patch_artifact")
+    requires_immutable = (
+        task_contract.get("kind") == "code"
+        or task.workspace_kind == "worktree"
+        or any(
+            supplied.get(key)
+            for key in ("base_sha", "head_sha", "changed_files", "patch_artifact")
+        )
     )
-    if not dependent_children or not requires_immutable:
+    if (
+        (not dependent_children and task_contract.get("kind") != "code")
+        or not requires_immutable
+    ):
         return metadata, supplied
     base = str(supplied.get("base_sha") or "").strip()
     head = str(supplied.get("head_sha") or "").strip()

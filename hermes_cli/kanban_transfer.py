@@ -47,7 +47,7 @@ ARCHIVE_FORMAT_VERSION = 1
 # workspace cannot be rebuilt on this machine is parked in ``triage`` only
 # if it is in one of these — terminal and already-parked tasks are left
 # alone rather than having their history rewritten.
-_DISPATCHABLE_STATUSES = ("ready", "running", "todo", "scheduled")
+_DISPATCHABLE_STATUSES = ("ready", "running", "todo", "scheduled", "review")
 _COUNTED_TABLES = ("tasks", "task_links", "task_comments", "task_events", "task_runs", "task_attachments")
 
 
