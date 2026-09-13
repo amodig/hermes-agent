@@ -49,6 +49,82 @@ def _finish_synthetic_run(
         ),
     )
 
+def _completion_mode_general(
+    conn: sqlite3.Connection,
+    task_before: Any,
+    task_id: str,
+    verdict: Optional[str],
+) -> Optional[str]:
+    if verdict is not None:
+        raise LifecycleEvidenceError("general tasks cannot carry a lifecycle verdict")
+    return None
+
+
+def _completion_mode_review(
+    conn: sqlite3.Connection,
+    task_before: Any,
+    task_id: str,
+    verdict: Optional[str],
+) -> str:
+    if verdict is None:
+        raise LifecycleEvidenceError("review completion requires verdict=APPROVE or REQUEST_CHANGES")
+    if str(verdict).strip().upper() not in {"APPROVE", "REQUEST_CHANGES"}:
+        raise LifecycleEvidenceError("review completion verdict must be APPROVE or REQUEST_CHANGES")
+    return "review"
+
+
+def _completion_mode_validation(
+    conn: sqlite3.Connection,
+    task_before: Any,
+    task_id: str,
+    verdict: Optional[str],
+) -> str:
+    if verdict is None:
+        raise LifecycleEvidenceError("validation completion requires verdict=PASS or FAIL")
+    if str(verdict).strip().upper() not in {"PASS", "FAIL"}:
+        raise LifecycleEvidenceError("validation completion verdict must be PASS or FAIL")
+    return "validation"
+
+
+def _completion_mode_code(
+    conn: sqlite3.Connection,
+    task_before: Any,
+    task_id: str,
+    verdict: Optional[str],
+) -> str:
+    claimed_event = (
+        _kb._latest_event(conn, task_id, task_before.current_run_id)
+        if task_before.current_run_id
+        else None
+    )
+    claimed_source = _kb._json_dict(_kb._row_get(claimed_event, "payload")).get("source_status")
+    completed_review = (
+        task_before.status == "done"
+        and task_before.lifecycle_contract.get("review_mode") == "same_card"
+        and get_lifecycle_state(conn, task_id).get("review_verdict") is not None
+    )
+    typed_phase = (
+        "review"
+        if task_before.status == "review" or claimed_source == "review" or completed_review
+        else "implementation"
+    )
+    if typed_phase == "review":
+        if verdict is None:
+            raise LifecycleEvidenceError("same-card review completion requires a verdict")
+        if str(verdict).strip().upper() not in {"APPROVE", "REQUEST_CHANGES"}:
+            raise LifecycleEvidenceError("same-card review verdict must be APPROVE or REQUEST_CHANGES")
+    elif verdict is not None:
+        raise LifecycleEvidenceError("implementation completion cannot carry a review verdict")
+    return typed_phase
+
+
+_COMPLETION_MODE_HANDLERS = {
+    "general": _completion_mode_general,
+    "review": _completion_mode_review,
+    "validation": _completion_mode_validation,
+    "code": _completion_mode_code,
+}
+
 def _completion_modes(
     conn: sqlite3.Connection,
     task_before: Any,
@@ -56,64 +132,27 @@ def _completion_modes(
     verdict: Optional[str],
 ) -> tuple[Optional[str], bool, bool]:
     typed_phase: Optional[str] = None
-    if task_before and task_before.lifecycle_contract:
-        kind = task_before.lifecycle_contract.get("kind")
-        if kind == "general":
-            if verdict is not None:
-                raise LifecycleEvidenceError("general tasks cannot carry a lifecycle verdict")
-        elif kind == "review":
-            typed_phase = "review"
-            if verdict is None:
-                raise LifecycleEvidenceError("review completion requires verdict=APPROVE or REQUEST_CHANGES")
-            if str(verdict).strip().upper() not in {"APPROVE", "REQUEST_CHANGES"}:
-                raise LifecycleEvidenceError("review completion verdict must be APPROVE or REQUEST_CHANGES")
-        elif kind == "validation":
-            typed_phase = "validation"
-            if verdict is None:
-                raise LifecycleEvidenceError("validation completion requires verdict=PASS or FAIL")
-            if str(verdict).strip().upper() not in {"PASS", "FAIL"}:
-                raise LifecycleEvidenceError("validation completion verdict must be PASS or FAIL")
-        elif kind == "code":
-            claimed_event = (
-                _kb._latest_event(conn, task_id, "claimed", task_before.current_run_id)
-                if task_before and task_before.current_run_id
-                else None
-            )
-            claimed_source = _kb._json_dict(_kb._row_get(claimed_event, "payload")).get("source_status")
-            completed_review = (
-                task_before.status == "done"
-                and task_before.lifecycle_contract.get("review_mode") == "same_card"
-                and get_lifecycle_state(conn, task_id).get("review_verdict") is not None
-            )
-            typed_phase = (
-                "review"
-                if task_before.status == "review" or claimed_source == "review" or completed_review
-                else "implementation"
-            )
-            if typed_phase == "review":
-                if verdict is None:
-                    raise LifecycleEvidenceError("same-card review completion requires a verdict")
-                if str(verdict).strip().upper() not in {"APPROVE", "REQUEST_CHANGES"}:
-                    raise LifecycleEvidenceError("same-card review verdict must be APPROVE or REQUEST_CHANGES")
-            elif verdict is not None:
-                raise LifecycleEvidenceError("implementation completion cannot carry a review verdict")
-        else:
-            if verdict is not None:
-                raise LifecycleEvidenceError("unknown lifecycle contract cannot carry a verdict")
+    contract = task_before.lifecycle_contract if task_before else None
+    if contract:
+        handler = _COMPLETION_MODE_HANDLERS.get(contract.get("kind"))
+        if handler is not None:
+            typed_phase = handler(conn, task_before, task_id, verdict)
+        elif verdict is not None:
+            raise LifecycleEvidenceError("unknown lifecycle contract cannot carry a verdict")
     elif verdict is not None:
         raise LifecycleEvidenceError("unclassified/general tasks cannot carry a lifecycle verdict")
     same_card_handoff = bool(
         task_before
-        and task_before.lifecycle_contract
-        and task_before.lifecycle_contract.get("kind") == "code"
-        and task_before.lifecycle_contract.get("review_mode") == "same_card"
+        and contract
+        and contract.get("kind") == "code"
+        and contract.get("review_mode") == "same_card"
         and typed_phase == "implementation"
     )
     same_card_changes = bool(
         task_before
-        and task_before.lifecycle_contract
-        and task_before.lifecycle_contract.get("kind") == "code"
-        and task_before.lifecycle_contract.get("review_mode") == "same_card"
+        and contract
+        and contract.get("kind") == "code"
+        and contract.get("review_mode") == "same_card"
         and typed_phase == "review"
         and str(verdict or "").strip().upper() == "REQUEST_CHANGES"
     )
@@ -186,29 +225,34 @@ def _commit_completion(
                         metadata=metadata,
                     )
                     stamp_run_id = synthetic_run_id
-                try:
-                    metadata = _kb._stamp_lifecycle_metadata(
-                        conn,
-                        task_id,
-                        metadata,
-                        phase=typed_phase,
-                        run_id=stamp_run_id,
-                        verdict=verdict,
-                    )
-                except LifecycleEvidenceError as error:
-                    if synthetic_run_id is not None:
-                        conn.execute(
-                            "DELETE FROM task_runs WHERE id = ? AND task_id = ?",
-                            (synthetic_run_id, task_id),
+                should_stamp = synthetic_run_id is not None or not (
+                    isinstance(metadata, dict)
+                    and isinstance(metadata.get("lifecycle"), dict)
+                )
+                if should_stamp:
+                    try:
+                        metadata = _kb._stamp_lifecycle_metadata(
+                            conn,
+                            task_id,
+                            metadata,
+                            phase=typed_phase,
+                            run_id=stamp_run_id,
+                            verdict=verdict,
                         )
-                    _kb._append_event(
-                        conn,
-                        task_id,
-                        "completion_blocked_lifecycle",
-                        {"reason": str(error)},
-                        run_id=expected_run_id,
-                    )
-                    return False, None, error
+                    except LifecycleEvidenceError as error:
+                        if synthetic_run_id is not None:
+                            conn.execute(
+                                "DELETE FROM task_runs WHERE id = ? AND task_id = ?",
+                                (synthetic_run_id, task_id),
+                            )
+                        _kb._append_event(
+                            conn,
+                            task_id,
+                            "completion_blocked_lifecycle",
+                            {"reason": str(error)},
+                            run_id=expected_run_id,
+                        )
+                        return False, None, error
             prior_status = _kb._task_status(conn, task_id)
             implementation_routing = _implementation_routing(conn, task_id)
             target_status = (
@@ -434,6 +478,30 @@ def complete_task(
                 {"reason": error.reason}, run_id=expected_run_id,
             )
         raise
+    if typed_phase is not None:
+        stamp_run_id = expected_run_id or (
+            task_before.current_run_id if task_before else None
+        )
+        if stamp_run_id is not None:
+            try:
+                metadata = _kb._stamp_lifecycle_metadata(
+                    conn,
+                    task_id,
+                    metadata,
+                    phase=typed_phase,
+                    run_id=stamp_run_id,
+                    verdict=verdict,
+                )
+            except LifecycleEvidenceError as error:
+                with _kb.write_txn(conn):
+                    _kb._append_event(
+                        conn,
+                        task_id,
+                        "completion_blocked_lifecycle",
+                        {"reason": str(error)},
+                        run_id=expected_run_id,
+                    )
+                raise
     handoff_summary = summary if summary is not None else result
     committed, run_id, boundary_error = _commit_completion(
         conn,
@@ -812,6 +880,30 @@ def request_review(
                 {"reason": error.reason},
             )
         return _ret(False, str(error))
+    if typed_code:
+        stamp_run_id = expected_run_id or (
+            task_before.current_run_id if task_before else None
+        )
+        if stamp_run_id is not None:
+            try:
+                metadata = _kb._stamp_lifecycle_metadata(
+                    conn,
+                    task_id,
+                    metadata,
+                    phase="implementation",
+                    run_id=stamp_run_id,
+                    verdict=None,
+                )
+            except LifecycleEvidenceError as error:
+                with _kb.write_txn(conn):
+                    _kb._append_event(
+                        conn,
+                        task_id,
+                        "completion_blocked_lifecycle",
+                        {"reason": str(error)},
+                        run_id=expected_run_id,
+                    )
+                return _ret(False, str(error))
     contract_err: Optional[_kb.CompletionContractError] = None
     synthetic_run_id: Optional[int] = None
     with _kb.write_txn(conn):
@@ -870,26 +962,31 @@ def request_review(
                         metadata=metadata,
                     )
                     stamp_run_id = synthetic_run_id
-                try:
-                    metadata = _kb._stamp_lifecycle_metadata(
-                        conn,
-                        task_id,
-                        metadata,
-                        phase="implementation",
-                        run_id=stamp_run_id,
-                        verdict=None,
-                    )
-                except LifecycleEvidenceError as error:
-                    if synthetic_run_id is not None:
-                        conn.execute(
-                            "DELETE FROM task_runs WHERE id = ? AND task_id = ?",
-                            (synthetic_run_id, task_id),
+                should_stamp = synthetic_run_id is not None or not (
+                    isinstance(metadata, dict)
+                    and isinstance(metadata.get("lifecycle"), dict)
+                )
+                if should_stamp:
+                    try:
+                        metadata = _kb._stamp_lifecycle_metadata(
+                            conn,
+                            task_id,
+                            metadata,
+                            phase="implementation",
+                            run_id=stamp_run_id,
+                            verdict=None,
                         )
-                    _kb._append_event(
-                        conn, task_id, "completion_blocked_lifecycle", {"reason": str(error)},
-                        run_id=expected_run_id,
-                    )
-                    return _ret(False, str(error))
+                    except LifecycleEvidenceError as error:
+                        if synthetic_run_id is not None:
+                            conn.execute(
+                                "DELETE FROM task_runs WHERE id = ? AND task_id = ?",
+                                (synthetic_run_id, task_id),
+                            )
+                        _kb._append_event(
+                            conn, task_id, "completion_blocked_lifecycle", {"reason": str(error)},
+                            run_id=expected_run_id,
+                        )
+                        return _ret(False, str(error))
 
             assignee_sql = ", assignee = ?" if reviewer is not None else ""
             run_guard = "" if expected_run_id is None else " AND current_run_id = ?"

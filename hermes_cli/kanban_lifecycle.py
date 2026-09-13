@@ -45,11 +45,59 @@ def _task_id(value: Any, field: str = "candidate_task_id") -> str:
     return text
 
 
+def _normalize_general_contract(value: Mapping[str, Any]) -> dict[str, Any]:
+    if set(value) != {"kind"}:
+        raise LifecycleContractError("general lifecycle_contract must be exactly {'kind': 'general'}")
+    return {"kind": "general"}
+
+
+def _normalize_code_contract(value: Mapping[str, Any]) -> dict[str, Any]:
+    expected = {"kind", "review_mode", "reviewer", "validation_required"}
+    if set(value) != expected:
+        raise LifecycleContractError(
+            "code lifecycle_contract must contain exactly kind, review_mode, reviewer, validation_required"
+        )
+    mode = str(value.get("review_mode") or "").strip().casefold()
+    if mode not in VALID_REVIEW_MODES:
+        raise LifecycleContractError("review_mode must be 'same_card' or 'separate_card'")
+    if not isinstance(value.get("validation_required"), bool):
+        raise LifecycleContractError("validation_required must be boolean")
+    return {
+        "kind": "code",
+        "review_mode": mode,
+        "reviewer": _profile(value.get("reviewer")),
+        "validation_required": bool(value["validation_required"]),
+    }
+
+
+def _normalize_role_contract(value: Mapping[str, Any], kind: str) -> dict[str, Any]:
+    if set(value) != {"kind", "candidate_task_id"}:
+        raise LifecycleContractError(
+            f"{kind} lifecycle_contract must contain exactly kind and candidate_task_id"
+        )
+    return {"kind": kind, "candidate_task_id": _task_id(value.get("candidate_task_id"))}
+
+
+def _normalize_review_contract(value: Mapping[str, Any]) -> dict[str, Any]:
+    return _normalize_role_contract(value, "review")
+
+
+def _normalize_validation_contract(value: Mapping[str, Any]) -> dict[str, Any]:
+    return _normalize_role_contract(value, "validation")
+
+
+_CONTRACT_NORMALIZERS = {
+    "general": _normalize_general_contract,
+    "code": _normalize_code_contract,
+    "review": _normalize_review_contract,
+    "validation": _normalize_validation_contract,
+}
+
 def normalize_contract(value: Any, *, default_on_none: bool = False) -> Optional[dict[str, Any]]:
     """Return a canonical contract or ``None`` for an historical NULL.
 
     New rows pass ``default_on_none=True`` and therefore get the explicit
-    general contract.  Existing NULL rows stay NULL until an operator binds
+    general contract. Existing NULL rows stay NULL until an operator binds
     them deliberately.
     """
     if value is None:
@@ -62,38 +110,10 @@ def normalize_contract(value: Any, *, default_on_none: bool = False) -> Optional
     if not isinstance(value, Mapping):
         raise LifecycleContractError("lifecycle_contract must be an object")
     kind = str(value.get("kind") or "").strip().casefold()
-    if kind == "general":
-        if set(value) != {"kind"}:
-            raise LifecycleContractError("general lifecycle_contract must be exactly {'kind': 'general'}")
-        return {"kind": "general"}
-    if kind == "code":
-        expected = {"kind", "review_mode", "reviewer", "validation_required"}
-        if set(value) != expected:
-            raise LifecycleContractError(
-                "code lifecycle_contract must contain exactly kind, review_mode, reviewer, validation_required"
-            )
-        mode = str(value.get("review_mode") or "").strip().casefold()
-        if mode not in VALID_REVIEW_MODES:
-            raise LifecycleContractError("review_mode must be 'same_card' or 'separate_card'")
-        if not isinstance(value.get("validation_required"), bool):
-            raise LifecycleContractError("validation_required must be boolean")
-        return {
-            "kind": "code",
-            "review_mode": mode,
-            "reviewer": _profile(value.get("reviewer")),
-            "validation_required": bool(value["validation_required"]),
-        }
-    if kind == "review":
-        if set(value) != {"kind", "candidate_task_id"}:
-            raise LifecycleContractError("review lifecycle_contract must contain exactly kind and candidate_task_id")
-        return {"kind": "review", "candidate_task_id": _task_id(value.get("candidate_task_id"))}
-    if kind == "validation":
-        if set(value) != {"kind", "candidate_task_id"}:
-            raise LifecycleContractError(
-                "validation lifecycle_contract must contain exactly kind and candidate_task_id"
-            )
-        return {"kind": "validation", "candidate_task_id": _task_id(value.get("candidate_task_id"))}
-    raise LifecycleContractError(f"lifecycle_contract.kind must be one of {sorted(VALID_CONTRACT_KINDS)}")
+    normalizer = _CONTRACT_NORMALIZERS.get(kind)
+    if normalizer is None:
+        raise LifecycleContractError(f"lifecycle_contract.kind must be one of {sorted(VALID_CONTRACT_KINDS)}")
+    return normalizer(value)
 
 
 def encode_contract(value: Any, *, default_on_none: bool = False) -> Optional[str]:
@@ -132,6 +152,68 @@ def _task_goal_revision_id(row: Optional[sqlite3.Row]) -> Optional[int]:
     return int(row["goal_revision_id"])
 
 
+def _validate_general_edge(
+    parent_id: str,
+    child_id: str,
+    parent: dict[str, Any],
+    child: dict[str, Any],
+    child_kind: str,
+    requirement: str,
+) -> bool:
+    return requirement == "phase_finished" and child_kind not in {"review", "validation"}
+
+
+def _validate_code_edge(
+    parent_id: str,
+    child_id: str,
+    parent: dict[str, Any],
+    child: dict[str, Any],
+    child_kind: str,
+    requirement: str,
+) -> bool:
+    if child_kind == "review" and child.get("candidate_task_id") == parent_id:
+        return requirement == "phase_finished" and parent.get("review_mode") == "separate_card"
+    if child_kind == "validation" and child.get("candidate_task_id") == parent_id:
+        return requirement == "review_approved" and parent.get("review_mode") == "same_card"
+    return child_kind == "general" and requirement == "phase_finished"
+
+
+def _validate_review_edge(
+    parent_id: str,
+    child_id: str,
+    parent: dict[str, Any],
+    child: dict[str, Any],
+    child_kind: str,
+    requirement: str,
+) -> bool:
+    return (
+        (
+            child_kind == "validation"
+            and child.get("candidate_task_id") == parent.get("candidate_task_id")
+            and requirement == "review_approved"
+        )
+        or (child_kind == "general" and requirement == "phase_finished")
+    )
+
+
+def _validate_validation_edge(
+    parent_id: str,
+    child_id: str,
+    parent: dict[str, Any],
+    child: dict[str, Any],
+    child_kind: str,
+    requirement: str,
+) -> bool:
+    return requirement == ("phase_finished" if child_kind == "general" else "validation_passed")
+
+
+_LIFECYCLE_EDGE_VALIDATORS = {
+    "general": _validate_general_edge,
+    "code": _validate_code_edge,
+    "review": _validate_review_edge,
+    "validation": _validate_validation_edge,
+}
+
 def validate_edge(
     conn: sqlite3.Connection,
     parent_id: str,
@@ -154,31 +236,8 @@ def validate_edge(
         )
     pk = p["kind"]
     ck = c["kind"]
-    legal = False
-    if pk == "general":
-        legal = requirement == "phase_finished" and ck not in {"review", "validation"}
-    elif pk == "code":
-        if ck == "review" and c.get("candidate_task_id") == parent_id:
-            legal = requirement == "phase_finished" and p.get("review_mode") == "separate_card"
-        elif ck == "validation" and c.get("candidate_task_id") == parent_id:
-            legal = requirement == "review_approved" and p.get("review_mode") == "same_card"
-        else:
-            legal = ck == "general" and requirement == "phase_finished"
-    elif pk == "review":
-        legal = (
-            (
-                ck == "validation"
-                and c.get("candidate_task_id") == p.get("candidate_task_id")
-                and requirement == "review_approved"
-            )
-            or (ck == "general" and requirement == "phase_finished")
-        )
-    elif pk == "validation":
-        legal = (
-            requirement == "validation_passed"
-            if ck != "general"
-            else requirement == "phase_finished"
-        )
+    validator = _LIFECYCLE_EDGE_VALIDATORS.get(pk)
+    legal = validator(parent_id, child_id, p, c, ck, requirement) if validator else False
     if not legal:
         raise LifecycleContractError(
             f"illegal lifecycle edge {parent_id}({pk}) -> {child_id}({ck}) with {requirement}"
