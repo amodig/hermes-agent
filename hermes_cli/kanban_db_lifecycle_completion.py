@@ -21,6 +21,7 @@ from hermes_cli.kanban_db_lifecycle_evidence import (
     _implementation_routing,
     _stamp_lifecycle_metadata,
 )
+from hermes_cli.kanban_db_lifecycle_rework import _prior_reviewer
 from hermes_cli.kanban_lifecycle import LifecycleEvidenceError, get_lifecycle_state
 
 class ArtifactPreservationError(RuntimeError):
