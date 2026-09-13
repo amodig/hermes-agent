@@ -65,19 +65,6 @@ try:
 except Exception:
     pass
 
-# Runtime verification follows early recovery so an interrupted update can
-# repair a missing or partial runtime module before the normal CLI imports it.
-from hermes_cli.kanban_runtime import (
-    assert_runtime_import_root as _assert_runtime_import_root,
-    runtime_identity as _runtime_identity,
-)
-_frozen_runtime_identity = _runtime_identity()
-_preimport_runtime_identity = _runtime_identity(_bootstrap_root)
-_assert_runtime_import_root(
-    _bootstrap_root,
-    expected=_frozen_runtime_identity,
-    identity=_preimport_runtime_identity,
-)
 
 if _early_runtime_argv in (["runtime-identity"], ["runtime-identity", "--json"], ["--runtime-identity"]):
     from hermes_cli.kanban_runtime import runtime_identity_json
@@ -3174,11 +3161,6 @@ def _register_plugin_cli_commands(subparsers) -> None:
         logging.getLogger(__name__).debug("Plugin CLI discovery failed: %s", _exc)
 
 
-_assert_runtime_import_root(
-    _bootstrap_root,
-    expected=_frozen_runtime_identity,
-    identity=_runtime_identity(_bootstrap_root),
-)
 
 def _cmd_sessions_lazy(args, **kwargs):
     """``hermes sessions`` handler; sessions_cmd imports only when the subcommand runs."""

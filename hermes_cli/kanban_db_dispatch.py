@@ -26,9 +26,6 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 import uuid
-from hermes_cli.kanban_runtime import runtime_identity as _freeze_runtime_identity
-
-_freeze_runtime_identity()
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -2391,6 +2388,7 @@ def _default_spawn(
     env.pop("HERMES_TUI", None)
 
     from hermes_cli.kanban_runtime import (
+        assert_runtime_import_root,
         decode_identity,
         encode_identity,
         prospective_identity,
@@ -2398,6 +2396,7 @@ def _default_spawn(
     )
 
     expected_identity = prospective_identity()
+    assert_runtime_import_root(identity=expected_identity)
     preparation_id = uuid.uuid4().hex
     preparation_path = (
         _kb.kanban_home() / "kanban" / "runtime-preparations"
