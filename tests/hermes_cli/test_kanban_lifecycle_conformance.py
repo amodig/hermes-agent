@@ -344,6 +344,27 @@ class KanbanLifecycleConformance(unittest.TestCase):
                     },
                 )
 
+    def test_review_card_requires_separate_card_candidate(self) -> None:
+        implementation = kb.create_task(
+            self.conn,
+            title="same-card candidate",
+            assignee="implementer",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "same_card",
+                "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        )
+        with self.assertRaises(kb.LifecycleContractError):
+            kb.create_task(
+                self.conn,
+                title="invalid downstream review",
+                assignee="reviewer",
+                initial_status="blocked",
+                lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
+            )
+
     def test_force_promotion_overrides_unfinished_parent(self) -> None:
         parent = kb.create_task(
             self.conn,

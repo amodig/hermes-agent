@@ -586,6 +586,20 @@ def _apply_status(conn, task_id: str, s: str, p, unknown_detail: str) -> bool:
     for ``running`` or an unknown status (``unknown_detail``)."""
     if s == "running":
         raise _StatusRejected(_RUNNING_DIRECT_MSG)
+    if s == "done":
+        current = kanban_db.get_task(conn, task_id)
+        contract = (current.lifecycle_contract or {}) if current else {}
+        metadata = p.metadata if isinstance(p.metadata, dict) else {}
+        if (
+            current
+            and current.status not in {"review", "done"}
+            and contract.get("kind") == "code"
+            and (not metadata.get("base_sha") or not metadata.get("head_sha"))
+        ):
+            raise _StatusRejected(
+                "dashboard cannot complete typed implementation cards; "
+                "use the worker or CLI with metadata.base_sha and metadata.head_sha Git evidence"
+            )
     handler = _STATUS_HANDLERS.get(s)
     if handler is None:
         raise _StatusRejected(unknown_detail)

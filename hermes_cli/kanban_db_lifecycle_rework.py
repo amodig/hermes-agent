@@ -165,7 +165,7 @@ def _typed_rework_graph(
         )
         if not implementation_assignee:
             raise ValueError("same-card rework requires original implementation routing")
-        _validate_lifecycle_role_identity(
+        _kb._validate_lifecycle_role_identity(
             conn,
             contract,
             implementation_assignee,

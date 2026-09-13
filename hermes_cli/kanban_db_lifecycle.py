@@ -130,6 +130,10 @@ def _validate_lifecycle_role_identity(
     declared_reviewer = _kb._canonical_assignee(candidate_contract.get("reviewer"))
 
     if kind == "review":
+        if candidate_contract.get("review_mode") != "separate_card":
+            raise LifecycleContractError(
+                "review cards require a separate-card code candidate"
+            )
         if not actor:
             raise LifecycleContractError(
                 "review cards require an assignee matching the declared reviewer"
