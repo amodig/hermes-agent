@@ -198,11 +198,16 @@
     return count && count > 1 ? tx(t, "selectedTasks", "{n} selected tasks", { n: count }) : tx(t, "thisTask", "this task");
   }
   function promptLifecycleVerdict(task, label) {
-    const kind = task && task.lifecycle_contract && task.lifecycle_contract.kind;
-    if (kind !== "review" && kind !== "validation") {
+    const contract = task && task.lifecycle_contract;
+    const kind = contract && contract.kind;
+    const sameCardReview = kind === "code"
+      && contract.review_mode === "same_card"
+      && task.status === "review";
+    const phase = sameCardReview ? "review" : kind;
+    if (phase !== "review" && phase !== "validation") {
       return { confirmed: true, verdict: null };
     }
-    const choices = kind === "review"
+    const choices = phase === "review"
       ? ["APPROVE", "REQUEST_CHANGES"]
       : ["PASS", "FAIL"];
     const value = window.prompt(

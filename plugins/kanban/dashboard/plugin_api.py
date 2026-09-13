@@ -326,7 +326,6 @@ def get_board(
             d = _task_dict(
                 t,
                 latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None),
-                conn=conn,
             )
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)

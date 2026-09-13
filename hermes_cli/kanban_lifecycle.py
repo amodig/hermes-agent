@@ -479,6 +479,10 @@ def get_lifecycle_state(conn: sqlite3.Connection, task_id: str) -> dict[str, Any
     # Code card: implementation evidence belongs to this task; review and
     # validation evidence may be same-card or typed child cards.
     implementation_snapshot = _candidate_snapshot(conn, task_id)
+    state["candidate_task_id"] = task_id
+    state["candidate_run_id"] = implementation_snapshot["run_id"]
+    state["head_sha"] = implementation_snapshot["head_sha"]
+    state["goal_revision_ids"] = {task_id: implementation_snapshot["goal_revision_id"]}
     state["execution_outcome"] = _execution_outcome(
         conn, task_id, implementation_snapshot["run_id"],
     )
