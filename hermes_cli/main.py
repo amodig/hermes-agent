@@ -71,10 +71,11 @@ from hermes_cli.kanban_runtime import (
     assert_runtime_import_root as _assert_runtime_import_root,
     runtime_identity as _runtime_identity,
 )
+_frozen_runtime_identity = _runtime_identity()
 _preimport_runtime_identity = _runtime_identity(_bootstrap_root)
 _assert_runtime_import_root(
     _bootstrap_root,
-    expected=_preimport_runtime_identity,
+    expected=_frozen_runtime_identity,
     identity=_preimport_runtime_identity,
 )
 
@@ -3175,8 +3176,8 @@ def _register_plugin_cli_commands(subparsers) -> None:
 
 _assert_runtime_import_root(
     _bootstrap_root,
-    expected=_preimport_runtime_identity,
-    identity=_preimport_runtime_identity,
+    expected=_frozen_runtime_identity,
+    identity=_runtime_identity(_bootstrap_root),
 )
 
 def _cmd_sessions_lazy(args, **kwargs):

@@ -1078,6 +1078,51 @@ def test_unlink_tasks_triggers_recompute_ready(kanban_home):
             "removes its last blocking dependency"
         )
 
+def test_unlink_tasks_refuses_required_lifecycle_edges(kanban_home):
+    with kbc.connect() as conn:
+        implementation = kb.create_task(
+            conn,
+            title="implementation",
+            assignee="implementer",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "reviewer",
+                "validation_required": True,
+            },
+        )
+        review = kb.create_task(
+            conn,
+            title="review",
+            assignee="reviewer",
+            parents=[implementation],
+            initial_status="blocked",
+            lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
+        )
+        validation = kb.create_task(
+            conn,
+            title="validation",
+            assignee="tester",
+            parents=[review],
+            initial_status="blocked",
+            lifecycle_contract={"kind": "validation", "candidate_task_id": implementation},
+        )
+        implementation_version = kb.get_task(conn, implementation).version
+        review_version = kb.get_task(conn, review).version
+
+        assert kb.unlink_tasks(conn, implementation, review) is False
+        assert kb.repair_unlink_tasks(
+            conn,
+            implementation,
+            review,
+            expected_parent_version=implementation_version,
+            expected_child_version=review_version,
+            reason="test required edge guard",
+        ) is False
+        assert kb.unlink_tasks(conn, review, validation) is False
+        assert kb.parent_ids(conn, review) == [implementation]
+        assert kb.parent_ids(conn, validation) == [review]
 
 
 # ---------------------------------------------------------------------------

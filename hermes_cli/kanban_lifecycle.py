@@ -202,6 +202,35 @@ def validate_edge(
                 )
     return requirement
 
+
+def is_required_lifecycle_edge(
+    conn: sqlite3.Connection, parent_id: str, child_id: str,
+) -> bool:
+    """Return whether removing this edge would break a typed role workflow."""
+    parent = _task_row(conn, parent_id)
+    child = _task_row(conn, child_id)
+    p = _row_contract(parent)
+    c = _row_contract(child)
+    if p is None or c is None:
+        return False
+    if p["kind"] == "code" and c["kind"] == "review":
+        return (
+            c.get("candidate_task_id") == parent_id
+            and p.get("review_mode") == "separate_card"
+        )
+    if p["kind"] == "code" and c["kind"] == "validation":
+        return (
+            c.get("candidate_task_id") == parent_id
+            and p.get("review_mode") == "same_card"
+        )
+    return (
+        p["kind"] == "review"
+        and c["kind"] == "validation"
+        and c.get("candidate_task_id") == p.get("candidate_task_id")
+    )
+
+
+
 def infer_edge_requirement(conn: sqlite3.Connection, parent_id: str, child_id: str) -> str:
     """Choose the only legal requirement for a newly declared edge."""
     valid: list[str] = []

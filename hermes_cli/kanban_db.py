@@ -35,6 +35,7 @@ from hermes_cli.kanban_lifecycle import (
     evaluate_dependencies,
     get_lifecycle_state,
     infer_edge_requirement,
+    is_required_lifecycle_edge,
     lifecycle_metadata,
     safe_decode_contract,
     validate_edge,
@@ -1786,6 +1787,12 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
     with write_txn(conn):
+        edge = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (parent_id, child_id),
+        ).fetchone()
+        if edge is None or is_required_lifecycle_edge(conn, parent_id, child_id):
+            return False
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?", (parent_id, child_id),
         )
@@ -1854,6 +1861,8 @@ def repair_unlink_tasks(
             (parent_id, child_id),
         ).fetchone()
         if edge is None:
+            return False
+        if is_required_lifecycle_edge(conn, parent_id, child_id):
             return False
         expected = {
             parent_id: expected_parent_version,
