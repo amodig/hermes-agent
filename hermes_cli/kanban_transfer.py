@@ -127,6 +127,11 @@ def _scrub_handoff_paths(conn: sqlite3.Connection) -> None:
         for key in ("branch_name", "workspace_path"):
             if payload.pop(key, None) is not None:
                 changed = True
+        routing = payload.get("lifecycle_routing")
+        if isinstance(routing, dict):
+            for key in ("branch_name", "workspace_path"):
+                if routing.pop(key, None) is not None:
+                    changed = True
         if changed:
             conn.execute(
                 "UPDATE task_runs SET metadata = ? WHERE id = ?",
@@ -442,7 +447,7 @@ def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[s
         ).fetchall()
         candidate_roots: set[str] = set()
         for row in tasks:
-            if row["status"] not in _DISPATCHABLE_STATUSES:
+            if row["status"] not in _DISPATCHABLE_STATUSES and row["status"] != "blocked":
                 continue
             for candidate_id in _candidate_handoff_ids(conn, row):
                 candidate = kb.get_task(conn, candidate_id)

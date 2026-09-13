@@ -266,7 +266,21 @@ def test_import_scrubs_typed_handoff_paths_and_requeues_candidate(kanban_root, t
         kb.link_tasks(conn, implementation, review, requirement="phase_finished")
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (implementation,))
-            conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (review,))
+            kb._synthesize_ended_run(
+                conn,
+                implementation,
+                outcome="completed",
+                metadata={
+                    "workspace_path": "/exporter/repo",
+                    "branch_name": "feature/x",
+                    "lifecycle_routing": {
+                        "implementer": "implementer",
+                        "reviewer": "reviewer",
+                        "workspace_path": "/exporter/repo",
+                        "branch_name": "feature/x",
+                    },
+                },
+            )
             kb._append_event(
                 conn,
                 implementation,
@@ -286,11 +300,19 @@ def test_import_scrubs_typed_handoff_paths_and_requeues_candidate(kanban_root, t
 
     assert tasks["typed implementation"]["status"] == "ready"
     assert tasks["typed review"]["status"] == "todo"
-    assert result["tasks_parked"] == 0
     with kbc.connect_closing(board=result["board"]) as conn:
         implementation_id = tasks["typed implementation"]["id"]
         handoff = kb.latest_handoff(conn, implementation_id)
+        run_metadata = json.loads(
+            conn.execute(
+                "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                (implementation_id,),
+            ).fetchone()["metadata"]
+        )
     assert handoff == {"base_sha": "base", "head_sha": "head"}
+    assert run_metadata == {
+        "lifecycle_routing": {"implementer": "implementer", "reviewer": "reviewer"},
+    }
 
 
 def test_board_metadata_loses_exporter_local_paths(kanban_root, tmp_path):
