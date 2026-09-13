@@ -239,7 +239,7 @@ def test_unresolvable_workspaces_are_parked_not_dispatched(kanban_root, tmp_path
     assert tasks["scratch task"]["status"] == "ready"
     assert tasks["scratch task"]["workspace_path"] is None
 
-def test_import_scrubs_typed_handoff_paths_and_parks_review_card(kanban_root, tmp_path):
+def test_import_scrubs_typed_handoff_paths_and_requeues_candidate(kanban_root, tmp_path):
     kb.create_board("alpha", name="Alpha Board")
     with kbc.connect_closing(board="alpha") as conn:
         implementation = kb.create_task(
@@ -284,8 +284,9 @@ def test_import_scrubs_typed_handoff_paths_and_parks_review_card(kanban_root, tm
     result = kt.import_board(archive)
     tasks = _tasks_by_title(result["board"])
 
-    assert tasks["typed review"]["status"] == "triage"
-    assert result["tasks_parked"] == 1
+    assert tasks["typed implementation"]["status"] == "ready"
+    assert tasks["typed review"]["status"] == "todo"
+    assert result["tasks_parked"] == 0
     with kbc.connect_closing(board=result["board"]) as conn:
         implementation_id = tasks["typed implementation"]["id"]
         handoff = kb.latest_handoff(conn, implementation_id)

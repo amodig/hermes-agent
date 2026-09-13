@@ -69,6 +69,32 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
     assert c1.assignee == "engineer"
 
 
+def test_decompose_rejects_role_without_candidate_parent_edge(kanban_home):
+    with kbc.connect() as conn:
+        root = _create_triage(conn, title="typed graph")
+        children = [
+            {"title": "implementation", "parents": []},
+            {
+                "title": "review",
+                "parents": [],
+                "lifecycle_contract": {
+                    "kind": "review",
+                    "candidate_task_index": 0,
+                },
+            },
+        ]
+        with pytest.raises(ValueError, match="candidate_task_index"):
+            kb.decompose_triage_task(
+                conn,
+                root,
+                root_assignee="orchestrator",
+                children=children,
+                author="decomposer",
+            )
+        assert kb.get_task(conn, root).status == "triage"
+        assert len(kb.list_tasks(conn, include_archived=True)) == 1
+
+
 def test_decompose_records_audit_comment_and_event(kanban_home):
     with kbc.connect() as conn:
         tid = _create_triage(conn)

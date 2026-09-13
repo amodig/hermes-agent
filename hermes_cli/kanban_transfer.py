@@ -291,8 +291,7 @@ def _read_board_metadata(path: Path) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
-def _candidate_handoff_needs_rebind(conn: sqlite3.Connection, row: sqlite3.Row) -> bool:
-    """True when an imported review lane needs a local immutable handoff."""
+def _candidate_handoff_ids(conn: sqlite3.Connection, row: sqlite3.Row) -> list[str]:
     contract = kb.safe_decode_contract(row["lifecycle_contract"])
     kind = contract.get("kind") if contract else None
     same_card = (
@@ -305,19 +304,107 @@ def _candidate_handoff_needs_rebind(conn: sqlite3.Connection, row: sqlite3.Row) 
         and str(row["assignee"] or "").strip().casefold() in kb.HANDOFF_CHILD_ASSIGNEES
     )
     if not same_card and not is_role:
-        return False
+        return []
     candidate_ids = [row["id"], *kb.parent_ids(conn, row["id"])]
     candidate_id = contract.get("candidate_task_id") if contract else None
     if candidate_id:
         candidate_ids.append(str(candidate_id))
     seen: set[str] = set()
+    candidate_handoffs: list[str] = []
     for candidate_id in candidate_ids:
         if candidate_id in seen:
             continue
         seen.add(candidate_id)
         if kb.latest_handoff(conn, candidate_id).get("head_sha"):
-            return True
-    return False
+            candidate_handoffs.append(candidate_id)
+    return candidate_handoffs
+
+
+def _candidate_handoff_needs_rebind(conn: sqlite3.Connection, row: sqlite3.Row) -> bool:
+    """True when an imported review lane needs a local immutable handoff."""
+    return bool(_candidate_handoff_ids(conn, row))
+def _requeue_imported_candidate(
+    conn: sqlite3.Connection, task_id: str,
+) -> tuple[list[str], list[str]]:
+    """Invalidate a typed candidate whose workspace was not transferred."""
+    candidate = kb.get_task(conn, task_id)
+    contract = candidate.lifecycle_contract if candidate else None
+    if (
+        candidate is None
+        or not contract
+        or contract.get("kind") != "code"
+        or candidate.status not in {"done", "review"}
+    ):
+        return [], []
+
+    parent_ids = kb.parent_ids(conn, task_id)
+    parent_rows = [kb.get_task(conn, parent_id) for parent_id in parent_ids]
+    candidate_status = (
+        "triage"
+        if candidate.workspace_kind in {"dir", "worktree"}
+        else "ready"
+        if all(parent is not None and parent.status in {"done", "archived"} for parent in parent_rows)
+        else "todo"
+    )
+    rows = conn.execute(
+        """
+        WITH RECURSIVE graph(id) AS (
+            SELECT ?
+            UNION
+            SELECT child_id FROM task_links JOIN graph ON parent_id = graph.id
+        )
+        SELECT t.id, t.status, t.version, t.completed_at, t.result
+        FROM graph JOIN tasks t ON t.id = graph.id ORDER BY t.id
+        """,
+        (task_id,),
+    ).fetchall()
+    invalidated: list[dict[str, Any]] = []
+    for row in rows:
+        if row["status"] == "archived":
+            continue
+        new_status = candidate_status if row["id"] == task_id else (
+            "blocked"
+            if row["status"] == "blocked" and kb._has_sticky_block(conn, row["id"])
+            else "triage"
+            if candidate_status == "triage"
+            else "todo"
+        )
+        conn.execute(
+            """
+            UPDATE tasks SET status = ?, version = version + 1,
+                completed_at = NULL, result = NULL, current_run_id = NULL,
+                claim_lock = NULL, claim_expires = NULL, worker_pid = NULL,
+                last_heartbeat_at = NULL, session_id = NULL, project_id = NULL,
+                candidate_run_id = NULL, consecutive_failures = 0,
+                last_failure_error = NULL,
+                block_kind = CASE WHEN ? = 'blocked' THEN block_kind ELSE NULL END,
+                block_recurrences = CASE WHEN ? = 'blocked' THEN block_recurrences ELSE 0 END
+            WHERE id = ?
+            """,
+            (new_status, new_status, new_status, row["id"]),
+        )
+        invalidated.append({
+            "id": row["id"],
+            "prior_status": row["status"],
+            "new_status": new_status,
+            "prior_version": int(row["version"] or 1),
+            "prior_completed_at": row["completed_at"],
+            "prior_result": row["result"],
+        })
+    if invalidated:
+        kb._append_event(
+            conn,
+            task_id,
+            "import_requeued",
+            {
+                "reason": "typed immutable handoff requires a local workspace",
+                "candidate_status": candidate_status,
+                "invalidated": invalidated,
+            },
+        )
+    invalidated_ids = [entry["id"] for entry in invalidated]
+    triaged_ids = [entry["id"] for entry in invalidated if entry["new_status"] == "triage"]
+    return invalidated_ids, triaged_ids
 
 def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[str, int], list[str]]:
     """Re-anchor an imported board's rows to this machine; returns ``(stats, warnings)``.
@@ -326,9 +413,9 @@ def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[s
       did not travel (``--no-attachments``) are dropped, since a dangling row
       breaks download in every UI.
     * Workspace paths are cleared. ``scratch`` regenerates on next claim;
-      dispatchable ``dir``/``worktree`` tasks are parked in ``triage``,
-      otherwise the dispatcher claims them, fails to build a workspace, and
-      burns them into the failure breaker.
+      dispatchable ``dir``/``worktree`` tasks are parked in ``triage``.
+      Typed candidates with immutable handoffs are requeued for a fresh
+      scratch workspace or parked when their workspace needs rebinding.
     * Runtime state is scrubbed again (untrusted input, one UPDATE).
     """
     warnings: list[str] = []
@@ -353,6 +440,38 @@ def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[s
         tasks = conn.execute(
             "SELECT id, status, workspace_kind, assignee, lifecycle_contract FROM tasks"
         ).fetchall()
+        candidate_roots: set[str] = set()
+        for row in tasks:
+            if row["status"] not in _DISPATCHABLE_STATUSES:
+                continue
+            for candidate_id in _candidate_handoff_ids(conn, row):
+                candidate = kb.get_task(conn, candidate_id)
+                contract = candidate.lifecycle_contract if candidate else None
+                if (
+                    candidate is not None
+                    and contract
+                    and contract.get("kind") == "code"
+                    and candidate.status in {"done", "review"}
+                ):
+                    candidate_roots.add(candidate_id)
+
+        requeued_ids: set[str] = set()
+        triaged_requeued: set[str] = set()
+        scratch_requeued = triage_requeued = 0
+        for candidate_id in sorted(candidate_roots):
+            invalidated_ids, triaged_ids = _requeue_imported_candidate(conn, candidate_id)
+            if not invalidated_ids:
+                continue
+            requeued_ids.update(invalidated_ids)
+            triaged_requeued.update(triaged_ids)
+            if triaged_ids:
+                triage_requeued += 1
+            else:
+                scratch_requeued += 1
+
+        tasks = conn.execute(
+            "SELECT id, status, workspace_kind, assignee, lifecycle_contract FROM tasks"
+        ).fetchall()
         workspace_parked = [
             row["id"]
             for row in tasks
@@ -364,13 +483,25 @@ def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[s
             row["id"]
             for row in tasks
             if row["id"] not in workspace_parked_set
+            and row["id"] not in requeued_ids
             and row["status"] in _DISPATCHABLE_STATUSES
             and _candidate_handoff_needs_rebind(conn, row)
         ]
-        parked = workspace_parked + candidate_parked
+        parked = list(dict.fromkeys(
+            workspace_parked + sorted(triaged_requeued) + candidate_parked
+        ))
         conn.execute("UPDATE tasks SET workspace_path = NULL, branch_name = NULL")
         if parked:
             conn.execute(f"UPDATE tasks SET status = 'triage' WHERE id IN ({_placeholders(parked)})", parked)
+        if scratch_requeued:
+            warnings.append(
+                f"{scratch_requeued} typed candidate(s) requeued with a fresh local scratch workspace"
+            )
+        if triage_requeued:
+            warnings.append(
+                f"{triage_requeued} typed candidate graph(s) moved to triage — "
+                "their workspace needs a local rebind before work can resume"
+            )
         if workspace_parked:
             warnings.append(
                 f"{len(workspace_parked)} task(s) moved to triage — their workspace was a directory or git "
