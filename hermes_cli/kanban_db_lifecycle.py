@@ -26,6 +26,7 @@ from hermes_cli.kanban_lifecycle import (
     infer_edge_requirement,
     lifecycle_metadata,
     safe_decode_contract,
+    is_required_lifecycle_edge,
     validate_edge,
 )
 
@@ -1245,6 +1246,18 @@ def _assert_no_lifecycle_role_references(
             and contract.get("candidate_task_id") == task_id
         ):
             role_ids.append(str(row["id"]))
+    required_children = [
+        str(row["child_id"])
+        for row in conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ?", (task_id,),
+        )
+        if is_required_lifecycle_edge(conn, task_id, str(row["child_id"]))
+    ]
+    if required_children:
+        raise LifecycleContractError(
+            f"cannot delete lifecycle task {task_id}: required child role card(s) still "
+            f"reference it ({', '.join(sorted(set(required_children)))})"
+        )
     if role_ids:
         raise LifecycleContractError(
             f"cannot delete candidate task {task_id}: lifecycle role card(s) still reference it "

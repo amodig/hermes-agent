@@ -367,6 +367,41 @@ class KanbanLifecycleConformance(unittest.TestCase):
         self.assertEqual(self._task(child).status, "ready")
 
 
+    def test_deletion_protects_review_parent_of_validation(self) -> None:
+        implementation = kb.create_task(
+            self.conn,
+            title="deletion candidate",
+            assignee="bob",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "alice",
+                "validation_required": True,
+            },
+        )
+        review = kb.create_task(
+            self.conn,
+            title="deletion review",
+            assignee="alice",
+            lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
+        )
+        validation = kb.create_task(
+            self.conn,
+            title="deletion validation",
+            assignee="tester",
+            parents=(review,),
+            lifecycle_contract={
+                "kind": "validation",
+                "candidate_task_id": implementation,
+            },
+        )
+        kb.link_tasks(self.conn, implementation, review, requirement="phase_finished")
+        with self.assertRaises(kb.LifecycleContractError):
+            kb.delete_task(self.conn, review)
+        self.assertIsNotNone(kb.get_task(self.conn, review))
+        self.assertIsNotNone(kb.get_task(self.conn, validation))
+
+
     def test_runtime_identity_fingerprints_review_skill(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-runtime-") as raw_root:
             root = Path(raw_root)
