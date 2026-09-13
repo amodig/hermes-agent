@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from hermes_cli import kanban_db as _kb
+from hermes_cli.kanban_db_lazy import _UPDATE_UNSET, _kb
 from hermes_cli.kanban_db_lifecycle_claims import (
     _landing_status_after_parents,
     _parents_satisfied,
@@ -502,13 +502,13 @@ def update_task(
     *,
     expected_version: int,
     reason: str,
-    title: Any = _kb._UPDATE_UNSET,
-    body: Any = _kb._UPDATE_UNSET,
-    assignee: Any = _kb._UPDATE_UNSET,
-    model: Any = _kb._UPDATE_UNSET,
-    provider: Any = _kb._UPDATE_UNSET,
-    goal_mode: Any = _kb._UPDATE_UNSET,
-    lifecycle_contract: Any = _kb._UPDATE_UNSET,
+    title: Any = _UPDATE_UNSET,
+    body: Any = _UPDATE_UNSET,
+    assignee: Any = _UPDATE_UNSET,
+    model: Any = _UPDATE_UNSET,
+    provider: Any = _UPDATE_UNSET,
+    goal_mode: Any = _UPDATE_UNSET,
+    lifecycle_contract: Any = _UPDATE_UNSET,
     transition: Optional[str] = None,
     author: Optional[str] = None,
 ) -> bool:

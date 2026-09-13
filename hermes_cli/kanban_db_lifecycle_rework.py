@@ -6,7 +6,7 @@ import os
 import sqlite3
 from typing import Any, Optional
 
-from hermes_cli import kanban_db as _kb
+from hermes_cli.kanban_db_lazy import _kb
 from hermes_cli.kanban_db_lifecycle_claims import (
     _landing_status_after_parents,
     _parents_satisfied,

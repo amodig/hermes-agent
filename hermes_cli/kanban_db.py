@@ -1574,7 +1574,7 @@ class GoalRevisionConflict(RuntimeError):
         )
 
 
-_UPDATE_UNSET = object()
+from hermes_cli.kanban_db_lazy import _UPDATE_UNSET
 
 
 def _goal_revision_dict(row: sqlite3.Row) -> dict[str, Any]:

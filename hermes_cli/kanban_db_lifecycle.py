@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from hermes_cli import kanban_db as _kb
+from hermes_cli.kanban_db_lazy import _kb
 from hermes_cli.kanban_lifecycle import (
     LifecycleContractError,
     LifecycleEvidenceError,

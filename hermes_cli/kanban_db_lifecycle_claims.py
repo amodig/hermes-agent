@@ -5,7 +5,7 @@ import sqlite3
 import time
 from typing import Any, Optional
 
-from hermes_cli import kanban_db as _kb
+from hermes_cli.kanban_db_lazy import _kb
 from hermes_cli.kanban_db_lifecycle_evidence import (
     _parent_handoff_start_error,
     _record_parent_handoff_start_error,

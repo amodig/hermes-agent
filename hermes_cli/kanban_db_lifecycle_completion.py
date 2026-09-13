@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from hermes_cli import kanban_db as _kb
+from hermes_cli.kanban_db_lazy import _kb
 from hermes_cli.kanban_db_lifecycle_claims import (
     _landing_status_after_parents,
     _parents_satisfied,
@@ -93,7 +93,7 @@ def _completion_mode_code(
     verdict: Optional[str],
 ) -> str:
     claimed_event = (
-        _kb._latest_event(conn, task_id, task_before.current_run_id)
+        _kb._latest_event(conn, task_id, "claimed", task_before.current_run_id)
         if task_before.current_run_id
         else None
     )

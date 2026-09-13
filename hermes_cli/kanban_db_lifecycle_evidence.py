@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Optional
 
-from hermes_cli import kanban_db as _kb
+from hermes_cli.kanban_db_lazy import _kb
 from hermes_cli.kanban_lifecycle import (
     LifecycleEvidenceError,
     _latest_head,
