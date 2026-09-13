@@ -272,6 +272,11 @@ def is_required_lifecycle_edge(
     c = _row_contract(child)
     if p is None or c is None:
         return False
+    edge = conn.execute(
+        "SELECT requirement FROM task_links WHERE parent_id = ? AND child_id = ?",
+        (parent_id, child_id),
+    ).fetchone()
+    requirement = edge["requirement"] if edge is not None else None
     if p["kind"] == "code" and c["kind"] == "review":
         return (
             c.get("candidate_task_id") == parent_id
@@ -282,6 +287,10 @@ def is_required_lifecycle_edge(
             c.get("candidate_task_id") == parent_id
             and p.get("review_mode") == "same_card"
         )
+    if p["kind"] == "review" and c["kind"] == "general":
+        return requirement == "review_approved"
+    if p["kind"] == "validation" and c["kind"] == "general":
+        return requirement == "validation_passed"
     return (
         p["kind"] == "review"
         and c["kind"] == "validation"

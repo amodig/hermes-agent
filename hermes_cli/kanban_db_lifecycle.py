@@ -87,19 +87,8 @@ def _validate_lifecycle_role_identity(
         if task_id is None:
             return
         validation_rows = conn.execute(
-            """
-            WITH RECURSIVE descendants(id) AS (
-                SELECT child_id FROM task_links WHERE parent_id = ?
-                UNION
-                SELECT l.child_id
-                FROM task_links l
-                JOIN descendants d ON d.id = l.parent_id
-            )
-            SELECT t.assignee, t.lifecycle_contract
-            FROM tasks t
-            JOIN descendants d ON d.id = t.id
-            """,
-            (task_id,),
+            "SELECT assignee, lifecycle_contract FROM tasks "
+            "WHERE lifecycle_contract IS NOT NULL"
         ).fetchall()
         for row in validation_rows:
             child_contract = safe_decode_contract(row["lifecycle_contract"])

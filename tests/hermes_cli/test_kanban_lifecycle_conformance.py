@@ -344,6 +344,29 @@ class KanbanLifecycleConformance(unittest.TestCase):
                     },
                 )
 
+    def test_orphan_validator_blocks_candidate_reassignment(self) -> None:
+        implementation = kb.create_task(
+            self.conn,
+            title="orphan validator candidate",
+            assignee="implementer",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "same_card",
+                "reviewer": "reviewer",
+                "validation_required": True,
+            },
+        )
+        kb.create_task(
+            self.conn,
+            title="orphan validator",
+            assignee="tester",
+            initial_status="blocked",
+            lifecycle_contract={"kind": "validation", "candidate_task_id": implementation},
+        )
+        with self.assertRaises(kb.LifecycleContractError):
+            kb.assign_task(self.conn, implementation, "tester")
+
     def test_review_card_requires_separate_card_candidate(self) -> None:
         implementation = kb.create_task(
             self.conn,

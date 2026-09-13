@@ -149,6 +149,9 @@ def test_decompose_allows_separate_card_validation_after_review(kanban_home):
         assert root_requirements[child_ids[1]] == "review_approved"
         assert root_requirements[child_ids[2]] == "validation_passed"
 
+        assert kb.unlink_tasks(conn, child_ids[1], root) is False
+        assert kb.unlink_tasks(conn, child_ids[2], root) is False
+
 
 def test_decompose_records_audit_comment_and_event(kanban_home):
     with kbc.connect() as conn:
