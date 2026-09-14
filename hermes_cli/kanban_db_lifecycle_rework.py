@@ -141,10 +141,16 @@ def _typed_rework_graph(
         validation_state and validation_state.get("validation_verdict") == "FAIL"
     ):
         raise ValueError("typed rework requires REQUEST_CHANGES or FAIL evidence")
+    review_diagnostics = set(review_state.get("diagnostics") or ())
+    allowed_same_card_rework = (
+        same_card
+        and review_state.get("review_verdict") == "REQUEST_CHANGES"
+        and review_diagnostics <= {"candidate_missing"}
+    )
     if (
-        review_state.get("diagnostics")
-        and not (same_card and review_state.get("review_verdict") == "REQUEST_CHANGES")
-    ) or (validation_state and validation_state.get("diagnostics")):
+        (review_diagnostics and not allowed_same_card_rework)
+        or (validation_state and validation_state.get("diagnostics"))
+    ):
         raise ValueError("typed rework evidence is stale or malformed")
     rejected_head = None
     for evidence in conn.execute(
