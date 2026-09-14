@@ -41,7 +41,7 @@ def _done_parent_with_done_child(conn):
     child_id = kb.create_task(
         conn, title="child", assignee="builder", parents=[parent_id],
     )
-    assert kb.complete_task(conn, child_id)
+    assert kb.complete_task(conn, child_id, summary="child result")
     return parent_id, child_id
 
 
@@ -59,7 +59,7 @@ def test_reopen_demotes_done_descendants_with_events_and_comments(conn):
     grandchild_id = kb.create_task(
         conn, title="grandchild", assignee="writer", parents=[child_id],
     )
-    assert kb.complete_task(conn, grandchild_id)
+    assert kb.complete_task(conn, grandchild_id, summary="grandchild result")
 
     _reopen_parent_directly(conn, parent_id)
     result = kb.invalidate_descendants_for_parent_reopen(
@@ -74,6 +74,7 @@ def test_reopen_demotes_done_descendants_with_events_and_comments(conn):
         task = kb.get_task(conn, tid)
         assert task is not None and task.status == "todo"
         assert task.completed_at is None
+        assert task.result is None
 
         events = kb.list_events(conn, tid)
         inval = [e for e in events if e.kind == "descendant_invalidated"]

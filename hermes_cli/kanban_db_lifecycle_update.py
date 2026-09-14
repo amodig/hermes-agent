@@ -569,6 +569,6 @@ def update_task(
     _kb.notify_task_updated(conn, task_id, changed_fields or ["version"])
     for entry in goal_invalidated:
         _kb.notify_task_updated(
-            conn, entry["id"], ("status", "version", "completed_at", "candidate_run_id"),
+            conn, entry["id"], ("status", "version", "completed_at", "candidate_run_id", "result"),
         )
     return True

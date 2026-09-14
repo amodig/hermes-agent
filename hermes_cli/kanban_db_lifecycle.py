@@ -793,7 +793,7 @@ def invalidate_descendants_for_parent_reopen(
             # consecutive_failures = 0: deliberate operator reset — see
             # docstring for why this diverges from reopen_review_task.
             conn.execute(
-                "UPDATE tasks SET status = 'todo', completed_at = NULL, "
+                "UPDATE tasks SET status = 'todo', completed_at = NULL, result = NULL, "
                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
                 "current_run_id = NULL, candidate_run_id = NULL, consecutive_failures = 0 WHERE id = ?", (row["id"],),
             )
