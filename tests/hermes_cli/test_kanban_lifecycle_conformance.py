@@ -1705,7 +1705,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix", "executable modes are POSIX-specific")
     def test_runtime_snapshot_preserves_executable_skill_bits(self) -> None:
-        source = ROOT / "skills" / "creative" / "manim-video" / "scripts" / "setup.sh"
+        source = RUNTIME_ROOT / "skills" / "creative" / "manim-video" / "scripts" / "setup.sh"
         if not source.is_file() or not (source.stat().st_mode & stat.S_IXUSR):
             self.skipTest("repository fixture has no executable skill helper")
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-mode-") as raw_home:
@@ -1732,7 +1732,7 @@ print(synced.stat().st_mode & stat.S_IXUSR)
             env["HERMES_HOME"] = raw_home
             env["PYTHONPATH"] = str(RUNTIME_ROOT)
             completed = subprocess.run(
-                [sys.executable, "-c", script, str(ROOT), raw_home],
+                [sys.executable, "-c", script, str(RUNTIME_ROOT), raw_home],
                 text=True,
                 capture_output=True,
                 env=env,

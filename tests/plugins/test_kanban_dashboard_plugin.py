@@ -459,6 +459,61 @@ def test_patch_typed_completion_rejects_combined_goal_edit(client):
     assert current["body"] == "original goal"
 
 
+def test_patch_typed_review_rejects_combined_goal_edit(client, tmp_path):
+    repo = tmp_path / "review-repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "dashboard@example.invalid")
+    git("config", "user.name", "Dashboard Test")
+    (repo / "README").write_text("base\n", encoding="utf-8")
+    git("add", "README")
+    git("commit", "-qm", "base")
+    head_sha = git("rev-parse", "HEAD")
+
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "typed implementation",
+            "body": "original goal",
+            "assignee": "builder",
+            "workspace_kind": "dir",
+            "workspace_path": str(repo),
+            "lifecycle_contract": {
+                "kind": "code",
+                "review_mode": "same_card",
+                "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        },
+    ).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "status": "review",
+            "assignee": "reviewer",
+            "title": "revised goal",
+            "body": "revised body",
+            "summary": "ready for review",
+            "metadata": {"base_sha": head_sha, "head_sha": head_sha},
+        },
+    )
+    assert response.status_code == 409
+    current = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
+    assert current["status"] == "ready"
+    assert current["assignee"] == "builder"
+    assert current["title"] == "typed implementation"
+    assert current["body"] == "original goal"
+
 
 
 def test_patch_expected_version_is_atomic_across_intervening_mutation(client, monkeypatch):
