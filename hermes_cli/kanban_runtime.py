@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,7 +22,6 @@ import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 import uuid
-import zipfile
 
 
 RUNTIME_IDENTITY_PROTOCOL = 1
@@ -157,30 +157,27 @@ def _pin_runtime_import_root(root: Path) -> None:
             pass
         retained.append(entry)
     sys.path[:] = [str(root), *retained]
-_FROZEN_IMPORT_ARCHIVE: Optional[Path] = None
+_FROZEN_IMPORT_ROOT: Optional[Path] = None
 
 
 def _is_frozen_import_location(location: str) -> bool:
-    archive = _FROZEN_IMPORT_ARCHIVE
-    if archive is None:
+    root = _FROZEN_IMPORT_ROOT
+    if root is None:
         return False
     normalized_location = str(location).replace("\\", "/")
-    normalized_archive = str(archive).replace("\\", "/")
-    return normalized_location.startswith(normalized_archive + "/")
+    normalized_root = str(root).replace("\\", "/")
+    return normalized_location.startswith(normalized_root + "/")
 
 
-def _remove_frozen_import_archive(path: Path) -> None:
-    try:
-        path.unlink()
-    except OSError:
-        pass
+def _remove_frozen_import_root(path: Path) -> None:
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def _freeze_runtime_import_root(root: Path) -> Path:
     """Serve future runtime imports from a pre-grant source snapshot."""
-    global _FROZEN_IMPORT_ARCHIVE
-    if _FROZEN_IMPORT_ARCHIVE is not None:
-        return _FROZEN_IMPORT_ARCHIVE
+    global _FROZEN_IMPORT_ROOT
+    if _FROZEN_IMPORT_ROOT is not None:
+        return _FROZEN_IMPORT_ROOT
     root = root.resolve()
     members: dict[str, Path] = {}
     for path in root.glob("*.py"):
@@ -197,19 +194,18 @@ def _freeze_runtime_import_root(root: Path) -> Path:
                 members[path.relative_to(root).as_posix()] = path
     for asset in _IDENTITY_ASSETS:
         members[asset] = _identity_asset_path(root, asset)
-    fd, archive_raw = tempfile.mkstemp(prefix="hermes-kanban-runtime-", suffix=".zip")
-    os.close(fd)
-    archive = Path(archive_raw).resolve()
+    snapshot_root = Path(tempfile.mkdtemp(prefix="hermes-kanban-runtime-")).resolve()
     try:
-        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as output:
-            for name, path in sorted(members.items()):
-                output.write(path, arcname=name)
+        for name, path in sorted(members.items()):
+            destination = snapshot_root / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, destination)
     except Exception:
-        _remove_frozen_import_archive(archive)
+        _remove_frozen_import_root(snapshot_root)
         raise
-    _FROZEN_IMPORT_ARCHIVE = archive
-    atexit.register(_remove_frozen_import_archive, archive)
-    _pin_runtime_import_root(archive)
+    _FROZEN_IMPORT_ROOT = snapshot_root
+    atexit.register(_remove_frozen_import_root, snapshot_root)
+    _pin_runtime_import_root(snapshot_root)
     for name, module in tuple(sys.modules.items()):
         package_path = getattr(module, "__path__", None)
         if package_path is None or not any(
@@ -217,10 +213,10 @@ def _freeze_runtime_import_root(root: Path) -> Path:
         ):
             continue
         try:
-            module.__path__ = [str(archive.joinpath(*name.split(".")))]
+            module.__path__ = [str(snapshot_root.joinpath(*name.split(".")))]
         except (AttributeError, TypeError):
             pass
-    return archive
+    return snapshot_root
 
 
 
@@ -512,7 +508,7 @@ def worker_bootstrap_post_import(*, wait_for_grant: bool = True) -> Optional[dic
         raise RuntimeIdentityError("worker bootstrap environment is incomplete")
     expected = decode_identity(expected_raw)
     # Snapshot every runtime source file before the final grant. Lazy turn and
-    # tool imports then resolve from this immutable archive, not a mutable checkout.
+    # tool imports then resolve from this immutable filesystem snapshot, not a mutable checkout.
     _freeze_runtime_import_root(_module_root())
     # ``main.py`` and ``cli.py`` defer these imports to keep ordinary CLI
     # startup cheap. Workers must load them before the final identity check;
