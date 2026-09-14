@@ -123,6 +123,9 @@ kanban_complete(
 )
 ```
 
+For a legacy/untyped review run, call `kanban_complete(...)` without a
+`verdict`; legacy cards have no typed lifecycle verdict to record.
+
 Include the exact checks that passed and any bounded caveat that does not block acceptance.
 
 #### Request changes
