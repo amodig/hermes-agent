@@ -122,11 +122,22 @@ def _implementation_routing(conn: sqlite3.Connection, task_id: str) -> dict[str,
         "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC",
         (task_id,),
     ).fetchall()
+    fallback: dict[str, Any] = {}
     for row in rows:
         routing = _kb._json_dict(row["metadata"]).get("lifecycle_routing")
-        if isinstance(routing, dict):
+        if not isinstance(routing, dict):
+            continue
+        if routing.get("implementer"):
             return routing
-    return {}
+        if not fallback:
+            fallback = routing
+
+    review_event = _kb._latest_event(conn, task_id, "review_requested")
+    review_payload = _kb._json_dict(_kb._row_get(review_event, "payload"))
+    implementer = review_payload.get("implementer")
+    if isinstance(implementer, str) and implementer.strip():
+        return {**fallback, "implementer": implementer}
+    return fallback
 
 def _lifecycle_observed_tasks(conn: sqlite3.Connection, task_id: str) -> tuple[str, ...]:
     task = _kb.get_task(conn, task_id)
