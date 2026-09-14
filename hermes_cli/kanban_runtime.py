@@ -433,7 +433,7 @@ def worker_bootstrap_from_env() -> Optional[dict[str, Any]]:
 
 
 def worker_bootstrap_post_import() -> Optional[dict[str, Any]]:
-    """Verify the fully imported worker, then wait for the final grant."""
+    """Verify imported worker command modules, then wait for the final grant."""
     path_raw = os.environ.get("HERMES_KANBAN_BOOTSTRAP_PATH", "").strip()
     if not path_raw:
         return None
@@ -442,6 +442,13 @@ def worker_bootstrap_post_import() -> Optional[dict[str, Any]]:
     if not preparation_id or not expected_raw:
         raise RuntimeIdentityError("worker bootstrap environment is incomplete")
     expected = decode_identity(expected_raw)
+    # ``main.py`` and ``cli.py`` defer these imports to keep ordinary CLI
+    # startup cheap. Workers must load them before the final identity check;
+    # otherwise an update can replace their source after this handshake and
+    # before the lazy import.
+    from cli import main as _cli_main  # noqa: F401
+    from run_agent import AIAgent as _worker_agent  # noqa: F401
+
     actual = assert_runtime_import_root(expected=expected)
     payload = {
         "ready": True,
@@ -452,10 +459,12 @@ def worker_bootstrap_post_import() -> Optional[dict[str, Any]]:
     }
     _atomic_write(Path(path_raw), payload)
     grant = _read_bootstrap_message()
+    final = assert_runtime_import_root(expected=expected)
     if (
         grant.get("grant") is not True
         or str(grant.get("preparation_id")) != preparation_id
         or not same_runtime_identity(grant.get("runtime_identity", {}), actual)
+        or not same_runtime_identity(final, actual)
     ):
         raise RuntimeIdentityError("worker bootstrap grant mismatch")
     if grant.get("run_id") is not None:

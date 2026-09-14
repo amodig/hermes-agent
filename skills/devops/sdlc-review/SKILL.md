@@ -49,8 +49,8 @@ This skill is loaded automatically by the review dispatcher. Start with `kanban_
 
 | Verdict | When | Final action |
 |---|---|---|
-| Approve | Acceptance criteria and verification pass | Typed card: `kanban_complete(verdict="APPROVE", ...)`; legacy card: `kanban_complete(...)` |
-| Request changes | Correctable implementation defects remain | Typed card: `kanban_complete(verdict="REQUEST_CHANGES", ...)`; legacy card: `kanban_request_changes` |
+| Approve | Acceptance criteria and verification pass | Typed review: `kanban_complete(verdict="APPROVE", ...)`; typed validation: `kanban_complete(verdict="PASS", ...)`; legacy card: `kanban_complete(...)` |
+| Request changes | Correctable implementation defects remain | Typed review: `kanban_complete(verdict="REQUEST_CHANGES", ...)`; typed validation: `kanban_complete(verdict="FAIL", ...)`; legacy card: `kanban_request_changes` |
 | Escalate | A human decision or external prerequisite is required | `kanban_block` |
 
 A requested-changes transition returns the task to its original implementer.
@@ -149,6 +149,15 @@ kanban_complete(
 )
 ```
 
+For a typed validation card, record a failed validation with:
+
+```text
+kanban_complete(
+    verdict="FAIL",
+    summary="<concise summary of the failed check and required correction>",
+)
+```
+
 For a legacy/untyped review run, return it to its implementer with:
 
 ```text
@@ -185,7 +194,7 @@ Do not edit the implementation while acting as reviewer. Request changes and let
 - **Vague findings:** “Needs work” does not give the implementer a reproducible correction target.
 - **Style-only blocking:** Do not request changes for preference-level nits when behavior and repository standards are satisfied.
 - **Skipping prior rounds:** Re-review must confirm both the requested corrections and preservation of previously passing behavior.
-- **Using blockers for ordinary rework:** In legacy/untyped review flows, correctable defects belong in `kanban_request_changes`; typed review and validation cards record `REQUEST_CHANGES` through `kanban_complete(verdict=...)`. Reserve `kanban_block` for genuine external blockers or human decisions.
+- **Using blockers for ordinary rework:** In legacy/untyped review flows, correctable defects belong in `kanban_request_changes`; typed review cards record `REQUEST_CHANGES`, and typed validation cards record `FAIL`, through `kanban_complete(verdict=...)`. Reserve `kanban_block` for genuine external blockers or human decisions.
 - **Completing without evidence:** Every approval summary must name the checks or artifacts actually inspected.
 
 ## Verification

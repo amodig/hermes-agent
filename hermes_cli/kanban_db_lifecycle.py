@@ -830,7 +830,7 @@ def invalidate_descendants_for_parent_reopen(
     return {"invalidated": invalidated, "terminations": terminations}
 
 def _lifecycle_graph_ids(conn: sqlite3.Connection, task_id: str) -> set[str]:
-    """Return a typed code/role graph and its required acceptance descendants."""
+    """Return a candidate and its owned typed role cards."""
     seed = conn.execute(
         "SELECT lifecycle_contract FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
@@ -844,53 +844,28 @@ def _lifecycle_graph_ids(conn: sqlite3.Connection, task_id: str) -> set[str]:
             "WHERE lifecycle_contract IS NOT NULL"
         )
     }
-    if contracts.get(task_id) is None:
+    seed_contract = contracts.get(task_id)
+    if seed_contract is None:
+        return set()
+    if seed_contract.get("kind") == "code":
+        candidate_id = task_id
+    elif seed_contract.get("kind") in {"review", "validation"}:
+        candidate_id = str(seed_contract.get("candidate_task_id") or "")
+    else:
         return set()
 
-    graph = {task_id}
-    while True:
-        before = len(graph)
-        candidate_ids = {
-            str(contract["candidate_task_id"])
-            for node_id in graph
-            for contract in (contracts.get(node_id),)
-            if contract
-            and contract.get("kind") in {"review", "validation"}
-            and contract.get("candidate_task_id")
-        }
-        candidate_ids.update(
-            node_id
-            for node_id in graph
-            if contracts.get(node_id)
-            and contracts[node_id].get("kind") == "code"
-        )
-        graph.update(candidate_id for candidate_id in candidate_ids if candidate_id in contracts)
-        graph.update(
-            node_id
-            for node_id, contract in contracts.items()
-            if contract
-            and contract.get("kind") in {"review", "validation"}
-            and str(contract.get("candidate_task_id") or "") in candidate_ids
-        )
-        for edge in conn.execute("SELECT parent_id, child_id FROM task_links"):
-            parent_id, child_id = str(edge["parent_id"]), str(edge["child_id"])
-            if parent_id not in graph and child_id not in graph:
-                continue
-            if not is_required_lifecycle_edge(conn, parent_id, child_id):
-                continue
-            graph.add(parent_id)
-            graph.add(child_id)
-        if len(graph) == before:
-            break
-
-    kinds = {
-        contracts[node_id].get("kind")
-        for node_id in graph
-        if contracts.get(node_id)
-    }
-    if "code" not in kinds or not kinds.intersection({"review", "validation"}):
+    candidate = contracts.get(candidate_id)
+    if candidate is None or candidate.get("kind") != "code":
         return set()
-    return graph
+    graph = {candidate_id}
+    graph.update(
+        node_id
+        for node_id, contract in contracts.items()
+        if contract
+        and contract.get("kind") in {"review", "validation"}
+        and str(contract.get("candidate_task_id") or "") == candidate_id
+    )
+    return graph if len(graph) > 1 else set()
 
 
 def _delete_archived_lifecycle_graph(

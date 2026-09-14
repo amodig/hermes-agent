@@ -951,6 +951,108 @@ class KanbanLifecycleConformance(unittest.TestCase):
 
 
 
+    def test_archived_lifecycle_graph_stops_at_external_required_edges(self) -> None:
+        implementation = kb.create_task(
+            self.conn,
+            title="boundary purge candidate",
+            assignee="bob",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "alice",
+                "validation_required": True,
+            },
+        )
+        review = kb.create_task(
+            self.conn,
+            title="boundary purge review",
+            assignee="alice",
+            initial_status="blocked",
+            lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
+        )
+        validation = kb.create_task(
+            self.conn,
+            title="boundary purge validation",
+            assignee="tester",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "validation",
+                "candidate_task_id": implementation,
+            },
+        )
+        downstream = kb.create_task(
+            self.conn,
+            title="boundary downstream task",
+            assignee="owner",
+            initial_status="blocked",
+            lifecycle_contract={"kind": "general"},
+        )
+        kb.link_tasks(self.conn, implementation, review, requirement="phase_finished")
+        kb.link_tasks(self.conn, review, validation, requirement="review_approved")
+        kb.link_tasks(self.conn, validation, downstream, requirement="validation_passed")
+        for task_id in (implementation, review, validation, downstream):
+            self.assertTrue(kb.archive_task(self.conn, task_id))
+
+        with self.assertRaises(kb.LifecycleContractError):
+            kb.delete_archived_task(self.conn, implementation)
+        for task_id in (implementation, review, validation, downstream):
+            self.assertIsNotNone(kb.get_task(self.conn, task_id))
+
+    def test_worker_command_imports_stay_pinned_after_final_grant(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kanban-conformance-worker-import-") as raw_root:
+            root = Path(raw_root)
+            for directory in runtime._IDENTITY_ROOTS:
+                package = root / directory
+                package.mkdir(parents=True)
+                (package / "module.py").write_text("value = 1\n", encoding="utf-8")
+            skill = root / "skills" / "devops" / "sdlc-review" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text("review instructions\n", encoding="utf-8")
+            (root / "cli.py").write_text(
+                "def main():\n    return 1\n",
+                encoding="utf-8",
+            )
+            (root / "run_agent.py").write_text(
+                "class AIAgent:\n    pass\n",
+                encoding="utf-8",
+            )
+            receipt = root / "receipt.json"
+            script = (
+                "import importlib, json, os, sys; "
+                "from pathlib import Path; "
+                "from hermes_cli import kanban_runtime as runtime; "
+                "root = Path(sys.argv[1]); receipt = Path(sys.argv[2]); "
+                "runtime._module_root = lambda module_root=None: root; "
+                "runtime._FROZEN_RUNTIME_IDENTITY = None; "
+                "sys.path.insert(0, str(root)); "
+                "sys.modules.pop('hermes_cli.kanban_runtime', None); "
+                "sys.modules.pop('hermes_cli', None); "
+                "expected = runtime.runtime_identity(root, pid=os.getpid(), "
+                "start_time=runtime.process_start_time()); "
+                "os.environ['HERMES_KANBAN_BOOTSTRAP_PATH'] = str(root / 'preparation.json'); "
+                "os.environ['HERMES_KANBAN_PREPARATION_ID'] = 'race-preparation'; "
+                "os.environ['HERMES_KANBAN_EXPECTED_RUNTIME'] = runtime.encode_identity(expected); "
+                "runtime._read_bootstrap_message = lambda: {"
+                "'grant': True, 'preparation_id': 'race-preparation', "
+                "'runtime_identity': expected.as_dict()}; "
+                "runtime.worker_bootstrap_post_import(); "
+                "(root / 'cli.py').write_text('def main():\\n    return 2\\n', encoding='utf-8'); "
+                "result = importlib.import_module('cli').main(); "
+                "receipt.write_text(json.dumps({'result': result}), encoding='utf-8')"
+            )
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(ROOT)
+            completed = subprocess.run(
+                [sys.executable, "-c", script, str(root), str(receipt)],
+                text=True,
+                capture_output=True,
+                env=env,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(json.loads(receipt.read_text(encoding="utf-8"))["result"], 1)
+
     def test_embedded_dispatcher_freezes_identity_before_first_tick(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-dispatcher-") as raw_root:
             root = Path(raw_root)
