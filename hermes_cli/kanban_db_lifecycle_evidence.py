@@ -175,20 +175,28 @@ def _emit_acceptance_changes(
         for task_id, old in before.items():
             projection = get_lifecycle_state(conn, task_id)
             new = projection.get("acceptance", "unclassified")
-            if new != old:
-                phase = (
-                    "validation"
-                    if projection.get("validation_verdict") is not None
-                    else "review"
-                    if projection.get("review_verdict") is not None
-                    else "implementation"
-                )
-                result = (
-                    projection.get("validation_verdict")
-                    or projection.get("review_verdict")
-                    or projection.get("execution_outcome")
-                )
-                changes.append((task_id, old, new, phase, result))
+            if new == old:
+                continue
+            # ``before`` predates the lifecycle mutation.  A concurrent
+            # writer may already have committed this same transition; the
+            # serialized acceptance event is the durable transition CAS.
+            latest = _kb._latest_event(conn, task_id, "acceptance_changed")
+            latest_payload = _kb._json_dict(_kb._row_get(latest, "payload"))
+            if latest_payload.get("new") == new:
+                continue
+            phase = (
+                "validation"
+                if projection.get("validation_verdict") is not None
+                else "review"
+                if projection.get("review_verdict") is not None
+                else "implementation"
+            )
+            result = (
+                projection.get("validation_verdict")
+                or projection.get("review_verdict")
+                or projection.get("execution_outcome")
+            )
+            changes.append((task_id, old, new, phase, result))
         for task_id, old, new, phase, result in changes:
             _kb._append_event(
                 conn,

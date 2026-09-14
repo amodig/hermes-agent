@@ -180,6 +180,38 @@ def test_acceptance_event_projection_holds_write_lock(kanban_home):
     finally:
         conn.close()
 
+def test_acceptance_event_deduplicates_stale_capture(kanban_home):
+    conn = kbc.connect()
+    try:
+        task_id = kb.create_task(conn, title="duplicate", assignee="worker")
+        with kbc.write_txn(conn):
+            kb._append_event(
+                conn,
+                task_id,
+                "acceptance_changed",
+                {"old": "pending", "new": "accepted", "phase": "review"},
+            )
+
+        with patch.object(
+            evidence,
+            "get_lifecycle_state",
+            return_value={"acceptance": "accepted"},
+        ):
+            assert evidence._emit_acceptance_changes(
+                conn,
+                {task_id: "pending"},
+                source_task_id=task_id,
+            ) == []
+
+        count = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'acceptance_changed'",
+            (task_id,),
+        ).fetchone()[0]
+        assert count == 1
+    finally:
+        conn.close()
+
 
 
 
