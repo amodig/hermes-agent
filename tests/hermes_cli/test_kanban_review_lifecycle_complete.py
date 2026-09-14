@@ -129,6 +129,80 @@ def test_synthetic_same_card_review_routes_changes_back_to_implementer(
     assert task.assignee == "builder"
 
 
+def test_reassigned_synthetic_review_uses_latest_implementer(
+    conn, tmp_path: Path
+):
+    repo = tmp_path / "reassigned-synthetic-review-repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "review@example.invalid")
+    _git(repo, "config", "user.name", "Review Test")
+    (repo / "README").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "README")
+    _git(repo, "commit", "-qm", "base")
+    base_head = _git(repo, "rev-parse", "HEAD")
+    task_id = kb.create_task(
+        conn,
+        title="Reassigned synthetic review",
+        assignee="builder",
+        workspace_kind="dir",
+        workspace_path=str(repo),
+        lifecycle_contract={
+            "kind": "code",
+            "review_mode": "same_card",
+            "reviewer": "reviewer",
+            "validation_required": False,
+        },
+    )
+
+    implementation = kb.claim_task(conn, task_id, claimer="builder:initial")
+    assert implementation is not None
+    assert kb.request_review(
+        conn,
+        task_id,
+        summary="initial implementation ready",
+        expected_run_id=implementation.current_run_id,
+        metadata={"base_sha": base_head, "head_sha": base_head},
+    )
+    review = kb.claim_review_task(conn, task_id, claimer="reviewer:initial")
+    assert review is not None
+    assert kb.complete_task(
+        conn,
+        task_id,
+        expected_run_id=review.current_run_id,
+        verdict="REQUEST_CHANGES",
+        summary="initial repair required",
+        metadata={"reviewed_head_sha": base_head},
+    )
+    assert kb.assign_task(conn, task_id, "replacement")
+
+    (repo / "README").write_text("reworked\n", encoding="utf-8")
+    _git(repo, "add", "README")
+    _git(repo, "commit", "-qm", "rework")
+    reworked_head = _git(repo, "rev-parse", "HEAD")
+    assert kb.request_review(
+        conn,
+        task_id,
+        summary="replacement implementation ready",
+        metadata={"base_sha": base_head, "head_sha": reworked_head},
+    )
+    review = kb.claim_review_task(conn, task_id, claimer="reviewer:replacement")
+    assert review is not None
+    assert kb.complete_task(
+        conn,
+        task_id,
+        expected_run_id=review.current_run_id,
+        verdict="REQUEST_CHANGES",
+        summary="replacement repair required",
+        metadata={"reviewed_head_sha": reworked_head},
+    )
+
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "ready"
+    assert task.assignee == "replacement"
+
+
 def test_same_card_review_supports_changes_and_approval_without_block_loop(conn):
     task_id = kb.create_task(conn, title="Implement guarded export", assignee="builder")
     implementation = kb.claim_task(conn, task_id, claimer="builder:1")

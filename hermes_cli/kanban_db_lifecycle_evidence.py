@@ -118,6 +118,12 @@ def _stamp_lifecycle_metadata(
     return updated
 
 def _implementation_routing(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+    review_event = _kb._latest_event(conn, task_id, "review_requested")
+    review_payload = _kb._json_dict(_kb._row_get(review_event, "payload"))
+    review_implementer = review_payload.get("implementer")
+    if not isinstance(review_implementer, str) or not review_implementer.strip():
+        review_implementer = None
+
     rows = conn.execute(
         "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC",
         (task_id,),
@@ -127,16 +133,17 @@ def _implementation_routing(conn: sqlite3.Connection, task_id: str) -> dict[str,
         routing = _kb._json_dict(row["metadata"]).get("lifecycle_routing")
         if not isinstance(routing, dict):
             continue
-        if routing.get("implementer"):
-            return routing
         if not fallback:
             fallback = routing
+        if review_implementer is not None:
+            if routing.get("implementer"):
+                return {**routing, "implementer": review_implementer}
+            continue
+        if routing.get("implementer"):
+            return routing
 
-    review_event = _kb._latest_event(conn, task_id, "review_requested")
-    review_payload = _kb._json_dict(_kb._row_get(review_event, "payload"))
-    implementer = review_payload.get("implementer")
-    if isinstance(implementer, str) and implementer.strip():
-        return {**fallback, "implementer": implementer}
+    if review_implementer is not None:
+        return {**fallback, "implementer": review_implementer}
     return fallback
 
 def _lifecycle_observed_tasks(conn: sqlite3.Connection, task_id: str) -> tuple[str, ...]:
