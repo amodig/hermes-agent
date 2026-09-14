@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import atexit
+import importlib.metadata as importlib_metadata
 import importlib.util
 import hashlib
 import json
@@ -369,34 +370,153 @@ def _runtime_lazy_import_names(members: Mapping[str, Path]) -> frozenset[str]:
     return frozenset(name for name in names if name)
 
 
+def _runtime_distribution_key(name: object) -> str:
+    return str(name or "").casefold().replace("_", "-").replace(".", "-")
+
+
+def _runtime_dependency_spec_locations(name: str, root: Path) -> set[Path]:
+    try:
+        spec = importlib.util.find_spec(name)
+    except (ImportError, AttributeError, ModuleNotFoundError, ValueError):
+        return set()
+    if spec is None:
+        return set()
+    candidates = list(spec.submodule_search_locations or ())
+    if not candidates and spec.origin:
+        candidates.append(spec.origin)
+    locations: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = Path(candidate).resolve()
+            resolved.relative_to(root)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            continue
+        if resolved.is_dir() or resolved.is_file():
+            locations.add(resolved)
+    return locations
+
+
+def _runtime_dependency_distribution_index(
+    root: Path,
+) -> tuple[dict[str, Any], dict[str, set[str]]]:
+    try:
+        distributions = tuple(importlib_metadata.distributions(path=[str(root)]))
+    except (OSError, ValueError):
+        return {}, {}
+
+    by_name: dict[str, Any] = {}
+    owners: dict[str, set[str]] = {}
+    for distribution in distributions:
+        name = _runtime_distribution_key(distribution.metadata.get("Name"))
+        if not name:
+            continue
+        by_name[name] = distribution
+        try:
+            files = distribution.files or ()
+        except (OSError, TypeError, ValueError):
+            files = ()
+        for file in files:
+            parts = Path(str(file)).parts
+            if not parts or parts[0] in {".", ".."}:
+                continue
+            top_level = parts[0]
+            if top_level.endswith((".dist-info", ".egg-info", ".data")):
+                continue
+            if top_level.endswith(".py"):
+                top_level = Path(top_level).stem
+            owners.setdefault(top_level, set()).add(name)
+            owners.setdefault(top_level.casefold(), set()).add(name)
+
+    try:
+        package_distributions = importlib_metadata.packages_distributions()
+    except (OSError, ValueError):
+        package_distributions = {}
+    for package, distribution_names in package_distributions.items():
+        package_key = package.casefold()
+        for distribution_name in distribution_names:
+            normalized = _runtime_distribution_key(distribution_name)
+            if normalized in by_name:
+                owners.setdefault(package, set()).add(normalized)
+                owners.setdefault(package_key, set()).add(normalized)
+    return by_name, owners
+
+
+def _runtime_requirement_distribution_name(raw_requirement: str) -> Optional[str]:
+    try:
+        from packaging.requirements import Requirement
+
+        requirement = Requirement(raw_requirement)
+        if requirement.marker is not None and not requirement.marker.evaluate():
+            return None
+        return _runtime_distribution_key(requirement.name)
+    except (ImportError, TypeError, ValueError):
+        token = str(raw_requirement).lstrip()
+        for separator in ("[", "<", ">", "=", "!", "~", ";", " ", "("):
+            token = token.split(separator, 1)[0]
+        return _runtime_distribution_key(token) or None
+
+
 def _runtime_dependency_locations(
     members: Mapping[str, Path], dependency_roots: tuple[Path, ...],
-) -> dict[Path, set[Path]]:
-    """Resolve only packages that startup or first-party lazy paths can import."""
-    locations = {root: set() for root in dependency_roots}
-    for name in _runtime_lazy_import_names(members):
-        try:
-            spec = importlib.util.find_spec(name)
-        except (ImportError, AttributeError, ModuleNotFoundError, ValueError):
-            continue
-        if spec is None:
-            continue
-        candidates = list(spec.submodule_search_locations or ())
-        if not candidates and spec.origin:
-            candidates.append(spec.origin)
-        for candidate in candidates:
-            try:
-                resolved = Path(candidate).resolve()
-            except (OSError, RuntimeError, TypeError):
+) -> dict[Path, tuple[tuple[Any, ...], set[Path]]]:
+    """Resolve the first-party dependency closure under each import root."""
+    locations: dict[Path, tuple[tuple[Any, ...], set[Path]]] = {}
+    import_names = _runtime_lazy_import_names(members)
+    for root in dependency_roots:
+        distributions, owners = _runtime_dependency_distribution_index(root)
+        selected_names: set[str] = set()
+        fallback_locations: set[Path] = set()
+        for import_name in import_names:
+            spec_locations = _runtime_dependency_spec_locations(import_name, root)
+            if not spec_locations:
                 continue
-            for root in dependency_roots:
-                try:
-                    resolved.relative_to(root)
-                except ValueError:
-                    continue
-                if resolved.is_dir() or resolved.is_file():
-                    locations[root].add(resolved)
+            owner_names = owners.get(import_name, set()) | owners.get(import_name.casefold(), set())
+            matching = {name for name in owner_names if name in distributions}
+            if matching:
+                selected_names.update(matching)
+                if any(not (distributions[name].files or ()) for name in matching):
+                    fallback_locations.update(spec_locations)
+            else:
+                fallback_locations.update(spec_locations)
+
+        pending = list(selected_names)
+        while pending:
+            distribution_name = pending.pop()
+            distribution = distributions[distribution_name]
+            try:
+                requirements = distribution.requires or ()
+            except (OSError, TypeError, ValueError):
+                requirements = ()
+            for raw_requirement in requirements:
+                dependency_name = _runtime_requirement_distribution_name(raw_requirement)
+                if dependency_name in distributions and dependency_name not in selected_names:
+                    selected_names.add(dependency_name)
+                    pending.append(dependency_name)
+        locations[root] = (
+            tuple(distributions[name] for name in sorted(selected_names)),
+            fallback_locations,
+        )
     return locations
+
+
+def _copy_runtime_dependency_distribution(
+    source_root: Path, destination_root: Path, distribution: Any,
+) -> None:
+    try:
+        files = distribution.files or ()
+    except (OSError, TypeError, ValueError):
+        files = ()
+    for file in files:
+        try:
+            source = Path(distribution.locate_file(file)).resolve()
+            relative = source.relative_to(source_root)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            continue
+        if not source.is_file():
+            continue
+        destination = destination_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        _copy_runtime_dependency_file(str(source), str(destination))
 
 
 def _copy_runtime_dependency_tree(
@@ -503,10 +623,12 @@ def _freeze_runtime_import_root(
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, destination)
         for index, source in enumerate(dependency_roots):
-            locations = dependency_locations[source]
-            if not locations:
+            distributions, locations = dependency_locations[source]
+            if not distributions and not locations:
                 continue
             destination = snapshot_root / ".third-party" / str(index)
+            for distribution in distributions:
+                _copy_runtime_dependency_distribution(source, destination, distribution)
             _copy_runtime_dependency_tree(source, destination, locations)
             dependency_sources.append(source)
             dependency_destinations.append(destination)

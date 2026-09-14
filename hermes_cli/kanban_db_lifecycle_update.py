@@ -20,6 +20,7 @@ from hermes_cli.kanban_lifecycle import (
     LifecycleContractError,
     decode_contract,
     encode_contract,
+    infer_edge_requirement,
     safe_decode_contract,
     validate_edge,
 )
@@ -58,7 +59,9 @@ class _UpdatePlan:
     candidate_run_id: Any
     goal_changed: bool
     lifecycle_changed: bool
+    lifecycle_reopened: bool
     goal_reopened: bool
+    rebound_edges: list[dict[str, Any]]
     changed_fields: list[str]
     goal_revision_id: int
 
@@ -269,21 +272,46 @@ def _build_update_plan(
             "UPDATE tasks SET lifecycle_contract = ? WHERE id = ?",
             (encode_contract(new_lifecycle, default_on_none=False), row["id"]),
         )
+        rebound_edges: list[dict[str, Any]] = []
         for edge in conn.execute(
             "SELECT parent_id, child_id, requirement FROM task_links "
             "WHERE parent_id = ? OR child_id = ? ORDER BY parent_id, child_id",
             (row["id"], row["id"]),
         ).fetchall():
-            requirement = edge["requirement"]
-            if not requirement:
-                continue
             endpoints = conn.execute(
                 "SELECT lifecycle_contract FROM tasks WHERE id IN (?, ?)",
                 (edge["parent_id"], edge["child_id"]),
             ).fetchall()
             if any(safe_decode_contract(endpoint["lifecycle_contract"]) is None for endpoint in endpoints):
                 continue
-            validate_edge(conn, edge["parent_id"], edge["child_id"], requirement)
+            requirement = edge["requirement"]
+            if requirement:
+                validate_edge(conn, edge["parent_id"], edge["child_id"], requirement)
+                continue
+            requirement = infer_edge_requirement(conn, edge["parent_id"], edge["child_id"])
+            conn.execute(
+                "UPDATE task_links SET requirement = ? WHERE parent_id = ? AND child_id = ?",
+                (requirement, edge["parent_id"], edge["child_id"]),
+            )
+            if not _parents_satisfied(conn, edge["child_id"]):
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                    (edge["child_id"],),
+                )
+            other_task_id = (
+                edge["child_id"] if edge["parent_id"] == row["id"] else edge["parent_id"]
+            )
+            conn.execute("UPDATE tasks SET version = version + 1 WHERE id = ?", (other_task_id,))
+            rebound_edges.append(
+                {
+                    "parent": edge["parent_id"],
+                    "child": edge["child_id"],
+                    "old_requirement": None,
+                    "requirement": requirement,
+                }
+            )
+    else:
+        rebound_edges = []
 
     new_status = row["status"]
     if request.transition_text:
@@ -306,6 +334,11 @@ def _build_update_plan(
                 if _parents_satisfied(conn, row["id"])
                 else "todo"
             )
+    lifecycle_reopened = bool(
+        lifecycle_changed
+        and row["status"] in {"done", "review"}
+        and new_status not in {"done", "archived"}
+    )
 
     goal_changed = (
         old_title != new_title
@@ -396,7 +429,9 @@ def _build_update_plan(
         ),
         goal_changed=goal_changed,
         lifecycle_changed=lifecycle_changed,
+        lifecycle_reopened=lifecycle_reopened,
         goal_reopened=goal_reopened,
+        rebound_edges=rebound_edges,
         changed_fields=changed_fields,
         goal_revision_id=goal_revision_id,
     )
@@ -475,7 +510,7 @@ def _persist_update(
         raise _kb.TaskUpdateConflict(
             f"task {task_id} update conflict: version changed while updating"
         )
-    if plan.goal_reopened:
+    if plan.goal_reopened or plan.lifecycle_reopened:
         conn.execute(
             "UPDATE tasks SET completed_at = NULL, result = NULL WHERE id = ?",
             (task_id,),
@@ -495,6 +530,7 @@ def _persist_update(
         "changed_fields": changed_fields,
         "transition": request.transition_text,
         "goal_revision": goal_revision,
+        "rebound_edges": plan.rebound_edges,
     }
     _kb._append_event(
         conn,
@@ -564,9 +600,16 @@ def update_task(
             conn, task_id, request, plan, actor=actor, goal_row=goal_row,
         )
         _emit_acceptance_changes(conn, acceptance_before, source_task_id=task_id)
+    for rebound_edge in plan.rebound_edges:
+        other_task_id = (
+            rebound_edge["child"]
+            if rebound_edge["parent"] == task_id
+            else rebound_edge["parent"]
+        )
+        _kb.notify_task_updated(conn, other_task_id, ("version", "status"))
+    _kb.notify_task_updated(conn, task_id, changed_fields or ["version"])
     for pid, claim_lock in goal_terminations:
         _kb._terminate_reclaimed_worker(pid, claim_lock)
-    _kb.notify_task_updated(conn, task_id, changed_fields or ["version"])
     for entry in goal_invalidated:
         _kb.notify_task_updated(
             conn, entry["id"], ("status", "version", "completed_at", "candidate_run_id", "result"),

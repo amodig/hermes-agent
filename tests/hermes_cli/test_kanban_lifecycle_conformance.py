@@ -774,6 +774,163 @@ class KanbanLifecycleConformance(unittest.TestCase):
         )
         self.assertEqual(get_lifecycle_state(self.conn, child)["acceptance"], "unclassified")
 
+    def test_binding_repairs_legacy_edges_and_clears_terminal_fields(self) -> None:
+        repo_home = tempfile.TemporaryDirectory(prefix="kanban-binding-git-")
+        self.addCleanup(repo_home.cleanup)
+        repo = Path(repo_home.name)
+        _git(repo, "init", "-q")
+        _git(repo, "config", "user.email", "conformance@example.invalid")
+        _git(repo, "config", "user.name", "Kanban Conformance")
+        (repo / "README").write_text("legacy\n", encoding="utf-8")
+        _git(repo, "add", "README")
+        _git(repo, "commit", "-qm", "legacy")
+        branch = _git(repo, "branch", "--show-current")
+        head = _git(repo, "rev-parse", "HEAD")
+
+        candidate = kb.create_task(
+            self.conn,
+            title="legacy validation candidate",
+            assignee="implementer",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "same_card",
+                "reviewer": "reviewer",
+                "validation_required": True,
+            },
+        )
+        with kb.write_txn(self.conn):
+            candidate_goal = int(self._task(candidate).goal_revision_id)
+            handoff = {
+                "base_sha": head,
+                "head_sha": head,
+                "branch_name": branch,
+                "workspace_path": str(repo),
+                "changed_files": [],
+            }
+            implementation_run = kb._synthesize_ended_run(
+                self.conn,
+                candidate,
+                outcome="completed",
+                summary="implementation complete",
+                metadata=handoff,
+            )
+            implementation_lifecycle = {
+                "schema": 1,
+                "phase": "implementation",
+                "candidate_task_id": candidate,
+                "candidate_run_id": implementation_run,
+                "head_sha": head,
+                "goal_revision_ids": {candidate: candidate_goal},
+                "task_goal_revision_id": candidate_goal,
+                "verdict": None,
+            }
+            self.conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (
+                    json.dumps({**handoff, "lifecycle": implementation_lifecycle}, sort_keys=True),
+                    implementation_run,
+                ),
+            )
+            review_run = kb._synthesize_ended_run(
+                self.conn,
+                candidate,
+                outcome="completed",
+                summary="review approved",
+                metadata=handoff,
+            )
+            review_lifecycle = {
+                **implementation_lifecycle,
+                "phase": "review",
+                "candidate_run_id": implementation_run,
+                "verdict": "APPROVE",
+            }
+            self.conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (
+                    json.dumps({**handoff, "lifecycle": review_lifecycle}, sort_keys=True),
+                    review_run,
+                ),
+            )
+            self.conn.execute(
+                "UPDATE tasks SET status = 'done', candidate_run_id = ?, completed_at = 123456 "
+                "WHERE id = ?",
+                (implementation_run, candidate),
+            )
+
+        validation = kb.create_task(
+            self.conn,
+            title="historical validation card",
+            assignee="tester",
+            initial_status="blocked",
+        )
+        downstream = kb.create_task(
+            self.conn,
+            title="validation dependent",
+            assignee="worker",
+            initial_status="blocked",
+            lifecycle_contract={"kind": "general"},
+        )
+        with kb.write_txn(self.conn):
+            self.conn.execute(
+                "UPDATE tasks SET lifecycle_contract = NULL, status = 'done', "
+                "completed_at = 123456, result = 'stale' WHERE id = ?",
+                (validation,),
+            )
+            self.conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (downstream,))
+            self.conn.execute(
+                "INSERT INTO task_links (parent_id, child_id, requirement) VALUES (?, ?, NULL)",
+                (candidate, validation),
+            )
+            self.conn.execute(
+                "INSERT INTO task_links (parent_id, child_id, requirement) VALUES (?, ?, NULL)",
+                (validation, downstream),
+            )
+        self.assertTrue(
+            kb.bind_lifecycle_contract(
+                self.conn,
+                validation,
+                {"kind": "validation", "candidate_task_id": candidate},
+                expected_version=self._task(validation).version,
+                reason="classify historical validation card",
+                author="operator",
+            )
+        )
+
+        rebound = self._task(validation)
+        self.assertEqual(rebound.status, "ready")
+        self.assertIsNone(rebound.completed_at)
+        self.assertIsNone(rebound.result)
+        edge = self.conn.execute(
+            "SELECT requirement FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (validation, downstream),
+        ).fetchone()
+        self.assertEqual(edge["requirement"], "validation_passed")
+        candidate_edge = self.conn.execute(
+            "SELECT requirement FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (candidate, validation),
+        ).fetchone()
+        self.assertEqual(candidate_edge["requirement"], "review_approved")
+        self.assertEqual(self._task(downstream).status, "todo")
+        self.assertFalse(kb.evaluate_dependencies(self.conn, downstream)["satisfied"])
+
+        validation_run = kb.claim_task(self.conn, validation, claimer="tester")
+        self.assertIsNotNone(validation_run)
+        self.assertTrue(
+            kb.complete_task(
+                self.conn,
+                validation,
+                result="failed validation",
+                verdict="FAIL",
+                expected_run_id=validation_run.current_run_id,
+            )
+        )
+        self.assertEqual(self._task(validation).status, "done")
+        dependency_state = kb.evaluate_dependencies(self.conn, downstream)
+        self.assertFalse(dependency_state["satisfied"])
+        self.assertEqual(dependency_state["blockers"][0]["requirement"], "validation_passed")
+        self.assertEqual(dependency_state["blockers"][0]["code"], "verdict_conflict")
+
     def test_legacy_triage_root_can_be_decomposed(self) -> None:
         root = kb.create_task(
             self.conn,
@@ -1571,7 +1728,44 @@ class KanbanLifecycleConformance(unittest.TestCase):
             third_party = root / "site-packages" / "third_party_lazy"
             third_party.mkdir(parents=True)
             (third_party / "__init__.py").write_text("", encoding="utf-8")
-            (third_party / "lazy.py").write_text("value = 1\n", encoding="utf-8")
+            (third_party / "lazy.py").write_text(
+                "from third_party_transitive import value\n"
+                "value = value\n",
+                encoding="utf-8",
+            )
+            transitive = root / "site-packages" / "third_party_transitive"
+            transitive.mkdir(parents=True)
+            (transitive / "__init__.py").write_text("value = 1\n", encoding="utf-8")
+            lazy_dist = root / "site-packages" / "third-party-lazy-1.0.dist-info"
+            lazy_dist.mkdir(parents=True)
+            (lazy_dist / "METADATA").write_text(
+                "Metadata-Version: 2.1\n"
+                "Name: third-party-lazy\n"
+                "Version: 1.0\n"
+                "Requires-Dist: third-party-transitive==1.0\n",
+                encoding="utf-8",
+            )
+            (lazy_dist / "RECORD").write_text(
+                "third_party_lazy/__init__.py,,\n"
+                "third_party_lazy/lazy.py,,\n"
+                "third-party-lazy-1.0.dist-info/METADATA,,\n"
+                "third-party-lazy-1.0.dist-info/RECORD,,\n",
+                encoding="utf-8",
+            )
+            transitive_dist = root / "site-packages" / "third-party-transitive-1.0.dist-info"
+            transitive_dist.mkdir(parents=True)
+            (transitive_dist / "METADATA").write_text(
+                "Metadata-Version: 2.1\n"
+                "Name: third-party-transitive\n"
+                "Version: 1.0\n",
+                encoding="utf-8",
+            )
+            (transitive_dist / "RECORD").write_text(
+                "third_party_transitive/__init__.py,,\n"
+                "third-party-transitive-1.0.dist-info/METADATA,,\n"
+                "third-party-transitive-1.0.dist-info/RECORD,,\n",
+                encoding="utf-8",
+            )
             unused = root / "site-packages" / "third_party_unused"
             unused.mkdir(parents=True)
             (unused / "__init__.py").write_text("value = 2\n", encoding="utf-8")
@@ -1674,6 +1868,8 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "'grant': True, 'preparation_id': 'race-preparation', "
                 "'runtime_identity': expected.as_dict()}; "
                 "runtime.worker_bootstrap_post_import(wait_for_grant=False); "
+                "assert (runtime._FROZEN_IMPORT_ROOT / '.third-party' / '0' / 'third-party-lazy-1.0.dist-info' / 'METADATA').is_file(); "
+                "assert (runtime._FROZEN_IMPORT_ROOT / '.third-party' / '0' / 'third_party_transitive' / '__init__.py').is_file(); "
                 "assert not (runtime._FROZEN_IMPORT_ROOT / '.third-party' / '0' / 'third_party_unused').exists(); "
                 "agent = importlib.import_module('run_agent').AIAgent(); "
                 "(root / 'cli.py').write_text('def main():\\n    return 2\\n', encoding='utf-8'); "
@@ -1689,6 +1885,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "(root / 'locales' / 'en.yaml').write_text('changed\\n', encoding='utf-8'); "
                 "(root / 'optional-mcps' / 'sample' / 'manifest.yaml').write_text('changed\\n', encoding='utf-8'); "
                 "(root / 'acp_adapter' / 'edit_approval.py').write_text('value = 2\\n', encoding='utf-8'); "
+                "(root / 'site-packages' / 'third_party_transitive' / '__init__.py').write_text('value = 2\\n', encoding='utf-8'); "
                 "(root / 'tui_gateway' / 'server.py').write_text('value = 2\\n', encoding='utf-8'); "
                 "(root / 'site-packages' / 'third_party_lazy' / 'lazy.py').write_text('value = 2\\n', encoding='utf-8'); "
                 "turn_value = agent.run_conversation(); "
