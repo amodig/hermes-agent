@@ -340,6 +340,61 @@ def _copy_runtime_dependency_file(source: str, destination: str) -> str:
             shutil.copy2(source, destination)
     return destination
 
+def _pin_loaded_dependency_imports(
+    source_roots: tuple[Path, ...], destinations: list[Path],
+) -> None:
+    """Point already-imported dependency packages at their frozen submodule roots."""
+    pairs = tuple(zip(source_roots, destinations))
+    if not pairs:
+        return
+
+    def snapshot_path(location: object) -> Optional[Path]:
+        try:
+            resolved = Path(location).resolve()
+        except (OSError, RuntimeError, TypeError):
+            return None
+        for source, destination in pairs:
+            try:
+                relative = resolved.relative_to(source)
+            except ValueError:
+                continue
+            return destination / relative
+        return None
+
+    for module in tuple(sys.modules.values()):
+        package_path = getattr(module, "__path__", None)
+        if package_path is None:
+            continue
+        try:
+            entries = tuple(package_path)
+        except (TypeError, ValueError):
+            continue
+        mapped_paths: list[object] = []
+        changed = False
+        for entry in entries:
+            mapped = snapshot_path(entry)
+            mapped_paths.append(str(mapped) if mapped is not None else entry)
+            changed = changed or mapped is not None
+        if not changed:
+            continue
+        try:
+            module.__path__ = mapped_paths
+            spec = getattr(module, "__spec__", None)
+            if spec is not None and spec.submodule_search_locations is not None:
+                spec.submodule_search_locations = mapped_paths
+            for attribute in ("__file__", "__cached__"):
+                mapped = snapshot_path(getattr(module, attribute, None))
+                if mapped is not None:
+                    setattr(module, attribute, str(mapped))
+            if spec is not None:
+                mapped = snapshot_path(getattr(spec, "origin", None))
+                if mapped is not None:
+                    spec.origin = str(mapped)
+        except (AttributeError, TypeError):
+            pass
+
+
+
 
 def _freeze_runtime_import_root(
     root: Path, *, include_dependencies: bool = False,
@@ -378,6 +433,7 @@ def _freeze_runtime_import_root(
     _pin_runtime_import_root(snapshot_root)
     for destination in reversed(dependency_destinations):
         sys.path.insert(1, str(destination))
+    _pin_loaded_dependency_imports(tuple(dependency_roots), dependency_destinations)
     for name, module in tuple(sys.modules.items()):
         package_path = getattr(module, "__path__", None)
         if package_path is None or not any(
