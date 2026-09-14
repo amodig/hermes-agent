@@ -19,6 +19,7 @@ from hermes_cli.kanban_db_lifecycle_evidence import (
     _completion_contract_snapshot,
     _emit_acceptance_changes,
     _implementation_routing,
+    _latest_lifecycle_run_id,
 )
 from hermes_cli.kanban_db_lifecycle_rework import _prior_reviewer
 from hermes_cli.kanban_lifecycle import LifecycleEvidenceError, get_lifecycle_state
@@ -597,18 +598,44 @@ def complete_task(
         if _done_task and _done_task.lifecycle_contract
         else "accepted"
     )
+    direct_hook_run_id = run_id
+    if (
+        _done_task
+        and _done_task.lifecycle_contract
+        and _done_task.lifecycle_contract.get("kind") == "code"
+        and typed_phase == "review"
+        and acceptance == "accepted"
+    ):
+        direct_hook_run_id = _latest_lifecycle_run_id(conn, task_id, "implementation")
     if _done_task and _done_task.status == "done":
         _kb._cleanup_workspace(conn, task_id)
-        if fire_lifecycle_hook and acceptance == "accepted":
-            _kb._fire_task_hook("kanban_task_completed", _done_task, task_id, run_id, summary=handoff_summary)
+        if (
+            fire_lifecycle_hook
+            and acceptance == "accepted"
+            and (typed_phase != "review" or direct_hook_run_id is not None)
+        ):
+            _kb._fire_task_hook(
+                "kanban_task_completed",
+                _done_task,
+                task_id,
+                direct_hook_run_id,
+                summary=handoff_summary,
+            )
     if fire_lifecycle_hook:
         for accepted_task_id in accepted_task_ids:
+            if accepted_task_id == task_id:
+                continue
+            candidate_run_id = _latest_lifecycle_run_id(
+                conn, accepted_task_id, "implementation",
+            )
+            if candidate_run_id is None:
+                continue
             accepted_task = _kb.get_task(conn, accepted_task_id)
             _kb._fire_task_hook(
                 "kanban_task_completed",
                 accepted_task,
                 accepted_task_id,
-                run_id,
+                candidate_run_id,
                 summary=handoff_summary,
             )
     return True

@@ -316,6 +316,83 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "pending",
             )
             self.assertEqual(self._task(validation).status, "ready")
+    def test_same_card_acceptance_fires_candidate_hook_once(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kanban-conformance-same-card-") as raw_repo:
+            repo = Path(raw_repo)
+            _git(repo, "init", "-q")
+            _git(repo, "config", "user.email", "conformance@example.invalid")
+            _git(repo, "config", "user.name", "Kanban Conformance")
+            (repo / "README").write_text("base\n", encoding="utf-8")
+            _git(repo, "add", "README")
+            _git(repo, "commit", "-qm", "base")
+            base_sha = _git(repo, "rev-parse", "HEAD")
+            (repo / "lifecycle.py").write_text("print('proof')\n", encoding="utf-8")
+            _git(repo, "add", "lifecycle.py")
+            _git(repo, "commit", "-qm", "implementation")
+            head_sha = _git(repo, "rev-parse", "HEAD")
+
+            implementation = kb.create_task(
+                self.conn,
+                title="same-card implementation",
+                assignee="implementer",
+                initial_status="blocked",
+                workspace_kind="dir",
+                workspace_path=str(repo),
+                lifecycle_contract={
+                    "kind": "code",
+                    "review_mode": "same_card",
+                    "reviewer": "reviewer",
+                    "validation_required": False,
+                },
+            )
+            self.assertTrue(kb.unblock_task(self.conn, implementation))
+            implementation_run = kb.claim_task(
+                self.conn, implementation, claimer="implementer:conformance"
+            )
+            self.assertIsNotNone(implementation_run)
+            self.assertTrue(
+                kb.complete_task(
+                    self.conn,
+                    implementation,
+                    expected_run_id=implementation_run.current_run_id,
+                    summary="Implementation evidence",
+                    metadata={
+                        "base_sha": base_sha,
+                        "head_sha": head_sha,
+                        "changed_files": ["lifecycle.py"],
+                    },
+                )
+            )
+            review_run = kb.claim_review_task(
+                self.conn, implementation, claimer="reviewer:conformance"
+            )
+            self.assertIsNotNone(review_run)
+            with patch.object(kb, "_fire_task_hook") as fire_hook:
+                self.assertTrue(
+                    kb.complete_task(
+                        self.conn,
+                        implementation,
+                        expected_run_id=review_run.current_run_id,
+                        verdict="APPROVE",
+                        summary="Review approved",
+                        metadata={"reviewed_head_sha": head_sha},
+                    )
+                )
+
+            candidate_completion_calls = [
+                call
+                for call in fire_hook.call_args_list
+                if (
+                    len(call.args) >= 3
+                    and call.args[0] == "kanban_task_completed"
+                    and call.args[2] == implementation
+                )
+            ]
+            self.assertEqual(len(candidate_completion_calls), 1)
+            self.assertEqual(
+                candidate_completion_calls[0].args[3],
+                implementation_run.current_run_id,
+            )
 
 
     def test_archived_negative_role_evidence_is_pending(self) -> None:
