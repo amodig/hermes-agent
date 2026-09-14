@@ -830,7 +830,7 @@ def invalidate_descendants_for_parent_reopen(
     return {"invalidated": invalidated, "terminations": terminations}
 
 def _lifecycle_graph_ids(conn: sqlite3.Connection, task_id: str) -> set[str]:
-    """Return a candidate and its owned typed role cards."""
+    """Return a typed candidate graph and connected typed candidates."""
     seed = conn.execute(
         "SELECT lifecycle_contract FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
@@ -857,14 +857,53 @@ def _lifecycle_graph_ids(conn: sqlite3.Connection, task_id: str) -> set[str]:
     candidate = contracts.get(candidate_id)
     if candidate is None or candidate.get("kind") != "code":
         return set()
-    graph = {candidate_id}
-    graph.update(
-        node_id
-        for node_id, contract in contracts.items()
-        if contract
-        and contract.get("kind") in {"review", "validation"}
-        and str(contract.get("candidate_task_id") or "") == candidate_id
-    )
+
+    candidate_ids = {candidate_id}
+    edges = conn.execute(
+        "SELECT parent_id, child_id, requirement FROM task_links"
+    ).fetchall()
+    while True:
+        connected: set[str] = set()
+        for edge in edges:
+            parent = contracts.get(str(edge["parent_id"]))
+            child = contracts.get(str(edge["child_id"]))
+            if (
+                parent is None
+                or child is None
+                or parent.get("kind") != "validation"
+                or child.get("kind") != "code"
+                or edge["requirement"] != "validation_passed"
+            ):
+                continue
+            parent_candidate_id = str(parent.get("candidate_task_id") or "")
+            child_candidate_id = str(edge["child_id"])
+            if (
+                parent_candidate_id in candidate_ids
+                and child_candidate_id not in candidate_ids
+            ):
+                connected.add(child_candidate_id)
+            elif (
+                child_candidate_id in candidate_ids
+                and contracts.get(parent_candidate_id, {}).get("kind") == "code"
+            ):
+                connected.add(parent_candidate_id)
+        new_candidates = connected - candidate_ids
+        if not new_candidates:
+            break
+        candidate_ids.update(new_candidates)
+
+    graph: set[str] = set()
+    for candidate_id in candidate_ids:
+        if contracts.get(candidate_id, {}).get("kind") != "code":
+            continue
+        graph.add(candidate_id)
+        graph.update(
+            node_id
+            for node_id, contract in contracts.items()
+            if contract
+            and contract.get("kind") in {"review", "validation"}
+            and str(contract.get("candidate_task_id") or "") == candidate_id
+        )
     return graph if len(graph) > 1 else set()
 
 

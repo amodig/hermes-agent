@@ -1012,6 +1012,60 @@ class KanbanLifecycleConformance(unittest.TestCase):
         for task_id in (implementation, review, validation, downstream, code_downstream):
             self.assertIsNotNone(kb.get_task(self.conn, task_id))
 
+    def test_archived_lifecycle_graph_can_purge_through_typed_validation_edge(
+        self,
+    ) -> None:
+        implementation = kb.create_task(
+            self.conn,
+            title="connected purge candidate",
+            assignee="bob",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "alice",
+                "validation_required": True,
+            },
+        )
+        review = kb.create_task(
+            self.conn,
+            title="connected purge review",
+            assignee="alice",
+            initial_status="blocked",
+            lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
+        )
+        validation = kb.create_task(
+            self.conn,
+            title="connected purge validation",
+            assignee="tester",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "validation",
+                "candidate_task_id": implementation,
+            },
+        )
+        downstream = kb.create_task(
+            self.conn,
+            title="connected downstream candidate",
+            assignee="owner",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "same_card",
+                "reviewer": "alice",
+                "validation_required": False,
+            },
+        )
+        kb.link_tasks(self.conn, implementation, review, requirement="phase_finished")
+        kb.link_tasks(self.conn, review, validation, requirement="review_approved")
+        kb.link_tasks(self.conn, validation, downstream, requirement="validation_passed")
+        for task_id in (implementation, review, validation, downstream):
+            self.assertTrue(kb.archive_task(self.conn, task_id))
+
+        self.assertTrue(kb.delete_archived_task(self.conn, implementation))
+        for task_id in (implementation, review, validation, downstream):
+            self.assertIsNone(kb.get_task(self.conn, task_id))
+
     def test_worker_command_imports_stay_pinned_after_final_grant(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-worker-import-") as raw_root:
             root = Path(raw_root)
@@ -1033,6 +1087,10 @@ class KanbanLifecycleConformance(unittest.TestCase):
             (root / "agent" / "__init__.py").write_text("", encoding="utf-8")
             (root / "agent" / "agent_init.py").write_text(
                 "def init_agent(*args, **kwargs):\n    return None\nvalue = 1\n",
+                encoding="utf-8",
+            )
+            (root / "agent" / "credits_tracker.py").write_text(
+                "value = 1\n",
                 encoding="utf-8",
             )
             receipt = root / "receipt.json"
@@ -1057,9 +1115,11 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "runtime.worker_bootstrap_post_import(); "
                 "(root / 'cli.py').write_text('def main():\\n    return 2\\n', encoding='utf-8'); "
                 "(root / 'agent' / 'agent_init.py').write_text('def init_agent(*args, **kwargs):\\n    return None\\nvalue = 2\\n', encoding='utf-8'); "
+                "(root / 'agent' / 'credits_tracker.py').write_text('value = 2\\n', encoding='utf-8'); "
                 "result = importlib.import_module('cli').main(); "
                 "agent_value = importlib.import_module('agent.agent_init').value; "
-                "receipt.write_text(json.dumps({'result': result, 'agent_value': agent_value}), encoding='utf-8')"
+                "tracker_value = importlib.import_module('agent.credits_tracker').value; "
+                "receipt.write_text(json.dumps({'result': result, 'agent_value': agent_value, 'tracker_value': tracker_value}), encoding='utf-8')"
             )
             env = os.environ.copy()
             env["PYTHONPATH"] = str(ROOT)
@@ -1073,7 +1133,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(
                 json.loads(receipt.read_text(encoding="utf-8")),
-                {"result": 1, "agent_value": 1},
+                {"result": 1, "agent_value": 1, "tracker_value": 1},
             )
 
     def test_embedded_dispatcher_freezes_identity_before_first_tick(self) -> None:
