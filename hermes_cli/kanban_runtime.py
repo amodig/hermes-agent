@@ -187,11 +187,12 @@ def _freeze_runtime_import_root(root: Path) -> Path:
         base = root / directory
         if not base.is_dir():
             raise RuntimeIdentityError(f"runtime identity directory is missing: {directory}")
-        for path in base.rglob("*.py"):
+        for path in base.rglob("*"):
+            relative = path.relative_to(root)
             if path.is_file() and not any(
-                part.startswith(".") or part == "__pycache__" for part in path.parts
+                part.startswith(".") or part == "__pycache__" for part in relative.parts
             ):
-                members[path.relative_to(root).as_posix()] = path
+                members[relative.as_posix()] = path
     for asset in _IDENTITY_ASSETS:
         members[asset] = _identity_asset_path(root, asset)
     snapshot_root = Path(tempfile.mkdtemp(prefix="hermes-kanban-runtime-")).resolve()

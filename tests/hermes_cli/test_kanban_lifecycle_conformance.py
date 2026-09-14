@@ -1100,6 +1100,10 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 package.mkdir(parents=True)
                 (package / "module.py").write_text("value = 1\n", encoding="utf-8")
             (root / "tools" / "__init__.py").write_text("", encoding="utf-8")
+            (root / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+            plugin = root / "plugins" / "sample"
+            plugin.mkdir(parents=True)
+            (plugin / "plugin.yaml").write_text("name: sample\n", encoding="utf-8")
             skill = root / "skills" / "devops" / "sdlc-review" / "SKILL.md"
             skill.parent.mkdir(parents=True)
             skill.write_text("review instructions\n", encoding="utf-8")
@@ -1140,11 +1144,19 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "    def run_conversation(self):\n"
                 "        return importlib.import_module('agent.turn_runner').value\n"
                 "    def discover_tools(self):\n"
-                "        return importlib.import_module('tools.registry').discover()\n",
+                "        return importlib.import_module('tools.registry').discover()\n"
+                "    def discover_plugins(self):\n"
+                "        return importlib.import_module('hermes_cli.plugins').discover()\n",
                 encoding="utf-8",
             )
             (root / "agent" / "turn_runner.py").write_text(
                 "value = 1\n",
+                encoding="utf-8",
+            )
+            (root / "hermes_cli" / "plugins.py").write_text(
+                "from pathlib import Path\n"
+                "def discover():\n"
+                "    return sorted(path.name for path in (Path(__file__).parent.parent / 'plugins').glob('*/plugin.yaml'))\n",
                 encoding="utf-8",
             )
             (root / "tools" / "registry.py").write_text(
@@ -1181,12 +1193,14 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "(root / 'agent' / 'empty_response_guard.py').write_text('value = 2\\n', encoding='utf-8'); "
                 "(root / 'agent' / 'turn_runner.py').write_text('value = 2\\n', encoding='utf-8'); "
                 "(root / 'tools' / 'registry.py').write_text('def discover():\\n    return [\"changed\"]\\n', encoding='utf-8'); "
+                "(root / 'plugins' / 'sample' / 'plugin.yaml').write_text('name: changed\\n', encoding='utf-8'); "
                 "turn_value = agent.run_conversation(); "
                 "discovered_tools = agent.discover_tools(); "
+                "discovered_plugins = agent.discover_plugins(); "
                 "result = importlib.import_module('cli').main(); "
                 "agent_value = importlib.import_module('agent.agent_init').value; "
                 "tracker_value = importlib.import_module('agent.credits_tracker').value; "
-                "receipt.write_text(json.dumps({'result': result, 'turn_value': turn_value, 'discovered_tools': discovered_tools, 'agent_value': agent_value, 'tracker_value': tracker_value, 'constructor_value': agent.value}), encoding='utf-8')"
+                "receipt.write_text(json.dumps({'result': result, 'turn_value': turn_value, 'discovered_tools': discovered_tools, 'discovered_plugins': discovered_plugins, 'agent_value': agent_value, 'tracker_value': tracker_value, 'constructor_value': agent.value}), encoding='utf-8')"
             )
             env = os.environ.copy()
             env["PYTHONPATH"] = str(ROOT)
@@ -1200,7 +1214,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(
                 json.loads(receipt.read_text(encoding="utf-8")),
-                {"result": 1, "turn_value": 1, "discovered_tools": ["__init__.py", "module.py", "registry.py"], "agent_value": 1, "tracker_value": 1, "constructor_value": 1},
+                {"result": 1, "turn_value": 1, "discovered_tools": ["__init__.py", "module.py", "registry.py"], "discovered_plugins": ["plugin.yaml"], "agent_value": 1, "tracker_value": 1, "constructor_value": 1},
             )
 
     def test_embedded_dispatcher_freezes_identity_before_first_tick(self) -> None:
