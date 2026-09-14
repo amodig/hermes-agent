@@ -149,20 +149,52 @@ def _contract_for(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, 
 
 
 class _ProjectionCache:
-    """Read-only board snapshot shared by lifecycle and dependency projections."""
+    """Read-only snapshot of the requested lifecycle dependency closure."""
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    _QUERY_BATCH_SIZE = 400
+
+    def __init__(self, conn: sqlite3.Connection, task_ids: list[str]) -> None:
         self.conn = conn
-        self.tasks = {
-            row["id"]: row for row in conn.execute("SELECT * FROM tasks").fetchall()
-        }
+        self.tasks: dict[str, sqlite3.Row] = {}
         self.links_by_parent: dict[str, list[dict[str, Any]]] = {}
         self.links_by_child: dict[str, list[dict[str, Any]]] = {}
         self.links_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
-        for row in conn.execute(
-            "SELECT parent_id, child_id, requirement FROM task_links "
-            "ORDER BY parent_id, child_id"
-        ).fetchall():
+
+        pending = set(task_ids)
+        queried_task_ids: set[str] = set()
+        link_rows: list[sqlite3.Row] = []
+        seen_link_pairs: set[tuple[str, str]] = set()
+        while pending - queried_task_ids:
+            batch = sorted(pending - queried_task_ids)[:self._QUERY_BATCH_SIZE]
+            queried_task_ids.update(batch)
+            placeholders = ",".join("?" for _ in batch)
+            for row in conn.execute(
+                f"SELECT * FROM tasks WHERE id IN ({placeholders})", batch,
+            ).fetchall():
+                self.tasks[row["id"]] = row
+                contract = safe_decode_contract(row["lifecycle_contract"])
+                candidate_id = (
+                    contract.get("candidate_task_id")
+                    if contract and contract.get("kind") in {"review", "validation"}
+                    else None
+                )
+                if candidate_id:
+                    pending.add(str(candidate_id))
+            new_links = conn.execute(
+                f"SELECT parent_id, child_id, requirement FROM task_links "
+                f"WHERE parent_id IN ({placeholders}) OR child_id IN ({placeholders}) "
+                "ORDER BY parent_id, child_id",
+                (*batch, *batch),
+            ).fetchall()
+            for row in new_links:
+                pending.update((row["parent_id"], row["child_id"]))
+                pair = (row["parent_id"], row["child_id"])
+                if pair not in seen_link_pairs:
+                    link_rows.append(row)
+                    seen_link_pairs.add(pair)
+
+        link_rows.sort(key=lambda row: (row["parent_id"], row["child_id"]))
+        for row in link_rows:
             link = {
                 "parent_id": row["parent_id"],
                 "child_id": row["child_id"],
@@ -173,16 +205,25 @@ class _ProjectionCache:
             self.links_by_pair[(row["parent_id"], row["child_id"])] = link
         self.runs_by_id: dict[int, sqlite3.Row] = {}
         self.runs_by_task: dict[str, list[sqlite3.Row]] = {}
-        for row in conn.execute(
-            "SELECT id, task_id, metadata, outcome FROM task_runs ORDER BY id DESC"
-        ).fetchall():
-            self.runs_by_id[int(row["id"])] = row
-            self.runs_by_task.setdefault(row["task_id"], []).append(row)
         self.events_by_task: dict[str, list[sqlite3.Row]] = {}
-        for row in conn.execute(
-            "SELECT id, task_id, kind, payload FROM task_events ORDER BY id DESC"
-        ).fetchall():
-            self.events_by_task.setdefault(row["task_id"], []).append(row)
+
+        task_ids_in_closure = sorted(self.tasks)
+        for start in range(0, len(task_ids_in_closure), self._QUERY_BATCH_SIZE):
+            batch = task_ids_in_closure[start:start + self._QUERY_BATCH_SIZE]
+            placeholders = ",".join("?" for _ in batch)
+            for row in conn.execute(
+                f"SELECT id, task_id, metadata, outcome FROM task_runs "
+                f"WHERE task_id IN ({placeholders}) ORDER BY id DESC",
+                batch,
+            ).fetchall():
+                self.runs_by_id[int(row["id"])] = row
+                self.runs_by_task.setdefault(row["task_id"], []).append(row)
+            for row in conn.execute(
+                f"SELECT id, task_id, kind, payload FROM task_events "
+                f"WHERE task_id IN ({placeholders}) ORDER BY id DESC",
+                batch,
+            ).fetchall():
+                self.events_by_task.setdefault(row["task_id"], []).append(row)
         self.lifecycle: dict[str, dict[str, Any]] = {}
         self.dependencies: dict[str, dict[str, Any]] = {}
 
@@ -1128,7 +1169,7 @@ def get_lifecycle_projections(
     ids = list(dict.fromkeys(task_ids))
     if not ids:
         return {}, {}
-    cache = _ProjectionCache(conn)
+    cache = _ProjectionCache(conn, ids)
     lifecycle = {
         task_id: get_lifecycle_state(conn, task_id, _cache=cache)
         for task_id in ids

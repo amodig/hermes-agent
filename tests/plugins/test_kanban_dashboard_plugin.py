@@ -167,6 +167,26 @@ def test_lifecycle_projections_batch_shared_snapshot(client):
     assert len(statements) <= 4
 
 
+def test_projection_cache_scopes_tasks_and_history_to_closure(client):
+    from hermes_cli import kanban_lifecycle as lifecycle
+
+    visible = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "visible"},
+    ).json()["task"]
+    unrelated = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "unrelated", "assignee": "worker"},
+    ).json()["task"]
+
+    with kbc.connect() as conn:
+        assert kb.claim_task(conn, unrelated["id"]) is not None
+        cache = lifecycle._ProjectionCache(conn, [visible["id"]])
+
+    assert set(cache.tasks) == {visible["id"]}
+    assert unrelated["id"] not in cache.runs_by_task
+    assert unrelated["id"] not in cache.events_by_task
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")
