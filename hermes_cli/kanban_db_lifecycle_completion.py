@@ -881,9 +881,13 @@ def edit_completed_task_result(
 ) -> bool:
     """Backfill the user-visible result for an already completed task."""
     if isinstance(metadata, dict) and (
-        "lifecycle" in metadata or "lifecycle_routing" in metadata
+        "lifecycle" in metadata
+        or "lifecycle_routing" in metadata
+        or any(key in metadata for key in _kb.HANDOFF_KEYS)
     ):
-        raise LifecycleEvidenceError("completed result edits cannot change lifecycle evidence or routing")
+        raise LifecycleEvidenceError(
+            "completed result edits cannot change lifecycle evidence, routing, or handoff fields"
+        )
     handoff_summary = summary if summary is not None else result
     with _kb.write_txn(conn):
         if _kb._task_status(conn, task_id) != "done":

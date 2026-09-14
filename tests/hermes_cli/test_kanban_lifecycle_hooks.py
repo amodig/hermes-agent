@@ -114,6 +114,41 @@ def test_general_completion_fires_hook(kanban_home, captured_hooks):
     assert completed[0][1]["task_id"] == task_id
     assert completed[0][1]["run_id"] == claimed.current_run_id
 
+def test_completed_result_edit_rejects_handoff_metadata(kanban_home):
+    conn = kbc.connect()
+    try:
+        task_id = kb.create_task(conn, title="immutable", assignee="worker")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        assert kb.complete_task(
+            conn,
+            task_id,
+            result="done",
+            metadata={"head_sha": "original"},
+        ) is True
+
+        with pytest.raises(kb.LifecycleEvidenceError, match="handoff"):
+            kb.edit_completed_task_result(
+                conn,
+                task_id,
+                result="edited",
+                metadata={"head_sha": "spoofed"},
+            )
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.result == "done"
+        run = conn.execute(
+            "SELECT metadata FROM task_runs "
+            "WHERE task_id = ? AND outcome = 'completed' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert run is not None
+        assert json.loads(run["metadata"])["head_sha"] == "original"
+    finally:
+        conn.close()
+
 def test_acceptance_event_projection_holds_write_lock(kanban_home):
     conn = kbc.connect()
     writer_start = threading.Event()
