@@ -37,7 +37,14 @@ _IDENTITY_ROOTS = (
     "acp_adapter",
     "tui_gateway",
 )
-_RUNTIME_RESOURCE_ROOTS = ("skills", "optional-skills", "locales", "optional-mcps")
+_RUNTIME_RESOURCE_ROOTS = (
+    ("skills", "HERMES_BUNDLED_SKILLS"),
+    ("optional-skills", "HERMES_OPTIONAL_SKILLS"),
+    ("locales", "HERMES_BUNDLED_LOCALES"),
+    ("optional-mcps", "HERMES_OPTIONAL_MCPS"),
+    ("plugins", "HERMES_BUNDLED_PLUGINS"),
+)
+
 _IDENTITY_ASSETS = ("skills/devops/sdlc-review/SKILL.md",)
 _BOOTSTRAP_INPUT_ENV = (
     "HERMES_KANBAN_BOOTSTRAP_PATH",
@@ -316,6 +323,14 @@ def _freeze_runtime_import_root(root: Path) -> Path:
     except Exception:
         _remove_frozen_import_root(snapshot_root)
         raise
+    for directory, env_var in _RUNTIME_RESOURCE_ROOTS:
+        source = _resource_root(root, directory, env_var)
+        if not source.is_dir():
+            continue
+        destination = snapshot_root / directory
+        destination.mkdir(parents=True, exist_ok=True)
+        os.environ[env_var] = str(destination)
+
     _FROZEN_IMPORT_ROOT = snapshot_root
     atexit.register(_remove_frozen_import_root, snapshot_root)
     _pin_runtime_import_root(snapshot_root)
@@ -335,39 +350,61 @@ def _freeze_runtime_import_root(root: Path) -> Path:
 
 
 
+def _resource_root(root: Path, directory: str, env_var: str) -> Path:
+    override = os.environ.get(env_var, "").strip()
+    if override:
+        candidate = Path(override).resolve()
+        if candidate.is_dir():
+            return candidate
+    return root / directory
+
+
 def _identity_asset_path(root: Path, asset: str) -> Path:
-    path = root / asset
+    if asset.startswith("skills/"):
+        path = _resource_root(root, "skills", "HERMES_BUNDLED_SKILLS")
+    else:
+        path = root
+    path = path / Path(asset).relative_to("skills") if asset.startswith("skills/") else path / asset
     if path.is_file():
         return path
-    if asset.startswith("skills/"):
-        bundled_root = os.environ.get("HERMES_BUNDLED_SKILLS")
-        if bundled_root:
-            path = Path(bundled_root) / Path(asset).relative_to("skills")
-            if path.is_file():
-                return path
     raise RuntimeIdentityError(f"runtime identity asset is missing: {asset}")
 
 def _runtime_snapshot_members(root: Path) -> dict[str, Path]:
     root = root.resolve()
     members: dict[str, Path] = {}
+
     for path in root.glob("*.py"):
         if path.is_file():
             members[path.name] = path
-    for directory in (*_IDENTITY_ROOTS, *_RUNTIME_RESOURCE_ROOTS):
-        base = root / directory
-        if not base.is_dir():
-            if directory in _IDENTITY_ROOTS:
-                raise RuntimeIdentityError(f"runtime identity directory is missing: {directory}")
-            continue
+
+    def add_tree(base: Path, destination_root: str) -> None:
         for path in base.rglob("*"):
-            relative = path.relative_to(root)
+            relative = path.relative_to(base)
             if path.is_file() and not any(
                 part.startswith(".") or part == "__pycache__" for part in relative.parts
             ):
-                members[relative.as_posix()] = path
+                members[(Path(destination_root) / relative).as_posix()] = path
+
+    for directory in _IDENTITY_ROOTS:
+        if directory == "plugins":
+            continue
+        base = root / directory
+        if not base.is_dir():
+            raise RuntimeIdentityError(f"runtime identity directory is missing: {directory}")
+        add_tree(base, directory)
+
+    for directory, env_var in _RUNTIME_RESOURCE_ROOTS:
+        base = _resource_root(root, directory, env_var)
+        if not base.is_dir():
+            if directory == "plugins":
+                raise RuntimeIdentityError(f"runtime identity directory is missing: {directory}")
+            continue
+        add_tree(base, directory)
+
     for asset in _IDENTITY_ASSETS:
         members[asset] = _identity_asset_path(root, asset)
     return members
+
 
 def _fingerprint(root: Path) -> str:
     digest = hashlib.sha256()

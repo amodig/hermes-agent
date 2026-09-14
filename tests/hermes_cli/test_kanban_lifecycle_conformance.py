@@ -1538,6 +1538,80 @@ print(synced.stat().st_mode & stat.S_IXUSR)
                 bundled_skill.write_text("packaged review instructions v2\n", encoding="utf-8")
                 self.assertNotEqual(before, _fingerprint(root))
 
+    def test_runtime_snapshot_fences_packaged_resource_roots(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kanban-conformance-packaged-resources-") as raw_root:
+            root = Path(raw_root) / "runtime"
+            for directory in runtime._IDENTITY_ROOTS:
+                if directory == "plugins":
+                    continue
+                package = root / directory
+                package.mkdir(parents=True)
+                (package / "module.py").write_text("value = 1\n", encoding="utf-8")
+            overrides: dict[str, str] = {}
+            external_roots: dict[str, Path] = {}
+            for directory, env_var in runtime._RUNTIME_RESOURCE_ROOTS:
+                external = Path(raw_root) / f"packaged-{directory}"
+                external.mkdir(parents=True)
+                (external / "marker.txt").write_text(f"{directory}:v1\n", encoding="utf-8")
+                if directory == "skills":
+                    skill = external / "devops" / "sdlc-review" / "SKILL.md"
+                    skill.parent.mkdir(parents=True)
+                    skill.write_text("packaged review instructions\n", encoding="utf-8")
+                overrides[env_var] = str(external)
+                external_roots[directory] = external
+
+            with patch.dict(os.environ, overrides, clear=False):
+                before = _fingerprint(root)
+                for directory, external in external_roots.items():
+                    (external / "marker.txt").write_text(f"{directory}:v2\n", encoding="utf-8")
+                current = _fingerprint(root)
+            self.assertNotEqual(before, current)
+
+            script = """
+import json
+import os
+import sys
+from pathlib import Path
+from hermes_cli import kanban_runtime as runtime
+
+root = Path(sys.argv[1])
+snapshot = runtime._freeze_runtime_import_root(root)
+payload = {
+    "fingerprint": runtime._fingerprint(snapshot),
+    "snapshot": str(snapshot),
+    "paths": {
+        env_var: os.environ[env_var]
+        for _directory, env_var in runtime._RUNTIME_RESOURCE_ROOTS
+    },
+    "markers": {
+        directory: (Path(os.environ[env_var]) / "marker.txt").read_text()
+        for directory, env_var in runtime._RUNTIME_RESOURCE_ROOTS
+    },
+}
+print(json.dumps(payload, sort_keys=True))
+runtime.cleanup_runtime_snapshot(snapshot)
+"""
+            env = os.environ.copy()
+            env.update(overrides)
+            env["PYTHONPATH"] = str(ROOT)
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            completed = subprocess.run(
+                [sys.executable, "-c", script, str(root)],
+                text=True,
+                capture_output=True,
+                env=env,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertEqual(payload["fingerprint"], current)
+            for directory, env_var in runtime._RUNTIME_RESOURCE_ROOTS:
+                self.assertEqual(
+                    Path(payload["paths"][env_var]),
+                    Path(payload["snapshot"]) / directory,
+                )
+                self.assertEqual(payload["markers"][directory], f"{directory}:v2\n")
+
     def test_completion_rechecks_candidate_head_at_commit_boundary(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-race-") as raw_repo:
             repo = Path(raw_repo)
