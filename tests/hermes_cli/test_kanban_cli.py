@@ -118,6 +118,34 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
     assert beta_titles == ["beta-task"]
 
 
+
+def test_lifecycle_contract_cli_errors_are_concise(kanban_home, capsys):
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    kc.build_parser(parser.add_subparsers(dest="command"))
+    args = parser.parse_args(
+        [
+            "kanban",
+            "create",
+            "invalid lifecycle task",
+            "--assignee",
+            "worker",
+            "--lifecycle-contract",
+            json.dumps(
+                {
+                    "kind": "code",
+                    "review_mode": "separate_card",
+                    "reviewer": "worker",
+                    "validation_required": False,
+                }
+            ),
+        ]
+    )
+
+    assert kc.kanban_command(args) == 1
+    error = capsys.readouterr().err
+    assert "reviewer must differ from the implementation assignee" in error
+    assert "Traceback" not in error
+
 # ---------------------------------------------------------------------------
 # Integration with the COMMAND_REGISTRY
 # ---------------------------------------------------------------------------
