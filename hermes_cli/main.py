@@ -3341,6 +3341,14 @@ def main():
         except Exception as exc:
             print(f"worker bootstrap refused: {exc}", file=sys.stderr)
             sys.exit(78)
+    if os.environ.get("HERMES_KANBAN_BOOTSTRAP_PATH"):
+        try:
+            from hermes_cli.kanban_runtime import worker_bootstrap_post_import
+
+            worker_bootstrap_post_import()
+        except Exception as exc:
+            print(f"worker post-import verification refused: {exc}", file=sys.stderr)
+            sys.exit(78)
     _set_process_title()
     _advertise_agent_env()
 

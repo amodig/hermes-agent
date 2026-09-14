@@ -331,12 +331,35 @@ def verify_worker_ready(
     return actual
 
 
-def worker_bootstrap_from_env() -> Optional[dict[str, Any]]:
-    """Publish a worker identity and wait for the parent grant, if requested.
+def _read_bootstrap_message() -> dict[str, Any]:
+    grant_queue: queue.Queue[Optional[str]] = queue.Queue(maxsize=1)
 
-    The normal CLI has no bootstrap side effect. Dispatcher workers opt in with
-    ``HERMES_KANBAN_BOOTSTRAP_PATH`` and remain unable to use Kanban tools until
-    the parent grants the matching preparation.
+    def _read_line() -> None:
+        try:
+            grant_queue.put(sys.stdin.readline())
+        except (OSError, ValueError):
+            grant_queue.put(None)
+
+    threading.Thread(target=_read_line, daemon=True).start()
+    try:
+        grant_line = grant_queue.get(timeout=_BOOTSTRAP_TIMEOUT_SECONDS)
+    except queue.Empty as exc:
+        raise RuntimeIdentityError("worker bootstrap message timed out") from exc
+    try:
+        message = json.loads(grant_line or "")
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise RuntimeIdentityError("malformed worker bootstrap message") from exc
+    if not isinstance(message, dict):
+        raise RuntimeIdentityError("worker bootstrap message must be an object")
+    return message
+
+def worker_bootstrap_from_env() -> Optional[dict[str, Any]]:
+    """Publish the pre-import identity and wait for the import release.
+
+    Dispatcher workers first prove that the early checkout matches the
+    dispatcher's snapshot.  The parent then releases startup imports; the
+    post-import handshake performs the final identity check before Kanban
+    tools are granted.
     """
     path_raw = os.environ.get("HERMES_KANBAN_BOOTSTRAP_PATH", "").strip()
     if not path_raw:
@@ -349,6 +372,7 @@ def worker_bootstrap_from_env() -> Optional[dict[str, Any]]:
     actual = runtime_identity()
     payload = {
         "ready": same_code_identity(expected, actual),
+        "phase": "pre_import",
         "preparation_id": preparation_id,
         "runtime_identity": actual.as_dict(),
     }
@@ -360,23 +384,51 @@ def worker_bootstrap_from_env() -> Optional[dict[str, Any]]:
         for key in _BOOTSTRAP_INPUT_ENV:
             os.environ.pop(key, None)
         return payload
-    grant_queue: queue.Queue[Optional[str]] = queue.Queue(maxsize=1)
 
-    def _read_grant() -> None:
-        try:
-            grant_queue.put(sys.stdin.readline())
-        except (OSError, ValueError) as exc:
-            grant_queue.put(None)
+    message = _read_bootstrap_message()
+    if message.get("grant") is True:
+        if (
+            str(message.get("preparation_id")) != preparation_id
+            or not same_runtime_identity(message.get("runtime_identity", {}), actual)
+        ):
+            raise RuntimeIdentityError("worker bootstrap grant mismatch")
+        if message.get("run_id") is not None:
+            os.environ["HERMES_KANBAN_RUN_ID"] = str(message["run_id"])
+        if message.get("claim_lock"):
+            os.environ["HERMES_KANBAN_CLAIM_LOCK"] = str(message["claim_lock"])
+        os.environ["HERMES_KANBAN_RUNTIME_GRANTED"] = "1"
+        for key in _BOOTSTRAP_INPUT_ENV:
+            os.environ.pop(key, None)
+        return payload
+    if (
+        message.get("continue_imports") is not True
+        or str(message.get("preparation_id")) != preparation_id
+        or not same_runtime_identity(message.get("runtime_identity", {}), actual)
+    ):
+        raise RuntimeIdentityError("worker bootstrap import handshake mismatch")
+    return payload
 
-    threading.Thread(target=_read_grant, daemon=True).start()
-    try:
-        grant_line = grant_queue.get(timeout=_BOOTSTRAP_TIMEOUT_SECONDS)
-    except queue.Empty as exc:
-        raise RuntimeIdentityError("worker bootstrap grant timed out") from exc
-    try:
-        grant = json.loads(grant_line or "")
-    except (json.JSONDecodeError, TypeError) as exc:
-        raise RuntimeIdentityError("malformed worker bootstrap grant") from exc
+
+def worker_bootstrap_post_import() -> Optional[dict[str, Any]]:
+    """Verify the fully imported worker, then wait for the final grant."""
+    path_raw = os.environ.get("HERMES_KANBAN_BOOTSTRAP_PATH", "").strip()
+    if not path_raw:
+        return None
+    preparation_id = os.environ.get("HERMES_KANBAN_PREPARATION_ID", "").strip()
+    expected_raw = os.environ.get("HERMES_KANBAN_EXPECTED_RUNTIME", "").strip()
+    if not preparation_id or not expected_raw:
+        raise RuntimeIdentityError("worker bootstrap environment is incomplete")
+    expected = decode_identity(expected_raw)
+    actual = assert_runtime_import_root(expected=expected)
+    payload = {
+        "ready": True,
+        "phase": "post_import",
+        "post_import": True,
+        "preparation_id": preparation_id,
+        "runtime_identity": actual.as_dict(),
+    }
+    _atomic_write(Path(path_raw), payload)
+    grant = _read_bootstrap_message()
     if (
         grant.get("grant") is not True
         or str(grant.get("preparation_id")) != preparation_id

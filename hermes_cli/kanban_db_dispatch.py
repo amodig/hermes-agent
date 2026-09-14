@@ -2491,10 +2491,38 @@ def _default_spawn(
             time.sleep(0.05)
         if payload is None:
             raise RuntimeError("worker bootstrap timed out")
-        # systemd-run is only the scope launcher; readiness reports Hermes's PID.
-        ready_pid = decode_identity(payload.get("runtime_identity")).pid
+        early_pid = decode_identity(payload.get("runtime_identity")).pid
+        early = verify_worker_ready(
+            payload, expected_identity, pid=early_pid, preparation_id=preparation_id,
+        )
+        if proc.stdin is None:
+            raise RuntimeError("worker bootstrap pipe unavailable")
+        proc.stdin.write(json.dumps({
+            "continue_imports": True,
+            "preparation_id": preparation_id,
+            "runtime_identity": early.as_dict(),
+        }, sort_keys=True).encode("utf-8") + b"\n")
+        proc.stdin.flush()
+
+        post_deadline = time.monotonic() + 10.0
+        post_payload = None
+        while time.monotonic() < post_deadline:
+            if preparation_path.is_file():
+                try:
+                    candidate = json.loads(preparation_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    candidate = None
+                if isinstance(candidate, dict) and candidate.get("post_import") is True:
+                    post_payload = candidate
+                    break
+            if proc.poll() is not None:
+                raise RuntimeError(f"worker exited before post-import verification ({proc.returncode})")
+            time.sleep(0.05)
+        if post_payload is None:
+            raise RuntimeError("worker post-import verification timed out")
+        ready_pid = decode_identity(post_payload.get("runtime_identity")).pid
         actual = verify_worker_ready(
-            payload, expected_identity, pid=ready_pid, preparation_id=preparation_id,
+            post_payload, expected_identity, pid=ready_pid, preparation_id=preparation_id,
         )
         _worker_processes[proc.pid] = proc
         _worker_pid_aliases[proc.pid] = actual.pid

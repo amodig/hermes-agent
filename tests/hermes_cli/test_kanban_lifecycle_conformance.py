@@ -532,6 +532,37 @@ class KanbanLifecycleConformance(unittest.TestCase):
         )
         self.assertEqual(get_lifecycle_state(self.conn, child)["acceptance"], "unclassified")
 
+    def test_legacy_triage_root_can_be_decomposed(self) -> None:
+        root = kb.create_task(
+            self.conn,
+            title="legacy triage root",
+            initial_status="blocked",
+        )
+        with kb.write_txn(self.conn):
+            self.conn.execute(
+                "UPDATE tasks SET lifecycle_contract = NULL, status = 'triage' WHERE id = ?",
+                (root,),
+            )
+        child_ids = kb.decompose_triage_task(
+            self.conn,
+            root,
+            root_assignee="orchestrator",
+            children=[{
+                "title": "legacy triage child",
+                "assignee": "worker",
+                "lifecycle_contract": {"kind": "general"},
+            }],
+            auto_promote=False,
+        )
+        self.assertEqual(len(child_ids or []), 1)
+        edge = self.conn.execute(
+            "SELECT requirement FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (child_ids[0], root),
+        ).fetchone()
+        self.assertIsNotNone(edge)
+        self.assertEqual(edge["requirement"], "phase_finished")
+        self.assertEqual(self._task(root).status, "todo")
+
     def test_review_card_requires_separate_card_candidate(self) -> None:
         implementation = kb.create_task(
             self.conn,
@@ -948,8 +979,9 @@ class KanbanLifecycleConformance(unittest.TestCase):
             script = (
                 "import json, os, sys; "
                 "from pathlib import Path; "
-                "from hermes_cli.kanban_runtime import worker_bootstrap_from_env; "
-                "worker_bootstrap_from_env(); "
+                "import hermes_cli.main; "
+                "from hermes_cli.kanban_runtime import worker_bootstrap_post_import; "
+                "worker_bootstrap_post_import(); "
                 "Path(sys.argv[1]).write_text(json.dumps({"
                 "'run': os.environ.get('HERMES_KANBAN_RUN_ID'), "
                 "'claim': os.environ.get('HERMES_KANBAN_CLAIM_LOCK')}))"

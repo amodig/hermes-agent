@@ -154,8 +154,8 @@ def test_real_user_systemd_scope_preserves_worker_context(
     receipt = workspace / "worker-receipt.json"
     script = (
         "import json, os, pathlib, sys, time; "
-        "from hermes_cli.kanban_runtime import worker_bootstrap_from_env; "
-        "worker_bootstrap_from_env(); "
+        "from hermes_cli.kanban_runtime import worker_bootstrap_from_env, worker_bootstrap_post_import; "
+        "worker_bootstrap_from_env(); worker_bootstrap_post_import(); "
         "pathlib.Path(sys.argv[1]).write_text(json.dumps({"
         "'pid': os.getpid(), 'cwd': os.getcwd(), "
         "'task': os.environ.get('HERMES_KANBAN_TASK'), "

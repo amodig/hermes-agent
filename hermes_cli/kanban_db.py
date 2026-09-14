@@ -3615,7 +3615,7 @@ def decompose_triage_task(
     with write_txn(conn):
         root_row = conn.execute(
             "SELECT id, status, tenant, workspace_kind, workspace_path, "
-            "goal_revision_id FROM tasks WHERE id = ?", (task_id,),
+            "goal_revision_id, lifecycle_contract FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
             return None
@@ -3690,7 +3690,11 @@ def decompose_triage_task(
         # Root waits for the whole graph: link it under EVERY child (simpler
         # than computing leaves; cycle-free since the root is only ever a child).
         for cid in child_ids:
-            requirement = infer_edge_requirement(conn, cid, task_id)
+            requirement = (
+                "phase_finished"
+                if root_row["lifecycle_contract"] is None
+                else infer_edge_requirement(conn, cid, task_id)
+            )
             _link(conn, cid, task_id, requirement=requirement)
         # Flip the root triage -> todo, assignee -> orchestrator.
         sets = ["status = 'todo'"]
