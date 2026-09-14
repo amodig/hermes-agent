@@ -1062,7 +1062,18 @@ class KanbanLifecycleConformance(unittest.TestCase):
         for task_id in (implementation, review, validation, downstream):
             self.assertTrue(kb.archive_task(self.conn, task_id))
 
-        self.assertTrue(kb.delete_archived_task(self.conn, implementation))
+        with self.assertRaises(kb.LifecycleContractError):
+            kb.delete_archived_task(self.conn, implementation)
+        for task_id in (implementation, review, validation, downstream):
+            self.assertIsNotNone(kb.get_task(self.conn, task_id))
+
+        self.assertTrue(
+            kb.delete_archived_task(
+                self.conn,
+                implementation,
+                requested_task_ids=(implementation, downstream),
+            )
+        )
         for task_id in (implementation, review, validation, downstream):
             self.assertIsNone(kb.get_task(self.conn, task_id))
 
@@ -1081,7 +1092,11 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 encoding="utf-8",
             )
             (root / "run_agent.py").write_text(
-                "class AIAgent:\n    pass\n",
+                "import importlib, os\n"
+                "class AIAgent:\n"
+                "    def __init__(self):\n"
+                "        assert os.environ.get('HERMES_KANBAN_RUNTIME_GRANTED') != '1'\n"
+                "        self.value = importlib.import_module('agent.empty_response_guard').value\n",
                 encoding="utf-8",
             )
             (root / "agent" / "__init__.py").write_text("", encoding="utf-8")
@@ -1090,6 +1105,10 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 encoding="utf-8",
             )
             (root / "agent" / "credits_tracker.py").write_text(
+                "value = 1\n",
+                encoding="utf-8",
+            )
+            (root / "agent" / "empty_response_guard.py").write_text(
                 "value = 1\n",
                 encoding="utf-8",
             )
@@ -1112,14 +1131,17 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "runtime._read_bootstrap_message = lambda: {"
                 "'grant': True, 'preparation_id': 'race-preparation', "
                 "'runtime_identity': expected.as_dict()}; "
-                "runtime.worker_bootstrap_post_import(); "
+                "runtime.worker_bootstrap_post_import(wait_for_grant=False); "
+                "agent = importlib.import_module('run_agent').AIAgent(); "
+                "runtime.worker_bootstrap_after_constructor(); "
                 "(root / 'cli.py').write_text('def main():\\n    return 2\\n', encoding='utf-8'); "
                 "(root / 'agent' / 'agent_init.py').write_text('def init_agent(*args, **kwargs):\\n    return None\\nvalue = 2\\n', encoding='utf-8'); "
                 "(root / 'agent' / 'credits_tracker.py').write_text('value = 2\\n', encoding='utf-8'); "
+                "(root / 'agent' / 'empty_response_guard.py').write_text('value = 2\\n', encoding='utf-8'); "
                 "result = importlib.import_module('cli').main(); "
                 "agent_value = importlib.import_module('agent.agent_init').value; "
                 "tracker_value = importlib.import_module('agent.credits_tracker').value; "
-                "receipt.write_text(json.dumps({'result': result, 'agent_value': agent_value, 'tracker_value': tracker_value}), encoding='utf-8')"
+                "receipt.write_text(json.dumps({'result': result, 'agent_value': agent_value, 'tracker_value': tracker_value, 'constructor_value': agent.value}), encoding='utf-8')"
             )
             env = os.environ.copy()
             env["PYTHONPATH"] = str(ROOT)
@@ -1133,7 +1155,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(
                 json.loads(receipt.read_text(encoding="utf-8")),
-                {"result": 1, "agent_value": 1, "tracker_value": 1},
+                {"result": 1, "agent_value": 1, "tracker_value": 1, "constructor_value": 1},
             )
 
     def test_embedded_dispatcher_freezes_identity_before_first_tick(self) -> None:

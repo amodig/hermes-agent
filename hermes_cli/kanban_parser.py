@@ -389,7 +389,7 @@ _SPECS = [
     _cmd("archive", [
         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
         _arg("--rm", dest="purge_ids", nargs="+",
-             help="Permanently delete already-archived task ids from the board"),
+             help="Permanently delete archived task ids; list every connected candidate id"),
     ], help="Archive one or more tasks"),
     _cmd("tail", [_TASK_ID, _arg("--interval", type=float, default=1.0)], help="Follow a task's event stream"),
     _cmd("dispatch", [

@@ -829,8 +829,13 @@ def invalidate_descendants_for_parent_reopen(
             _kb._terminate_reclaimed_worker(pid, claim_lock)
     return {"invalidated": invalidated, "terminations": terminations}
 
-def _lifecycle_graph_ids(conn: sqlite3.Connection, task_id: str) -> set[str]:
-    """Return a typed candidate graph and connected typed candidates."""
+def _lifecycle_graph_ids(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    requested_task_ids: Iterable[str] = (),
+) -> set[str]:
+    """Return an owned typed graph and explicitly requested connected candidates."""
     seed = conn.execute(
         "SELECT lifecycle_contract FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
@@ -858,6 +863,18 @@ def _lifecycle_graph_ids(conn: sqlite3.Connection, task_id: str) -> set[str]:
     if candidate is None or candidate.get("kind") != "code":
         return set()
 
+    requested_candidate_ids = {candidate_id}
+    for requested_task_id in requested_task_ids:
+        requested_contract = contracts.get(str(requested_task_id))
+        if requested_contract is None:
+            continue
+        if requested_contract.get("kind") == "code":
+            requested_candidate_ids.add(str(requested_task_id))
+        elif requested_contract.get("kind") in {"review", "validation"}:
+            requested_candidate_id = str(requested_contract.get("candidate_task_id") or "")
+            if contracts.get(requested_candidate_id, {}).get("kind") == "code":
+                requested_candidate_ids.add(requested_candidate_id)
+
     candidate_ids = {candidate_id}
     edges = conn.execute(
         "SELECT parent_id, child_id, requirement FROM task_links"
@@ -879,11 +896,12 @@ def _lifecycle_graph_ids(conn: sqlite3.Connection, task_id: str) -> set[str]:
             child_candidate_id = str(edge["child_id"])
             if (
                 parent_candidate_id in candidate_ids
-                and child_candidate_id not in candidate_ids
+                and child_candidate_id in requested_candidate_ids
             ):
                 connected.add(child_candidate_id)
             elif (
                 child_candidate_id in candidate_ids
+                and parent_candidate_id in requested_candidate_ids
                 and contracts.get(parent_candidate_id, {}).get("kind") == "code"
             ):
                 connected.add(parent_candidate_id)
@@ -1000,24 +1018,38 @@ def _assert_no_lifecycle_role_references(
         )
 
 
-def delete_archived_lifecycle_graph(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Atomically hard-delete a fully archived typed lifecycle graph."""
+def delete_archived_lifecycle_graph(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    requested_task_ids: Iterable[str] = (),
+) -> bool:
+    """Atomically purge a typed graph plus explicitly requested connected candidates."""
     with _kb.write_txn(conn):
         if _kb._task_status(conn, task_id) != "archived":
             return False
-        graph_ids = _lifecycle_graph_ids(conn, task_id)
+        graph_ids = _lifecycle_graph_ids(
+            conn, task_id, requested_task_ids=requested_task_ids,
+        )
         if len(graph_ids) <= 1:
             return False
         _delete_archived_lifecycle_graph(conn, graph_ids)
         return True
 
 
-def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete an archived task or its fully archived typed lifecycle graph."""
+def delete_archived_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    requested_task_ids: Iterable[str] = (),
+) -> bool:
+    """Purge an archived task or its graph plus explicitly requested candidates."""
     with _kb.write_txn(conn):
         if _kb._task_status(conn, task_id) != "archived":
             return False
-        graph_ids = _lifecycle_graph_ids(conn, task_id)
+        graph_ids = _lifecycle_graph_ids(
+            conn, task_id, requested_task_ids=requested_task_ids,
+        )
         if len(graph_ids) > 1:
             _delete_archived_lifecycle_graph(conn, graph_ids)
             return True

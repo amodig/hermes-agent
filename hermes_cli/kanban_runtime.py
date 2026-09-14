@@ -432,8 +432,8 @@ def worker_bootstrap_from_env() -> Optional[dict[str, Any]]:
     return payload
 
 
-def worker_bootstrap_post_import() -> Optional[dict[str, Any]]:
-    """Verify imported worker command modules, then wait for the final grant."""
+def worker_bootstrap_post_import(*, wait_for_grant: bool = True) -> Optional[dict[str, Any]]:
+    """Verify imported worker command modules before granting Kanban access."""
     path_raw = os.environ.get("HERMES_KANBAN_BOOTSTRAP_PATH", "").strip()
     if not path_raw:
         return None
@@ -460,6 +460,15 @@ def worker_bootstrap_post_import() -> Optional[dict[str, Any]]:
         "runtime_identity": actual.as_dict(),
     }
     _atomic_write(Path(path_raw), payload)
+    if wait_for_grant:
+        _finish_worker_bootstrap_grant(expected, preparation_id, actual)
+    return payload
+
+def _finish_worker_bootstrap_grant(
+    expected: RuntimeIdentity,
+    preparation_id: str,
+    actual: RuntimeIdentity,
+) -> None:
     grant = _read_bootstrap_message()
     final = assert_runtime_import_root(expected=expected)
     if (
@@ -476,8 +485,20 @@ def worker_bootstrap_post_import() -> Optional[dict[str, Any]]:
     os.environ["HERMES_KANBAN_RUNTIME_GRANTED"] = "1"
     for key in _BOOTSTRAP_INPUT_ENV:
         os.environ.pop(key, None)
-    return payload
 
+
+def worker_bootstrap_after_constructor() -> None:
+    """Grant Kanban access only after the worker agent constructor completes."""
+    path_raw = os.environ.get("HERMES_KANBAN_BOOTSTRAP_PATH", "").strip()
+    if not path_raw:
+        return
+    preparation_id = os.environ.get("HERMES_KANBAN_PREPARATION_ID", "").strip()
+    expected_raw = os.environ.get("HERMES_KANBAN_EXPECTED_RUNTIME", "").strip()
+    if not preparation_id or not expected_raw:
+        raise RuntimeIdentityError("worker bootstrap environment is incomplete")
+    expected = decode_identity(expected_raw)
+    actual = assert_runtime_import_root(expected=expected)
+    _finish_worker_bootstrap_grant(expected, preparation_id, actual)
 
 def runtime_identity_json(module_root: Optional[os.PathLike[str] | str] = None) -> str:
     return encode_identity(runtime_identity(module_root))

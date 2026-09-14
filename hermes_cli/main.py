@@ -3344,8 +3344,7 @@ def main():
     if os.environ.get("HERMES_KANBAN_BOOTSTRAP_PATH"):
         try:
             from hermes_cli.kanban_runtime import worker_bootstrap_post_import
-
-            worker_bootstrap_post_import()
+            worker_bootstrap_post_import(wait_for_grant=False)
         except Exception as exc:
             print(f"worker post-import verification refused: {exc}", file=sys.stderr)
             sys.exit(78)

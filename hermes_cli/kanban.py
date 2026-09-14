@@ -1236,7 +1236,9 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                 if tid in deleted:
                     print(f"Deleted {tid}")
                     continue
-                if kb.delete_archived_task(conn, tid):
+                if kb.delete_archived_task(
+                    conn, tid, requested_task_ids=requested,
+                ):
                     deleted.add(tid)
                     deleted.update(
                         candidate
