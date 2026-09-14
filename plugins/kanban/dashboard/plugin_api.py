@@ -720,7 +720,14 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     raise _conflict(f"status transition to {s!r} not valid from current state")
 
 
-def _patch_title_body(conn, task_id: str, payload: UpdateTaskBody, board: Optional[str]) -> None:
+def _patch_title_body(
+    conn,
+    task_id: str,
+    payload: UpdateTaskBody,
+    board: Optional[str],
+    *,
+    expected_version: Optional[int] = None,
+) -> None:
     """Revise goal fields through the same optimistic-concurrency API as CLI/tools."""
     sent = getattr(payload, "model_fields_set", getattr(payload, "__fields_set__", set()))
     wants_title = "title" in sent
@@ -734,7 +741,9 @@ def _patch_title_body(conn, task_id: str, payload: UpdateTaskBody, board: Option
     if current is None:
         raise HTTPException(status_code=404, detail="task not found")
     expected_version = (
-        payload.expected_version if payload.expected_version is not None else current.version
+        expected_version
+        if expected_version is not None
+        else payload.expected_version if payload.expected_version is not None else current.version
     )
     reason = (payload.reason or "dashboard task edit").strip()
     with _map_errors(409, ValueError, RuntimeError):
@@ -755,8 +764,13 @@ def _patch_title_body(conn, task_id: str, payload: UpdateTaskBody, board: Option
 
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
-    with _board_conn(board) as (board, conn):
+    with _board_conn(board) as (board, conn), kbc.composite_write_txn(conn):
         current = _require_task(conn, task_id)
+        request_version = (
+            payload.expected_version
+            if payload.expected_version is not None
+            else current.version
+        )
         if (
             payload.expected_version is not None
             and payload.expected_version != current.version
@@ -799,7 +813,13 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if payload.priority is not None:
             _set_priority(conn, task_id, payload.priority, board)
         if {"title", "body", "lifecycle_contract"} & set(sent):
-            _patch_title_body(conn, task_id, payload, board)
+            _patch_title_body(
+                conn,
+                task_id,
+                payload,
+                board,
+                expected_version=request_version,
+            )
         updated = kanban_db.get_task(conn, task_id)
         return {"task": _task_dict(updated, conn=conn) if updated else None}
 

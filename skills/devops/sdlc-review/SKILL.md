@@ -49,7 +49,7 @@ This skill is loaded automatically by the review dispatcher. Start with `kanban_
 
 | Verdict | When | Final action |
 |---|---|---|
-| Approve | Acceptance criteria and verification pass | `kanban_complete(verdict="APPROVE", ...)` |
+| Approve | Acceptance criteria and verification pass | Typed card: `kanban_complete(verdict="APPROVE", ...)`; legacy card: `kanban_complete(...)` |
 | Request changes | Correctable implementation defects remain | Typed card: `kanban_complete(verdict="REQUEST_CHANGES", ...)`; legacy card: `kanban_request_changes` |
 | Escalate | A human decision or external prerequisite is required | `kanban_block` |
 

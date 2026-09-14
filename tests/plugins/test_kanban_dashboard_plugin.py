@@ -301,6 +301,40 @@ def test_patch_expected_version_rejects_side_effects(client):
     assert current["title"] == "fresh title"
 
 
+def test_patch_expected_version_is_atomic_across_intervening_mutation(client, monkeypatch):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "before", "assignee": "old"},
+    ).json()["task"]
+    original_assign = kb.assign_task
+
+    def interleaved_assign(conn, task_id, profile):
+        assert kb.update_task(
+            conn,
+            task_id,
+            expected_version=task["version"],
+            reason="intervening edit",
+            title="intervening title",
+        )
+        return original_assign(conn, task_id, profile)
+
+    monkeypatch.setattr(kb, "assign_task", interleaved_assign)
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "expected_version": task["version"],
+            "assignee": "new",
+            "title": "requested title",
+        },
+    )
+
+    assert response.status_code == 409
+    current = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
+    assert current["version"] == task["version"]
+    assert current["title"] == "before"
+    assert current["assignee"] == "old"
+
+
 def test_reopening_parent_demotes_ready_child(client):
     """Reopening a completed parent must invalidate ready children immediately.
 

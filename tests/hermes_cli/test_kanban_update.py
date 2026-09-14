@@ -202,6 +202,30 @@ def test_binding_historical_null_contract_preserves_blocked_status(kanban_home):
         )
         assert kb.get_task(conn, task_id).status == "blocked"
 
+
+
+def test_binding_historical_null_contract_preserves_parent_gate(kanban_home):
+    with kbc.connect_closing() as conn:
+        parent_id = kb.create_task(conn, title="open parent")
+        child_id = kb.create_task(conn, title="historical child", parents=[parent_id])
+        assert kb.get_task(conn, child_id).status == "todo"
+
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET lifecycle_contract = NULL WHERE id = ?", (child_id,))
+
+        assert kb.update_task(
+            conn,
+            child_id,
+            expected_version=1,
+            reason="classify historical task",
+            lifecycle_contract={"kind": "general"},
+        )
+        assert kb.get_task(conn, child_id).status == "todo"
+
+        assert kb.complete_task(conn, parent_id, summary="finished")
+        assert kb.get_task(conn, child_id).status == "ready"
+
+
 def test_claimed_update_is_rejected_and_run_history_links_and_comments_survive(
     kanban_home,
 ):

@@ -116,6 +116,11 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     so cleanup never blocks completion. ``scratch`` is removed; ``worktree``
     only when provably free of work (clean tree, every commit reachable from a
     remote-tracking ref); ``dir`` is intentionally preserved."""
+    if _kb._defer_post_commit(
+        lambda: _cleanup_workspace(conn, task_id),
+        conn=conn,
+    ):
+        return
     try:
         row = conn.execute(_WORKSPACE_ROW_SQL, (task_id,)).fetchone()
         if not row:

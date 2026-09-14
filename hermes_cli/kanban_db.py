@@ -40,7 +40,7 @@ from hermes_cli.kanban_lifecycle import (
     safe_decode_contract,
     validate_edge,
 )
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -213,10 +213,20 @@ def _assert_not_delegated_child_mutation() -> None:
         raise PermissionError("delegate_task child contexts cannot mutate Kanban tasks or boards")
 
 
+def _defer_post_commit(callback: Callable[[], Any], *, conn: Optional[sqlite3.Connection] = None) -> bool:
+    from hermes_cli.kanban_db_connect import defer_post_commit
+
+    return defer_post_commit(callback, conn=conn)
+
+
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
     """Best-effort lifecycle hook. Call AFTER the write txn commits (plugins never
     run under the SQLite write lock, always see durable state); failures are
     swallowed so an observer can never break a transition."""
+    if _defer_post_commit(
+        lambda: _fire_kanban_lifecycle_hook(event, task_id, **dict(fields)),
+    ):
+        return
     try:
         from hermes_cli.lifecycle import invoke_hook
 
@@ -278,6 +288,12 @@ def notify_task_updated(
     """``on_kanban_task_updated`` AFTER a non-lifecycle task mutation commits
     (also for direct-SQL surfaces like dashboard field editors).
     ``changed_fields`` carries field NAMES only, never values."""
+    changed_fields = tuple(changed_fields)
+    if _defer_post_commit(
+        lambda: notify_task_updated(conn, task_id, changed_fields, board=board),
+        conn=conn,
+    ):
+        return
     if not _kanban_observer_consumed("on_kanban_task_updated"):
         return
     try:

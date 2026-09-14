@@ -342,6 +342,10 @@ def _terminate_reclaimed_worker(
     if not str(claim_lock).startswith(_kb._host_prefix()):
         return info
     info["host_local"] = True
+    if _kb._defer_post_commit(
+        lambda: _terminate_reclaimed_worker(pid, claim_lock, signal_fn=signal_fn),
+    ):
+        return info
 
     kill = _kill_fn(signal_fn)
     if kill is None:
