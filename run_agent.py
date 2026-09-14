@@ -278,9 +278,6 @@ class AIAgent(
                           "no longer sleep between executions.", DeprecationWarning, stacklevel=2)
         from agent.agent_init import init_agent
         init_agent(self, **init_kwargs)
-        if os.environ.get("HERMES_KANBAN_BOOTSTRAP_PATH"):
-            from hermes_cli.kanban_runtime import worker_bootstrap_after_constructor
-            worker_bootstrap_after_constructor()
 
     def _get_session_db_for_recall(self):
         """SessionDB for recall, opening the default state DB when no ``session_db`` was passed so the

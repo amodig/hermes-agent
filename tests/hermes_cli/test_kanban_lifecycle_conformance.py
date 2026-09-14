@@ -1051,20 +1051,35 @@ class KanbanLifecycleConformance(unittest.TestCase):
             initial_status="blocked",
             lifecycle_contract={
                 "kind": "code",
-                "review_mode": "same_card",
+                "review_mode": "separate_card",
                 "reviewer": "alice",
                 "validation_required": False,
             },
         )
+        downstream_review = kb.create_task(
+            self.conn,
+            title="connected downstream review",
+            assignee="alice",
+            initial_status="blocked",
+            lifecycle_contract={"kind": "review", "candidate_task_id": downstream},
+        )
         kb.link_tasks(self.conn, implementation, review, requirement="phase_finished")
         kb.link_tasks(self.conn, review, validation, requirement="review_approved")
         kb.link_tasks(self.conn, validation, downstream, requirement="validation_passed")
-        for task_id in (implementation, review, validation, downstream):
+        for task_id in (implementation, review, validation, downstream, downstream_review):
             self.assertTrue(kb.archive_task(self.conn, task_id))
 
         with self.assertRaises(kb.LifecycleContractError):
             kb.delete_archived_task(self.conn, implementation)
-        for task_id in (implementation, review, validation, downstream):
+        for task_id in (implementation, review, validation, downstream, downstream_review):
+            self.assertIsNotNone(kb.get_task(self.conn, task_id))
+        with self.assertRaises(kb.LifecycleContractError):
+            kb.delete_archived_task(
+                self.conn,
+                implementation,
+                requested_task_ids=(implementation, downstream_review),
+            )
+        for task_id in (implementation, review, validation, downstream, downstream_review):
             self.assertIsNotNone(kb.get_task(self.conn, task_id))
 
         self.assertTrue(
@@ -1074,7 +1089,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 requested_task_ids=(implementation, downstream),
             )
         )
-        for task_id in (implementation, review, validation, downstream):
+        for task_id in (implementation, review, validation, downstream, downstream_review):
             self.assertIsNone(kb.get_task(self.conn, task_id))
 
     def test_worker_command_imports_stay_pinned_after_final_grant(self) -> None:
@@ -1092,16 +1107,21 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 encoding="utf-8",
             )
             (root / "run_agent.py").write_text(
-                "import importlib, os\n"
+                "from agent.agent_init import init_agent\n"
                 "class AIAgent:\n"
                 "    def __init__(self):\n"
-                "        assert os.environ.get('HERMES_KANBAN_RUNTIME_GRANTED') != '1'\n"
-                "        self.value = importlib.import_module('agent.empty_response_guard').value\n",
+                "        init_agent(self)\n",
                 encoding="utf-8",
             )
             (root / "agent" / "__init__.py").write_text("", encoding="utf-8")
             (root / "agent" / "agent_init.py").write_text(
-                "def init_agent(*args, **kwargs):\n    return None\nvalue = 1\n",
+                "import importlib, os\n"
+                "def init_agent(agent):\n"
+                "    assert os.environ.get('HERMES_KANBAN_RUNTIME_GRANTED') != '1'\n"
+                "    agent.value = importlib.import_module('agent.empty_response_guard').value\n"
+                "    from __main__ import _after_init\n"
+                "    _after_init()\n"
+                "value = 1\n",
                 encoding="utf-8",
             )
             (root / "agent" / "credits_tracker.py").write_text(
@@ -1125,6 +1145,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "sys.modules.pop('hermes_cli', None); "
                 "expected = runtime.runtime_identity(root, pid=os.getpid(), "
                 "start_time=runtime.process_start_time()); "
+                "_after_init = runtime.worker_bootstrap_after_constructor; "
                 "os.environ['HERMES_KANBAN_BOOTSTRAP_PATH'] = str(root / 'preparation.json'); "
                 "os.environ['HERMES_KANBAN_PREPARATION_ID'] = 'race-preparation'; "
                 "os.environ['HERMES_KANBAN_EXPECTED_RUNTIME'] = runtime.encode_identity(expected); "
@@ -1133,7 +1154,6 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "'runtime_identity': expected.as_dict()}; "
                 "runtime.worker_bootstrap_post_import(wait_for_grant=False); "
                 "agent = importlib.import_module('run_agent').AIAgent(); "
-                "runtime.worker_bootstrap_after_constructor(); "
                 "(root / 'cli.py').write_text('def main():\\n    return 2\\n', encoding='utf-8'); "
                 "(root / 'agent' / 'agent_init.py').write_text('def init_agent(*args, **kwargs):\\n    return None\\nvalue = 2\\n', encoding='utf-8'); "
                 "(root / 'agent' / 'credits_tracker.py').write_text('value = 2\\n', encoding='utf-8'); "

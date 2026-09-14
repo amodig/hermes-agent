@@ -863,17 +863,12 @@ def _lifecycle_graph_ids(
     if candidate is None or candidate.get("kind") != "code":
         return set()
 
-    requested_candidate_ids = {candidate_id}
-    for requested_task_id in requested_task_ids:
-        requested_contract = contracts.get(str(requested_task_id))
-        if requested_contract is None:
-            continue
-        if requested_contract.get("kind") == "code":
-            requested_candidate_ids.add(str(requested_task_id))
-        elif requested_contract.get("kind") in {"review", "validation"}:
-            requested_candidate_id = str(requested_contract.get("candidate_task_id") or "")
-            if contracts.get(requested_candidate_id, {}).get("kind") == "code":
-                requested_candidate_ids.add(requested_candidate_id)
+    requested_candidate_ids = {
+        str(requested_task_id)
+        for requested_task_id in requested_task_ids
+        if (contracts.get(str(requested_task_id)) or {}).get("kind") == "code"
+    }
+    requested_candidate_ids.add(candidate_id)
 
     candidate_ids = {candidate_id}
     edges = conn.execute(

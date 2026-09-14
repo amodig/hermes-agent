@@ -2302,6 +2302,9 @@ def init_agent(
     _emit_compression_summary(agent, cs)
     _snapshot_primary_runtime(agent)
 
+    if os.environ.get("HERMES_KANBAN_BOOTSTRAP_PATH"):
+        from hermes_cli.kanban_runtime import worker_bootstrap_after_constructor
+        worker_bootstrap_after_constructor()
 
 __all__ = ["init_agent"]
 
