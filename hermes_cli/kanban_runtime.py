@@ -26,7 +26,17 @@ import uuid
 
 RUNTIME_IDENTITY_PROTOCOL = 1
 _BOOTSTRAP_TIMEOUT_SECONDS = 10.0
-_IDENTITY_ROOTS = ("hermes_cli", "tools", "agent", "gateway", "plugins", "providers", "cron")
+_IDENTITY_ROOTS = (
+    "hermes_cli",
+    "tools",
+    "agent",
+    "gateway",
+    "plugins",
+    "providers",
+    "cron",
+    "acp_adapter",
+    "tui_gateway",
+)
 _RUNTIME_RESOURCE_ROOTS = ("skills", "optional-skills", "locales", "optional-mcps")
 _IDENTITY_ASSETS = ("skills/devops/sdlc-review/SKILL.md",)
 _BOOTSTRAP_INPUT_ENV = (

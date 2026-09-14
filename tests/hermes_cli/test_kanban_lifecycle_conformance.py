@@ -1101,6 +1101,13 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 (package / "module.py").write_text("value = 1\n", encoding="utf-8")
             (root / "tools" / "__init__.py").write_text("", encoding="utf-8")
             (root / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+            for package_name, module_name in (
+                ("acp_adapter", "edit_approval.py"),
+                ("tui_gateway", "server.py"),
+            ):
+                package = root / package_name
+                (package / "__init__.py").write_text("", encoding="utf-8")
+                (package / module_name).write_text("value = 1\n", encoding="utf-8")
             plugin = root / "plugins" / "sample"
             plugin.mkdir(parents=True)
             (plugin / "plugin.yaml").write_text("name: sample\n", encoding="utf-8")
@@ -1158,7 +1165,12 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "    def discover_plugins(self):\n"
                 "        return importlib.import_module('hermes_cli.plugins').discover()\n"
                 "    def discover_resources(self):\n"
-                "        return importlib.import_module('hermes_cli.plugins').discover_resources()\n",
+                "        return importlib.import_module('hermes_cli.plugins').discover_resources()\n"
+                "    def run_lazy_guards(self):\n"
+                "        return (\n"
+                "            importlib.import_module('acp_adapter.edit_approval').value,\n"
+                "            importlib.import_module('tui_gateway.server').value,\n"
+                "        )\n",
                 encoding="utf-8",
             )
             (root / "agent" / "turn_runner.py").write_text(
@@ -1220,14 +1232,17 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "(root / 'optional-skills' / 'optional' / 'SKILL.md').write_text('changed\\n', encoding='utf-8'); "
                 "(root / 'locales' / 'en.yaml').write_text('changed\\n', encoding='utf-8'); "
                 "(root / 'optional-mcps' / 'sample' / 'manifest.yaml').write_text('changed\\n', encoding='utf-8'); "
+                "(root / 'acp_adapter' / 'edit_approval.py').write_text('value = 2\\n', encoding='utf-8'); "
+                "(root / 'tui_gateway' / 'server.py').write_text('value = 2\\n', encoding='utf-8'); "
                 "turn_value = agent.run_conversation(); "
                 "discovered_tools = agent.discover_tools(); "
                 "discovered_plugins = agent.discover_plugins(); "
                 "discovered_resources = agent.discover_resources(); "
+                "lazy_values = agent.run_lazy_guards(); "
                 "result = importlib.import_module('cli').main(); "
                 "agent_value = importlib.import_module('agent.agent_init').value; "
                 "tracker_value = importlib.import_module('agent.credits_tracker').value; "
-                "receipt.write_text(json.dumps({'result': result, 'turn_value': turn_value, 'discovered_tools': discovered_tools, 'discovered_plugins': discovered_plugins, 'discovered_resources': discovered_resources, 'agent_value': agent_value, 'tracker_value': tracker_value, 'constructor_value': agent.value}), encoding='utf-8')"
+                "receipt.write_text(json.dumps({'result': result, 'turn_value': turn_value, 'discovered_tools': discovered_tools, 'discovered_plugins': discovered_plugins, 'discovered_resources': discovered_resources, 'lazy_values': lazy_values, 'agent_value': agent_value, 'tracker_value': tracker_value, 'constructor_value': agent.value}), encoding='utf-8')"
             )
             env = os.environ.copy()
             env["PYTHONPATH"] = str(ROOT)
@@ -1241,7 +1256,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(
                 json.loads(receipt.read_text(encoding="utf-8")),
-                {"result": 1, "turn_value": 1, "discovered_tools": ["__init__.py", "module.py", "registry.py"], "discovered_plugins": ["plugin.yaml"], "discovered_resources": {"skill": "other skill\n", "description": "category\n", "optional_skill": "optional skill\n", "locale": "locale: en\n", "optional_mcp": "name: optional\n"}, "agent_value": 1, "tracker_value": 1, "constructor_value": 1},
+                {"result": 1, "turn_value": 1, "discovered_tools": ["__init__.py", "module.py", "registry.py"], "discovered_plugins": ["plugin.yaml"], "discovered_resources": {"skill": "other skill\n", "description": "category\n", "optional_skill": "optional skill\n", "locale": "locale: en\n", "optional_mcp": "name: optional\n"}, "lazy_values": [1, 1], "agent_value": 1, "tracker_value": 1, "constructor_value": 1},
             )
 
     def test_reaped_worker_removes_runtime_snapshot(self) -> None:
@@ -1258,7 +1273,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
     def test_embedded_dispatcher_freezes_identity_before_first_tick(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-dispatcher-") as raw_root:
             root = Path(raw_root)
-            for directory in ("hermes_cli", "tools", "agent", "gateway", "plugins", "providers", "cron"):
+            for directory in runtime._IDENTITY_ROOTS:
                 package = root / directory
                 package.mkdir(parents=True)
                 (package / "module.py").write_text("value = 1\n", encoding="utf-8")
@@ -1282,7 +1297,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
     def test_runtime_identity_fingerprints_review_skill(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-runtime-") as raw_root:
             root = Path(raw_root)
-            for directory in ("hermes_cli", "tools", "agent", "gateway", "plugins", "providers", "cron"):
+            for directory in runtime._IDENTITY_ROOTS:
                 package = root / directory
                 package.mkdir(parents=True)
                 (package / "module.py").write_text("value = 1\n", encoding="utf-8")
