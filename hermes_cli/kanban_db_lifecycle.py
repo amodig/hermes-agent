@@ -835,7 +835,7 @@ def _lifecycle_graph_ids(
     *,
     requested_task_ids: Iterable[str] = (),
 ) -> set[str]:
-    """Return an owned typed graph and explicitly requested connected candidates."""
+    """Return an owned typed graph and explicitly requested connected tasks."""
     seed = conn.execute(
         "SELECT lifecycle_contract FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
@@ -863,10 +863,15 @@ def _lifecycle_graph_ids(
     if candidate is None or candidate.get("kind") != "code":
         return set()
 
-    requested_candidate_ids = {
+    requested_ids = {
         str(requested_task_id)
         for requested_task_id in requested_task_ids
-        if (contracts.get(str(requested_task_id)) or {}).get("kind") == "code"
+        if str(requested_task_id).strip()
+    }
+    requested_candidate_ids = {
+        requested_task_id
+        for requested_task_id in requested_ids
+        if (contracts.get(requested_task_id) or {}).get("kind") == "code"
     }
     requested_candidate_ids.add(candidate_id)
 
@@ -917,6 +922,17 @@ def _lifecycle_graph_ids(
             and contract.get("kind") in {"review", "validation"}
             and str(contract.get("candidate_task_id") or "") == candidate_id
         )
+    requested_boundaries = requested_ids - graph
+    for edge in edges:
+        parent_id, child_id = str(edge["parent_id"]), str(edge["child_id"])
+        if parent_id in graph and child_id in requested_boundaries:
+            boundary_id = child_id
+        elif child_id in graph and parent_id in requested_boundaries:
+            boundary_id = parent_id
+        else:
+            continue
+        if is_required_lifecycle_edge(conn, parent_id, child_id):
+            graph.add(boundary_id)
     return graph if len(graph) > 1 else set()
 
 

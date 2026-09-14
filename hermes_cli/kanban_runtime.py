@@ -208,7 +208,7 @@ def _freeze_runtime_import_root(root: Path) -> Path:
         for name, path in sorted(members.items()):
             destination = snapshot_root / name
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(path, destination)
+            shutil.copy2(path, destination)
     except Exception:
         _remove_frozen_import_root(snapshot_root)
         raise

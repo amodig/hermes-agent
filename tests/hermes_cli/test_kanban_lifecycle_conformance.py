@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import stat
 import sqlite3
 import sys
 import subprocess
@@ -1012,6 +1013,62 @@ class KanbanLifecycleConformance(unittest.TestCase):
         for task_id in (implementation, review, validation, downstream, code_downstream):
             self.assertIsNotNone(kb.get_task(self.conn, task_id))
 
+    def test_archived_lifecycle_graph_can_purge_requested_general_boundary(self) -> None:
+        implementation = kb.create_task(
+            self.conn,
+            title="general boundary candidate",
+            assignee="bob",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "alice",
+                "validation_required": True,
+            },
+        )
+        review = kb.create_task(
+            self.conn,
+            title="general boundary review",
+            assignee="alice",
+            initial_status="blocked",
+            lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
+        )
+        validation = kb.create_task(
+            self.conn,
+            title="general boundary validation",
+            assignee="tester",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "validation",
+                "candidate_task_id": implementation,
+            },
+        )
+        downstream = kb.create_task(
+            self.conn,
+            title="general boundary downstream",
+            assignee="owner",
+            initial_status="blocked",
+            lifecycle_contract={"kind": "general"},
+        )
+        kb.link_tasks(self.conn, implementation, review, requirement="phase_finished")
+        kb.link_tasks(self.conn, review, validation, requirement="review_approved")
+        kb.link_tasks(self.conn, validation, downstream, requirement="validation_passed")
+        task_ids = (implementation, review, validation, downstream)
+        for task_id in task_ids:
+            self.assertTrue(kb.archive_task(self.conn, task_id))
+
+        with self.assertRaises(kb.LifecycleContractError):
+            kb.delete_archived_task(self.conn, implementation)
+        self.assertTrue(
+            kb.delete_archived_task(
+                self.conn,
+                implementation,
+                requested_task_ids=(implementation, downstream),
+            )
+        )
+        for task_id in task_ids:
+            self.assertIsNone(kb.get_task(self.conn, task_id))
+
     def test_archived_lifecycle_graph_can_purge_through_typed_validation_edge(
         self,
     ) -> None:
@@ -1258,6 +1315,44 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 json.loads(receipt.read_text(encoding="utf-8")),
                 {"result": 1, "turn_value": 1, "discovered_tools": ["__init__.py", "module.py", "registry.py"], "discovered_plugins": ["plugin.yaml"], "discovered_resources": {"skill": "other skill\n", "description": "category\n", "optional_skill": "optional skill\n", "locale": "locale: en\n", "optional_mcp": "name: optional\n"}, "lazy_values": [1, 1], "agent_value": 1, "tracker_value": 1, "constructor_value": 1},
             )
+
+    @unittest.skipUnless(os.name == "posix", "executable modes are POSIX-specific")
+    def test_runtime_snapshot_preserves_executable_skill_bits(self) -> None:
+        source = ROOT / "skills" / "creative" / "manim-video" / "scripts" / "setup.sh"
+        if not source.is_file() or not (source.stat().st_mode & stat.S_IXUSR):
+            self.skipTest("repository fixture has no executable skill helper")
+        with tempfile.TemporaryDirectory(prefix="kanban-conformance-mode-") as raw_home:
+            script = """
+import os
+import stat
+import sys
+from pathlib import Path
+
+from hermes_cli import kanban_runtime as runtime
+
+root = Path(sys.argv[1])
+home = Path(sys.argv[2])
+snapshot = runtime._freeze_runtime_import_root(root)
+os.environ["HERMES_HOME"] = str(home)
+os.environ["HERMES_BUNDLED_SKILLS"] = str(snapshot / "skills")
+from tools.skills_sync import sync_skills
+
+sync_skills(quiet=True)
+synced = home / "skills" / "creative" / "manim-video" / "scripts" / "setup.sh"
+print(synced.stat().st_mode & stat.S_IXUSR)
+"""
+            env = os.environ.copy()
+            env["HERMES_HOME"] = raw_home
+            env["PYTHONPATH"] = str(ROOT)
+            completed = subprocess.run(
+                [sys.executable, "-c", script, str(ROOT), raw_home],
+                text=True,
+                capture_output=True,
+                env=env,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(int(completed.stdout.strip()), stat.S_IXUSR)
 
     def test_reaped_worker_removes_runtime_snapshot(self) -> None:
         snapshot = Path(tempfile.mkdtemp(prefix="hermes-kanban-runtime-"))
