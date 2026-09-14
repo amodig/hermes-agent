@@ -46,6 +46,7 @@ _RUNTIME_RESOURCE_ROOTS = (
 )
 
 _IDENTITY_ASSETS = ("skills/devops/sdlc-review/SKILL.md",)
+_RUNTIME_DEPENDENCY_ROOT_NAMES = frozenset({"site-packages", "dist-packages"})
 _BOOTSTRAP_INPUT_ENV = (
     "HERMES_KANBAN_BOOTSTRAP_PATH",
     "HERMES_KANBAN_PREPARATION_ID",
@@ -307,19 +308,60 @@ def cleanup_runtime_snapshot(path: Optional[os.PathLike[str] | str]) -> None:
         return
     _remove_frozen_import_root(snapshot)
 
-def _freeze_runtime_import_root(root: Path) -> Path:
+def _runtime_dependency_roots() -> tuple[Path, ...]:
+    """Return active interpreter package roots that can change during an update."""
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    for entry in sys.path:
+        if not entry:
+            continue
+        try:
+            candidate = Path(entry)
+            if candidate.name not in _RUNTIME_DEPENDENCY_ROOT_NAMES:
+                continue
+            candidate = candidate.resolve()
+        except (OSError, RuntimeError, TypeError):
+            continue
+        if candidate.is_dir() and candidate not in seen:
+            roots.append(candidate)
+            seen.add(candidate)
+    return tuple(roots)
+
+
+def _copy_runtime_dependency_file(source: str, destination: str) -> str:
+    # Dependency installers replace non-source artifacts atomically. Hardlinks keep that
+    # snapshot cheap; Python sources are copied because an in-place edit must not leak through.
+    if Path(source).suffix in {".py", ".pyi"}:
+        shutil.copy2(source, destination)
+    else:
+        try:
+            os.link(source, destination)
+        except OSError:
+            shutil.copy2(source, destination)
+    return destination
+
+
+def _freeze_runtime_import_root(
+    root: Path, *, include_dependencies: bool = False,
+) -> Path:
     """Serve future runtime imports from a pre-grant source snapshot."""
     global _FROZEN_IMPORT_ROOT
     if _FROZEN_IMPORT_ROOT is not None:
         return _FROZEN_IMPORT_ROOT
     root = root.resolve()
     members = _runtime_snapshot_members(root)
+    dependency_roots = _runtime_dependency_roots() if include_dependencies else ()
+    dependency_destinations: list[Path] = []
     snapshot_root = Path(tempfile.mkdtemp(prefix="hermes-kanban-runtime-")).resolve()
     try:
         for name, path in sorted(members.items()):
             destination = snapshot_root / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, destination)
+        for index, source in enumerate(dependency_roots):
+            destination = snapshot_root / ".third-party" / str(index)
+            shutil.copytree(source, destination, copy_function=_copy_runtime_dependency_file)
+            dependency_destinations.append(destination)
     except Exception:
         _remove_frozen_import_root(snapshot_root)
         raise
@@ -334,6 +376,8 @@ def _freeze_runtime_import_root(root: Path) -> Path:
     _FROZEN_IMPORT_ROOT = snapshot_root
     atexit.register(_remove_frozen_import_root, snapshot_root)
     _pin_runtime_import_root(snapshot_root)
+    for destination in reversed(dependency_destinations):
+        sys.path.insert(1, str(destination))
     for name, module in tuple(sys.modules.items()):
         package_path = getattr(module, "__path__", None)
         if package_path is None or not any(
@@ -659,7 +703,7 @@ def worker_bootstrap_post_import(*, wait_for_grant: bool = True) -> Optional[dic
     expected = decode_identity(expected_raw)
     # Snapshot every runtime source file before the final grant. Lazy turn and
     # tool imports then resolve from this immutable filesystem snapshot, not a mutable checkout.
-    snapshot_root = _freeze_runtime_import_root(_module_root())
+    snapshot_root = _freeze_runtime_import_root(_module_root(), include_dependencies=True)
     if _fingerprint(snapshot_root) != expected.fingerprint:
         raise RuntimeIdentityError("runtime snapshot changed during startup")
     # ``main.py`` and ``cli.py`` defer these imports to keep ordinary CLI

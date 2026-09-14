@@ -1568,6 +1568,9 @@ class KanbanLifecycleConformance(unittest.TestCase):
             for path, content in resource_files.items():
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(content, encoding="utf-8")
+            third_party = root / "site-packages"
+            third_party.mkdir()
+            (third_party / "third_party_lazy.py").write_text("value = 1\n", encoding="utf-8")
             (root / "cli.py").write_text(
                 "def main():\n    return 1\n",
                 encoding="utf-8",
@@ -1614,6 +1617,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "        return (\n"
                 "            importlib.import_module('acp_adapter.edit_approval').value,\n"
                 "            importlib.import_module('tui_gateway.server').value,\n"
+                "            importlib.import_module('third_party_lazy').value,\n"
                 "        )\n",
                 encoding="utf-8",
             )
@@ -1651,6 +1655,8 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "runtime._module_root = lambda module_root=None: root; "
                 "runtime._FROZEN_RUNTIME_IDENTITY = None; "
                 "sys.path.insert(0, str(root)); "
+                "sys.path[:] = [entry for entry in sys.path if Path(entry or '.').name not in ('site-packages', 'dist-packages')]; "
+                "sys.path.insert(0, str(root / 'site-packages')); "
                 "sys.modules.pop('hermes_cli.kanban_runtime', None); "
                 "sys.modules.pop('hermes_cli', None); "
                 "expected = runtime.runtime_identity(root, pid=os.getpid(), "
@@ -1678,6 +1684,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "(root / 'optional-mcps' / 'sample' / 'manifest.yaml').write_text('changed\\n', encoding='utf-8'); "
                 "(root / 'acp_adapter' / 'edit_approval.py').write_text('value = 2\\n', encoding='utf-8'); "
                 "(root / 'tui_gateway' / 'server.py').write_text('value = 2\\n', encoding='utf-8'); "
+                "(root / 'site-packages' / 'third_party_lazy.py').write_text('value = 2\\n', encoding='utf-8'); "
                 "turn_value = agent.run_conversation(); "
                 "discovered_tools = agent.discover_tools(); "
                 "discovered_plugins = agent.discover_plugins(); "
@@ -1700,7 +1707,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(
                 json.loads(receipt.read_text(encoding="utf-8")),
-                {"result": 1, "turn_value": 1, "discovered_tools": ["__init__.py", "module.py", "registry.py"], "discovered_plugins": ["plugin.yaml"], "discovered_resources": {"skill": "other skill\n", "description": "category\n", "optional_skill": "optional skill\n", "locale": "locale: en\n", "optional_mcp": "name: optional\n"}, "lazy_values": [1, 1], "agent_value": 1, "tracker_value": 1, "constructor_value": 1},
+                {"result": 1, "turn_value": 1, "discovered_tools": ["__init__.py", "module.py", "registry.py"], "discovered_plugins": ["plugin.yaml"], "discovered_resources": {"skill": "other skill\n", "description": "category\n", "optional_skill": "optional skill\n", "locale": "locale: en\n", "optional_mcp": "name: optional\n"}, "lazy_values": [1, 1, 1], "agent_value": 1, "tracker_value": 1, "constructor_value": 1},
             )
 
     @unittest.skipUnless(os.name == "posix", "executable modes are POSIX-specific")
