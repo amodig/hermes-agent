@@ -592,7 +592,11 @@ KANBAN_UPDATE_SCHEMA = _schema(
         "goal_mode": _prop("boolean", "Enable or disable goal-mode execution."),
         "lifecycle_contract": {
             **_LIFECYCLE_CONTRACT_SCHEMA,
-            "description": "Explicitly bind or change this task's lifecycle contract.",
+            "description": (
+                "Bind a lifecycle contract only on a historical unclassified "
+                "task; classification is immutable after binding. New tasks "
+                "must receive their lifecycle classification at creation."
+            ),
         },
         "expected_version": _prop(
             "integer", "Current task version required for the CAS update."

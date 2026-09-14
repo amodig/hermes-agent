@@ -1108,7 +1108,8 @@ class KanbanLifecycleConformance(unittest.TestCase):
             )
             (root / "run_agent.py").write_text(
                 "from agent.agent_init import init_agent\n"
-                "class AIAgent:\n"
+                "from agent.turn_facade import TurnFacadeMixin\n"
+                "class AIAgent(TurnFacadeMixin):\n"
                 "    def __init__(self):\n"
                 "        init_agent(self)\n",
                 encoding="utf-8",
@@ -1129,6 +1130,17 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 encoding="utf-8",
             )
             (root / "agent" / "empty_response_guard.py").write_text(
+                "value = 1\n",
+                encoding="utf-8",
+            )
+            (root / "agent" / "turn_facade.py").write_text(
+                "import importlib\n"
+                "class TurnFacadeMixin:\n"
+                "    def run_conversation(self):\n"
+                "        return importlib.import_module('agent.turn_runner').value\n",
+                encoding="utf-8",
+            )
+            (root / "agent" / "turn_runner.py").write_text(
                 "value = 1\n",
                 encoding="utf-8",
             )
@@ -1158,10 +1170,12 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "(root / 'agent' / 'agent_init.py').write_text('def init_agent(*args, **kwargs):\\n    return None\\nvalue = 2\\n', encoding='utf-8'); "
                 "(root / 'agent' / 'credits_tracker.py').write_text('value = 2\\n', encoding='utf-8'); "
                 "(root / 'agent' / 'empty_response_guard.py').write_text('value = 2\\n', encoding='utf-8'); "
+                "(root / 'agent' / 'turn_runner.py').write_text('value = 2\\n', encoding='utf-8'); "
+                "turn_value = agent.run_conversation(); "
                 "result = importlib.import_module('cli').main(); "
                 "agent_value = importlib.import_module('agent.agent_init').value; "
                 "tracker_value = importlib.import_module('agent.credits_tracker').value; "
-                "receipt.write_text(json.dumps({'result': result, 'agent_value': agent_value, 'tracker_value': tracker_value, 'constructor_value': agent.value}), encoding='utf-8')"
+                "receipt.write_text(json.dumps({'result': result, 'turn_value': turn_value, 'agent_value': agent_value, 'tracker_value': tracker_value, 'constructor_value': agent.value}), encoding='utf-8')"
             )
             env = os.environ.copy()
             env["PYTHONPATH"] = str(ROOT)
@@ -1175,7 +1189,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(
                 json.loads(receipt.read_text(encoding="utf-8")),
-                {"result": 1, "agent_value": 1, "tracker_value": 1, "constructor_value": 1},
+                {"result": 1, "turn_value": 1, "agent_value": 1, "tracker_value": 1, "constructor_value": 1},
             )
 
     def test_embedded_dispatcher_freezes_identity_before_first_tick(self) -> None:

@@ -7,6 +7,7 @@ actual worker claim against PID reuse.
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import os
@@ -14,11 +15,13 @@ from pathlib import Path
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 import uuid
+import zipfile
 
 
 RUNTIME_IDENTITY_PROTOCOL = 1
@@ -154,6 +157,70 @@ def _pin_runtime_import_root(root: Path) -> None:
             pass
         retained.append(entry)
     sys.path[:] = [str(root), *retained]
+_FROZEN_IMPORT_ARCHIVE: Optional[Path] = None
+
+
+def _is_frozen_import_location(location: str) -> bool:
+    archive = _FROZEN_IMPORT_ARCHIVE
+    if archive is None:
+        return False
+    normalized_location = str(location).replace("\\", "/")
+    normalized_archive = str(archive).replace("\\", "/")
+    return normalized_location.startswith(normalized_archive + "/")
+
+
+def _remove_frozen_import_archive(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _freeze_runtime_import_root(root: Path) -> Path:
+    """Serve future runtime imports from a pre-grant source snapshot."""
+    global _FROZEN_IMPORT_ARCHIVE
+    if _FROZEN_IMPORT_ARCHIVE is not None:
+        return _FROZEN_IMPORT_ARCHIVE
+    root = root.resolve()
+    members: dict[str, Path] = {}
+    for path in root.glob("*.py"):
+        if path.is_file():
+            members[path.name] = path
+    for directory in _IDENTITY_ROOTS:
+        base = root / directory
+        if not base.is_dir():
+            raise RuntimeIdentityError(f"runtime identity directory is missing: {directory}")
+        for path in base.rglob("*.py"):
+            if path.is_file() and not any(
+                part.startswith(".") or part == "__pycache__" for part in path.parts
+            ):
+                members[path.relative_to(root).as_posix()] = path
+    for asset in _IDENTITY_ASSETS:
+        members[asset] = _identity_asset_path(root, asset)
+    fd, archive_raw = tempfile.mkstemp(prefix="hermes-kanban-runtime-", suffix=".zip")
+    os.close(fd)
+    archive = Path(archive_raw).resolve()
+    try:
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as output:
+            for name, path in sorted(members.items()):
+                output.write(path, arcname=name)
+    except Exception:
+        _remove_frozen_import_archive(archive)
+        raise
+    _FROZEN_IMPORT_ARCHIVE = archive
+    atexit.register(_remove_frozen_import_archive, archive)
+    _pin_runtime_import_root(archive)
+    for name, module in tuple(sys.modules.items()):
+        package_path = getattr(module, "__path__", None)
+        if package_path is None or not any(
+            name == prefix or name.startswith(f"{prefix}.") for prefix in _IDENTITY_ROOTS
+        ):
+            continue
+        try:
+            module.__path__ = [str(archive.joinpath(*name.split(".")))]
+        except (AttributeError, TypeError):
+            pass
+    return archive
 
 
 
@@ -285,6 +352,8 @@ def assert_runtime_import_root(
             continue
         location = getattr(module, "__file__", None)
         if not location:
+            continue
+        if _is_frozen_import_location(str(location)):
             continue
         try:
             Path(location).resolve().relative_to(root)
@@ -442,6 +511,9 @@ def worker_bootstrap_post_import(*, wait_for_grant: bool = True) -> Optional[dic
     if not preparation_id or not expected_raw:
         raise RuntimeIdentityError("worker bootstrap environment is incomplete")
     expected = decode_identity(expected_raw)
+    # Snapshot every runtime source file before the final grant. Lazy turn and
+    # tool imports then resolve from this immutable archive, not a mutable checkout.
+    _freeze_runtime_import_root(_module_root())
     # ``main.py`` and ``cli.py`` defer these imports to keep ordinary CLI
     # startup cheap. Workers must load them before the final identity check;
     # otherwise an update can replace their source after this handshake and
