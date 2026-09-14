@@ -142,6 +142,27 @@ def test_standalone_dispatcher_keeps_direct_worker_spawn(
 
 
 @pytest.mark.linux_only
+def test_module_worker_rejects_workspace_root_module(
+    worker_setup: tuple[Path, kb.Task], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tools import process_registry
+
+    workspace, task = worker_setup
+    workspace.joinpath("hermes_bootstrap.py").write_text(
+        "from pathlib import Path\n"
+        "Path('workspace-bootstrap-loaded').write_text('yes')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: [sys.executable, "-m", "hermes_cli.main"])
+    monkeypatch.setenv("INVOCATION_ID", "managed-gateway-test")
+    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: False)
+    monkeypatch.setenv("PYTHONPATH", str(Path(kbd.__file__).resolve().parents[1]))
+
+    with pytest.raises(RuntimeError, match="worker exited before post-import verification"):
+        kbd._default_spawn(task, str(workspace))
+
+
+@pytest.mark.linux_only
 def test_real_user_systemd_scope_preserves_worker_context(
     worker_setup: tuple[Path, kb.Task], monkeypatch: pytest.MonkeyPatch
 ) -> None:

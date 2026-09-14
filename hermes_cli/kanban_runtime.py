@@ -138,6 +138,10 @@ def _version(root: Path) -> str:
     start += len(marker)
     end = text.find('"', start)
     return text[start:end] if end > start else "unknown"
+def _identity_root_module_names(root: Path) -> frozenset[str]:
+    return frozenset(path.stem for path in root.glob("*.py") if path.is_file())
+
+
 
 
 
@@ -257,9 +261,13 @@ def assert_runtime_import_root(
     if expected is not None and not same_code_identity(expected, observed):
         raise RuntimeIdentityError("runtime code changed during startup")
     prefixes = _IDENTITY_ROOTS
+    root_modules = _identity_root_module_names(root)
     mixed: list[str] = []
     for name, module in tuple(sys.modules.items()):
-        if not any(name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes):
+        if not (
+            name in root_modules
+            or any(name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes)
+        ):
             continue
         location = getattr(module, "__file__", None)
         if not location:
