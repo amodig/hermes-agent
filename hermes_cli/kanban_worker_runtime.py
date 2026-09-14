@@ -125,18 +125,15 @@ def reap_worker_zombies() -> "list[int]":
     """Reap exited workers without blocking; poll retained handles on Windows."""
     reaped: "list[int]" = []
     if os.name != "nt":
-        try:
-            while True:
-                try:
-                    pid, status = os.waitpid(-1, os.WNOHANG)
-                except ChildProcessError:
-                    break
-                if pid == 0:
-                    break
-                _record_worker_exit(pid, status)
-                reaped.append(pid)
-        except Exception:
-            pass
+        for launcher_pid in tuple(_worker_processes):
+            try:
+                pid, status = os.waitpid(launcher_pid, os.WNOHANG)
+            except (ChildProcessError, OSError):
+                continue
+            if pid == 0:
+                continue
+            _record_worker_exit(pid, status)
+            reaped.append(pid)
     else:
         for pid, process in list(_worker_processes.items()):
             try:

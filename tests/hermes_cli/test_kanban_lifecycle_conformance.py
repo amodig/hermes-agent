@@ -1572,6 +1572,9 @@ class KanbanLifecycleConformance(unittest.TestCase):
             third_party.mkdir(parents=True)
             (third_party / "__init__.py").write_text("", encoding="utf-8")
             (third_party / "lazy.py").write_text("value = 1\n", encoding="utf-8")
+            unused = root / "site-packages" / "third_party_unused"
+            unused.mkdir(parents=True)
+            (unused / "__init__.py").write_text("value = 2\n", encoding="utf-8")
             (root / "cli.py").write_text(
                 "def main():\n    return 1\n",
                 encoding="utf-8",
@@ -1671,6 +1674,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "'grant': True, 'preparation_id': 'race-preparation', "
                 "'runtime_identity': expected.as_dict()}; "
                 "runtime.worker_bootstrap_post_import(wait_for_grant=False); "
+                "assert not (runtime._FROZEN_IMPORT_ROOT / '.third-party' / '0' / 'third_party_unused').exists(); "
                 "agent = importlib.import_module('run_agent').AIAgent(); "
                 "(root / 'cli.py').write_text('def main():\\n    return 2\\n', encoding='utf-8'); "
                 "(root / 'agent' / 'agent_init.py').write_text('def init_agent(*args, **kwargs):\\n    return None\\nvalue = 2\\n', encoding='utf-8'); "
@@ -1795,6 +1799,26 @@ print(synced.stat().st_mode & stat.S_IXUSR)
             kbd._worker_pid_aliases.pop(launcher_pid, None)
             kbd._worker_processes.pop(launcher_pid, None)
             kbd._recent_worker_exits.pop(worker_pid, None)
+
+    @unittest.skipUnless(os.name == "posix", "waitpid is POSIX-specific")
+    def test_worker_reaper_does_not_consume_unregistered_children(self) -> None:
+        registered_pid = 2_147_482_998
+        kbd._worker_processes[registered_pid] = SimpleNamespace(returncode=None)
+        calls: list[int] = []
+
+        def waitpid(pid: int, options: int) -> tuple[int, int]:
+            calls.append(pid)
+            self.assertEqual(options, os.WNOHANG)
+            self.assertEqual(pid, registered_pid)
+            return registered_pid, 0
+
+        try:
+            with patch.object(kbd.os, "waitpid", side_effect=waitpid):
+                self.assertEqual(kbd.reap_worker_zombies(), [registered_pid])
+            self.assertEqual(calls, [registered_pid])
+        finally:
+            kbd._worker_processes.pop(registered_pid, None)
+            kbd._recent_worker_exits.pop(registered_pid, None)
 
     def test_runtime_sha_reads_packed_worktree_refs_from_common_git_dir(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-packed-ref-") as raw_root:

@@ -7,7 +7,9 @@ actual worker claim against PID reuse.
 
 from __future__ import annotations
 
+import ast
 import atexit
+import importlib.util
 import hashlib
 import json
 import os
@@ -327,6 +329,91 @@ def _runtime_dependency_roots() -> tuple[Path, ...]:
             seen.add(candidate)
     return tuple(roots)
 
+def _runtime_lazy_import_names(members: Mapping[str, Path]) -> frozenset[str]:
+    """Find first-party import targets that may resolve after the snapshot."""
+    names: set[str] = set()
+
+    class _Visitor(ast.NodeVisitor):
+        def visit_Import(self, node: ast.Import) -> None:
+            names.update(alias.name.partition(".")[0] for alias in node.names)
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            if node.level == 0 and node.module:
+                names.add(node.module.partition(".")[0])
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if node.args:
+                function = node.func
+                is_import_module = (
+                    isinstance(function, ast.Attribute)
+                    and function.attr == "import_module"
+                    and isinstance(function.value, ast.Name)
+                    and function.value.id == "importlib"
+                )
+                is_import = isinstance(function, ast.Name) and function.id == "__import__"
+                if is_import_module or is_import:
+                    value = node.args[0]
+                    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                        names.add(value.value.partition(".")[0])
+            self.generic_visit(node)
+
+    for path in members.values():
+        if path.suffix != ".py":
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except (OSError, SyntaxError, UnicodeError):
+            continue
+        _Visitor().visit(tree)
+
+    return frozenset(name for name in names if name)
+
+
+def _runtime_dependency_locations(
+    members: Mapping[str, Path], dependency_roots: tuple[Path, ...],
+) -> dict[Path, set[Path]]:
+    """Resolve only packages that startup or first-party lazy paths can import."""
+    locations = {root: set() for root in dependency_roots}
+    for name in _runtime_lazy_import_names(members):
+        try:
+            spec = importlib.util.find_spec(name)
+        except (ImportError, AttributeError, ModuleNotFoundError, ValueError):
+            continue
+        if spec is None:
+            continue
+        candidates = list(spec.submodule_search_locations or ())
+        if not candidates and spec.origin:
+            candidates.append(spec.origin)
+        for candidate in candidates:
+            try:
+                resolved = Path(candidate).resolve()
+            except (OSError, RuntimeError, TypeError):
+                continue
+            for root in dependency_roots:
+                try:
+                    resolved.relative_to(root)
+                except ValueError:
+                    continue
+                if resolved.is_dir() or resolved.is_file():
+                    locations[root].add(resolved)
+    return locations
+
+
+def _copy_runtime_dependency_tree(
+    source_root: Path, destination_root: Path, locations: set[Path],
+) -> None:
+    for source in sorted(locations):
+        relative = source.relative_to(source_root)
+        destination = destination_root / relative
+        if source.is_dir():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(
+                source, destination, copy_function=_copy_runtime_dependency_file, dirs_exist_ok=True,
+            )
+        elif source.is_file():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _copy_runtime_dependency_file(str(source), str(destination))
+
 
 def _copy_runtime_dependency_file(source: str, destination: str) -> str:
     # Dependency installers replace non-source artifacts atomically. Hardlinks keep that
@@ -406,6 +493,8 @@ def _freeze_runtime_import_root(
     root = root.resolve()
     members = _runtime_snapshot_members(root)
     dependency_roots = _runtime_dependency_roots() if include_dependencies else ()
+    dependency_locations = _runtime_dependency_locations(members, dependency_roots)
+    dependency_sources: list[Path] = []
     dependency_destinations: list[Path] = []
     snapshot_root = Path(tempfile.mkdtemp(prefix="hermes-kanban-runtime-")).resolve()
     try:
@@ -414,8 +503,12 @@ def _freeze_runtime_import_root(
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, destination)
         for index, source in enumerate(dependency_roots):
+            locations = dependency_locations[source]
+            if not locations:
+                continue
             destination = snapshot_root / ".third-party" / str(index)
-            shutil.copytree(source, destination, copy_function=_copy_runtime_dependency_file)
+            _copy_runtime_dependency_tree(source, destination, locations)
+            dependency_sources.append(source)
             dependency_destinations.append(destination)
     except Exception:
         _remove_frozen_import_root(snapshot_root)
@@ -433,7 +526,7 @@ def _freeze_runtime_import_root(
     _pin_runtime_import_root(snapshot_root)
     for destination in reversed(dependency_destinations):
         sys.path.insert(1, str(destination))
-    _pin_loaded_dependency_imports(tuple(dependency_roots), dependency_destinations)
+    _pin_loaded_dependency_imports(tuple(dependency_sources), dependency_destinations)
     for name, module in tuple(sys.modules.items()):
         package_path = getattr(module, "__path__", None)
         if package_path is None or not any(
