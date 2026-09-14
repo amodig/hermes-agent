@@ -240,6 +240,16 @@ def validate_edge(
         )
     pk = p["kind"]
     ck = c["kind"]
+    if ck == "validation":
+        candidate_contract = _contract_for(conn, c["candidate_task_id"])
+        if (
+            candidate_contract is None
+            or candidate_contract.get("kind") != "code"
+            or not candidate_contract.get("validation_required")
+        ):
+            raise LifecycleContractError(
+                "validation edges require a code candidate with validation_required=true"
+            )
     validator = _LIFECYCLE_EDGE_VALIDATORS.get(pk)
     legal = validator(parent_id, child_id, p, c, ck, requirement) if validator else False
     if not legal:

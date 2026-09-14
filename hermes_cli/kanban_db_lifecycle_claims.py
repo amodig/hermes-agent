@@ -192,6 +192,7 @@ def claim_task(
     worker_pid: Optional[int] = None, worker_start_time: Optional[int] = None,
     preparation_id: Optional[str] = None,
     expected_task: Any = None,
+    fire_hook: bool = True,
 ) -> Optional[_kb.Task]:
     """Atomically transition ``ready -> running``.
 
@@ -238,7 +239,8 @@ def claim_task(
         if run_id is None:
             return None
         claimed = _kb.get_task(conn, task_id)
-    _kb._fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
+    if fire_hook:
+        _kb._fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
     return claimed
 
 def claim_review_task(
@@ -247,6 +249,7 @@ def claim_review_task(
     worker_pid: Optional[int] = None, worker_start_time: Optional[int] = None,
     preparation_id: Optional[str] = None,
     expected_task: Any = None,
+    fire_hook: bool = True,
 ) -> Optional[_kb.Task]:
     """Atomic ``review -> running`` (None when lost). Parents are re-checked
     (one may have reopened meanwhile) and a NEW run tracks the reviewer
@@ -291,7 +294,8 @@ def claim_review_task(
         if run_id is None:
             return None
         claimed = _kb.get_task(conn, task_id)
-    _kb._fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
+    if fire_hook:
+        _kb._fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
     return claimed
 
 def release_stale_claims(conn: sqlite3.Connection, *, signal_fn=None) -> int:

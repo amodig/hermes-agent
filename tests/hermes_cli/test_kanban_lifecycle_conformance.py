@@ -825,6 +825,138 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 initial_status="blocked",
                 lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
             )
+    def test_validation_edges_require_explicit_candidate_validation(self) -> None:
+        same_card_candidate = kb.create_task(
+            self.conn,
+            title="same-card candidate without validation",
+            assignee="implementer",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "same_card",
+                "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        )
+        same_card_validation = kb.create_task(
+            self.conn,
+            title="invalid same-card validation",
+            assignee="tester",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "validation",
+                "candidate_task_id": same_card_candidate,
+            },
+        )
+        with self.assertRaises(kb.LifecycleContractError):
+            kb.link_tasks(
+                self.conn,
+                same_card_candidate,
+                same_card_validation,
+                requirement="review_approved",
+            )
+        with self.assertRaises(kb.LifecycleContractError):
+            kb.create_task(
+                self.conn,
+                title="invalid same-card validation parent",
+                assignee="tester",
+                initial_status="blocked",
+                parents=[same_card_candidate],
+                lifecycle_contract={
+                    "kind": "validation",
+                    "candidate_task_id": same_card_candidate,
+                },
+            )
+
+        separate_candidate = kb.create_task(
+            self.conn,
+            title="separate-card candidate without validation",
+            assignee="implementer",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        )
+        review = kb.create_task(
+            self.conn,
+            title="valid separate-card review",
+            assignee="reviewer",
+            initial_status="blocked",
+            parents=[separate_candidate],
+            lifecycle_contract={"kind": "review", "candidate_task_id": separate_candidate},
+        )
+        separate_validation = kb.create_task(
+            self.conn,
+            title="invalid separate-card validation",
+            assignee="tester",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "validation",
+                "candidate_task_id": separate_candidate,
+            },
+        )
+        with self.assertRaises(kb.LifecycleContractError):
+            kb.link_tasks(
+                self.conn,
+                review,
+                separate_validation,
+                requirement="review_approved",
+            )
+        with self.assertRaises(kb.LifecycleContractError):
+            kb.create_task(
+                self.conn,
+                title="invalid separate-card validation parent",
+                assignee="tester",
+                initial_status="blocked",
+                parents=[review],
+                lifecycle_contract={
+                    "kind": "validation",
+                    "candidate_task_id": separate_candidate,
+                },
+            )
+
+    def test_default_dispatch_grants_worker_before_claimed_hook(self) -> None:
+        task_id = kb.create_task(
+            self.conn,
+            title="grant before claimed hook",
+            assignee="implementer",
+            initial_status="blocked",
+        )
+        self.assertTrue(kb.unblock_task(self.conn, task_id))
+        identity = runtime_identity(RUNTIME_ROOT)
+        order: list[str] = []
+
+        def fake_default_spawn(task, workspace, *, board=None, defer_grant=False):
+            self.assertTrue(defer_grant)
+
+            def grant(_run_id, _claim_lock):
+                order.append("grant")
+
+            return kbd.WorkerLaunch(
+                identity.pid,
+                identity.as_dict(),
+                "claimed-hook-order",
+                grant=grant,
+            )
+
+        def fire_task_hook(event, _task, _task_id, _run_id, **_fields):
+            if event == "kanban_task_claimed":
+                order.append("claimed")
+
+        with patch.object(kbd, "_profile_exists_fn", return_value=None), patch.object(
+            kbd, "_default_spawn", side_effect=fake_default_spawn,
+        ), patch.object(kb, "_fire_task_hook", side_effect=fire_task_hook):
+            result = kbd.dispatch_once(
+                self.conn,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+
+        self.assertEqual([entry[0] for entry in result.spawned], [task_id])
+        self.assertEqual(order, ["grant", "claimed"])
 
     def test_force_promotion_overrides_unfinished_parent(self) -> None:
         parent = kb.create_task(

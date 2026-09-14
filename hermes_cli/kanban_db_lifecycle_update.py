@@ -476,8 +476,11 @@ def _persist_update(
             f"task {task_id} update conflict: version changed while updating"
         )
     if plan.goal_reopened:
-        conn.execute("UPDATE tasks SET completed_at = NULL WHERE id = ?", (task_id,))
-        changed_fields.append("completed_at")
+        conn.execute(
+            "UPDATE tasks SET completed_at = NULL, result = NULL WHERE id = ?",
+            (task_id,),
+        )
+        changed_fields.extend(("completed_at", "result"))
     if plan.goal_changed:
         goal_revision = _kb.get_effective_goal(conn, task_id)
     payload = {

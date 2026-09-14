@@ -1514,6 +1514,7 @@ def _dispatch_lane_task(
                 worker_start_time=launch.runtime_identity["start_time"],
                 preparation_id=launch.preparation_id,
                 expected_task=preflight,
+                fire_hook=False,
             )
             if claimed is None:
                 if launch.cancel:
@@ -1576,6 +1577,9 @@ def _dispatch_lane_task(
             preparation_id = launch.preparation_id
             if launch.grant:
                 launch.grant(int(claimed.current_run_id), claimed.claim_lock)
+                _kb._fire_task_hook(
+                    "kanban_task_claimed", claimed, claimed.id, claimed.current_run_id,
+                )
         else:
             pid = launch
             launch_identity = None
