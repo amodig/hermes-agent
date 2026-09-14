@@ -69,12 +69,17 @@ def _validate_lifecycle_role_identity(
     if task_id is not None:
         task_row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
         task_status = _kb._row_get(task_row, "status")
+    review_phase = task_status in {"review", "done"} or (
+        task_status == "blocked"
+        and task_id is not None
+        and _kb._resume_status_from_events(conn, task_id) == "review"
+    )
     if kind == "code":
         if (
             actor
             and contract.get("review_mode") == "same_card"
             and phase != "implementation"
-            and task_status in {"review", "done"}
+            and review_phase
         ):
             if actor != _kb._canonical_assignee(contract.get("reviewer")):
                 raise LifecycleContractError(

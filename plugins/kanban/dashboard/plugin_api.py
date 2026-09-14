@@ -820,6 +820,26 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 board,
                 expected_version=request_version,
             )
+        # Domain status/assignment/priority/override mutators record their own
+        # events, but this route owns the optimistic-concurrency version.
+        if (
+            not ({"title", "body", "lifecycle_contract"} & set(sent))
+            and (
+                payload.status is not None
+                or payload.assignee is not None
+                or payload.priority is not None
+                or any(wanted(payload) for wanted, _, _ in _OVERRIDE_OPS)
+            )
+        ):
+            cur = conn.execute(
+                "UPDATE tasks SET version = version + 1 "
+                "WHERE id = ? AND version = ?",
+                (task_id, request_version),
+            )
+            if cur.rowcount != 1:
+                raise _conflict(
+                    f"task {task_id} update conflict: version changed while updating"
+                )
         updated = kanban_db.get_task(conn, task_id)
         return {"task": _task_dict(updated, conn=conn) if updated else None}
 

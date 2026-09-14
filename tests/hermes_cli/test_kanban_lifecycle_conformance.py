@@ -668,6 +668,32 @@ class KanbanLifecycleConformance(unittest.TestCase):
         self.assertIsNone(kb.claim_task(self.conn, validation, claimer="tester"))
         self.assertEqual(self._task(validation).status, "todo")
 
+    def test_blocked_same_card_review_keeps_reviewer_identity(self) -> None:
+        task_id = kb.create_task(
+            self.conn,
+            title="blocked same-card review",
+            assignee="builder",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "same_card",
+                "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        )
+        with kb.write_txn(self.conn):
+            kb._append_event(
+                self.conn,
+                task_id,
+                "blocked",
+                {"source_status": "review", "resume_status": "review"},
+            )
+
+        with self.assertRaises(kb.LifecycleContractError):
+            kb.assign_task(self.conn, task_id, "builder")
+        self.assertTrue(kb.assign_task(self.conn, task_id, "reviewer"))
+
+
     def test_deletion_protects_review_parent_of_validation(self) -> None:
         implementation = kb.create_task(
             self.conn,

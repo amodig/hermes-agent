@@ -112,6 +112,30 @@ def test_completion_records_and_enforces_exact_head(kanban_home, tmp_path):
         assert event.payload["expected_head_sha"] == head
 
 
+def test_review_claim_aborts_after_parent_head_moves(kanban_home, tmp_path):
+    repo, base, branch = _repo(tmp_path)
+    with kbc.connect_closing() as conn:
+        parent, reviewer = _lane(conn, repo, branch)
+        head = _commit(repo)
+        assert kb.claim_task(conn, parent) is not None
+        assert kb.complete_task(
+            conn, parent, metadata={"base_sha": base, "head_sha": head}
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET lifecycle_contract = NULL, status = 'review' "
+                "WHERE id = ?", (reviewer,)
+            )
+        _commit(repo, "src/moved.py")
+
+        assert kb.claim_review_task(conn, reviewer) is None
+        assert kb.get_task(conn, reviewer).status == "review"
+        assert any(
+            event.kind == "handoff_head_moved"
+            for event in kb.list_events(conn, reviewer)
+        )
+
+
 def test_legacy_handoff_requeues_and_recompletes_same_lane(kanban_home, tmp_path):
     from tools import kanban_tools as kt
 

@@ -336,6 +336,44 @@ def test_patch_expected_version_is_atomic_across_intervening_mutation(client, mo
 
 
 
+@pytest.mark.parametrize(
+    ("patch", "field", "expected"),
+    [
+        ({"assignee": "new"}, "assignee", "new"),
+        ({"status": "blocked", "block_reason": "manual"}, "status", "blocked"),
+        ({"priority": 7}, "priority", 7),
+        ({"model_override": "test-model"}, "model_override", "test-model"),
+        ({"reasoning_effort": "high"}, "reasoning_effort", "high"),
+    ],
+)
+def test_patch_expected_version_advances_direct_mutations(
+    client, patch, field, expected
+):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "versioned mutation", "assignee": "old"},
+    ).json()["task"]
+    stale_version = task["version"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json=patch,
+    )
+    assert response.status_code == 200, response.text
+    updated = response.json()["task"]
+    assert updated[field] == expected
+    assert updated["version"] == stale_version + 1
+
+    stale = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"expected_version": stale_version, "priority": 99},
+    )
+    assert stale.status_code == 409
+    current = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
+    assert current[field] == expected
+    assert current["version"] == stale_version + 1
+
+
 def test_deferred_cleanup_skips_a_reopened_task(client, tmp_path, monkeypatch):
     workspace_root = tmp_path / "workspaces"
     workspace = workspace_root / "task"

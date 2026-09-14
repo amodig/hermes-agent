@@ -261,6 +261,7 @@ def claim_review_task(
         handoff_error = _parent_handoff_start_error(conn, task_id)
         if handoff_error is not None:
             _record_parent_handoff_start_error(conn, task_id, handoff_error)
+            return None
         dependencies = evaluate_dependencies(conn, task_id)
         if not dependencies["satisfied"] and not (
             _forced_promotion_active(conn, task_id)
