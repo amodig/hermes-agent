@@ -2469,6 +2469,7 @@ def _retry_status_for_run(
 _RUN_OUTCOME_TERMINAL_STATUS = {
     "completed": "done",
     "review_requested": "review",
+    "validation_requested": "validation",
     "changes_requested": "changes_requested",
     "blocked": "blocked",
     "dependency_wait": "blocked",

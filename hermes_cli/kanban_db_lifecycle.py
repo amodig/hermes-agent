@@ -957,6 +957,28 @@ def _lifecycle_graph_ids(
     return graph if len(graph) > 1 else set()
 
 
+def _requested_lifecycle_graph_ids(
+    conn: sqlite3.Connection,
+    task_id: str,
+    requested_task_ids: Iterable[str],
+) -> set[str]:
+    requested_ids = tuple(requested_task_ids)
+    graph_ids = _lifecycle_graph_ids(
+        conn, task_id, requested_task_ids=requested_ids,
+    )
+    if len(graph_ids) > 1:
+        return graph_ids
+    for requested_id in requested_ids:
+        if str(requested_id) == task_id:
+            continue
+        candidate_graph = _lifecycle_graph_ids(
+            conn, str(requested_id), requested_task_ids=requested_ids,
+        )
+        if task_id in candidate_graph:
+            return candidate_graph
+    return graph_ids
+
+
 def _delete_archived_lifecycle_graph(
     conn: sqlite3.Connection, graph_ids: set[str],
 ) -> None:
@@ -1060,8 +1082,8 @@ def delete_archived_lifecycle_graph(
     with _kb.write_txn(conn):
         if _kb._task_status(conn, task_id) != "archived":
             return False
-        graph_ids = _lifecycle_graph_ids(
-            conn, task_id, requested_task_ids=requested_task_ids,
+        graph_ids = _requested_lifecycle_graph_ids(
+            conn, task_id, requested_task_ids,
         )
         if len(graph_ids) <= 1:
             return False
@@ -1079,8 +1101,8 @@ def delete_archived_task(
     with _kb.write_txn(conn):
         if _kb._task_status(conn, task_id) != "archived":
             return False
-        graph_ids = _lifecycle_graph_ids(
-            conn, task_id, requested_task_ids=requested_task_ids,
+        graph_ids = _requested_lifecycle_graph_ids(
+            conn, task_id, requested_task_ids,
         )
         if len(graph_ids) > 1:
             _delete_archived_lifecycle_graph(conn, graph_ids)

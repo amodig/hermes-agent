@@ -162,6 +162,17 @@ class KanbanLifecycleConformance(unittest.TestCase):
                     },
                 )
             )
+            implementation_events = kb.list_events(self.conn, implementation)
+            self.assertNotIn(
+                "completed", {event.kind for event in implementation_events}
+            )
+            self.assertIn(
+                "review_requested", {event.kind for event in implementation_events}
+            )
+            self.assertEqual(
+                get_lifecycle_state(self.conn, implementation)["acceptance"],
+                "pending",
+            )
             trace.append("implementation:running->done")
             self.assertEqual(self._task(review).status, "review")
             trace.append("review:blocked->review")
@@ -203,6 +214,93 @@ class KanbanLifecycleConformance(unittest.TestCase):
             self.assertEqual(acceptance["validation_verdict"], "PASS")
             trace.append("implementation:acceptance=pending->accepted")
             self.assertEqual(trace[-1], fixture["expected_trace"][-1])
+
+    def test_same_card_review_waits_for_validation_before_terminal_completion(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kanban-conformance-validation-") as raw_repo:
+            repo = Path(raw_repo)
+            _git(repo, "init", "-q")
+            _git(repo, "config", "user.email", "conformance@example.invalid")
+            _git(repo, "config", "user.name", "Kanban Conformance")
+            (repo / "README").write_text("base\n", encoding="utf-8")
+            _git(repo, "add", "README")
+            _git(repo, "commit", "-qm", "base")
+            base_sha = _git(repo, "rev-parse", "HEAD")
+            (repo / "lifecycle.py").write_text("print('proof')\n", encoding="utf-8")
+            _git(repo, "add", "lifecycle.py")
+            _git(repo, "commit", "-qm", "implementation")
+            head_sha = _git(repo, "rev-parse", "HEAD")
+
+            implementation = kb.create_task(
+                self.conn,
+                title="same-card validation implementation",
+                assignee="implementer",
+                initial_status="blocked",
+                workspace_kind="dir",
+                workspace_path=str(repo),
+                lifecycle_contract={
+                    "kind": "code",
+                    "review_mode": "same_card",
+                    "reviewer": "reviewer",
+                    "validation_required": True,
+                },
+            )
+            validation = kb.create_task(
+                self.conn,
+                title="same-card validation",
+                assignee="tester",
+                initial_status="blocked",
+                lifecycle_contract={
+                    "kind": "validation",
+                    "candidate_task_id": implementation,
+                },
+            )
+            kb.link_tasks(
+                self.conn, implementation, validation, requirement="review_approved"
+            )
+            self.assertTrue(kb.unblock_task(self.conn, implementation))
+            implementation_run = kb.claim_task(
+                self.conn, implementation, claimer="implementer:conformance"
+            )
+            self.assertIsNotNone(implementation_run)
+            self.assertTrue(
+                kb.complete_task(
+                    self.conn,
+                    implementation,
+                    expected_run_id=implementation_run.current_run_id,
+                    summary="Implementation evidence",
+                    metadata={
+                        "base_sha": base_sha,
+                        "head_sha": head_sha,
+                        "changed_files": ["lifecycle.py"],
+                    },
+                )
+            )
+            review_run = kb.claim_review_task(
+                self.conn, implementation, claimer="reviewer:conformance"
+            )
+            self.assertIsNotNone(review_run)
+            with patch.object(kb, "_fire_task_hook") as fire_hook:
+                self.assertTrue(
+                    kb.complete_task(
+                        self.conn,
+                        implementation,
+                        expected_run_id=review_run.current_run_id,
+                        verdict="APPROVE",
+                        summary="Review approved",
+                        metadata={"reviewed_head_sha": head_sha},
+                    )
+                )
+                fire_hook.assert_not_called()
+
+            events = kb.list_events(self.conn, implementation)
+            self.assertNotIn("completed", {event.kind for event in events})
+            self.assertIn("validation_requested", {event.kind for event in events})
+            self.assertEqual(
+                get_lifecycle_state(self.conn, implementation)["acceptance"],
+                "pending",
+            )
+            self.assertEqual(self._task(validation).status, "ready")
+
 
     def test_archived_negative_role_evidence_is_pending(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-archive-") as raw_repo:
@@ -1064,8 +1162,8 @@ class KanbanLifecycleConformance(unittest.TestCase):
         self.assertTrue(
             kb.delete_archived_task(
                 self.conn,
-                implementation,
-                requested_task_ids=(implementation, downstream),
+                downstream,
+                requested_task_ids=(downstream, implementation),
             )
         )
         for task_id in task_ids:
@@ -1770,6 +1868,23 @@ runtime.cleanup_runtime_snapshot(snapshot)
         self.assertIn("review result: APPROVE", message)
         self.assertIsNone(wake)
         self.assertIsNone(detail)
+        stale_event = SimpleNamespace(
+            kind="acceptance_changed",
+            payload={
+                "old": "accepted",
+                "new": "stale",
+                "phase": "validation",
+                "result": "PASS",
+            },
+        )
+        stale_message, stale_wake, stale_detail = notifier._fmt_acceptance_changed(
+            stale_event, notice
+        )
+        self.assertIn("acceptance: accepted → stale", stale_message)
+        self.assertIn("(validation result: PASS)", stale_message)
+        self.assertNotEqual(stale_message, "ℹ️ Lifecycle validation result: PASS")
+        self.assertIsNone(stale_wake)
+        self.assertIsNone(stale_detail)
     def test_default_dispatch_fences_child_before_claim(self) -> None:
         task_id = kb.create_task(
             self.conn,

@@ -300,6 +300,39 @@ def test_patch_expected_version_rejects_side_effects(client):
     assert current["assignee"] == "old"
     assert current["title"] == "fresh title"
 
+def test_patch_typed_completion_rejects_combined_goal_edit(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "typed implementation",
+            "body": "original goal",
+            "assignee": "builder",
+            "lifecycle_contract": {
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        },
+    ).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "status": "done",
+            "title": "revised goal",
+            "body": "revised body",
+            "metadata": {"base_sha": "base", "head_sha": "head"},
+        },
+    )
+    assert response.status_code == 409
+    current = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
+    assert current["status"] == "ready"
+    assert current["title"] == "typed implementation"
+    assert current["body"] == "original goal"
+
+
+
 
 def test_patch_expected_version_is_atomic_across_intervening_mutation(client, monkeypatch):
     task = client.post(

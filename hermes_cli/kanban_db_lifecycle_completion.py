@@ -163,6 +163,33 @@ def _completion_modes(
         and str(verdict or "").strip().upper() == "REQUEST_CHANGES"
     )
     return typed_phase, same_card_handoff, same_card_changes
+def _completion_handoff_kind(
+    task_before: Any,
+    *,
+    typed_phase: Optional[str],
+    same_card_handoff: bool,
+    same_card_changes: bool,
+    verdict: Optional[str],
+) -> Optional[str]:
+    if same_card_changes:
+        return "changes_requested"
+    if same_card_handoff:
+        return "review_requested"
+    contract = task_before.lifecycle_contract if task_before else None
+    if not isinstance(contract, dict) or contract.get("kind") != "code":
+        return None
+    if typed_phase == "implementation" and contract.get("review_mode") == "separate_card":
+        return "review_requested"
+    if (
+        typed_phase == "review"
+        and contract.get("review_mode") == "same_card"
+        and contract.get("validation_required")
+        and str(verdict or "").strip().upper() == "APPROVE"
+    ):
+        return "validation_requested"
+    return None
+
+
 
 def _commit_completion(
     conn: sqlite3.Connection,
@@ -220,13 +247,20 @@ def _commit_completion(
                     {"reason": error.reason}, run_id=expected_run_id,
                 )
                 return False, None, error
+            handoff_kind = _completion_handoff_kind(
+                task_before,
+                typed_phase=typed_phase,
+                same_card_handoff=same_card_handoff,
+                same_card_changes=same_card_changes,
+                verdict=verdict,
+            )
             if typed_phase is not None:
                 stamp_run_id = expected_run_id or _kb._current_run_id(conn, task_id)
                 if stamp_run_id is None:
                     synthetic_run_id = _kb._synthesize_ended_run(
                         conn,
                         task_id,
-                        outcome="review_requested" if same_card_handoff else "completed",
+                        outcome=handoff_kind or "completed",
                         summary=handoff_summary,
                         metadata=metadata,
                     )
@@ -269,9 +303,19 @@ def _commit_completion(
                 else "done"
             )
             completed_at = None if target_status != "done" else now
-            reviewer_profile = (
+            handoff_reviewer = (
                 task_before.lifecycle_contract.get("reviewer")
-                if same_card_handoff and task_before and task_before.lifecycle_contract
+                if (
+                    handoff_kind in {"review_requested", "validation_requested"}
+                    and task_before
+                    and task_before.lifecycle_contract
+                    and task_before.lifecycle_contract.get("kind") == "code"
+                )
+                else None
+            )
+            reviewer_profile = (
+                handoff_reviewer
+                if same_card_handoff
                 else implementation_routing.get("implementer")
                 if same_card_changes
                 else None
@@ -322,13 +366,7 @@ def _commit_completion(
                 )
             if isinstance(metadata, dict):
                 _stage_completion_artifacts(conn, task_id, metadata, now)
-            run_outcome = (
-                "review_requested"
-                if same_card_handoff
-                else "changes_requested"
-                if same_card_changes
-                else "completed"
-            )
+            run_outcome = handoff_kind or "completed"
             run_id = _kb._end_run(
                 conn,
                 task_id,
@@ -363,7 +401,7 @@ def _commit_completion(
             event_summary = handoff_summary
             if prior_status == "review" and not event_summary:
                 event_summary = _kb._REVIEW_APPROVED_NOTE
-            if same_card_changes:
+            if handoff_kind == "changes_requested":
                 _kb._append_event(
                     conn,
                     task_id,
@@ -381,7 +419,7 @@ def _commit_completion(
                     },
                     run_id=run_id,
                 )
-            elif same_card_handoff:
+            elif handoff_kind == "review_requested":
                 _kb._append_event(
                     conn,
                     task_id,
@@ -389,7 +427,23 @@ def _commit_completion(
                     {
                         "summary": _kb._first_line(event_summary, 400) or None,
                         "implementer": task_before.assignee if task_before else None,
-                        "reviewer": reviewer_profile,
+                        "reviewer": handoff_reviewer or reviewer_profile,
+                        "lifecycle": (
+                            metadata.get("lifecycle")
+                            if isinstance(metadata, dict)
+                            else None
+                        ),
+                    },
+                    run_id=run_id,
+                )
+            elif handoff_kind == "validation_requested":
+                _kb._append_event(
+                    conn,
+                    task_id,
+                    "validation_requested",
+                    {
+                        "summary": _kb._first_line(event_summary, 400) or None,
+                        "reviewer": handoff_reviewer,
                         "lifecycle": (
                             metadata.get("lifecycle")
                             if isinstance(metadata, dict)
@@ -536,10 +590,15 @@ def complete_task(
     _kb.recompute_ready(conn)  # separate txn so children see ``done``
     _emit_acceptance_changes(conn, acceptance_before, source_task_id=task_id)
     _done_task = _kb.get_task(conn, task_id)
+    acceptance = (
+        get_lifecycle_state(conn, task_id).get("acceptance")
+        if _done_task and _done_task.lifecycle_contract
+        else "accepted"
+    )
     if _done_task and _done_task.status == "done":
         _kb._cleanup_workspace(conn, task_id)
-    if fire_lifecycle_hook and _done_task and _done_task.status == "done":
-        _kb._fire_task_hook("kanban_task_completed", _done_task, task_id, run_id, summary=handoff_summary)
+        if fire_lifecycle_hook and acceptance == "accepted":
+            _kb._fire_task_hook("kanban_task_completed", _done_task, task_id, run_id, summary=handoff_summary)
     return True
 
 def _gate_created_cards(

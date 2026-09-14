@@ -31,13 +31,12 @@ def _kbn():
 TERMINAL_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out", "status",
     "archived", "unblocked", "block_loop_detected", "review_requested",
-    "changes_requested", "acceptance_changed",
+    "validation_requested", "changes_requested", "acceptance_changed",
 )
 # Kinds that hand a decision back to the origin, which must take a turn.
-# status/archived/unblocked/acceptance_changed are bookkeeping notifications.
 _WAKE_KINDS = (
     "completed", "gave_up", "crashed", "timed_out", "blocked",
-    "review_requested", "changes_requested", "block_loop_detected",
+    "review_requested", "validation_requested", "changes_requested", "block_loop_detected",
 )
 # Consecutive send failures (adapter raised OR reported SendResult(success=False))
 # before a sub is dropped as a dead chat. 12 ≈ 60s at the 5s cadence: a transient
@@ -287,6 +286,17 @@ def _fmt_review_requested(ev, n) -> tuple:
         wake_handoff = _first_line(summary, 200)
     return f"👀 {n.head} ready for review — {n.title}{handoff}", wake_handoff, None
 
+def _fmt_validation_requested(ev, n) -> tuple:
+    handoff = ""
+    wake_handoff = None
+    summary = _payload(ev, "summary")
+    if summary:
+        summary = str(summary)
+        handoff = f"\n{summary[:200]}"
+        wake_handoff = _first_line(summary, 200)
+    return f"🧪 {n.head} ready for validation — {n.title}{handoff}", wake_handoff, None
+
+
 
 def _fmt_changes_requested(ev, n) -> tuple:
     payload = ev.payload or {}
@@ -303,8 +313,13 @@ def _fmt_changes_requested(ev, n) -> tuple:
 
 def _fmt_acceptance_changed(ev, n) -> tuple:
     phase = _safe_review_reason(_payload(ev, "phase"), 32) or "lifecycle"
-    result = _safe_review_reason(_payload(ev, "result"), 80) or "evidence updated"
-    return f"ℹ️ {n.head} {phase} result: {result}", None, None
+    result = _safe_review_reason(_payload(ev, "result"), 80)
+    old = _safe_review_reason(_payload(ev, "old"), 32)
+    new = _safe_review_reason(_payload(ev, "new"), 32)
+    if old and new:
+        verdict = f" ({phase} result: {result})" if result else ""
+        return f"ℹ️ {n.head} acceptance: {old} → {new}{verdict}", None, None
+    return f"ℹ️ {n.head} {phase} result: {result or 'evidence updated'}", None, None
 
 
 # archived / unblocked are claimed (so the cursor advances past them) but
@@ -323,6 +338,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "status": lambda ev, n: (f"🔄 {n.head} → {_payload(ev, 'status') or ''}", None, None),
     "acceptance_changed": _fmt_acceptance_changed,
     "review_requested": _fmt_review_requested,
+    "validation_requested": _fmt_validation_requested,
     "changes_requested": _fmt_changes_requested,
     # Re-blocked for the same cause past the limit and routed to `triage` for a
     # human. It emits no blocked/status event, so ping loudly here.
