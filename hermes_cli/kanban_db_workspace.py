@@ -29,7 +29,7 @@ _ACTIVE_CHILDREN_SQL = (
     "LIMIT 1"
 )
 
-_WORKSPACE_ROW_SQL = "SELECT workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?"
+_WORKSPACE_ROW_SQL = "SELECT status, workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?"
 
 
 def _git(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProcess:
