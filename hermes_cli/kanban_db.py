@@ -4468,6 +4468,7 @@ from hermes_cli.kanban_db_lifecycle import (  # noqa: E402
     claim_task,
     complete_task,
     create_task,
+    delete_archived_lifecycle_graph,
     delete_archived_task,
     delete_task,
     edit_completed_task_result,

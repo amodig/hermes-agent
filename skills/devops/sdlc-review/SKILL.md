@@ -185,7 +185,7 @@ Do not edit the implementation while acting as reviewer. Request changes and let
 - **Vague findings:** “Needs work” does not give the implementer a reproducible correction target.
 - **Style-only blocking:** Do not request changes for preference-level nits when behavior and repository standards are satisfied.
 - **Skipping prior rounds:** Re-review must confirm both the requested corrections and preservation of previously passing behavior.
-- **Using blockers for ordinary rework:** Correctable defects belong in `kanban_request_changes`; reserve `kanban_block` for genuine external blockers or human decisions.
+- **Using blockers for ordinary rework:** In legacy/untyped review flows, correctable defects belong in `kanban_request_changes`; typed review and validation cards record `REQUEST_CHANGES` through `kanban_complete(verdict=...)`. Reserve `kanban_block` for genuine external blockers or human decisions.
 - **Completing without evidence:** Every approval summary must name the checks or artifacts actually inspected.
 
 ## Verification

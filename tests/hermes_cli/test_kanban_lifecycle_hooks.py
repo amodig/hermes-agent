@@ -68,6 +68,30 @@ def test_claim_fires_hook(kanban_home, captured_hooks):
 
 
 
+def test_review_claim_fires_hook(kanban_home, captured_hooks):
+    conn = kbc.connect()
+    try:
+        task_id = kb.create_task(conn, title="review", assignee="builder")
+        implementation = kb.claim_task(conn, task_id, claimer="builder")
+        assert implementation is not None
+        assert kb.request_review(
+            conn, task_id, reviewer="reviewer",
+            expected_run_id=implementation.current_run_id,
+        )
+        claimed = kb.claim_review_task(conn, task_id, claimer="reviewer")
+        assert claimed is not None
+    finally:
+        conn.close()
+    fired = [
+        event for event in captured_hooks
+        if event[0] == "kanban_task_claimed"
+        and event[1]["run_id"] == claimed.current_run_id
+    ]
+    assert len(fired) == 1
+    assert fired[0][1]["task_id"] == task_id
+    assert fired[0][1]["assignee"] == "reviewer"
+
+
 def test_misbehaving_hook_does_not_break_transition(kanban_home, monkeypatch):
     """A hook callback that raises must not break the board transition."""
     mgr = get_plugin_manager()

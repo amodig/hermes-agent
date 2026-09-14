@@ -290,7 +290,9 @@ def claim_review_task(
         )
         if run_id is None:
             return None
-        return _kb.get_task(conn, task_id)
+        claimed = _kb.get_task(conn, task_id)
+    _kb._fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
+    return claimed
 
 def release_stale_claims(conn: sqlite3.Connection, *, signal_fn=None) -> int:
     """Reclaim ``running`` tasks whose claim expired; returns the count reclaimed.

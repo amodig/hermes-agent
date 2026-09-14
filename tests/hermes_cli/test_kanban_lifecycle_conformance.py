@@ -862,6 +862,94 @@ class KanbanLifecycleConformance(unittest.TestCase):
         self.assertIsNotNone(kb.get_task(self.conn, implementation))
         self.assertIsNotNone(kb.get_task(self.conn, validation))
 
+    def test_archived_lifecycle_graph_can_be_purged_atomically(self) -> None:
+        implementation = kb.create_task(
+            self.conn,
+            title="purge candidate",
+            assignee="bob",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "alice",
+                "validation_required": True,
+            },
+        )
+        review = kb.create_task(
+            self.conn,
+            title="purge review",
+            assignee="alice",
+            initial_status="blocked",
+            lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
+        )
+        validation = kb.create_task(
+            self.conn,
+            title="purge validation",
+            assignee="tester",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "validation",
+                "candidate_task_id": implementation,
+            },
+        )
+        kb.link_tasks(self.conn, implementation, review, requirement="phase_finished")
+        kb.link_tasks(self.conn, review, validation, requirement="review_approved")
+        for task_id in (implementation, review, validation):
+            self.assertTrue(kb.archive_task(self.conn, task_id))
+
+        self.assertTrue(kb.delete_archived_task(self.conn, implementation))
+        for task_id in (implementation, review, validation):
+            self.assertIsNone(kb.get_task(self.conn, task_id))
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM task_links WHERE parent_id IN (?, ?, ?) "
+                "OR child_id IN (?, ?, ?)",
+                (implementation, review, validation, implementation, review, validation),
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_archived_lifecycle_graph_purge_requires_every_node_archived(self) -> None:
+        implementation = kb.create_task(
+            self.conn,
+            title="partial purge candidate",
+            assignee="bob",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "alice",
+                "validation_required": True,
+            },
+        )
+        review = kb.create_task(
+            self.conn,
+            title="partial purge review",
+            assignee="alice",
+            initial_status="blocked",
+            lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
+        )
+        validation = kb.create_task(
+            self.conn,
+            title="partial purge validation",
+            assignee="tester",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "validation",
+                "candidate_task_id": implementation,
+            },
+        )
+        kb.link_tasks(self.conn, implementation, review, requirement="phase_finished")
+        kb.link_tasks(self.conn, review, validation, requirement="review_approved")
+        self.assertTrue(kb.archive_task(self.conn, implementation))
+        self.assertTrue(kb.archive_task(self.conn, review))
+
+        with self.assertRaises(kb.LifecycleContractError):
+            kb.delete_archived_task(self.conn, implementation)
+        for task_id in (implementation, review, validation):
+            self.assertIsNotNone(kb.get_task(self.conn, task_id))
+
+
 
     def test_embedded_dispatcher_freezes_identity_before_first_tick(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-dispatcher-") as raw_root:

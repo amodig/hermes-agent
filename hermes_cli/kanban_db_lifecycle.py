@@ -829,6 +829,116 @@ def invalidate_descendants_for_parent_reopen(
             _kb._terminate_reclaimed_worker(pid, claim_lock)
     return {"invalidated": invalidated, "terminations": terminations}
 
+def _lifecycle_graph_ids(conn: sqlite3.Connection, task_id: str) -> set[str]:
+    """Return a typed code/role graph and its required acceptance descendants."""
+    seed = conn.execute(
+        "SELECT lifecycle_contract FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if seed is None or seed["lifecycle_contract"] is None:
+        return set()
+
+    contracts = {
+        str(row["id"]): safe_decode_contract(row["lifecycle_contract"])
+        for row in conn.execute(
+            "SELECT id, lifecycle_contract FROM tasks "
+            "WHERE lifecycle_contract IS NOT NULL"
+        )
+    }
+    if contracts.get(task_id) is None:
+        return set()
+
+    graph = {task_id}
+    while True:
+        before = len(graph)
+        candidate_ids = {
+            str(contract["candidate_task_id"])
+            for node_id in graph
+            for contract in (contracts.get(node_id),)
+            if contract
+            and contract.get("kind") in {"review", "validation"}
+            and contract.get("candidate_task_id")
+        }
+        candidate_ids.update(
+            node_id
+            for node_id in graph
+            if contracts.get(node_id)
+            and contracts[node_id].get("kind") == "code"
+        )
+        graph.update(candidate_id for candidate_id in candidate_ids if candidate_id in contracts)
+        graph.update(
+            node_id
+            for node_id, contract in contracts.items()
+            if contract
+            and contract.get("kind") in {"review", "validation"}
+            and str(contract.get("candidate_task_id") or "") in candidate_ids
+        )
+        for edge in conn.execute("SELECT parent_id, child_id FROM task_links"):
+            parent_id, child_id = str(edge["parent_id"]), str(edge["child_id"])
+            if parent_id not in graph and child_id not in graph:
+                continue
+            if not is_required_lifecycle_edge(conn, parent_id, child_id):
+                continue
+            graph.add(parent_id)
+            graph.add(child_id)
+        if len(graph) == before:
+            break
+
+    kinds = {
+        contracts[node_id].get("kind")
+        for node_id in graph
+        if contracts.get(node_id)
+    }
+    if "code" not in kinds or not kinds.intersection({"review", "validation"}):
+        return set()
+    return graph
+
+
+def _delete_archived_lifecycle_graph(
+    conn: sqlite3.Connection, graph_ids: set[str],
+) -> None:
+    """Delete one fully archived typed graph inside the caller's transaction."""
+    ordered_ids = sorted(graph_ids)
+    placeholders = ", ".join("?" for _ in ordered_ids)
+    rows = conn.execute(
+        f"SELECT id, status FROM tasks WHERE id IN ({placeholders})",
+        tuple(ordered_ids),
+    ).fetchall()
+    if len(rows) != len(ordered_ids):
+        raise LifecycleContractError("cannot purge lifecycle graph with a missing task")
+    unarchived = sorted(row["id"] for row in rows if row["status"] != "archived")
+    if unarchived:
+        raise LifecycleContractError(
+            "cannot purge lifecycle graph until every task is archived "
+            f"({', '.join(unarchived)})"
+        )
+
+    required_boundary: set[str] = set()
+    for edge in conn.execute(
+        f"SELECT parent_id, child_id FROM task_links "
+        f"WHERE parent_id IN ({placeholders}) OR child_id IN ({placeholders})",
+        tuple(ordered_ids) * 2,
+    ):
+        parent_id, child_id = str(edge["parent_id"]), str(edge["child_id"])
+        if parent_id in graph_ids and child_id in graph_ids:
+            continue
+        if is_required_lifecycle_edge(conn, parent_id, child_id):
+            required_boundary.add(f"{parent_id}->{child_id}")
+    if required_boundary:
+        raise LifecycleContractError(
+            "cannot purge lifecycle graph with required external edges "
+            f"({', '.join(sorted(required_boundary))})"
+        )
+
+    for node_id in ordered_ids:
+        _kb._delete_task_relations(conn, node_id)
+    deleted = conn.execute(
+        f"DELETE FROM tasks WHERE id IN ({placeholders})",
+        tuple(ordered_ids),
+    )
+    if deleted.rowcount != len(ordered_ids):
+        raise LifecycleContractError("lifecycle graph purge deleted an unexpected task set")
+
+
 def _assert_no_lifecycle_role_references(
     conn: sqlite3.Connection, task_id: str,
 ) -> None:
@@ -875,12 +985,28 @@ def _assert_no_lifecycle_role_references(
             f"({', '.join(sorted(role_ids))})"
         )
 
-def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete an ARCHIVED task (+ related rows); anything else must be
-    archived first so data loss takes two deliberate actions."""
+
+def delete_archived_lifecycle_graph(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Atomically hard-delete a fully archived typed lifecycle graph."""
     with _kb.write_txn(conn):
         if _kb._task_status(conn, task_id) != "archived":
             return False
+        graph_ids = _lifecycle_graph_ids(conn, task_id)
+        if len(graph_ids) <= 1:
+            return False
+        _delete_archived_lifecycle_graph(conn, graph_ids)
+        return True
+
+
+def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Hard-delete an archived task or its fully archived typed lifecycle graph."""
+    with _kb.write_txn(conn):
+        if _kb._task_status(conn, task_id) != "archived":
+            return False
+        graph_ids = _lifecycle_graph_ids(conn, task_id)
+        if len(graph_ids) > 1:
+            _delete_archived_lifecycle_graph(conn, graph_ids)
+            return True
         _assert_no_lifecycle_role_references(conn, task_id)
 
         _kb._delete_task_relations(conn, task_id)

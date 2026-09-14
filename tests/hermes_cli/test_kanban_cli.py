@@ -147,6 +147,51 @@ def test_lifecycle_contract_cli_errors_are_concise(kanban_home, capsys):
     assert "Traceback" not in error
 
 # ---------------------------------------------------------------------------
+
+def test_archive_rm_purges_archived_lifecycle_graph(kanban_home):
+    with kbc.connect() as conn:
+        implementation = kb.create_task(
+            conn,
+            title="cli purge candidate",
+            assignee="builder",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "reviewer",
+                "validation_required": True,
+            },
+        )
+        review = kb.create_task(
+            conn,
+            title="cli purge review",
+            assignee="reviewer",
+            initial_status="blocked",
+            lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
+        )
+        validation = kb.create_task(
+            conn,
+            title="cli purge validation",
+            assignee="tester",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "validation",
+                "candidate_task_id": implementation,
+            },
+        )
+        kb.link_tasks(conn, implementation, review, requirement="phase_finished")
+        kb.link_tasks(conn, review, validation, requirement="review_approved")
+        for task_id in (implementation, review, validation):
+            assert kb.archive_task(conn, task_id)
+
+    output = kc.run_slash(f"archive --rm {implementation} {review} {validation}")
+    assert output.count("Deleted ") == 3
+    with kbc.connect() as conn:
+        assert all(kb.get_task(conn, task_id) is None for task_id in (
+            implementation, review, validation,
+        ))
+
+
 # Integration with the COMMAND_REGISTRY
 # ---------------------------------------------------------------------------
 
