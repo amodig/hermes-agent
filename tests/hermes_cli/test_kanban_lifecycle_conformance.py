@@ -877,7 +877,11 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "completed_at = 123456, result = 'stale' WHERE id = ?",
                 (validation,),
             )
-            self.conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (downstream,))
+            self.conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = 123456, "
+                "result = 'obsolete' WHERE id = ?",
+                (downstream,),
+            )
             self.conn.execute(
                 "INSERT INTO task_links (parent_id, child_id, requirement) VALUES (?, ?, NULL)",
                 (candidate, validation),
@@ -912,7 +916,8 @@ class KanbanLifecycleConformance(unittest.TestCase):
         ).fetchone()
         self.assertEqual(candidate_edge["requirement"], "review_approved")
         self.assertEqual(self._task(downstream).status, "todo")
-        self.assertFalse(kb.evaluate_dependencies(self.conn, downstream)["satisfied"])
+        self.assertIsNone(self._task(downstream).completed_at)
+        self.assertIsNone(self._task(downstream).result)
 
         validation_run = kb.claim_task(self.conn, validation, claimer="tester")
         self.assertIsNotNone(validation_run)
@@ -1736,6 +1741,23 @@ class KanbanLifecycleConformance(unittest.TestCase):
             transitive = root / "site-packages" / "third_party_transitive"
             transitive.mkdir(parents=True)
             (transitive / "__init__.py").write_text("value = 1\n", encoding="utf-8")
+            dynamic = root / "site-packages" / "third_party_dynamic"
+            dynamic.mkdir(parents=True)
+            (dynamic / "__init__.py").write_text("value = 1\n", encoding="utf-8")
+            dynamic_dist = root / "site-packages" / "third-party-dynamic-1.0.dist-info"
+            dynamic_dist.mkdir(parents=True)
+            (dynamic_dist / "METADATA").write_text(
+                "Metadata-Version: 2.1\n"
+                "Name: third-party-dynamic\n"
+                "Version: 1.0\n",
+                encoding="utf-8",
+            )
+            (dynamic_dist / "RECORD").write_text(
+                "third_party_dynamic/__init__.py,,\n"
+                "third-party-dynamic-1.0.dist-info/METADATA,,\n"
+                "third-party-dynamic-1.0.dist-info/RECORD,,\n",
+                encoding="utf-8",
+            )
             lazy_dist = root / "site-packages" / "third-party-lazy-1.0.dist-info"
             lazy_dist.mkdir(parents=True)
             (lazy_dist / "METADATA").write_text(
@@ -1811,12 +1833,28 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "        return importlib.import_module('hermes_cli.plugins').discover()\n"
                 "    def discover_resources(self):\n"
                 "        return importlib.import_module('hermes_cli.plugins').discover_resources()\n"
+                "    def run_dynamic_tool(self):\n"
+                "        return importlib.import_module('tools.registry').dynamic_value()\n"
                 "    def run_lazy_guards(self):\n"
                 "        return (\n"
                 "            importlib.import_module('acp_adapter.edit_approval').value,\n"
                 "            importlib.import_module('tui_gateway.server').value,\n"
                 "            importlib.import_module('third_party_lazy.lazy').value,\n"
                 "        )\n",
+                encoding="utf-8",
+            )
+            (root / "tools" / "registry.py").write_text(
+                "import importlib\n"
+                "from pathlib import Path\n"
+                "def _sdk_importer(module):\n"
+                "    def _import():\n"
+                "        return importlib.import_module(module)\n"
+                "    return _import\n"
+                "_import_dynamic = _sdk_importer('third_party_dynamic')\n"
+                "def discover():\n"
+                "    return sorted(path.name for path in Path(__file__).parent.glob('*.py'))\n"
+                "def dynamic_value():\n"
+                "    return _import_dynamic().value\n",
                 encoding="utf-8",
             )
             (root / "agent" / "turn_runner.py").write_text(
@@ -1836,12 +1874,6 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "        'locale': (root / 'locales' / 'en.yaml').read_text(),\n"
                 "        'optional_mcp': (root / 'optional-mcps' / 'sample' / 'manifest.yaml').read_text(),\n"
                 "    }\n",
-                encoding="utf-8",
-            )
-            (root / "tools" / "registry.py").write_text(
-                "from pathlib import Path\n"
-                "def discover():\n"
-                "    return sorted(path.name for path in Path(__file__).parent.glob('*.py'))\n",
                 encoding="utf-8",
             )
             receipt = root / "receipt.json"
@@ -1870,6 +1902,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "runtime.worker_bootstrap_post_import(wait_for_grant=False); "
                 "assert (runtime._FROZEN_IMPORT_ROOT / '.third-party' / '0' / 'third-party-lazy-1.0.dist-info' / 'METADATA').is_file(); "
                 "assert (runtime._FROZEN_IMPORT_ROOT / '.third-party' / '0' / 'third_party_transitive' / '__init__.py').is_file(); "
+                "assert (runtime._FROZEN_IMPORT_ROOT / '.third-party' / '0' / 'third_party_dynamic' / '__init__.py').is_file(); "
                 "assert not (runtime._FROZEN_IMPORT_ROOT / '.third-party' / '0' / 'third_party_unused').exists(); "
                 "agent = importlib.import_module('run_agent').AIAgent(); "
                 "(root / 'cli.py').write_text('def main():\\n    return 2\\n', encoding='utf-8'); "
@@ -1886,6 +1919,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "(root / 'optional-mcps' / 'sample' / 'manifest.yaml').write_text('changed\\n', encoding='utf-8'); "
                 "(root / 'acp_adapter' / 'edit_approval.py').write_text('value = 2\\n', encoding='utf-8'); "
                 "(root / 'site-packages' / 'third_party_transitive' / '__init__.py').write_text('value = 2\\n', encoding='utf-8'); "
+                "(root / 'site-packages' / 'third_party_dynamic' / '__init__.py').write_text('value = 2\\n', encoding='utf-8'); "
                 "(root / 'tui_gateway' / 'server.py').write_text('value = 2\\n', encoding='utf-8'); "
                 "(root / 'site-packages' / 'third_party_lazy' / 'lazy.py').write_text('value = 2\\n', encoding='utf-8'); "
                 "turn_value = agent.run_conversation(); "
@@ -1893,10 +1927,11 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "discovered_plugins = agent.discover_plugins(); "
                 "discovered_resources = agent.discover_resources(); "
                 "lazy_values = agent.run_lazy_guards(); "
+                "dynamic_value = agent.run_dynamic_tool(); "
                 "result = importlib.import_module('cli').main(); "
                 "agent_value = importlib.import_module('agent.agent_init').value; "
                 "tracker_value = importlib.import_module('agent.credits_tracker').value; "
-                "receipt.write_text(json.dumps({'result': result, 'turn_value': turn_value, 'discovered_tools': discovered_tools, 'discovered_plugins': discovered_plugins, 'discovered_resources': discovered_resources, 'lazy_values': lazy_values, 'agent_value': agent_value, 'tracker_value': tracker_value, 'constructor_value': agent.value}), encoding='utf-8')"
+                "receipt.write_text(json.dumps({'result': result, 'turn_value': turn_value, 'discovered_tools': discovered_tools, 'discovered_plugins': discovered_plugins, 'discovered_resources': discovered_resources, 'lazy_values': lazy_values, 'dynamic_value': dynamic_value, 'agent_value': agent_value, 'tracker_value': tracker_value, 'constructor_value': agent.value}), encoding='utf-8')"
             )
             env = os.environ.copy()
             env["PYTHONPATH"] = str(RUNTIME_ROOT)
@@ -1910,7 +1945,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(
                 json.loads(receipt.read_text(encoding="utf-8")),
-                {"result": 1, "turn_value": 1, "discovered_tools": ["__init__.py", "module.py", "registry.py"], "discovered_plugins": ["plugin.yaml"], "discovered_resources": {"skill": "other skill\n", "description": "category\n", "optional_skill": "optional skill\n", "locale": "locale: en\n", "optional_mcp": "name: optional\n"}, "lazy_values": [1, 1, 1], "agent_value": 1, "tracker_value": 1, "constructor_value": 1},
+                {"result": 1, "turn_value": 1, "discovered_tools": ["__init__.py", "module.py", "registry.py"], "discovered_plugins": ["plugin.yaml"], "discovered_resources": {"skill": "other skill\n", "description": "category\n", "optional_skill": "optional skill\n", "locale": "locale: en\n", "optional_mcp": "name: optional\n"}, "lazy_values": [1, 1, 1], "dynamic_value": 1, "agent_value": 1, "tracker_value": 1, "constructor_value": 1},
             )
 
     @unittest.skipUnless(os.name == "posix", "executable modes are POSIX-specific")

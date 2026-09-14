@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import ast
 import atexit
+import hashlib
 import importlib.metadata as importlib_metadata
 import importlib.util
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -352,7 +352,11 @@ def _runtime_lazy_import_names(members: Mapping[str, Path]) -> frozenset[str]:
                     and function.value.id == "importlib"
                 )
                 is_import = isinstance(function, ast.Name) and function.id == "__import__"
-                if is_import_module or is_import:
+                is_lazy_importer = (
+                    isinstance(function, ast.Name)
+                    and function.id in {"_sdk_importer", "_import_sdk_names"}
+                )
+                if is_import_module or is_import or is_lazy_importer:
                     value = node.args[0]
                     if isinstance(value, ast.Constant) and isinstance(value.value, str):
                         names.add(value.value.partition(".")[0])

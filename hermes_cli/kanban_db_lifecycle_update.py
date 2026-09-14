@@ -293,11 +293,6 @@ def _build_update_plan(
                 "UPDATE task_links SET requirement = ? WHERE parent_id = ? AND child_id = ?",
                 (requirement, edge["parent_id"], edge["child_id"]),
             )
-            if not _parents_satisfied(conn, edge["child_id"]):
-                conn.execute(
-                    "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
-                    (edge["child_id"],),
-                )
             other_task_id = (
                 edge["child_id"] if edge["parent_id"] == row["id"] else edge["parent_id"]
             )
@@ -474,7 +469,15 @@ def _persist_update(
         )
         goal_revision_id = int(goal_cur.lastrowid)
         changed_fields.append("goal_revision")
-    if plan.goal_reopened:
+    if (
+        plan.goal_reopened
+        or plan.lifecycle_reopened
+        or (
+            plan.lifecycle_changed
+            and plan.rebound_edges
+            and plan.new_status not in {"done", "archived"}
+        )
+    ):
         invalidation = _invalidate_descendants_for_parent_reopen(
             conn, task_id, author=actor,
         )
