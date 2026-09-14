@@ -2279,6 +2279,7 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
     cmd = _trusted_module_hermes_argv(_resolve_hermes_argv())
     cmd.extend([
+        "-p", profile_arg,
         # A worker must NEVER boot the interactive TUI: its no-TTY bail-out
         # exits 0 without doing the task → "protocol violation" every attempt.
         "--cli",
