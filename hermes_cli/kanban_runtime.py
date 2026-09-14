@@ -27,6 +27,7 @@ import uuid
 RUNTIME_IDENTITY_PROTOCOL = 1
 _BOOTSTRAP_TIMEOUT_SECONDS = 10.0
 _IDENTITY_ROOTS = ("hermes_cli", "tools", "agent", "gateway", "plugins", "providers", "cron")
+_RUNTIME_RESOURCE_ROOTS = ("skills", "optional-skills", "locales", "optional-mcps")
 _IDENTITY_ASSETS = ("skills/devops/sdlc-review/SKILL.md",)
 _BOOTSTRAP_INPUT_ENV = (
     "HERMES_KANBAN_BOOTSTRAP_PATH",
@@ -173,6 +174,18 @@ def _remove_frozen_import_root(path: Path) -> None:
     shutil.rmtree(path, ignore_errors=True)
 
 
+def cleanup_runtime_snapshot(path: Optional[os.PathLike[str] | str]) -> None:
+    """Remove a worker snapshot path previously emitted by this module."""
+    if not path:
+        return
+    snapshot = Path(path).resolve()
+    if (
+        snapshot.parent != Path(tempfile.gettempdir()).resolve()
+        or not snapshot.name.startswith("hermes-kanban-runtime-")
+    ):
+        return
+    _remove_frozen_import_root(snapshot)
+
 def _freeze_runtime_import_root(root: Path) -> Path:
     """Serve future runtime imports from a pre-grant source snapshot."""
     global _FROZEN_IMPORT_ROOT
@@ -183,10 +196,12 @@ def _freeze_runtime_import_root(root: Path) -> Path:
     for path in root.glob("*.py"):
         if path.is_file():
             members[path.name] = path
-    for directory in _IDENTITY_ROOTS:
+    for directory in (*_IDENTITY_ROOTS, *_RUNTIME_RESOURCE_ROOTS):
         base = root / directory
         if not base.is_dir():
-            raise RuntimeIdentityError(f"runtime identity directory is missing: {directory}")
+            if directory in _IDENTITY_ROOTS:
+                raise RuntimeIdentityError(f"runtime identity directory is missing: {directory}")
+            continue
         for path in base.rglob("*"):
             relative = path.relative_to(root)
             if path.is_file() and not any(
@@ -510,7 +525,7 @@ def worker_bootstrap_post_import(*, wait_for_grant: bool = True) -> Optional[dic
     expected = decode_identity(expected_raw)
     # Snapshot every runtime source file before the final grant. Lazy turn and
     # tool imports then resolve from this immutable filesystem snapshot, not a mutable checkout.
-    _freeze_runtime_import_root(_module_root())
+    snapshot_root = _freeze_runtime_import_root(_module_root())
     # ``main.py`` and ``cli.py`` defer these imports to keep ordinary CLI
     # startup cheap. Workers must load them before the final identity check;
     # otherwise an update can replace their source after this handshake and
@@ -527,6 +542,7 @@ def worker_bootstrap_post_import(*, wait_for_grant: bool = True) -> Optional[dic
         "post_import": True,
         "preparation_id": preparation_id,
         "runtime_identity": actual.as_dict(),
+        "runtime_snapshot": str(snapshot_root),
     }
     _atomic_write(Path(path_raw), payload)
     if wait_for_grant:

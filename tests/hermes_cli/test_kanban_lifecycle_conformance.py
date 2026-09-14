@@ -1107,6 +1107,16 @@ class KanbanLifecycleConformance(unittest.TestCase):
             skill = root / "skills" / "devops" / "sdlc-review" / "SKILL.md"
             skill.parent.mkdir(parents=True)
             skill.write_text("review instructions\n", encoding="utf-8")
+            resource_files = {
+                root / "skills" / "other" / "SKILL.md": "other skill\n",
+                root / "skills" / "category" / "DESCRIPTION.md": "category\n",
+                root / "optional-skills" / "optional" / "SKILL.md": "optional skill\n",
+                root / "locales" / "en.yaml": "locale: en\n",
+                root / "optional-mcps" / "sample" / "manifest.yaml": "name: optional\n",
+            }
+            for path, content in resource_files.items():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
             (root / "cli.py").write_text(
                 "def main():\n    return 1\n",
                 encoding="utf-8",
@@ -1146,7 +1156,9 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "    def discover_tools(self):\n"
                 "        return importlib.import_module('tools.registry').discover()\n"
                 "    def discover_plugins(self):\n"
-                "        return importlib.import_module('hermes_cli.plugins').discover()\n",
+                "        return importlib.import_module('hermes_cli.plugins').discover()\n"
+                "    def discover_resources(self):\n"
+                "        return importlib.import_module('hermes_cli.plugins').discover_resources()\n",
                 encoding="utf-8",
             )
             (root / "agent" / "turn_runner.py").write_text(
@@ -1156,7 +1168,16 @@ class KanbanLifecycleConformance(unittest.TestCase):
             (root / "hermes_cli" / "plugins.py").write_text(
                 "from pathlib import Path\n"
                 "def discover():\n"
-                "    return sorted(path.name for path in (Path(__file__).parent.parent / 'plugins').glob('*/plugin.yaml'))\n",
+                "    return sorted(path.name for path in (Path(__file__).parent.parent / 'plugins').glob('*/plugin.yaml'))\n"
+                "def discover_resources():\n"
+                "    root = Path(__file__).parent.parent\n"
+                "    return {\n"
+                "        'skill': (root / 'skills' / 'other' / 'SKILL.md').read_text(),\n"
+                "        'description': (root / 'skills' / 'category' / 'DESCRIPTION.md').read_text(),\n"
+                "        'optional_skill': (root / 'optional-skills' / 'optional' / 'SKILL.md').read_text(),\n"
+                "        'locale': (root / 'locales' / 'en.yaml').read_text(),\n"
+                "        'optional_mcp': (root / 'optional-mcps' / 'sample' / 'manifest.yaml').read_text(),\n"
+                "    }\n",
                 encoding="utf-8",
             )
             (root / "tools" / "registry.py").write_text(
@@ -1194,13 +1215,19 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "(root / 'agent' / 'turn_runner.py').write_text('value = 2\\n', encoding='utf-8'); "
                 "(root / 'tools' / 'registry.py').write_text('def discover():\\n    return [\"changed\"]\\n', encoding='utf-8'); "
                 "(root / 'plugins' / 'sample' / 'plugin.yaml').write_text('name: changed\\n', encoding='utf-8'); "
+                "(root / 'skills' / 'other' / 'SKILL.md').write_text('changed\\n', encoding='utf-8'); "
+                "(root / 'skills' / 'category' / 'DESCRIPTION.md').write_text('changed\\n', encoding='utf-8'); "
+                "(root / 'optional-skills' / 'optional' / 'SKILL.md').write_text('changed\\n', encoding='utf-8'); "
+                "(root / 'locales' / 'en.yaml').write_text('changed\\n', encoding='utf-8'); "
+                "(root / 'optional-mcps' / 'sample' / 'manifest.yaml').write_text('changed\\n', encoding='utf-8'); "
                 "turn_value = agent.run_conversation(); "
                 "discovered_tools = agent.discover_tools(); "
                 "discovered_plugins = agent.discover_plugins(); "
+                "discovered_resources = agent.discover_resources(); "
                 "result = importlib.import_module('cli').main(); "
                 "agent_value = importlib.import_module('agent.agent_init').value; "
                 "tracker_value = importlib.import_module('agent.credits_tracker').value; "
-                "receipt.write_text(json.dumps({'result': result, 'turn_value': turn_value, 'discovered_tools': discovered_tools, 'discovered_plugins': discovered_plugins, 'agent_value': agent_value, 'tracker_value': tracker_value, 'constructor_value': agent.value}), encoding='utf-8')"
+                "receipt.write_text(json.dumps({'result': result, 'turn_value': turn_value, 'discovered_tools': discovered_tools, 'discovered_plugins': discovered_plugins, 'discovered_resources': discovered_resources, 'agent_value': agent_value, 'tracker_value': tracker_value, 'constructor_value': agent.value}), encoding='utf-8')"
             )
             env = os.environ.copy()
             env["PYTHONPATH"] = str(ROOT)
@@ -1214,8 +1241,19 @@ class KanbanLifecycleConformance(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(
                 json.loads(receipt.read_text(encoding="utf-8")),
-                {"result": 1, "turn_value": 1, "discovered_tools": ["__init__.py", "module.py", "registry.py"], "discovered_plugins": ["plugin.yaml"], "agent_value": 1, "tracker_value": 1, "constructor_value": 1},
+                {"result": 1, "turn_value": 1, "discovered_tools": ["__init__.py", "module.py", "registry.py"], "discovered_plugins": ["plugin.yaml"], "discovered_resources": {"skill": "other skill\n", "description": "category\n", "optional_skill": "optional skill\n", "locale": "locale: en\n", "optional_mcp": "name: optional\n"}, "agent_value": 1, "tracker_value": 1, "constructor_value": 1},
             )
+
+    def test_reaped_worker_removes_runtime_snapshot(self) -> None:
+        snapshot = Path(tempfile.mkdtemp(prefix="hermes-kanban-runtime-"))
+        worker_pid = 2_147_483_000
+        try:
+            kbd._worker_runtime_snapshots[worker_pid] = snapshot
+            kbd._record_worker_exit(worker_pid, 0)
+            self.assertFalse(snapshot.exists())
+        finally:
+            kbd._worker_runtime_snapshots.pop(worker_pid, None)
+            kbd._recent_worker_exits.pop(worker_pid, None)
 
     def test_embedded_dispatcher_freezes_identity_before_first_tick(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-dispatcher-") as raw_root:

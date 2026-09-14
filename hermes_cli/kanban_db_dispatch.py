@@ -166,11 +166,19 @@ Without this registry a fenced worker can outlive ``_default_spawn``'s local
 handle; ``Popen.__del__`` then warns while the worker is still legitimately
 running.
 """
+_worker_runtime_snapshots: "dict[int, Path]" = {}
+"""Filesystem snapshots retained until their launcher process is reaped."""
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
     """Record a reaped worker exit under its verified Hermes PID."""
     launcher_pid = int(pid)
+    snapshot = _worker_runtime_snapshots.pop(launcher_pid, None)
+    if snapshot is not None:
+        with contextlib.suppress(Exception):
+            from hermes_cli.kanban_runtime import cleanup_runtime_snapshot
+
+            cleanup_runtime_snapshot(snapshot)
     worker_pid = _worker_pid_aliases.pop(launcher_pid, launcher_pid)
     process = _worker_processes.pop(launcher_pid, None)
     if process is not None and getattr(process, "returncode", None) is None:
@@ -2422,6 +2430,7 @@ def _default_spawn(
 
     from hermes_cli.kanban_runtime import (
         assert_runtime_import_root,
+        cleanup_runtime_snapshot,
         decode_identity,
         encode_identity,
         prospective_identity,
@@ -2449,6 +2458,7 @@ def _default_spawn(
     )
     log_f = _open_worker_log(task, board)
     proc = None
+    snapshot_path: Optional[Path] = None
 
     def _close_resources() -> None:
         with contextlib.suppress(Exception):
@@ -2460,6 +2470,7 @@ def _default_spawn(
             log_f.close()
 
     def _cancel() -> None:
+        nonlocal snapshot_path
         with contextlib.suppress(Exception):
             if proc is not None:
                 proc.terminate()
@@ -2469,6 +2480,10 @@ def _default_spawn(
         if proc is not None and proc.poll() is not None:
             _worker_pid_aliases.pop(proc.pid, None)
             _worker_processes.pop(proc.pid, None)
+            snapshot = _worker_runtime_snapshots.pop(proc.pid, None) or snapshot_path
+            with contextlib.suppress(Exception):
+                cleanup_runtime_snapshot(snapshot)
+            snapshot_path = None
         _close_resources()
 
     try:
@@ -2537,8 +2552,13 @@ def _default_spawn(
         actual = verify_worker_ready(
             post_payload, expected_identity, pid=ready_pid, preparation_id=preparation_id,
         )
+        raw_snapshot = post_payload.get("runtime_snapshot")
+        if isinstance(raw_snapshot, str) and raw_snapshot:
+            snapshot_path = Path(raw_snapshot)
         _worker_processes[proc.pid] = proc
         _worker_pid_aliases[proc.pid] = actual.pid
+        if snapshot_path is not None:
+            _worker_runtime_snapshots[proc.pid] = snapshot_path
         def _grant(run_id: int, claim_lock: Optional[str]) -> None:
             if proc is None or proc.stdin is None:
                 raise RuntimeError("worker bootstrap pipe unavailable")
