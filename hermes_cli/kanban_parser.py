@@ -253,8 +253,8 @@ _SPECS = [
         _arg("--author", help=argparse.SUPPRESS),
         _json_flag(help="Emit JSON output"),
         _arg("--lifecycle-contract",
-             help="JSON lifecycle contract to bind or replace; historical NULL contracts "
-                  "must be bound explicitly."),
+             help="JSON lifecycle contract to bind a historical NULL contract; "
+                  "classification must be supplied at task creation."),
     ], help="Atomically revise a task with optimistic concurrency"),
     _cmd("assign", [_TASK_ID, _arg("profile", help="Profile name (or 'none' to unassign)")],
          help="Assign or reassign a task"),

@@ -410,6 +410,102 @@ def test_typed_same_card_rework_rejects_newer_review_handoff(kanban_home, tmp_pa
 
         assert kb.get_task(conn, implementation).status == "review"
 
+def test_typed_same_card_rework_rechecks_evidence_inside_transaction(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo, base, _branch = _repo(tmp_path)
+    with kbc.connect_closing() as conn:
+        implementation = kb.create_task(
+            conn,
+            title="racing same-card implementation",
+            assignee="implementer",
+            initial_status="blocked",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "same_card",
+                "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        )
+        assert kb.unblock_task(conn, implementation)
+        first_run = kb.claim_task(conn, implementation, claimer="implementer:1")
+        assert first_run is not None
+        first_head = _commit(repo, "src/first.py")
+        assert kb.complete_task(
+            conn,
+            implementation,
+            expected_run_id=first_run.current_run_id,
+            metadata={"base_sha": base, "head_sha": first_head},
+        )
+        review_run = kb.claim_review_task(conn, implementation, claimer="reviewer:1")
+        assert review_run is not None
+        assert kb.complete_task(
+            conn,
+            implementation,
+            expected_run_id=review_run.current_run_id,
+            verdict="REQUEST_CHANGES",
+            summary="repair required",
+            metadata={"reviewed_head_sha": first_head},
+        )
+        task = kb.get_task(conn, implementation)
+        assert task is not None
+
+        expected_version = task.version
+
+        import hermes_cli.kanban_db_lifecycle_rework as rework
+
+        original_implementation_routing = rework._implementation_routing
+        raced = False
+        second_review = None
+
+        def racing_implementation_routing(connection, task_id):
+            nonlocal raced, second_review
+            routing = original_implementation_routing(connection, task_id)
+            if not raced:
+                raced = True
+                second_run = kb.claim_task(conn, implementation, claimer="implementer:2")
+                assert second_run is not None
+                second_head = _commit(repo, "src/second.py")
+                assert kb.complete_task(
+                    conn,
+                    implementation,
+                    expected_run_id=second_run.current_run_id,
+                    metadata={"base_sha": base, "head_sha": second_head},
+                )
+                second_review = kb.claim_review_task(
+                    conn, implementation, claimer="reviewer:2"
+                )
+                assert second_review is not None
+                assert kb.complete_task(
+                    conn,
+                    implementation,
+                    expected_run_id=second_review.current_run_id,
+                    verdict="REQUEST_CHANGES",
+                    summary="second repair required",
+                    metadata={"reviewed_head_sha": second_head},
+                )
+            return routing
+
+        monkeypatch.setattr(
+            rework, "_implementation_routing", racing_implementation_routing
+        )
+        with pytest.raises(ValueError, match="evidence changed"):
+            kb.rework_review_graph(
+                conn,
+                implementation,
+                expected_implementation_version=expected_version,
+                reason="reject stale rework request",
+            )
+        current = kb.get_task(conn, implementation)
+        assert current is not None
+        assert raced
+        assert second_review is not None
+        assert current.status == "ready"
+        assert current.current_run_id is None
+        assert current.version == expected_version
+
 
 def test_separate_reviewer_requires_explicit_approval(kanban_home, tmp_path):
     repo, base, branch = _repo(tmp_path)

@@ -1289,9 +1289,21 @@ class KanbanLifecycleConformance(unittest.TestCase):
             skill = root / "skills" / "devops" / "sdlc-review" / "SKILL.md"
             skill.parent.mkdir(parents=True)
             skill.write_text("review instructions v1\n", encoding="utf-8")
+            locale = root / "locales" / "en.yaml"
+            locale.parent.mkdir(parents=True)
+            locale.write_text("locale: v1\n", encoding="utf-8")
+            plugin_manifest = root / "plugins" / "sample" / "plugin.yaml"
+            plugin_manifest.parent.mkdir(parents=True)
+            plugin_manifest.write_text("name: v1\n", encoding="utf-8")
 
             before = _fingerprint(root)
             skill.write_text("review instructions v2\n", encoding="utf-8")
+            self.assertNotEqual(before, _fingerprint(root))
+            before = _fingerprint(root)
+            locale.write_text("locale: v2\n", encoding="utf-8")
+            self.assertNotEqual(before, _fingerprint(root))
+            before = _fingerprint(root)
+            plugin_manifest.write_text("name: v2\n", encoding="utf-8")
             self.assertNotEqual(before, _fingerprint(root))
             bundled_root = root / "packaged-skills"
             bundled_skill = bundled_root / "devops" / "sdlc-review" / "SKILL.md"

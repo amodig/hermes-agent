@@ -192,24 +192,7 @@ def _freeze_runtime_import_root(root: Path) -> Path:
     if _FROZEN_IMPORT_ROOT is not None:
         return _FROZEN_IMPORT_ROOT
     root = root.resolve()
-    members: dict[str, Path] = {}
-    for path in root.glob("*.py"):
-        if path.is_file():
-            members[path.name] = path
-    for directory in (*_IDENTITY_ROOTS, *_RUNTIME_RESOURCE_ROOTS):
-        base = root / directory
-        if not base.is_dir():
-            if directory in _IDENTITY_ROOTS:
-                raise RuntimeIdentityError(f"runtime identity directory is missing: {directory}")
-            continue
-        for path in base.rglob("*"):
-            relative = path.relative_to(root)
-            if path.is_file() and not any(
-                part.startswith(".") or part == "__pycache__" for part in relative.parts
-            ):
-                members[relative.as_posix()] = path
-    for asset in _IDENTITY_ASSETS:
-        members[asset] = _identity_asset_path(root, asset)
+    members = _runtime_snapshot_members(root)
     snapshot_root = Path(tempfile.mkdtemp(prefix="hermes-kanban-runtime-")).resolve()
     try:
         for name, path in sorted(members.items()):
@@ -250,32 +233,32 @@ def _identity_asset_path(root: Path, asset: str) -> Path:
                 return path
     raise RuntimeIdentityError(f"runtime identity asset is missing: {asset}")
 
-def _fingerprint(root: Path) -> str:
-    digest = hashlib.sha256()
-    relatives: list[Path] = []
-    asset_paths: dict[Path, Path] = {}
-    relatives.extend(
-        path.relative_to(root)
-        for path in root.glob("*.py")
-        if path.is_file()
-    )
-    for directory in _IDENTITY_ROOTS:
+def _runtime_snapshot_members(root: Path) -> dict[str, Path]:
+    root = root.resolve()
+    members: dict[str, Path] = {}
+    for path in root.glob("*.py"):
+        if path.is_file():
+            members[path.name] = path
+    for directory in (*_IDENTITY_ROOTS, *_RUNTIME_RESOURCE_ROOTS):
         base = root / directory
         if not base.is_dir():
-            raise RuntimeIdentityError(f"runtime identity directory is missing: {directory}")
-        relatives.extend(
-            path.relative_to(root)
-            for path in base.rglob("*.py")
-            if path.is_file()
-            and not any(part.startswith(".") or part == "__pycache__" for part in path.parts)
-        )
+            if directory in _IDENTITY_ROOTS:
+                raise RuntimeIdentityError(f"runtime identity directory is missing: {directory}")
+            continue
+        for path in base.rglob("*"):
+            relative = path.relative_to(root)
+            if path.is_file() and not any(
+                part.startswith(".") or part == "__pycache__" for part in relative.parts
+            ):
+                members[relative.as_posix()] = path
     for asset in _IDENTITY_ASSETS:
-        relative = Path(asset)
-        asset_paths[relative] = _identity_asset_path(root, asset)
-        relatives.append(relative)
-    for relative in sorted(set(relatives), key=lambda value: value.as_posix()):
-        path = asset_paths.get(relative, root / relative)
-        digest.update(relative.as_posix().encode("utf-8"))
+        members[asset] = _identity_asset_path(root, asset)
+    return members
+
+def _fingerprint(root: Path) -> str:
+    digest = hashlib.sha256()
+    for name, path in sorted(_runtime_snapshot_members(root).items()):
+        digest.update(name.encode("utf-8"))
         digest.update(b"\0")
         digest.update(path.read_bytes())
         digest.update(b"\0")
@@ -526,6 +509,8 @@ def worker_bootstrap_post_import(*, wait_for_grant: bool = True) -> Optional[dic
     # Snapshot every runtime source file before the final grant. Lazy turn and
     # tool imports then resolve from this immutable filesystem snapshot, not a mutable checkout.
     snapshot_root = _freeze_runtime_import_root(_module_root())
+    if _fingerprint(snapshot_root) != expected.fingerprint:
+        raise RuntimeIdentityError("runtime snapshot changed during startup")
     # ``main.py`` and ``cli.py`` defer these imports to keep ordinary CLI
     # startup cheap. Workers must load them before the final identity check;
     # otherwise an update can replace their source after this handshake and

@@ -146,6 +146,18 @@ def test_lifecycle_contract_cli_errors_are_concise(kanban_home, capsys):
     assert "reviewer must differ from the implementation assignee" in error
     assert "Traceback" not in error
 
+def test_lifecycle_contract_help_describes_legacy_binding_only(capsys):
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    kc.build_parser(parser.add_subparsers(dest="command"))
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["kanban", "update", "--help"])
+    help_text = " ".join(capsys.readouterr().out.split())
+
+    assert "bind a historical NULL contract" in help_text
+    assert "classification must be supplied at task creation" in help_text
+    assert "bind or replace" not in help_text
+
 # ---------------------------------------------------------------------------
 
 def test_archive_rm_purges_archived_lifecycle_graph(kanban_home):

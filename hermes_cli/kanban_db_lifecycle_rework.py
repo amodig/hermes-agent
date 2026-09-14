@@ -132,37 +132,60 @@ def _typed_rework_graph(
             return prior_result
         raise ValueError("rework_fingerprint_conflict: stored result is malformed")
 
-    acceptance_before = _capture_acceptance(conn, implementation_id)
-    review_state = get_lifecycle_state(conn, actual_reviewer_id)
-    validation_state = (
-        get_lifecycle_state(conn, actual_tester_id) if actual_tester_id else None
-    )
-    if review_state.get("review_verdict") != "REQUEST_CHANGES" and not (
-        validation_state and validation_state.get("validation_verdict") == "FAIL"
-    ):
-        raise ValueError("typed rework requires REQUEST_CHANGES or FAIL evidence")
-    review_diagnostics = set(review_state.get("diagnostics") or ())
-    allowed_same_card_rework = (
-        same_card
-        and review_state.get("review_verdict") == "REQUEST_CHANGES"
-        and review_diagnostics <= {"candidate_missing"}
-    )
-    if (
-        (review_diagnostics and not allowed_same_card_rework)
-        or (validation_state and validation_state.get("diagnostics"))
-    ):
-        raise ValueError("typed rework evidence is stale or malformed")
-    rejected_head = None
-    for evidence in conn.execute(
-        "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC",
-        (implementation_id,),
-    ).fetchall():
-        lifecycle = _kb._json_dict(evidence["metadata"]).get("lifecycle")
-        if isinstance(lifecycle, dict) and lifecycle.get("head_sha"):
-            rejected_head = str(lifecycle["head_sha"]).strip()
-            break
-    if not rejected_head:
-        raise ValueError("typed rework requires an immutable rejected implementation head")
+    def _validated_evidence() -> tuple[dict[str, Any], Optional[dict[str, Any]], str]:
+        review_state = get_lifecycle_state(conn, actual_reviewer_id)
+        validation_state = (
+            get_lifecycle_state(conn, actual_tester_id) if actual_tester_id else None
+        )
+        if review_state.get("review_verdict") != "REQUEST_CHANGES" and not (
+            validation_state and validation_state.get("validation_verdict") == "FAIL"
+        ):
+            raise ValueError("typed rework requires REQUEST_CHANGES or FAIL evidence")
+        review_diagnostics = set(review_state.get("diagnostics") or ())
+        allowed_same_card_rework = (
+            same_card
+            and review_state.get("review_verdict") == "REQUEST_CHANGES"
+            and review_diagnostics <= {"candidate_missing"}
+        )
+        if (
+            (review_diagnostics and not allowed_same_card_rework)
+            or (validation_state and validation_state.get("diagnostics"))
+        ):
+            raise ValueError("typed rework evidence is stale or malformed")
+        rejected_head = None
+        for evidence in conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC",
+            (implementation_id,),
+        ).fetchall():
+            lifecycle = _kb._json_dict(evidence["metadata"]).get("lifecycle")
+            if isinstance(lifecycle, dict) and lifecycle.get("head_sha"):
+                rejected_head = str(lifecycle["head_sha"]).strip()
+                break
+        if not rejected_head:
+            raise ValueError("typed rework requires an immutable rejected implementation head")
+        return review_state, validation_state, rejected_head
+
+    def _evidence_key(
+        evidence: tuple[dict[str, Any], Optional[dict[str, Any]], str],
+    ) -> tuple[Any, ...]:
+        review_state, validation_state, rejected_head = evidence
+
+        def _state_key(state: Optional[dict[str, Any]]) -> Optional[tuple[Any, ...]]:
+            if state is None:
+                return None
+            return (
+                state.get("head_sha"),
+                state.get("candidate_run_id"),
+                state.get("review_verdict"),
+                state.get("validation_verdict"),
+                state.get("acceptance"),
+                tuple(state.get("diagnostics") or ()),
+            )
+
+        return _state_key(review_state), _state_key(validation_state), rejected_head
+
+    evidence_before = _validated_evidence()
+    rejected_head = evidence_before[2]
 
     implementation_assignee = None
     if same_card:
@@ -203,6 +226,11 @@ def _typed_rework_graph(
                     f"task {task_id} update conflict: expected version {expected_version}, "
                     f"current version {row['version']}"
                 )
+        current_evidence = _validated_evidence()
+        if _evidence_key(current_evidence) != _evidence_key(evidence_before):
+            raise ValueError("typed rework evidence changed during update")
+        acceptance_before = _capture_acceptance(conn, implementation_id)
+        rejected_head = current_evidence[2]
         descendants = conn.execute(
             """
             WITH RECURSIVE graph(id) AS (
