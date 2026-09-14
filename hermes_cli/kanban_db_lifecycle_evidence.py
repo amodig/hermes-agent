@@ -170,27 +170,25 @@ def _emit_acceptance_changes(
 ) -> list[str]:
     if not before:
         return []
-    changes: list[tuple[str, str, str, str, Any]] = []
-    for task_id, old in before.items():
-        projection = get_lifecycle_state(conn, task_id)
-        new = projection.get("acceptance", "unclassified")
-        if new != old:
-            phase = (
-                "validation"
-                if projection.get("validation_verdict") is not None
-                else "review"
-                if projection.get("review_verdict") is not None
-                else "implementation"
-            )
-            result = (
-                projection.get("validation_verdict")
-                or projection.get("review_verdict")
-                or projection.get("execution_outcome")
-            )
-            changes.append((task_id, old, new, phase, result))
-    if not changes:
-        return []
     with _kb.write_txn(conn):
+        changes: list[tuple[str, str, str, str, Any]] = []
+        for task_id, old in before.items():
+            projection = get_lifecycle_state(conn, task_id)
+            new = projection.get("acceptance", "unclassified")
+            if new != old:
+                phase = (
+                    "validation"
+                    if projection.get("validation_verdict") is not None
+                    else "review"
+                    if projection.get("review_verdict") is not None
+                    else "implementation"
+                )
+                result = (
+                    projection.get("validation_verdict")
+                    or projection.get("review_verdict")
+                    or projection.get("execution_outcome")
+                )
+                changes.append((task_id, old, new, phase, result))
         for task_id, old, new, phase, result in changes:
             _kb._append_event(
                 conn,

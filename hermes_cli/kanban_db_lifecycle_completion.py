@@ -611,7 +611,7 @@ def complete_task(
         _kb._cleanup_workspace(conn, task_id)
         if (
             fire_lifecycle_hook
-            and acceptance == "accepted"
+            and acceptance in {"accepted", "not_applicable"}
             and (typed_phase != "review" or direct_hook_run_id is not None)
         ):
             _kb._fire_task_hook(

@@ -8,12 +8,16 @@ and that a misbehaving hook callback never breaks the transition.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import threading
+from unittest.mock import patch
 
 import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_lifecycle_evidence as evidence
 from hermes_cli.plugins import VALID_HOOKS, get_plugin_manager
 
 
@@ -90,6 +94,93 @@ def test_review_claim_fires_hook(kanban_home, captured_hooks):
     assert len(fired) == 1
     assert fired[0][1]["task_id"] == task_id
     assert fired[0][1]["assignee"] == "reviewer"
+
+def test_general_completion_fires_hook(kanban_home, captured_hooks):
+    conn = kbc.connect()
+    try:
+        task_id = kb.create_task(conn, title="general", assignee="worker")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        assert kb.complete_task(conn, task_id, summary="done") is True
+    finally:
+        conn.close()
+
+    completed = [
+        event
+        for event in captured_hooks
+        if event[0] == "kanban_task_completed"
+    ]
+    assert len(completed) == 1
+    assert completed[0][1]["task_id"] == task_id
+    assert completed[0][1]["run_id"] == claimed.current_run_id
+
+def test_acceptance_event_projection_holds_write_lock(kanban_home):
+    conn = kbc.connect()
+    writer_start = threading.Event()
+    writer_acquired = threading.Event()
+    writer_done = threading.Event()
+    writer_errors = []
+    try:
+        task_id = kb.create_task(conn, title="race", assignee="worker")
+
+        def mutate_task():
+            competing = kbc.connect()
+            try:
+                writer_start.wait(timeout=5)
+                with kbc.write_txn(competing):
+                    writer_acquired.set()
+                    competing.execute(
+                        "UPDATE tasks SET version = version + 1 WHERE id = ?",
+                        (task_id,),
+                    )
+            except BaseException as error:
+                writer_errors.append(error)
+            finally:
+                competing.close()
+                writer_done.set()
+
+        writer = threading.Thread(target=mutate_task)
+        writer.start()
+
+        def projected_state(connection, observed_id):
+            state = {
+                "acceptance": "accepted",
+                "review_verdict": "APPROVE",
+                "validation_verdict": None,
+                "execution_outcome": None,
+            }
+            if observed_id == task_id and not connection.in_transaction:
+                writer_start.set()
+                assert writer_done.wait(timeout=5)
+            return state
+
+        with patch.object(evidence, "get_lifecycle_state", side_effect=projected_state):
+            accepted = evidence._emit_acceptance_changes(
+                conn,
+                {task_id: "pending"},
+                source_task_id=task_id,
+            )
+
+        assert accepted == [task_id]
+        assert not writer_acquired.is_set()
+        event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'acceptance_changed' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert event is not None
+        assert json.loads(event["payload"])["new"] == "accepted"
+
+        writer_start.set()
+        assert writer_done.wait(timeout=5)
+        writer.join(timeout=5)
+        assert not writer.is_alive()
+        assert writer_errors == []
+    finally:
+        conn.close()
+
+
 
 
 def test_misbehaving_hook_does_not_break_transition(kanban_home, monkeypatch):
