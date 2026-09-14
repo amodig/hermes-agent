@@ -117,6 +117,28 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_board_cards_include_lifecycle_and_dependency_projections(client):
+    parent = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "parent"},
+    ).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "child", "parents": [parent["id"]]},
+    ).json()["task"]
+
+    board = client.get("/api/plugins/kanban/board").json()
+    card = next(
+        task
+        for column in board["columns"]
+        for task in column["tasks"]
+        if task["id"] == child["id"]
+    )
+
+    assert card["lifecycle"]["acceptance"] == "not_applicable"
+    assert card["dependencies"]["satisfied"] is False
+    assert card["dependencies"]["blockers"][0]["parent_id"] == parent["id"]
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")
