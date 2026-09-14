@@ -293,7 +293,7 @@ def is_required_lifecycle_edge(
         )
     if p["kind"] == "review" and c["kind"] == "general":
         return requirement == "review_approved"
-    if p["kind"] == "validation" and c["kind"] == "general":
+    if p["kind"] == "validation":
         return requirement == "validation_passed"
     return (
         p["kind"] == "review"

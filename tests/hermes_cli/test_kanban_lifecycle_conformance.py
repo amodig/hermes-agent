@@ -988,15 +988,28 @@ class KanbanLifecycleConformance(unittest.TestCase):
             initial_status="blocked",
             lifecycle_contract={"kind": "general"},
         )
+        code_downstream = kb.create_task(
+            self.conn,
+            title="boundary downstream code task",
+            assignee="owner",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "same_card",
+                "reviewer": "alice",
+                "validation_required": False,
+            },
+        )
         kb.link_tasks(self.conn, implementation, review, requirement="phase_finished")
         kb.link_tasks(self.conn, review, validation, requirement="review_approved")
         kb.link_tasks(self.conn, validation, downstream, requirement="validation_passed")
-        for task_id in (implementation, review, validation, downstream):
+        kb.link_tasks(self.conn, validation, code_downstream, requirement="validation_passed")
+        for task_id in (implementation, review, validation, downstream, code_downstream):
             self.assertTrue(kb.archive_task(self.conn, task_id))
 
         with self.assertRaises(kb.LifecycleContractError):
             kb.delete_archived_task(self.conn, implementation)
-        for task_id in (implementation, review, validation, downstream):
+        for task_id in (implementation, review, validation, downstream, code_downstream):
             self.assertIsNotNone(kb.get_task(self.conn, task_id))
 
     def test_worker_command_imports_stay_pinned_after_final_grant(self) -> None:
@@ -1015,6 +1028,11 @@ class KanbanLifecycleConformance(unittest.TestCase):
             )
             (root / "run_agent.py").write_text(
                 "class AIAgent:\n    pass\n",
+                encoding="utf-8",
+            )
+            (root / "agent" / "__init__.py").write_text("", encoding="utf-8")
+            (root / "agent" / "agent_init.py").write_text(
+                "def init_agent(*args, **kwargs):\n    return None\nvalue = 1\n",
                 encoding="utf-8",
             )
             receipt = root / "receipt.json"
@@ -1038,8 +1056,10 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "'runtime_identity': expected.as_dict()}; "
                 "runtime.worker_bootstrap_post_import(); "
                 "(root / 'cli.py').write_text('def main():\\n    return 2\\n', encoding='utf-8'); "
+                "(root / 'agent' / 'agent_init.py').write_text('def init_agent(*args, **kwargs):\\n    return None\\nvalue = 2\\n', encoding='utf-8'); "
                 "result = importlib.import_module('cli').main(); "
-                "receipt.write_text(json.dumps({'result': result}), encoding='utf-8')"
+                "agent_value = importlib.import_module('agent.agent_init').value; "
+                "receipt.write_text(json.dumps({'result': result, 'agent_value': agent_value}), encoding='utf-8')"
             )
             env = os.environ.copy()
             env["PYTHONPATH"] = str(ROOT)
@@ -1051,7 +1071,10 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertEqual(json.loads(receipt.read_text(encoding="utf-8"))["result"], 1)
+            self.assertEqual(
+                json.loads(receipt.read_text(encoding="utf-8")),
+                {"result": 1, "agent_value": 1},
+            )
 
     def test_embedded_dispatcher_freezes_identity_before_first_tick(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-dispatcher-") as raw_root:

@@ -448,6 +448,7 @@ def worker_bootstrap_post_import() -> Optional[dict[str, Any]]:
     # before the lazy import.
     from cli import main as _cli_main  # noqa: F401
     from run_agent import AIAgent as _worker_agent  # noqa: F401
+    from agent.agent_init import init_agent as _init_agent  # noqa: F401
 
     actual = assert_runtime_import_root(expected=expected)
     payload = {
