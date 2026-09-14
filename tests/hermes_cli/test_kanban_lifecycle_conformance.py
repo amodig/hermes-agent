@@ -278,6 +278,74 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 get_lifecycle_state(self.conn, implementation)["acceptance"], "pending"
             )
 
+
+    def test_cross_phase_verdicts_are_malformed(self) -> None:
+        candidate = kb.create_task(
+            self.conn,
+            title="cross-phase candidate",
+            assignee="implementer",
+            initial_status="blocked",
+            workspace_kind="dir",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "reviewer",
+                "validation_required": True,
+            },
+        )
+        review = kb.create_task(
+            self.conn,
+            title="cross-phase review",
+            assignee="reviewer",
+            initial_status="blocked",
+            parents=[candidate],
+            lifecycle_contract={"kind": "review", "candidate_task_id": candidate},
+        )
+        validation = kb.create_task(
+            self.conn,
+            title="cross-phase validation",
+            assignee="tester",
+            initial_status="blocked",
+            parents=[review],
+            lifecycle_contract={"kind": "validation", "candidate_task_id": candidate},
+        )
+        with kb.write_txn(self.conn):
+            self.conn.execute(
+                "UPDATE tasks SET status = 'done' WHERE id IN (?, ?, ?)",
+                (candidate, review, validation),
+            )
+            for task_id, phase, verdict in (
+                (review, "review", "PASS"),
+                (validation, "validation", "APPROVE"),
+            ):
+                self.conn.execute(
+                    "INSERT INTO task_runs "
+                    "(task_id, status, started_at, ended_at, outcome, metadata) "
+                    "VALUES (?, 'done', 1, 2, 'completed', ?)",
+                    (
+                        task_id,
+                        json.dumps(
+                            {
+                                "lifecycle": {
+                                    "schema": 1,
+                                    "phase": phase,
+                                    "verdict": verdict,
+                                }
+                            }
+                        ),
+                    ),
+                )
+
+        review_state = get_lifecycle_state(self.conn, review)
+        validation_state = get_lifecycle_state(self.conn, validation)
+        assert review_state["review_verdict"] is None
+        assert validation_state["validation_verdict"] is None
+        assert review_state["acceptance"] == "pending"
+        assert validation_state["acceptance"] == "pending"
+        assert "verdict_malformed" in review_state["diagnostics"]
+        assert "verdict_malformed" in validation_state["diagnostics"]
+        assert get_lifecycle_state(self.conn, candidate)["acceptance"] == "pending"
+
     def test_separate_card_validator_preserves_implementer_identity(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-identity-") as raw_repo:
             repo = Path(raw_repo)

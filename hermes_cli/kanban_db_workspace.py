@@ -123,7 +123,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         return
     try:
         row = conn.execute(_WORKSPACE_ROW_SQL, (task_id,)).fetchone()
-        if not row:
+        if not row or row["status"] not in {"done", "archived", "failed", "cancelled"}:
             return
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]

@@ -16,6 +16,10 @@ VALID_REQUIREMENTS = frozenset({"phase_finished", "review_approved", "validation
 VALID_CONTRACT_KINDS = frozenset({"general", "code", "review", "validation"})
 VALID_REVIEW_MODES = frozenset({"same_card", "separate_card"})
 VALID_VERDICTS = frozenset({"APPROVE", "REQUEST_CHANGES", "PASS", "FAIL"})
+_VALID_VERDICTS_BY_PHASE = {
+    "review": frozenset({"APPROVE", "REQUEST_CHANGES"}),
+    "validation": frozenset({"PASS", "FAIL"}),
+}
 
 
 class LifecycleContractError(ValueError):
@@ -510,7 +514,7 @@ def _verdict_for(conn: sqlite3.Connection, task_id: str, phase: str) -> tuple[Op
     verdict = latest.get("verdict")
     if verdict is None:
         return None, latest, "verdict_missing"
-    if not isinstance(verdict, str) or verdict not in VALID_VERDICTS:
+    if not isinstance(verdict, str) or verdict not in _VALID_VERDICTS_BY_PHASE.get(phase, ()):
         return None, latest, "verdict_malformed"
     return verdict, latest, None
 

@@ -335,6 +335,29 @@ def test_patch_expected_version_is_atomic_across_intervening_mutation(client, mo
     assert current["assignee"] == "old"
 
 
+
+def test_deferred_cleanup_skips_a_reopened_task(client, tmp_path, monkeypatch):
+    workspace_root = tmp_path / "workspaces"
+    workspace = workspace_root / "task"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(workspace_root))
+
+    with kbc.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="reopened task",
+            workspace_kind="scratch",
+            workspace_path=str(workspace),
+        )
+        with kbc.composite_write_txn(conn):
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+            kb._cleanup_workspace(conn, task_id)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+
+    assert workspace.is_dir()
+
 def test_reopening_parent_demotes_ready_child(client):
     """Reopening a completed parent must invalidate ready children immediately.
 
