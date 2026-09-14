@@ -161,55 +161,158 @@ class _ProjectionCache:
         self.links_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
 
         pending = set(task_ids)
+        dependency_targets = set(task_ids)
+        state_targets = set(task_ids)
         queried_task_ids: set[str] = set()
-        link_rows: list[sqlite3.Row] = []
-        seen_link_pairs: set[tuple[str, str]] = set()
-        while pending - queried_task_ids:
-            batch = sorted(pending - queried_task_ids)[:self._QUERY_BATCH_SIZE]
-            queried_task_ids.update(batch)
-            placeholders = ",".join("?" for _ in batch)
-            for row in conn.execute(
-                f"SELECT * FROM tasks WHERE id IN ({placeholders})", batch,
-            ).fetchall():
-                self.tasks[row["id"]] = row
-                contract = safe_decode_contract(row["lifecycle_contract"])
-                candidate_id = (
-                    contract.get("candidate_task_id")
-                    if contract and contract.get("kind") in {"review", "validation"}
-                    else None
-                )
-                if candidate_id:
-                    pending.add(str(candidate_id))
-            new_links = conn.execute(
-                f"SELECT parent_id, child_id, requirement FROM task_links "
-                f"WHERE parent_id IN ({placeholders}) OR child_id IN ({placeholders}) "
-                "ORDER BY parent_id, child_id",
-                (*batch, *batch),
-            ).fetchall()
-            for row in new_links:
-                pending.update((row["parent_id"], row["child_id"]))
-                pair = (row["parent_id"], row["child_id"])
-                if pair not in seen_link_pairs:
-                    link_rows.append(row)
-                    seen_link_pairs.add(pair)
+        queried_parent_ids: set[str] = set()
+        queried_role_parent_ids: set[str] = set()
+        role_expansion_targets: set[str] = set()
+        while True:
+            task_batch = sorted(pending - queried_task_ids)[:self._QUERY_BATCH_SIZE]
+            if task_batch:
+                queried_task_ids.update(task_batch)
+                placeholders = ",".join("?" for _ in task_batch)
+                for row in conn.execute(
+                    f"SELECT * FROM tasks WHERE id IN ({placeholders})", task_batch,
+                ).fetchall():
+                    self.tasks[row["id"]] = row
 
-        link_rows.sort(key=lambda row: (row["parent_id"], row["child_id"]))
-        for row in link_rows:
-            link = {
-                "parent_id": row["parent_id"],
-                "child_id": row["child_id"],
-                "requirement": row["requirement"],
-            }
-            self.links_by_parent.setdefault(row["parent_id"], []).append(link)
-            self.links_by_child.setdefault(row["child_id"], []).append(link)
-            self.links_by_pair[(row["parent_id"], row["child_id"])] = link
+            parent_batch = sorted(dependency_targets - queried_parent_ids)[:self._QUERY_BATCH_SIZE]
+            if parent_batch:
+                queried_parent_ids.update(parent_batch)
+                placeholders = ",".join("?" for _ in parent_batch)
+                for row in conn.execute(
+                    "SELECT l.parent_id, l.child_id, l.requirement, "
+                    "p.status AS parent_status, p.lifecycle_contract AS parent_contract, "
+                    "t.lifecycle_contract AS child_contract "
+                    "FROM task_links l "
+                    "JOIN tasks p ON p.id = l.parent_id "
+                    "JOIN tasks t ON t.id = l.child_id "
+                    f"WHERE l.child_id IN ({placeholders}) ORDER BY p.id",
+                    parent_batch,
+                ).fetchall():
+                    pending.add(row["parent_id"])
+                    parent_contract = safe_decode_contract(row["parent_contract"])
+                    requirement = row["requirement"] or "phase_finished"
+                    if (
+                        requirement != "phase_finished"
+                        and row["child_id"] in dependency_targets
+                        and parent_contract
+                        and parent_contract["kind"] in {"code", "review", "validation"}
+                    ):
+                        state_targets.add(row["parent_id"])
+                    self._store_link(
+                        row["parent_id"],
+                        row["child_id"],
+                        row["requirement"],
+                        parent_status=row["parent_status"],
+                        parent_contract=row["parent_contract"],
+                        child_contract=row["child_contract"],
+                    )
+
+            for task_id in state_targets:
+                row = self.tasks.get(task_id)
+                contract = _row_contract(row) if row is not None else None
+                if row is None or not contract:
+                    continue
+                if contract["kind"] in {"review", "validation"}:
+                    pending.add(str(contract["candidate_task_id"]))
+                if contract["kind"] == "code":
+                    role_expansion_targets.add(task_id)
+
+            role_parent_ids: list[str] = []
+            for task_id in sorted(role_expansion_targets - queried_role_parent_ids):
+                row = self.tasks.get(task_id)
+                if row is None:
+                    if task_id in queried_task_ids:
+                        queried_role_parent_ids.add(task_id)
+                    continue
+                contract = _row_contract(row)
+                if contract is None:
+                    queried_role_parent_ids.add(task_id)
+                    continue
+                if contract["kind"] == "code":
+                    role_parent_ids.append(task_id)
+                    continue
+                if contract["kind"] != "review":
+                    queried_role_parent_ids.add(task_id)
+                    continue
+                candidate_id = str(contract.get("candidate_task_id") or "")
+                if candidate_id not in queried_task_ids:
+                    continue
+                candidate_row = self.tasks.get(candidate_id)
+                candidate_contract = (
+                    _row_contract(candidate_row) if candidate_row is not None else None
+                )
+                if (
+                    candidate_contract
+                    and candidate_contract.get("kind") == "code"
+                    and candidate_contract.get("validation_required")
+                ):
+                    role_parent_ids.append(task_id)
+                else:
+                    queried_role_parent_ids.add(task_id)
+
+            if role_parent_ids:
+                queried_role_parent_ids.update(role_parent_ids)
+                for start in range(0, len(role_parent_ids), self._QUERY_BATCH_SIZE):
+                    role_batch = role_parent_ids[start:start + self._QUERY_BATCH_SIZE]
+                    placeholders = ",".join("?" for _ in role_batch)
+                    for row in conn.execute(
+                        "SELECT l.parent_id, l.child_id, l.requirement, "
+                        "c.lifecycle_contract AS child_contract "
+                        "FROM task_links l JOIN tasks c ON c.id = l.child_id "
+                        f"WHERE l.parent_id IN ({placeholders}) ORDER BY c.id",
+                        role_batch,
+                    ).fetchall():
+                        parent_contract = _row_contract(self.tasks[row["parent_id"]])
+                        child_contract = safe_decode_contract(row["child_contract"])
+                        if self._is_role_child(
+                            row["parent_id"], parent_contract, child_contract,
+                        ):
+                            pending.add(row["child_id"])
+                            state_targets.add(row["child_id"])
+                            if (
+                                parent_contract
+                                and parent_contract.get("kind") == "code"
+                                and parent_contract.get("review_mode") == "separate_card"
+                                and parent_contract.get("validation_required")
+                                and child_contract
+                                and child_contract.get("kind") == "review"
+                            ):
+                                role_expansion_targets.add(row["child_id"])
+                            self._store_link(
+                                row["parent_id"],
+                                row["child_id"],
+                                row["requirement"],
+                                parent_status=self.tasks[row["parent_id"]]["status"],
+                                parent_contract=self.tasks[row["parent_id"]]["lifecycle_contract"],
+                                child_contract=row["child_contract"],
+                            )
+
+            if not task_batch and not parent_batch and not role_parent_ids:
+                break
+
+        for links in (*self.links_by_parent.values(), *self.links_by_child.values()):
+            links.sort(key=lambda link: (link["parent_id"], link["child_id"]))
+
         self.runs_by_id: dict[int, sqlite3.Row] = {}
         self.runs_by_task: dict[str, list[sqlite3.Row]] = {}
         self.events_by_task: dict[str, list[sqlite3.Row]] = {}
-
-        task_ids_in_closure = sorted(self.tasks)
-        for start in range(0, len(task_ids_in_closure), self._QUERY_BATCH_SIZE):
-            batch = task_ids_in_closure[start:start + self._QUERY_BATCH_SIZE]
+        history_ids: set[str] = set()
+        for task_id in state_targets:
+            row = self.tasks.get(task_id)
+            contract = _row_contract(row) if row is not None else None
+            if not contract:
+                continue
+            if contract["kind"] in {"code", "review", "validation"}:
+                history_ids.add(task_id)
+            candidate_id = contract.get("candidate_task_id")
+            if candidate_id and candidate_id in self.tasks:
+                history_ids.add(str(candidate_id))
+        history_ids_list = sorted(history_ids)
+        for start in range(0, len(history_ids_list), self._QUERY_BATCH_SIZE):
+            batch = history_ids_list[start:start + self._QUERY_BATCH_SIZE]
             placeholders = ",".join("?" for _ in batch)
             for row in conn.execute(
                 f"SELECT id, task_id, metadata, outcome FROM task_runs "
@@ -227,36 +330,92 @@ class _ProjectionCache:
         self.lifecycle: dict[str, dict[str, Any]] = {}
         self.dependencies: dict[str, dict[str, Any]] = {}
 
+    @staticmethod
+    def _is_role_child(
+        parent_id: str,
+        parent_contract: Optional[dict[str, Any]],
+        child_contract: Optional[dict[str, Any]],
+    ) -> bool:
+        if not parent_contract or not child_contract:
+            return False
+        child_kind = child_contract.get("kind")
+        candidate_id = child_contract.get("candidate_task_id")
+        if parent_contract.get("kind") == "code":
+            return (
+                parent_contract.get("review_mode") == "separate_card"
+                and child_kind == "review"
+                and candidate_id == parent_id
+            ) or (
+                parent_contract.get("review_mode") == "same_card"
+                and parent_contract.get("validation_required")
+                and child_kind == "validation"
+                and candidate_id == parent_id
+            )
+        return (
+            parent_contract.get("kind") == "review"
+            and child_kind == "validation"
+            and candidate_id == parent_contract.get("candidate_task_id")
+        )
+
+    def _store_link(
+        self,
+        parent_id: str,
+        child_id: str,
+        requirement: Optional[str],
+        *,
+        parent_status: Optional[str] = None,
+        parent_contract: Any = None,
+        child_contract: Any = None,
+    ) -> None:
+        pair = (parent_id, child_id)
+        link = self.links_by_pair.get(pair)
+        if link is None:
+            link = {
+                "parent_id": parent_id,
+                "child_id": child_id,
+                "requirement": requirement,
+                "parent_status": parent_status,
+                "parent_contract": parent_contract,
+                "child_contract": child_contract,
+            }
+            self.links_by_pair[pair] = link
+            self.links_by_parent.setdefault(parent_id, []).append(link)
+            self.links_by_child.setdefault(child_id, []).append(link)
+            return
+        if parent_status is not None:
+            link["parent_status"] = parent_status
+        if parent_contract is not None:
+            link["parent_contract"] = parent_contract
+        if child_contract is not None:
+            link["child_contract"] = child_contract
+
     def role_children(self, task_id: str) -> list[dict[str, Any]]:
         return [
             {
                 "id": link["child_id"],
-                "lifecycle_contract": self.tasks[link["child_id"]]["lifecycle_contract"],
+                "lifecycle_contract": link["child_contract"],
             }
             for link in self.links_by_parent.get(task_id, ())
-            if link["child_id"] in self.tasks
         ]
 
     def review_rows(self, task_id: str) -> list[dict[str, Any]]:
         return [
             {
                 "requirement": link["requirement"],
-                "lifecycle_contract": self.tasks[link["parent_id"]]["lifecycle_contract"],
+                "lifecycle_contract": link["parent_contract"],
             }
             for link in self.links_by_child.get(task_id, ())
-            if link["parent_id"] in self.tasks
         ]
 
     def parent_rows(self, task_id: str) -> list[dict[str, Any]]:
         return [
             {
                 "parent_id": link["parent_id"],
-                "parent_status": self.tasks[link["parent_id"]]["status"],
-                "lifecycle_contract": self.tasks[link["parent_id"]]["lifecycle_contract"],
+                "parent_status": link["parent_status"],
+                "lifecycle_contract": link["parent_contract"],
                 "requirement": link["requirement"],
             }
             for link in self.links_by_child.get(task_id, ())
-            if link["parent_id"] in self.tasks
         ]
 
 

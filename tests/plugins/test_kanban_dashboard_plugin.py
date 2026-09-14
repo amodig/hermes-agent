@@ -186,6 +186,63 @@ def test_projection_cache_scopes_tasks_and_history_to_closure(client):
     assert unrelated["id"] not in cache.runs_by_task
     assert unrelated["id"] not in cache.events_by_task
 
+def test_projection_cache_excludes_irrelevant_linked_descendants(client):
+    from hermes_cli import kanban_lifecycle as lifecycle
+
+    with kbc.connect() as conn:
+        implementation = kb.create_task(
+            conn,
+            title="implementation",
+            assignee="implementer",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "reviewer",
+                "validation_required": True,
+            },
+        )
+        review = kb.create_task(
+            conn,
+            title="review",
+            assignee="reviewer",
+            initial_status="blocked",
+            parents=[implementation],
+            lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
+        )
+        archived_child = kb.create_task(
+            conn,
+            title="archived child",
+            initial_status="blocked",
+            parents=[implementation],
+        )
+        archived_grandchild = kb.create_task(
+            conn,
+            title="archived grandchild",
+            initial_status="blocked",
+            parents=[archived_child],
+        )
+        assert kb.archive_task(conn, archived_grandchild)
+        assert kb.archive_task(conn, archived_child)
+        validation = kb.create_task(
+            conn,
+            title="validation",
+            assignee="tester",
+            initial_status="blocked",
+            parents=[review],
+            lifecycle_contract={
+                "kind": "validation",
+                "candidate_task_id": implementation,
+            },
+        )
+        role_cache = lifecycle._ProjectionCache(conn, [validation])
+        cache = lifecycle._ProjectionCache(conn, [implementation])
+        assert set(role_cache.tasks) == {implementation, review, validation}
+
+    assert set(cache.tasks) == {implementation, review, validation}
+    assert archived_child not in cache.tasks
+    assert archived_grandchild not in cache.tasks
+
 
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
