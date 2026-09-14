@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from gateway import kanban_watchers_notifier as notifier
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_runtime as runtime
 from hermes_cli.kanban_lifecycle import get_lifecycle_state
 from hermes_cli.kanban_parser import build_parser
 from hermes_cli.kanban_runtime import (
@@ -463,6 +464,74 @@ class KanbanLifecycleConformance(unittest.TestCase):
         self.assertEqual(kb.recompute_ready(self.conn), 1)
         self.assertEqual(self._task(unrelated).status, "ready")
 
+    def test_legacy_null_contracts_remain_schedulable(self) -> None:
+        legacy_review = kb.create_task(
+            self.conn,
+            title="legacy verdictless review",
+            assignee="reviewer",
+            initial_status="blocked",
+        )
+        with kb.write_txn(self.conn):
+            self.conn.execute(
+                "UPDATE tasks SET lifecycle_contract = NULL, status = 'review' WHERE id = ?",
+                (legacy_review,),
+            )
+        review_run = kb.claim_review_task(self.conn, legacy_review, claimer="reviewer")
+        self.assertIsNotNone(review_run)
+        self.assertTrue(
+            kb.complete_task(
+                self.conn,
+                legacy_review,
+                expected_run_id=review_run.current_run_id,
+                summary="legacy review completed without a verdict",
+            )
+        )
+        self.assertEqual(
+            get_lifecycle_state(self.conn, legacy_review)["acceptance"],
+            "unclassified",
+        )
+
+        parent = kb.create_task(
+            self.conn,
+            title="legacy parent",
+            initial_status="blocked",
+        )
+        child = kb.create_task(
+            self.conn,
+            title="legacy dependent",
+            assignee="worker",
+            initial_status="blocked",
+            parents=(parent,),
+        )
+        with kb.write_txn(self.conn):
+            self.conn.execute(
+                "UPDATE tasks SET lifecycle_contract = NULL WHERE id IN (?, ?)",
+                (parent, child),
+            )
+            self.conn.execute(
+                "UPDATE task_links SET requirement = NULL WHERE parent_id = ? AND child_id = ?",
+                (parent, child),
+            )
+            self.conn.execute(
+                "UPDATE tasks SET status = 'done' WHERE id = ?", (parent,),
+            )
+        self.assertEqual(
+            kb.evaluate_dependencies(self.conn, child),
+            {"satisfied": True, "blockers": []},
+        )
+        self.assertEqual(kb.recompute_ready(self.conn), 1)
+        child_run = kb.claim_task(self.conn, child, claimer="worker")
+        self.assertIsNotNone(child_run)
+        self.assertTrue(
+            kb.complete_task(
+                self.conn,
+                child,
+                expected_run_id=child_run.current_run_id,
+                summary="legacy dependent completed",
+            )
+        )
+        self.assertEqual(get_lifecycle_state(self.conn, child)["acceptance"], "unclassified")
+
     def test_review_card_requires_separate_card_candidate(self) -> None:
         implementation = kb.create_task(
             self.conn,
@@ -532,6 +601,73 @@ class KanbanLifecycleConformance(unittest.TestCase):
             )
         self.assertIsNotNone(kb.claim_task(self.conn, child, claimer="operator"))
 
+    def test_force_promotion_cannot_bypass_missing_role_edges(self) -> None:
+        candidate = kb.create_task(
+            self.conn,
+            title="orphaned role candidate",
+            assignee="implementer",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "reviewer",
+                "validation_required": True,
+            },
+        )
+        review = kb.create_task(
+            self.conn,
+            title="orphaned review",
+            assignee="reviewer",
+            initial_status="blocked",
+            lifecycle_contract={"kind": "review", "candidate_task_id": candidate},
+        )
+        validation = kb.create_task(
+            self.conn,
+            title="orphaned validation",
+            assignee="tester",
+            initial_status="blocked",
+            lifecycle_contract={"kind": "validation", "candidate_task_id": candidate},
+        )
+
+        promoted, reason = kb.promote_task(
+            self.conn, review, actor="operator", reason="override", force=True,
+        )
+        self.assertFalse(promoted)
+        self.assertIn("candidate_edge_missing", reason or "")
+        self.assertEqual(self._task(review).status, "blocked")
+        promoted, reason = kb.promote_task(
+            self.conn, validation, actor="operator", reason="override", force=True,
+        )
+        self.assertFalse(promoted)
+        self.assertIn("candidate_edge_missing", reason or "")
+        self.assertEqual(self._task(validation).status, "blocked")
+
+        with kb.write_txn(self.conn):
+            self.conn.execute(
+                "UPDATE tasks SET status = 'review' WHERE id = ?", (review,),
+            )
+            kb._append_event(
+                self.conn,
+                review,
+                "promoted_manual",
+                {"actor": "operator", "reason": "override", "forced": True},
+            )
+        self.assertIsNone(kb.claim_review_task(self.conn, review, claimer="reviewer"))
+        self.assertEqual(self._task(review).status, "todo")
+
+        with kb.write_txn(self.conn):
+            self.conn.execute(
+                "UPDATE tasks SET status = 'ready' WHERE id = ?", (validation,),
+            )
+            kb._append_event(
+                self.conn,
+                validation,
+                "promoted_manual",
+                {"actor": "operator", "reason": "override", "forced": True},
+            )
+        self.assertIsNone(kb.claim_task(self.conn, validation, claimer="tester"))
+        self.assertEqual(self._task(validation).status, "todo")
+
     def test_deletion_protects_review_parent_of_validation(self) -> None:
         implementation = kb.create_task(
             self.conn,
@@ -566,6 +702,30 @@ class KanbanLifecycleConformance(unittest.TestCase):
         self.assertIsNotNone(kb.get_task(self.conn, review))
         self.assertIsNotNone(kb.get_task(self.conn, validation))
 
+
+    def test_embedded_dispatcher_freezes_identity_before_first_tick(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kanban-conformance-dispatcher-") as raw_root:
+            root = Path(raw_root)
+            for directory in ("hermes_cli", "tools", "agent", "gateway", "plugins", "providers", "cron"):
+                package = root / directory
+                package.mkdir(parents=True)
+                (package / "module.py").write_text("value = 1\n", encoding="utf-8")
+            skill = root / "skills" / "devops" / "sdlc-review" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text("review instructions\n", encoding="utf-8")
+
+            from gateway.kanban_watchers_dispatcher import _KanbanDispatcher
+
+            with patch.object(runtime, "_FROZEN_RUNTIME_IDENTITY", None), patch.object(
+                runtime, "_module_root", return_value=root,
+            ):
+                _KanbanDispatcher(object(), object())
+                frozen = runtime.runtime_identity()
+                (root / "hermes_cli" / "module.py").write_text("value = 2\n", encoding="utf-8")
+                expected = runtime.prospective_identity()
+
+            self.assertEqual(expected.fingerprint, frozen.fingerprint)
+            self.assertNotEqual(frozen.fingerprint, _fingerprint(root))
 
     def test_runtime_identity_fingerprints_review_skill(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-runtime-") as raw_root:

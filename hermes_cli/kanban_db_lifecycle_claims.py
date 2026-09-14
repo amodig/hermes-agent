@@ -12,6 +12,7 @@ from hermes_cli.kanban_db_lifecycle_evidence import (
 )
 from hermes_cli.kanban_lifecycle import (
     LifecycleContractError,
+    _forceable_dependency_override,
     evaluate_dependencies,
     safe_decode_contract,
 )
@@ -208,11 +209,13 @@ def claim_task(
         if handoff_error is not None:
             _record_parent_handoff_start_error(conn, task_id, handoff_error)
             return None
+        dependencies = evaluate_dependencies(conn, task_id)
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
-        # recompute_ready re-promotes when the parents finish.
-        dependencies = evaluate_dependencies(conn, task_id)
-        if not dependencies["satisfied"] and not _forced_promotion_active(conn, task_id):
+        if not dependencies["satisfied"] and not (
+            _forced_promotion_active(conn, task_id)
+            and _forceable_dependency_override(dependencies)
+        ):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'", (task_id,),
@@ -258,9 +261,11 @@ def claim_review_task(
         handoff_error = _parent_handoff_start_error(conn, task_id)
         if handoff_error is not None:
             _record_parent_handoff_start_error(conn, task_id, handoff_error)
-            return None
         dependencies = evaluate_dependencies(conn, task_id)
-        if not dependencies["satisfied"] and not _forced_promotion_active(conn, task_id):
+        if not dependencies["satisfied"] and not (
+            _forced_promotion_active(conn, task_id)
+            and _forceable_dependency_override(dependencies)
+        ):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'review' AND claim_lock IS NULL", (task_id,),

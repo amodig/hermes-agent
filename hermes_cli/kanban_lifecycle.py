@@ -711,7 +711,7 @@ def get_goal_acceptance(conn: sqlite3.Connection, root_id: str) -> dict[str, Any
 
 
 def evaluate_dependencies(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
-    """Evaluate every direct typed edge without changing the board."""
+    """Evaluate direct edges while preserving historical NULL contracts."""
     task = _task_row(conn, task_id)
     if task is None:
         return {
@@ -723,7 +723,9 @@ def evaluate_dependencies(conn: sqlite3.Connection, task_id: str) -> dict[str, A
                 "message": "task does not exist",
             }],
         }
-    if _row_contract(task) is None:
+    task_contract = _row_contract(task)
+    raw_task_contract = task["lifecycle_contract"]
+    if task_contract is None and raw_task_contract is not None:
         return {
             "satisfied": False,
             "blockers": [{
@@ -734,26 +736,25 @@ def evaluate_dependencies(conn: sqlite3.Connection, task_id: str) -> dict[str, A
             }],
         }
     blockers: list[dict[str, Any]] = []
-    contract = _row_contract(task)
-    if contract and contract.get("kind") in {"review", "validation"}:
-        candidate_id = str(contract.get("candidate_task_id") or "")
+    if task_contract and task_contract.get("kind") in {"review", "validation"}:
+        candidate_id = str(task_contract.get("candidate_task_id") or "")
         candidate = _task_row(conn, candidate_id)
         candidate_contract = _row_contract(candidate)
         same_card_validation = (
-            contract.get("kind") == "validation"
+            task_contract.get("kind") == "validation"
             and candidate_contract is not None
             and candidate_contract.get("kind") == "code"
             and candidate_contract.get("review_mode") == "same_card"
         )
         requires_candidate_edge = (
-            contract.get("kind") == "review" or same_card_validation
+            task_contract.get("kind") == "review" or same_card_validation
         )
         candidate_edge = conn.execute(
             "SELECT requirement FROM task_links WHERE parent_id = ? AND child_id = ?",
             (candidate_id, task_id),
         ).fetchone()
         review_edge = None
-        if contract.get("kind") == "validation" and not requires_candidate_edge:
+        if task_contract.get("kind") == "validation" and not requires_candidate_edge:
             review_rows = conn.execute(
                 """
                 SELECT l.requirement, p.lifecycle_contract
@@ -785,7 +786,6 @@ def evaluate_dependencies(conn: sqlite3.Connection, task_id: str) -> dict[str, A
                 "message": f"role card must depend directly on {dependency}",
             })
 
-
     rows = conn.execute(
         "SELECT p.id AS parent_id, p.status AS parent_status, p.lifecycle_contract, "
         "       l.requirement FROM task_links l JOIN tasks p ON p.id = l.parent_id "
@@ -794,48 +794,124 @@ def evaluate_dependencies(conn: sqlite3.Connection, task_id: str) -> dict[str, A
     for row in rows:
         parent_id = row["parent_id"]
         requirement = row["requirement"]
+        if requirement is None:
+            requirement = "phase_finished"
         base = {"parent_id": parent_id, "requirement": requirement}
-        if requirement not in VALID_REQUIREMENTS:
-            blockers.append({**base, "code": "lifecycle_unclassified", "message": "dependency edge has no lifecycle requirement"})
+        raw_parent_contract = row["lifecycle_contract"]
+        parent_contract = safe_decode_contract(raw_parent_contract)
+        if parent_contract is None and raw_parent_contract is not None:
+            blockers.append({
+                **base,
+                "code": "lifecycle_unclassified",
+                "message": "parent lifecycle contract is unclassified",
+            })
             continue
-        contract = safe_decode_contract(row["lifecycle_contract"])
-        if contract is None:
-            blockers.append({**base, "code": "lifecycle_unclassified", "message": "parent lifecycle contract is unclassified"})
+        if requirement not in VALID_REQUIREMENTS:
+            blockers.append({
+                **base,
+                "code": "lifecycle_unclassified",
+                "message": "dependency edge has no lifecycle requirement",
+            })
             continue
         if row["parent_status"] == "archived":
-            if contract["kind"] != "general":
-                blockers.append({**base, "code": "goal_revision_stale", "message": "typed code/review/validation parent was archived"})
+            if parent_contract is not None and parent_contract["kind"] != "general":
+                blockers.append({
+                    **base,
+                    "code": "goal_revision_stale",
+                    "message": "typed code/review/validation parent was archived",
+                })
             continue
         if requirement == "phase_finished":
             if row["parent_status"] != "done":
-                blockers.append({**base, "code": "verdict_missing", "message": "parent phase has not finished"})
+                blockers.append({
+                    **base,
+                    "code": "verdict_missing",
+                    "message": "parent phase has not finished",
+                })
+            continue
+        if parent_contract is None:
+            blockers.append({
+                **base,
+                "code": "lifecycle_unclassified",
+                "message": "parent lifecycle contract is unclassified",
+            })
             continue
         projection = get_lifecycle_state(conn, parent_id)
         if requirement == "review_approved":
             verdict = projection.get("review_verdict")
             if verdict is None:
-                blockers.append({**base, "code": "verdict_missing", "message": "review approval is missing"})
+                blockers.append({
+                    **base,
+                    "code": "verdict_missing",
+                    "message": "review approval is missing",
+                })
             elif verdict == "REQUEST_CHANGES":
-                blockers.append({**base, "code": "verdict_conflict", "message": "review requested changes"})
+                blockers.append({
+                    **base,
+                    "code": "verdict_conflict",
+                    "message": "review requested changes",
+                })
             elif verdict != "APPROVE":
-                blockers.append({**base, "code": "verdict_malformed", "message": "review verdict is invalid"})
+                blockers.append({
+                    **base,
+                    "code": "verdict_malformed",
+                    "message": "review verdict is invalid",
+                })
             elif projection.get("acceptance") == "stale":
-                blockers.append({**base, "code": "candidate_head_mismatch", "message": "review evidence is stale"})
+                blockers.append({
+                    **base,
+                    "code": "candidate_head_mismatch",
+                    "message": "review evidence is stale",
+                })
             elif row["parent_status"] != "done":
-                blockers.append({**base, "code": "verdict_missing", "message": "approved review card is not complete"})
+                blockers.append({
+                    **base,
+                    "code": "verdict_missing",
+                    "message": "approved review card is not complete",
+                })
         elif requirement == "validation_passed":
             verdict = projection.get("validation_verdict")
             if verdict is None:
-                blockers.append({**base, "code": "verdict_missing", "message": "validation pass is missing"})
+                blockers.append({
+                    **base,
+                    "code": "verdict_missing",
+                    "message": "validation pass is missing",
+                })
             elif verdict == "FAIL":
-                blockers.append({**base, "code": "verdict_conflict", "message": "validation failed"})
+                blockers.append({
+                    **base,
+                    "code": "verdict_conflict",
+                    "message": "validation failed",
+                })
             elif verdict != "PASS":
-                blockers.append({**base, "code": "verdict_malformed", "message": "validation verdict is invalid"})
+                blockers.append({
+                    **base,
+                    "code": "verdict_malformed",
+                    "message": "validation verdict is invalid",
+                })
             elif projection.get("acceptance") == "stale":
-                blockers.append({**base, "code": "candidate_head_mismatch", "message": "validation evidence is stale"})
+                blockers.append({
+                    **base,
+                    "code": "candidate_head_mismatch",
+                    "message": "validation evidence is stale",
+                })
             elif row["parent_status"] != "done":
-                blockers.append({**base, "code": "verdict_missing", "message": "validation card is not complete"})
+                blockers.append({
+                    **base,
+                    "code": "verdict_missing",
+                    "message": "validation card is not complete",
+                })
     return {"satisfied": not blockers, "blockers": blockers}
+
+
+def _forceable_dependency_override(dependencies: Mapping[str, Any]) -> bool:
+    """Allow force only for unfinished parent-phase dependencies."""
+    blockers = dependencies.get("blockers") or ()
+    return bool(
+        not dependencies.get("satisfied")
+        and blockers
+        and all(blocker.get("code") == "verdict_missing" for blocker in blockers)
+    )
 
 
 def lifecycle_metadata(

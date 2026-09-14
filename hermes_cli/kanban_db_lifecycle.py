@@ -19,6 +19,7 @@ from hermes_cli.kanban_lifecycle import (
     LifecycleContractError,
     LifecycleEvidenceError,
     _latest_head,
+    _forceable_dependency_override,
     decode_contract,
     encode_contract,
     evaluate_dependencies,
@@ -616,9 +617,11 @@ def promote_task(
             f"task {task_id} is {cur_status!r}; promote only applies to "
             f"'todo' or 'blocked'"
         )
-
     dependency = evaluate_dependencies(conn, task_id)
-    if not dependency["satisfied"] and not force:
+
+    if not dependency["satisfied"] and (
+        not force or not _forceable_dependency_override(dependency)
+    ):
         blockers = dependency.get("blockers") or []
         detail = "; ".join(
             f"{item.get('parent_id')}: {item.get('code')}" for item in blockers

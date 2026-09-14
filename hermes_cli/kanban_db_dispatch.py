@@ -1505,6 +1505,13 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+def _freeze_runtime_identity() -> None:
+    """Freeze the parent code identity when dispatching starts."""
+    from hermes_cli.kanban_runtime import runtime_identity
+
+    runtime_identity()
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -1528,6 +1535,7 @@ def dispatch_once(
     ``skipped_locked=True`` and writes nothing; the lock is keyed on the
     resolved DB path so unrelated boards tick in parallel.
     """
+    _freeze_runtime_identity()
     def _locked_tick() -> DispatchResult:
         return _dispatch_once_locked(
             conn,
@@ -2545,6 +2553,7 @@ def run_daemon(
     the gateway dispatcher and ``hermes kanban dispatch`` — the standalone
     daemon must not be the one uncapped entry point.
     """
+    _freeze_runtime_identity()
     import threading
 
     if stop_event is None:
