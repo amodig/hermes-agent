@@ -277,6 +277,21 @@ def main(argv: list[str] | None = None) -> int:
         if not runtime_root.is_dir():
             raise RuntimeError(f"runtime root does not exist: {runtime_root}")
         identity = _probe_identity(runtime_root, sys.executable)
+        if args.layer == "installed":
+            reported_root = identity.get("module_root")
+            if not reported_root:
+                raise RuntimeError("installed runtime identity did not report module_root")
+            try:
+                observed_root = Path(str(reported_root)).resolve()
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"installed runtime identity has invalid module_root: {reported_root!r}"
+                ) from exc
+            if observed_root != runtime_root:
+                raise RuntimeError(
+                    "installed runtime identity root mismatch: "
+                    f"expected {runtime_root}, got {observed_root}"
+                )
         receipt["reference"].update(
             {
                 "code_sha": identity.get("code_sha"),

@@ -2089,6 +2089,19 @@ def _module_hermes_argv() -> list[str]:
     """Interpreter-bound Hermes CLI invocation (``hermes_cli.main`` is the
     console-script target — there is no top-level ``hermes`` package)."""
     return [sys.executable, "-m", "hermes_cli.main"]
+def _trusted_module_hermes_argv(command: list[str]) -> list[str]:
+    """Launch the module fallback from the dispatcher runtime root."""
+    module_argv = _module_hermes_argv()
+    if command[:3] != module_argv:
+        return command
+    runtime_root = str(Path(__file__).resolve().parents[1])
+    bootstrap = (
+        "import runpy,sys;"
+        f"sys.path.insert(0,{runtime_root!r});"
+        "runpy.run_module('hermes_cli.main',run_name='__main__')"
+    )
+    return [sys.executable, "-I", "-c", bootstrap, *command[3:]]
+
 
 
 def _absolute_hermes_path(path: str) -> str:
@@ -2264,9 +2277,8 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
 
 def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
     """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
-    cmd = [
-        *_resolve_hermes_argv(),
-        "-p", profile_arg,
+    cmd = _trusted_module_hermes_argv(_resolve_hermes_argv())
+    cmd.extend([
         # A worker must NEVER boot the interactive TUI: its no-TTY bail-out
         # exits 0 without doing the task → "protocol violation" every attempt.
         "--cli",
@@ -2274,7 +2286,7 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
         # profile's shell-hook allowlist; pass --accept-hooks explicitly so
         # configured hooks still register.
         "--accept-hooks",
-    ]
+    ])
     # One `--skills X` pair per name: easier to read in `ps` and avoids quoting
     # ambiguity if a skill name contains unusual chars.
     for sk in task.skills or ():

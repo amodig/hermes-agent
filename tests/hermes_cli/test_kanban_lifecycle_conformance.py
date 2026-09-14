@@ -347,6 +347,54 @@ class KanbanLifecycleConformance(unittest.TestCase):
         assert "verdict_malformed" in validation_state["diagnostics"]
         assert get_lifecycle_state(self.conn, candidate)["acceptance"] == "pending"
 
+    def test_missing_candidate_verdicts_are_not_accepted(self) -> None:
+        candidate = kb.create_task(
+            self.conn,
+            title="missing lifecycle candidate",
+            assignee="implementer",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "reviewer",
+                "validation_required": True,
+            },
+        )
+        for kind, assignee, phase, verdict in (
+            ("review", "reviewer", "review", "APPROVE"),
+            ("validation", "tester", "validation", "PASS"),
+        ):
+            role = kb.create_task(
+                self.conn,
+                title=f"missing {phase} candidate role",
+                assignee=assignee,
+                initial_status="blocked",
+                lifecycle_contract={"kind": kind, "candidate_task_id": candidate},
+            )
+            with kb.write_txn(self.conn):
+                kb._synthesize_ended_run(
+                    self.conn,
+                    role,
+                    outcome="completed",
+                    metadata={
+                        "lifecycle": {
+                            "schema": 1,
+                            "phase": phase,
+                            "candidate_task_id": candidate,
+                            "candidate_run_id": 99,
+                            "head_sha": "missing-head",
+                            "goal_revision_ids": {candidate: 1},
+                            "task_goal_revision_id": 1,
+                            "verdict": verdict,
+                        }
+                    },
+                )
+                self.conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (role,))
+
+            state = get_lifecycle_state(self.conn, role)
+            self.assertEqual(state["acceptance"], "stale")
+            self.assertEqual(state["diagnostics"], ["candidate_missing"])
+
     def test_separate_card_validator_preserves_implementer_identity(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-identity-") as raw_repo:
             repo = Path(raw_repo)

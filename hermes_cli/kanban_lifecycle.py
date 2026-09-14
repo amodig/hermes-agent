@@ -567,7 +567,7 @@ def get_lifecycle_state(conn: sqlite3.Connection, task_id: str) -> dict[str, Any
             )
             if not fresh and freshness_reason:
                 state["diagnostics"].append(freshness_reason)
-        if freshness_reason in {"candidate_head_mismatch", "goal_revision_stale"}:
+        if freshness_reason:
             state["acceptance"] = "stale"
         elif verdict in {"REQUEST_CHANGES", "FAIL"} and row["status"] == "done":
             state["acceptance"] = "rejected"
@@ -653,7 +653,7 @@ def get_lifecycle_state(conn: sqlite3.Connection, task_id: str) -> dict[str, Any
     if row["status"] == "archived":
         state["acceptance"] = "stale"
     elif state["diagnostics"] and any(
-        d in {"candidate_head_mismatch", "goal_revision_stale", "role_conflict"}
+        d in {"candidate_missing", "candidate_head_mismatch", "goal_revision_stale", "role_conflict"}
         for d in state["diagnostics"]
     ):
         state["acceptance"] = "stale"

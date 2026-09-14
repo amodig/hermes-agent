@@ -142,15 +142,17 @@ def test_standalone_dispatcher_keeps_direct_worker_spawn(
 
 
 @pytest.mark.linux_only
-def test_module_worker_rejects_workspace_root_module(
+def test_module_worker_ignores_workspace_root_module(
     worker_setup: tuple[Path, kb.Task], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from tools import process_registry
 
     workspace, task = worker_setup
+    marker = workspace / "workspace-bootstrap-loaded"
     workspace.joinpath("hermes_bootstrap.py").write_text(
         "from pathlib import Path\n"
-        "Path('workspace-bootstrap-loaded').write_text('yes')\n",
+        "Path('workspace-bootstrap-loaded').write_text('yes')\n"
+        "raise SystemExit(42)\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: [sys.executable, "-m", "hermes_cli.main"])
@@ -158,8 +160,19 @@ def test_module_worker_rejects_workspace_root_module(
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: False)
     monkeypatch.setenv("PYTHONPATH", str(Path(kbd.__file__).resolve().parents[1]))
 
-    with pytest.raises(RuntimeError, match="worker exited before post-import verification"):
-        kbd._default_spawn(task, str(workspace))
+    launch = kbd._default_spawn(task, str(workspace), defer_grant=True)
+    try:
+        assert isinstance(launch, kbd.WorkerLaunch)
+        assert launch.grant is not None
+        launch.grant(task.current_run_id or 0, task.claim_lock)
+        deadline = time.monotonic() + 5
+        while kbd._pid_alive(launch.pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+    finally:
+        if launch.cancel:
+            launch.cancel()
+
+    assert not marker.exists()
 
 
 
