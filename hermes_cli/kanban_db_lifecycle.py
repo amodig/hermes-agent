@@ -852,6 +852,18 @@ def _assert_no_lifecycle_role_references(
         )
         if is_required_lifecycle_edge(conn, task_id, str(row["child_id"]))
     ]
+    required_parents = [
+        str(row["parent_id"])
+        for row in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ?", (task_id,)
+        )
+        if is_required_lifecycle_edge(conn, str(row["parent_id"]), task_id)
+    ]
+    if required_parents:
+        raise LifecycleContractError(
+            f"cannot delete lifecycle task {task_id}: required parent task(s) still "
+            f"reference it ({', '.join(sorted(set(required_parents)))})"
+        )
     if required_children:
         raise LifecycleContractError(
             f"cannot delete lifecycle task {task_id}: required child role card(s) still "

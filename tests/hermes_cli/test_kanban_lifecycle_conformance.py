@@ -808,6 +808,61 @@ class KanbanLifecycleConformance(unittest.TestCase):
         self.assertIsNotNone(kb.get_task(self.conn, validation))
 
 
+    def test_deletion_protects_leaf_review_role(self) -> None:
+        implementation = kb.create_task(
+            self.conn,
+            title="leaf deletion candidate",
+            assignee="bob",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "alice",
+                "validation_required": False,
+            },
+        )
+        review = kb.create_task(
+            self.conn,
+            title="leaf deletion review",
+            assignee="alice",
+            lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
+        )
+        kb.link_tasks(self.conn, implementation, review, requirement="phase_finished")
+
+        with self.assertRaises(kb.LifecycleContractError):
+            kb.delete_task(self.conn, review)
+        self.assertIsNotNone(kb.get_task(self.conn, implementation))
+        self.assertIsNotNone(kb.get_task(self.conn, review))
+
+    def test_deletion_protects_terminal_validation_role(self) -> None:
+        implementation = kb.create_task(
+            self.conn,
+            title="terminal validation candidate",
+            assignee="bob",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "same_card",
+                "reviewer": "alice",
+                "validation_required": True,
+            },
+        )
+        validation = kb.create_task(
+            self.conn,
+            title="terminal validation",
+            assignee="tester",
+            lifecycle_contract={
+                "kind": "validation",
+                "candidate_task_id": implementation,
+            },
+        )
+        kb.link_tasks(self.conn, implementation, validation, requirement="review_approved")
+        self.assertTrue(kb.archive_task(self.conn, validation))
+
+        with self.assertRaises(kb.LifecycleContractError):
+            kb.delete_archived_task(self.conn, validation)
+        self.assertIsNotNone(kb.get_task(self.conn, implementation))
+        self.assertIsNotNone(kb.get_task(self.conn, validation))
+
+
     def test_embedded_dispatcher_freezes_identity_before_first_tick(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-dispatcher-") as raw_root:
             root = Path(raw_root)
