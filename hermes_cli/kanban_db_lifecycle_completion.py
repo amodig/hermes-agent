@@ -588,7 +588,9 @@ def complete_task(
     # Success wipes the breaker counter (history stays on the event log).
     _kb._clear_failure_counter(conn, task_id)
     _kb.recompute_ready(conn)  # separate txn so children see ``done``
-    _emit_acceptance_changes(conn, acceptance_before, source_task_id=task_id)
+    accepted_task_ids = _emit_acceptance_changes(
+        conn, acceptance_before, source_task_id=task_id,
+    )
     _done_task = _kb.get_task(conn, task_id)
     acceptance = (
         get_lifecycle_state(conn, task_id).get("acceptance")
@@ -599,6 +601,16 @@ def complete_task(
         _kb._cleanup_workspace(conn, task_id)
         if fire_lifecycle_hook and acceptance == "accepted":
             _kb._fire_task_hook("kanban_task_completed", _done_task, task_id, run_id, summary=handoff_summary)
+    if fire_lifecycle_hook:
+        for accepted_task_id in accepted_task_ids:
+            accepted_task = _kb.get_task(conn, accepted_task_id)
+            _kb._fire_task_hook(
+                "kanban_task_completed",
+                accepted_task,
+                accepted_task_id,
+                run_id,
+                summary=handoff_summary,
+            )
     return True
 
 def _gate_created_cards(

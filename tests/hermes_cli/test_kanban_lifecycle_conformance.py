@@ -197,15 +197,31 @@ class KanbanLifecycleConformance(unittest.TestCase):
             validation_run = kb.claim_task(self.conn, validation, claimer="tester:conformance")
             self.assertIsNotNone(validation_run)
             trace.append("validation:ready->running")
-            self.assertTrue(
-                kb.complete_task(
-                    self.conn,
-                    validation,
-                    expected_run_id=validation_run.current_run_id,
-                    verdict="PASS",
-                    summary="Validation passed on reviewed head",
-                    metadata={"head_sha": head_sha},
+            with patch.object(kb, "_fire_task_hook") as fire_hook:
+                self.assertTrue(
+                    kb.complete_task(
+                        self.conn,
+                        validation,
+                        expected_run_id=validation_run.current_run_id,
+                        verdict="PASS",
+                        summary="Validation passed on reviewed head",
+                        metadata={"head_sha": head_sha},
+                    )
                 )
+            candidate_completion_calls = [
+                call
+                for call in fire_hook.call_args_list
+                if (
+                    len(call.args) >= 3
+                    and call.args[0] == "kanban_task_completed"
+                    and call.args[2] == implementation
+                )
+            ]
+            self.assertEqual(len(candidate_completion_calls), 1)
+            self.assertEqual(candidate_completion_calls[0].args[1].id, implementation)
+            self.assertEqual(
+                candidate_completion_calls[0].kwargs["summary"],
+                "Validation passed on reviewed head",
             )
             trace.append("validation:running->done")
             acceptance = get_lifecycle_state(self.conn, implementation)
@@ -1464,7 +1480,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "receipt.write_text(json.dumps({'result': result, 'turn_value': turn_value, 'discovered_tools': discovered_tools, 'discovered_plugins': discovered_plugins, 'discovered_resources': discovered_resources, 'lazy_values': lazy_values, 'agent_value': agent_value, 'tracker_value': tracker_value, 'constructor_value': agent.value}), encoding='utf-8')"
             )
             env = os.environ.copy()
-            env["PYTHONPATH"] = str(ROOT)
+            env["PYTHONPATH"] = str(RUNTIME_ROOT)
             completed = subprocess.run(
                 [sys.executable, "-c", script, str(root), str(receipt)],
                 text=True,
@@ -1505,7 +1521,7 @@ print(synced.stat().st_mode & stat.S_IXUSR)
 """
             env = os.environ.copy()
             env["HERMES_HOME"] = raw_home
-            env["PYTHONPATH"] = str(ROOT)
+            env["PYTHONPATH"] = str(RUNTIME_ROOT)
             completed = subprocess.run(
                 [sys.executable, "-c", script, str(ROOT), raw_home],
                 text=True,
@@ -1691,7 +1707,7 @@ runtime.cleanup_runtime_snapshot(snapshot)
 """
             env = os.environ.copy()
             env.update(overrides)
-            env["PYTHONPATH"] = str(ROOT)
+            env["PYTHONPATH"] = str(RUNTIME_ROOT)
             env["PYTHONDONTWRITEBYTECODE"] = "1"
             completed = subprocess.run(
                 [sys.executable, "-c", script, str(root)],

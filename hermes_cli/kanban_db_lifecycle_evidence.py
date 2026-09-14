@@ -167,9 +167,9 @@ def _emit_acceptance_changes(
     before: dict[str, str],
     *,
     source_task_id: Optional[str] = None,
-) -> None:
+) -> list[str]:
     if not before:
-        return
+        return []
     changes: list[tuple[str, str, str, str, Any]] = []
     for task_id, old in before.items():
         projection = get_lifecycle_state(conn, task_id)
@@ -189,7 +189,7 @@ def _emit_acceptance_changes(
             )
             changes.append((task_id, old, new, phase, result))
     if not changes:
-        return
+        return []
     with _kb.write_txn(conn):
         for task_id, old, new, phase, result in changes:
             _kb._append_event(
@@ -204,6 +204,7 @@ def _emit_acceptance_changes(
                     "source_task_id": source_task_id,
                 },
             )
+    return [task_id for task_id, _old, new, _phase, _result in changes if new == "accepted"]
 
 def _handoff_children(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, str]]:
     rows = conn.execute(
