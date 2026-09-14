@@ -142,6 +142,20 @@ def _identity_root_module_names(root: Path) -> frozenset[str]:
     return frozenset(path.stem for path in root.glob("*.py") if path.is_file())
 
 
+def _pin_runtime_import_root(root: Path) -> None:
+    """Put the verified checkout before the worker workspace on ``sys.path``."""
+    root = root.resolve()
+    retained: list[str] = []
+    for entry in sys.path:
+        try:
+            if Path(entry or os.getcwd()).resolve() == root:
+                continue
+        except OSError:
+            pass
+        retained.append(entry)
+    sys.path[:] = [str(root), *retained]
+
+
 
 
 
@@ -387,6 +401,7 @@ def worker_bootstrap_from_env() -> Optional[dict[str, Any]]:
     _atomic_write(Path(path_raw), payload)
     if not payload["ready"]:
         raise RuntimeIdentityError("worker runtime identity mismatch")
+    _pin_runtime_import_root(Path(actual.module_root))
     if os.environ.get("HERMES_KANBAN_BOOTSTRAP_WAIT", "1").lower() in {"0", "false", "no", "off"}:
         os.environ["HERMES_KANBAN_RUNTIME_GRANTED"] = "1"
         for key in _BOOTSTRAP_INPUT_ENV:

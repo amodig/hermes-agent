@@ -291,6 +291,64 @@ def _rework_graph(conn, repo: Path, base: str, branch: str) -> tuple[str, str, s
     return implementation, reviewer, tester, descendant, first_head
 
 
+def test_typed_same_card_rework_refuses_active_implementation(kanban_home, tmp_path):
+    repo, base, _branch = _repo(tmp_path)
+    with kbc.connect_closing() as conn:
+        implementation = kb.create_task(
+            conn,
+            title="typed same-card implementation",
+            assignee="implementer",
+            initial_status="blocked",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "same_card",
+                "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        )
+        assert kb.unblock_task(conn, implementation)
+        head = _commit(repo)
+        implementation_run = kb.claim_task(conn, implementation, claimer="implementer:1")
+        assert implementation_run is not None
+        assert kb.complete_task(
+            conn,
+            implementation,
+            expected_run_id=implementation_run.current_run_id,
+            metadata={"base_sha": base, "head_sha": head},
+        )
+        review_run = kb.claim_review_task(conn, implementation, claimer="reviewer:1")
+        assert review_run is not None
+        assert kb.complete_task(
+            conn,
+            implementation,
+            expected_run_id=review_run.current_run_id,
+            verdict="REQUEST_CHANGES",
+            summary="repair required",
+            metadata={"reviewed_head_sha": head},
+        )
+        awaiting_rework = kb.get_task(conn, implementation)
+        assert awaiting_rework is not None
+        assert awaiting_rework.status == "ready"
+
+        active = kb.claim_task(conn, implementation, claimer="implementer:2")
+        assert active is not None
+        with pytest.raises(ValueError, match="is claimed"):
+            kb.rework_review_graph(
+                conn,
+                implementation,
+                expected_implementation_version=active.version,
+                reason="repair the rejected implementation",
+            )
+
+        unchanged = kb.get_task(conn, implementation)
+        assert unchanged is not None
+        assert unchanged.status == "running"
+        assert unchanged.current_run_id == active.current_run_id
+        assert unchanged.claim_lock == active.claim_lock
+
+
 def test_separate_reviewer_requires_explicit_approval(kanban_home, tmp_path):
     repo, base, branch = _repo(tmp_path)
     with kbc.connect_closing() as conn:

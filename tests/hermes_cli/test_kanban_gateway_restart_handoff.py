@@ -162,6 +162,39 @@ def test_module_worker_rejects_workspace_root_module(
         kbd._default_spawn(task, str(workspace))
 
 
+
+@pytest.mark.linux_only
+def test_module_worker_pins_runtime_root_before_lazy_import(
+    worker_setup: tuple[Path, kb.Task], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tools import process_registry
+
+    workspace, task = worker_setup
+    marker = workspace / "workspace-model-tools-loaded"
+    workspace.joinpath("model_tools.py").write_text(
+        "from pathlib import Path\n"
+        "Path('workspace-model-tools-loaded').write_text('yes')\n"
+        "raise RuntimeError('workspace model_tools loaded')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: [sys.executable, "-m", "hermes_cli.main"])
+    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: False)
+    monkeypatch.setenv("PYTHONPATH", str(Path(kbd.__file__).resolve().parents[1]))
+
+    launch = kbd._default_spawn(task, str(workspace), defer_grant=True)
+    assert isinstance(launch, kbd.WorkerLaunch)
+    try:
+        assert launch.grant is not None
+        launch.grant(task.current_run_id or 0, task.claim_lock)
+        deadline = time.monotonic() + 5
+        while kbd._pid_alive(launch.pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+    finally:
+        if launch.cancel:
+            launch.cancel()
+
+    assert not marker.exists()
+
 @pytest.mark.linux_only
 def test_real_user_systemd_scope_preserves_worker_context(
     worker_setup: tuple[Path, kb.Task], monkeypatch: pytest.MonkeyPatch

@@ -213,7 +213,9 @@ def _typed_rework_graph(
         for row in descendants:
             if row["status"] == "running" or row["claim_lock"] or row["current_run_id"] or row["worker_pid"]:
                 raise ValueError(f"cannot rework graph while task {row['id']} is claimed")
-        for row in [rows[task_id] for task_id in reset_ids]:
+        for row in rows.values():
+            if row["status"] == "running" or row["claim_lock"] or row["current_run_id"] or row["worker_pid"]:
+                raise ValueError(f"cannot rework graph while task {row['id']} is claimed")
             if row["status"] == "archived":
                 raise ValueError(f"cannot rework archived task {row['id']}")
         implementation_status = "ready" if _parents_satisfied(conn, implementation_id) else "todo"
