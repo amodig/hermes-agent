@@ -146,13 +146,16 @@ def _git_sha(root: Path) -> str:
         head = (git_dir / "HEAD").read_text(encoding="ascii").strip()
         if head.startswith("ref: "):
             ref = head[5:].strip()
-            candidates = [git_dir / ref]
-            common_dir = git_dir / "commondir"
-            if common_dir.is_file():
-                common = Path(common_dir.read_text(encoding="utf-8").strip())
+            common_dir = git_dir
+            commondir_file = git_dir / "commondir"
+            if commondir_file.is_file():
+                common = Path(commondir_file.read_text(encoding="utf-8").strip())
                 if not common.is_absolute():
                     common = (git_dir / common).resolve()
-                candidates.append(common / ref)
+                common_dir = common
+            candidates = [git_dir / ref]
+            if common_dir != git_dir:
+                candidates.append(common_dir / ref)
             for candidate in candidates:
                 try:
                     sha = _valid(candidate.read_text(encoding="ascii"))
@@ -160,7 +163,7 @@ def _git_sha(root: Path) -> str:
                     continue
                 if sha:
                     return sha
-            for packed in (git_dir / "packed-refs", candidates[-1].parent.parent / "packed-refs"):
+            for packed in (git_dir / "packed-refs", common_dir / "packed-refs"):
                 if not packed.is_file():
                     continue
                 for line in packed.read_text(encoding="ascii").splitlines():

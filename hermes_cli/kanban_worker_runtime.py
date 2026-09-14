@@ -482,6 +482,13 @@ def _default_spawn(
         )
         if override is not None:
             env[var] = override
+    env["HERMES_KANBAN_DB"] = str(_kb.kanban_db_path(board=board))
+    env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(_kb.workspaces_root(board=board))
+    _retag_legacy_worker_sessions(env["HERMES_KANBAN_WORKSPACES_ROOT"])
+    env["HERMES_KANBAN_BOARD"] = _kb._normalize_board_slug(board) or _kb.get_current_board()
+    env["HERMES_PROFILE"] = profile_arg
+    env.pop("HERMES_TUI", None)
+
     from hermes_cli.kanban_runtime import (
         _sweep_runtime_snapshots,
         _write_runtime_snapshot_owner,
@@ -612,6 +619,8 @@ def _default_spawn(
         if isinstance(raw_snapshot, str) and raw_snapshot:
             snapshot_path = Path(raw_snapshot)
         _worker_processes[proc.pid] = proc
+        _worker_pid_aliases[proc.pid] = actual.pid
+
         if snapshot_path is not None:
             _write_runtime_snapshot_owner(
                 snapshot_path, pid=actual.pid, start_time=actual.start_time,

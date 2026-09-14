@@ -31,13 +31,14 @@ from hermes_cli.kanban_parser import build_parser
 from hermes_cli.kanban_runtime import (
     RuntimeIdentityError,
     _fingerprint,
+    _git_sha,
+    process_start_time,
     assert_runtime_import_root,
     code_identity,
-    process_start_time,
     runtime_identity,
     same_code_identity,
 )
-from unittest.mock import patch
+
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_ROOT = Path(os.environ.get("HERMES_CONFORMANCE_RUNTIME_ROOT", ROOT)).resolve()
@@ -1448,6 +1449,34 @@ print(synced.stat().st_mode & stat.S_IXUSR)
                 runtime._sweep_runtime_snapshots()
             self.assertFalse(stale.exists())
             self.assertTrue(live.exists())
+
+    def test_reaped_launcher_exit_uses_verified_worker_pid(self) -> None:
+        launcher_pid = 2_147_482_999
+        worker_pid = launcher_pid - 1
+        rate_limit = kb.KANBAN_RATE_LIMIT_EXIT_CODE
+        kbd._worker_pid_aliases[launcher_pid] = worker_pid
+        kbd._worker_processes[launcher_pid] = SimpleNamespace(returncode=None)
+        try:
+            kbd._record_worker_exit(launcher_pid, rate_limit << 8)
+            self.assertEqual(kbd._classify_worker_exit(worker_pid), ("rate_limited", rate_limit))
+        finally:
+            kbd._worker_pid_aliases.pop(launcher_pid, None)
+            kbd._worker_processes.pop(launcher_pid, None)
+            kbd._recent_worker_exits.pop(worker_pid, None)
+
+    def test_runtime_sha_reads_packed_worktree_refs_from_common_git_dir(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kanban-conformance-packed-ref-") as raw_root:
+            root = Path(raw_root) / "worktree"
+            common = Path(raw_root) / "repo.git"
+            git_dir = common / "worktrees" / "worktree"
+            root.mkdir()
+            git_dir.mkdir(parents=True)
+            (root / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+            (git_dir / "HEAD").write_text("ref: refs/heads/feature\n", encoding="ascii")
+            (git_dir / "commondir").write_text("../..\n", encoding="ascii")
+            sha = "a" * 40
+            (common / "packed-refs").write_text(f"{sha} refs/heads/feature\n", encoding="ascii")
+            self.assertEqual(_git_sha(root), sha)
 
     def test_embedded_dispatcher_freezes_identity_before_first_tick(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-dispatcher-") as raw_root:
