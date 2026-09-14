@@ -875,64 +875,85 @@ def _lifecycle_graph_ids(
     }
     requested_candidate_ids.add(candidate_id)
 
-    candidate_ids = {candidate_id}
     edges = conn.execute(
         "SELECT parent_id, child_id, requirement FROM task_links"
     ).fetchall()
-    while True:
-        connected: set[str] = set()
-        for edge in edges:
-            parent = contracts.get(str(edge["parent_id"]))
-            child = contracts.get(str(edge["child_id"]))
-            if (
-                parent is None
-                or child is None
-                or parent.get("kind") != "validation"
-                or child.get("kind") != "code"
-                or edge["requirement"] != "validation_passed"
-            ):
-                continue
-            parent_candidate_id = str(parent.get("candidate_task_id") or "")
-            child_candidate_id = str(edge["child_id"])
-            if (
-                parent_candidate_id in candidate_ids
-                and child_candidate_id in requested_candidate_ids
-            ):
-                connected.add(child_candidate_id)
-            elif (
-                child_candidate_id in candidate_ids
-                and parent_candidate_id in requested_candidate_ids
-                and contracts.get(parent_candidate_id, {}).get("kind") == "code"
-            ):
-                connected.add(parent_candidate_id)
-        new_candidates = connected - candidate_ids
-        if not new_candidates:
-            break
-        candidate_ids.update(new_candidates)
 
-    graph: set[str] = set()
-    for candidate_id in candidate_ids:
-        if contracts.get(candidate_id, {}).get("kind") != "code":
-            continue
-        graph.add(candidate_id)
-        graph.update(
-            node_id
-            for node_id, contract in contracts.items()
-            if contract
-            and contract.get("kind") in {"review", "validation"}
-            and str(contract.get("candidate_task_id") or "") == candidate_id
-        )
-    requested_boundaries = requested_ids - graph
-    for edge in edges:
-        parent_id, child_id = str(edge["parent_id"]), str(edge["child_id"])
-        if parent_id in graph and child_id in requested_boundaries:
-            boundary_id = child_id
-        elif child_id in graph and parent_id in requested_boundaries:
-            boundary_id = parent_id
-        else:
-            continue
-        if is_required_lifecycle_edge(conn, parent_id, child_id):
-            graph.add(boundary_id)
+    candidate_ids = {candidate_id}
+    boundary_ids: set[str] = set()
+    while True:
+        while True:
+            connected_candidates: set[str] = set()
+            for edge in edges:
+                parent = contracts.get(str(edge["parent_id"]))
+                child = contracts.get(str(edge["child_id"]))
+                if (
+                    parent is None
+                    or child is None
+                    or parent.get("kind") != "validation"
+                    or child.get("kind") != "code"
+                    or edge["requirement"] != "validation_passed"
+                ):
+                    continue
+                parent_candidate_id = str(parent.get("candidate_task_id") or "")
+                child_candidate_id = str(edge["child_id"])
+                if (
+                    parent_candidate_id in candidate_ids
+                    and child_candidate_id in requested_candidate_ids
+                ):
+                    connected_candidates.add(child_candidate_id)
+                elif (
+                    child_candidate_id in candidate_ids
+                    and parent_candidate_id in requested_candidate_ids
+                    and contracts.get(parent_candidate_id, {}).get("kind") == "code"
+                ):
+                    connected_candidates.add(parent_candidate_id)
+            new_candidates = connected_candidates - candidate_ids
+            if not new_candidates:
+                break
+            candidate_ids.update(new_candidates)
+
+        graph: set[str] = set(boundary_ids)
+        for candidate_id in candidate_ids:
+            if contracts.get(candidate_id, {}).get("kind") != "code":
+                continue
+            graph.add(candidate_id)
+            graph.update(
+                node_id
+                for node_id, contract in contracts.items()
+                if contract
+                and contract.get("kind") in {"review", "validation"}
+                and str(contract.get("candidate_task_id") or "") == candidate_id
+            )
+
+        requested_boundaries = requested_ids - graph
+        connected_boundaries: set[str] = set()
+        connected_role_candidates: set[str] = set()
+        for edge in edges:
+            parent_id, child_id = str(edge["parent_id"]), str(edge["child_id"])
+            if parent_id in graph:
+                boundary_id = child_id
+            elif child_id in graph:
+                boundary_id = parent_id
+            else:
+                continue
+            if not is_required_lifecycle_edge(conn, parent_id, child_id):
+                continue
+            if boundary_id in requested_boundaries:
+                connected_boundaries.add(boundary_id)
+                continue
+            boundary = contracts.get(boundary_id) or {}
+            role_candidate_id = str(boundary.get("candidate_task_id") or "")
+            if (
+                boundary.get("kind") in {"review", "validation"}
+                and role_candidate_id in requested_candidate_ids
+                and role_candidate_id not in candidate_ids
+            ):
+                connected_role_candidates.add(role_candidate_id)
+        if not connected_boundaries and not connected_role_candidates:
+            break
+        boundary_ids.update(connected_boundaries)
+        candidate_ids.update(connected_role_candidates)
     return graph if len(graph) > 1 else set()
 
 

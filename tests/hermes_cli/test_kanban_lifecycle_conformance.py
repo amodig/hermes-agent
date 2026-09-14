@@ -19,6 +19,7 @@ import subprocess
 import time
 import tempfile
 import unittest
+from unittest.mock import patch
 from types import SimpleNamespace
 
 from gateway import kanban_watchers_notifier as notifier
@@ -1069,6 +1070,68 @@ class KanbanLifecycleConformance(unittest.TestCase):
         for task_id in task_ids:
             self.assertIsNone(kb.get_task(self.conn, task_id))
 
+    def test_archived_lifecycle_graph_closes_converging_requested_candidates(self) -> None:
+        def _candidate_graph(prefix: str, assignee: str) -> tuple[str, str, str]:
+            candidate = kb.create_task(
+                self.conn,
+                title=f"{prefix} candidate",
+                assignee=assignee,
+                initial_status="blocked",
+                lifecycle_contract={
+                    "kind": "code",
+                    "review_mode": "separate_card",
+                    "reviewer": "alice",
+                    "validation_required": True,
+                },
+            )
+            review = kb.create_task(
+                self.conn,
+                title=f"{prefix} review",
+                assignee="alice",
+                initial_status="blocked",
+                lifecycle_contract={"kind": "review", "candidate_task_id": candidate},
+            )
+            validation = kb.create_task(
+                self.conn,
+                title=f"{prefix} validation",
+                assignee="tester",
+                initial_status="blocked",
+                lifecycle_contract={"kind": "validation", "candidate_task_id": candidate},
+            )
+            kb.link_tasks(self.conn, candidate, review, requirement="phase_finished")
+            kb.link_tasks(self.conn, review, validation, requirement="review_approved")
+            return candidate, review, validation
+
+        candidate_a, review_a, validation_a = _candidate_graph("converging A", "bob")
+        candidate_b, review_b, validation_b = _candidate_graph("converging B", "carol")
+        boundary = kb.create_task(
+            self.conn,
+            title="converging general boundary",
+            assignee="owner",
+            initial_status="blocked",
+            lifecycle_contract={"kind": "general"},
+        )
+        kb.link_tasks(self.conn, validation_a, boundary, requirement="validation_passed")
+        kb.link_tasks(self.conn, validation_b, boundary, requirement="validation_passed")
+        task_ids = (
+            candidate_a, review_a, validation_a,
+            candidate_b, review_b, validation_b, boundary,
+        )
+        for task_id in task_ids:
+            self.assertTrue(kb.archive_task(self.conn, task_id))
+
+        with self.assertRaises(kb.LifecycleContractError):
+            kb.delete_archived_task(self.conn, candidate_a)
+        self.assertTrue(
+            kb.delete_archived_task(
+                self.conn,
+                candidate_a,
+                requested_task_ids=(candidate_a, candidate_b, boundary),
+            )
+        )
+        for task_id in task_ids:
+            self.assertIsNone(kb.get_task(self.conn, task_id))
+
     def test_archived_lifecycle_graph_can_purge_through_typed_validation_edge(
         self,
     ) -> None:
@@ -1364,6 +1427,27 @@ print(synced.stat().st_mode & stat.S_IXUSR)
         finally:
             kbd._worker_runtime_snapshots.pop(worker_pid, None)
             kbd._recent_worker_exits.pop(worker_pid, None)
+
+    def test_runtime_snapshot_sweep_removes_dead_owners(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kanban-conformance-snapshot-sweep-") as raw_root:
+            root = Path(raw_root)
+            stale = root / "hermes-kanban-runtime-stale"
+            live = root / "hermes-kanban-runtime-live"
+            stale.mkdir()
+            live.mkdir()
+            owner_file = runtime._RUNTIME_SNAPSHOT_OWNER_FILE
+            (stale / owner_file).write_text(
+                json.dumps({"pid": os.getpid(), "start_time": process_start_time() + 1}),
+                encoding="utf-8",
+            )
+            (live / owner_file).write_text(
+                json.dumps({"pid": os.getpid(), "start_time": process_start_time()}),
+                encoding="utf-8",
+            )
+            with patch.object(runtime.tempfile, "gettempdir", return_value=raw_root):
+                runtime._sweep_runtime_snapshots()
+            self.assertFalse(stale.exists())
+            self.assertTrue(live.exists())
 
     def test_embedded_dispatcher_freezes_identity_before_first_tick(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-dispatcher-") as raw_root:

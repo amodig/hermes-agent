@@ -72,14 +72,32 @@ def _policy_digest(policy_root: Path | None) -> str | None:
     return digest.hexdigest()
 
 
-def _probe_identity(runtime_root: Path, python: str) -> dict:
+def _pythonpath(layer: str, runtime_root: Path) -> str:
+    roots = (runtime_root,) if layer == "installed" else (runtime_root, REPO_ROOT)
+    return os.pathsep.join(dict.fromkeys(str(value) for value in roots))
+
+
+
+
+def _installed_unittest_runner() -> str:
+    return (
+        "import importlib.util,sys,unittest;"
+        "spec=importlib.util.spec_from_file_location('installed_conformance',sys.argv[1]);"
+        "module=importlib.util.module_from_spec(spec);"
+        "sys.modules[spec.name]=module;"
+        "spec.loader.exec_module(module);"
+        "result=unittest.TextTestRunner(verbosity=2).run("
+        "unittest.defaultTestLoader.loadTestsFromModule(module));"
+        "raise SystemExit(0 if result.wasSuccessful() else 1)"
+    )
+
+
+def _probe_identity(runtime_root: Path, python: str, *, layer: str) -> dict:
     env = os.environ.copy()
     env.update(
         {
             "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONPATH": os.pathsep.join(
-                value for value in (str(runtime_root), str(REPO_ROOT)) if value
-            ),
+            "PYTHONPATH": _pythonpath(layer, runtime_root),
         }
     )
     with tempfile.TemporaryDirectory(prefix="kanban-identity-home-") as home:
@@ -181,19 +199,21 @@ def _run_suite(layer: str, runtime_root: Path, python: str, junit: Path | None) 
             "HERMES_CONFORMANCE_RUNTIME_ROOT": str(runtime_root),
             "HERMES_HOME": tempfile.mkdtemp(prefix="kanban-suite-home-"),
             "HERMES_KANBAN_HOME": tempfile.mkdtemp(prefix="kanban-suite-kanban-"),
-            "PYTHONPATH": os.pathsep.join(
-                dict.fromkeys(str(value) for value in (runtime_root, REPO_ROOT))
-            ),
+            "PYTHONPATH": _pythonpath(layer, runtime_root),
         }
     )
     if layer == "source" and _pytest_available(python):
         command = [str(REPO_ROOT / "scripts" / "run_tests.sh"), str(TEST_FILE)]
         runner = "scripts/run_tests.sh"
         cwd = REPO_ROOT
+    elif layer == "installed":
+        command = [python, "-c", _installed_unittest_runner(), str(TEST_FILE)]
+        runner = "python -c <installed conformance runner>"
+        cwd = runtime_root
     else:
         command = [python, "-m", "unittest", "-v", TEST_MODULE]
         runner = "python -m unittest"
-        cwd = runtime_root if layer == "installed" else REPO_ROOT
+        cwd = REPO_ROOT
     result = subprocess.run(
         command,
         cwd=cwd,
@@ -206,7 +226,8 @@ def _run_suite(layer: str, runtime_root: Path, python: str, junit: Path | None) 
     )
     return result.returncode, result.stdout + result.stderr, runner, env["PYTHONPATH"]
 
-def _run_scenario_probe(runtime_root: Path, python: str) -> tuple[int, str]:
+
+def _run_scenario_probe(layer: str, runtime_root: Path, python: str) -> tuple[int, str]:
     """Recover test ids when the canonical runner only prints file summaries."""
     env = os.environ.copy()
     env.update(
@@ -215,14 +236,16 @@ def _run_scenario_probe(runtime_root: Path, python: str) -> tuple[int, str]:
             "HERMES_CONFORMANCE_RUNTIME_ROOT": str(runtime_root),
             "HERMES_HOME": tempfile.mkdtemp(prefix="kanban-scenario-home-"),
             "HERMES_KANBAN_HOME": tempfile.mkdtemp(prefix="kanban-scenario-kanban-"),
-            "PYTHONPATH": os.pathsep.join(
-                dict.fromkeys(str(value) for value in (runtime_root, REPO_ROOT))
-            ),
+            "PYTHONPATH": _pythonpath(layer, runtime_root),
         }
     )
+    if layer == "installed":
+        command = [python, "-c", _installed_unittest_runner(), str(TEST_FILE)]
+    else:
+        command = [python, "-m", "unittest", "-v", TEST_MODULE]
     result = subprocess.run(
-        [python, "-m", "unittest", "-v", TEST_MODULE],
-        cwd=runtime_root,
+        command,
+        cwd=runtime_root if layer == "installed" else REPO_ROOT,
         env=env,
         capture_output=True,
         text=True,
@@ -231,6 +254,7 @@ def _run_scenario_probe(runtime_root: Path, python: str) -> tuple[int, str]:
         timeout=300,
     )
     return result.returncode, result.stdout + result.stderr
+
 
 
 def _write_receipt(path: Path, receipt: dict) -> Path:
@@ -276,7 +300,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if not runtime_root.is_dir():
             raise RuntimeError(f"runtime root does not exist: {runtime_root}")
-        identity = _probe_identity(runtime_root, sys.executable)
+        identity = _probe_identity(runtime_root, sys.executable, layer=args.layer)
         if args.layer == "installed":
             reported_root = identity.get("module_root")
             if not reported_root:
@@ -305,7 +329,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         scenarios = _parse_scenarios(output, args.junit)
         if not scenarios:
-            probe_code, probe_output = _run_scenario_probe(runtime_root, sys.executable)
+            probe_code, probe_output = _run_scenario_probe(
+                args.layer, runtime_root, sys.executable,
+            )
             scenarios = _parse_scenarios(probe_output, None)
             receipt["reference"]["scenario_runner"] = "python -m unittest -v"
             if return_code == 0 and probe_code != 0:

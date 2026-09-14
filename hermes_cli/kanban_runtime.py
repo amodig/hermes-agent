@@ -126,6 +126,52 @@ _PROCESS_START_TIME = int(time.time_ns())
 
 
 def _git_sha(root: Path) -> str:
+    def _valid(value: str) -> str:
+        value = value.strip()
+        return value if len(value) == 40 and all(char in "0123456789abcdef" for char in value) else ""
+
+    try:
+        marker = root / ".git"
+        if marker.is_dir():
+            git_dir = marker
+        else:
+            text = marker.read_text(encoding="utf-8").strip()
+            prefix, separator, value = text.partition(":")
+            if prefix != "gitdir" or not separator:
+                raise OSError("invalid gitdir marker")
+            git_dir = Path(value.strip())
+            if not git_dir.is_absolute():
+                git_dir = (root / git_dir).resolve()
+
+        head = (git_dir / "HEAD").read_text(encoding="ascii").strip()
+        if head.startswith("ref: "):
+            ref = head[5:].strip()
+            candidates = [git_dir / ref]
+            common_dir = git_dir / "commondir"
+            if common_dir.is_file():
+                common = Path(common_dir.read_text(encoding="utf-8").strip())
+                if not common.is_absolute():
+                    common = (git_dir / common).resolve()
+                candidates.append(common / ref)
+            for candidate in candidates:
+                try:
+                    sha = _valid(candidate.read_text(encoding="ascii"))
+                except OSError:
+                    continue
+                if sha:
+                    return sha
+            for packed in (git_dir / "packed-refs", candidates[-1].parent.parent / "packed-refs"):
+                if not packed.is_file():
+                    continue
+                for line in packed.read_text(encoding="ascii").splitlines():
+                    if line and not line.startswith(("#", "^")):
+                        sha, _, packed_ref = line.partition(" ")
+                        if packed_ref == ref:
+                            return _valid(sha) or "unknown"
+            return "unknown"
+        return _valid(head) or "unknown"
+    except (OSError, UnicodeError, ValueError):
+        pass
     try:
         result = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "HEAD"],
@@ -137,7 +183,7 @@ def _git_sha(root: Path) -> str:
     except (OSError, subprocess.SubprocessError, TypeError):
         return "unknown"
     sha = result.stdout.strip()
-    return sha or "unknown"
+    return sha if len(sha) == 40 else "unknown"
 
 
 def _version(root: Path) -> str:
@@ -169,6 +215,61 @@ def _pin_runtime_import_root(root: Path) -> None:
         retained.append(entry)
     sys.path[:] = [str(root), *retained]
 _FROZEN_IMPORT_ROOT: Optional[Path] = None
+
+_RUNTIME_SNAPSHOT_OWNER_FILE = ".hermes-kanban-runtime-owner.json"
+_RUNTIME_SNAPSHOT_ORPHAN_GRACE_SECONDS = 3600
+
+
+def _sweep_runtime_snapshots() -> None:
+    """Remove snapshots left by workers from an older gateway process."""
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    try:
+        snapshots = temp_root.glob("hermes-kanban-runtime-*")
+    except OSError:
+        return
+    now = time.time()
+    for snapshot in snapshots:
+        try:
+            if not snapshot.is_dir():
+                continue
+            owner_path = snapshot / _RUNTIME_SNAPSHOT_OWNER_FILE
+            try:
+                owner = json.loads(owner_path.read_text(encoding="utf-8"))
+                pid = int(owner["pid"])
+                start_time = int(owner["start_time"])
+            except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+                owner = None
+                pid = 0
+                start_time = 0
+            if owner is not None:
+                try:
+                    if pid > 0 and process_start_time(pid) == start_time:
+                        continue
+                except (RuntimeIdentityError, OSError, ValueError):
+                    pass
+                _remove_frozen_import_root(snapshot)
+                continue
+            if now - snapshot.stat().st_mtime < _RUNTIME_SNAPSHOT_ORPHAN_GRACE_SECONDS:
+                continue
+            _remove_frozen_import_root(snapshot)
+        except OSError:
+            continue
+
+
+def _write_runtime_snapshot_owner(
+    snapshot: Path,
+    *,
+    pid: Optional[int] = None,
+    start_time: Optional[int] = None,
+) -> None:
+    owner_pid = int(pid or os.getpid())
+    owner_start_time = (
+        process_start_time(owner_pid) if start_time is None else int(start_time)
+    )
+    _atomic_write(
+        snapshot / _RUNTIME_SNAPSHOT_OWNER_FILE,
+        {"pid": owner_pid, "start_time": owner_start_time},
+    )
 
 
 def _is_frozen_import_location(location: str) -> bool:
@@ -582,3 +683,6 @@ def worker_bootstrap_after_constructor() -> None:
 
 def runtime_identity_json(module_root: Optional[os.PathLike[str] | str] = None) -> str:
     return encode_identity(runtime_identity(module_root))
+
+if not os.environ.get("HERMES_KANBAN_BOOTSTRAP_PATH"):
+    _sweep_runtime_snapshots()

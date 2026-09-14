@@ -35,7 +35,9 @@ if _bootstrap_root not in sys.path:
     sys.path.insert(0, _bootstrap_root)
 
 _early_runtime_argv = sys.argv[1:]
-if os.environ.get("HERMES_KANBAN_BOOTSTRAP_PATH"):
+if os.environ.get("HERMES_KANBAN_BOOTSTRAP_PATH") and not os.environ.get(
+    "HERMES_KANBAN_BOOTSTRAP_DONE",
+):
     try:
         # Worker bootstrap is the one narrow path allowed to import the
         # runtime module before early recovery.
