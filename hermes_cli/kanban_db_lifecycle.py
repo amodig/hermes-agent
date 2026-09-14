@@ -472,7 +472,6 @@ def link_tasks(
 ) -> None:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
-    acceptance_before = _capture_acceptance(conn, child_id)
     with _kb.write_txn(conn):
         missing = _kb._missing_task_ids(conn, [parent_id, child_id])
         if missing:
@@ -485,6 +484,7 @@ def link_tasks(
             "SELECT requirement FROM task_links WHERE parent_id = ? AND child_id = ?",
             (parent_id, child_id),
         ).fetchone()
+        acceptance_before = _capture_acceptance(conn, child_id)
         if existing is not None:
             current = existing["requirement"]
             if current == requested:
@@ -544,7 +544,7 @@ def link_tasks(
             conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'", (child_id,),
             )
-    _emit_acceptance_changes(conn, acceptance_before, source_task_id=child_id)
+        _emit_acceptance_changes(conn, acceptance_before, source_task_id=child_id)
 
 def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     """Promote ``todo``/``blocked`` tasks whose parents are all done/archived;

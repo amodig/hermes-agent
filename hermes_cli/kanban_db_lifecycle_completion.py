@@ -209,15 +209,16 @@ def _commit_completion(
     summary: Optional[str],
     result: Optional[str],
     verdict: Optional[str],
-) -> tuple[bool, Optional[int], Optional[Exception]]:
+) -> tuple[bool, Optional[int], Optional[Exception], list[str]]:
     contract_err: Optional[_kb.CompletionContractError] = None
     run_id: Optional[int] = None
     synthetic_run_id: Optional[int] = None
+    accepted_task_ids: list[str] = []
     with _kb.write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
-            return False, None, None
+            return False, None, None, accepted_task_ids
         if _completion_contract_snapshot(conn, task_id) != preflight_contract:
             contract_err = _kb.CompletionContractError(
                 task_id,
@@ -241,13 +242,13 @@ def _commit_completion(
                     {"reason": error.reason, "changed_files": error.changed_files},
                     run_id=expected_run_id,
                 )
-                return False, None, error
+                return False, None, error, accepted_task_ids
             except _kb.HandoffValidationError as error:
                 _kb._append_event(
                     conn, task_id, "completion_blocked_handoff",
                     {"reason": error.reason}, run_id=expected_run_id,
                 )
-                return False, None, error
+                return False, None, error, accepted_task_ids
             handoff_kind = _completion_handoff_kind(
                 task_before,
                 typed_phase=typed_phase,
@@ -293,7 +294,7 @@ def _commit_completion(
                             {"reason": str(error)},
                             run_id=expected_run_id,
                         )
-                        return False, None, error
+                        return False, None, error, accepted_task_ids
             prior_status = _kb._task_status(conn, task_id)
             implementation_routing = _implementation_routing(conn, task_id)
             target_status = (
@@ -346,13 +347,14 @@ def _commit_completion(
             if expected_run_id is not None:
                 sql += " AND current_run_id = ?"
                 params = (*params, int(expected_run_id))
+            acceptance_before = _capture_acceptance(conn, task_id)
             if conn.execute(sql, params).rowcount != 1:
                 if synthetic_run_id is not None:
                     conn.execute(
                         "DELETE FROM task_runs WHERE id = ? AND task_id = ?",
                         (synthetic_run_id, task_id),
                     )
-                return False, None, None
+                return False, None, None, accepted_task_ids
             if same_card_changes:
                 conn.execute("UPDATE tasks SET candidate_run_id = NULL WHERE id = ?", (task_id,))
             if (
@@ -461,9 +463,12 @@ def _commit_completion(
                     _completed_event_payload(result, event_summary, verified_cards, metadata),
                     run_id=run_id,
                 )
+            accepted_task_ids = _emit_acceptance_changes(
+                conn, acceptance_before, source_task_id=task_id,
+            )
     if contract_err is not None:
         raise contract_err
-    return True, run_id, None
+    return True, run_id, None, accepted_task_ids
 
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
@@ -508,7 +513,6 @@ def complete_task(
         if supplied_head and projection.get("head_sha") and supplied_head != projection["head_sha"]:
             raise LifecycleEvidenceError("verdict_conflict: terminal implementation head differs from stored evidence")
         return True
-    acceptance_before = _capture_acceptance(conn, task_id)
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -564,7 +568,7 @@ def complete_task(
                     )
                 raise
     handoff_summary = summary if summary is not None else result
-    committed, run_id, boundary_error = _commit_completion(
+    committed, run_id, boundary_error, accepted_task_ids = _commit_completion(
         conn,
         task_id,
         task_before=task_before,
@@ -589,9 +593,6 @@ def complete_task(
     # Success wipes the breaker counter (history stays on the event log).
     _kb._clear_failure_counter(conn, task_id)
     _kb.recompute_ready(conn)  # separate txn so children see ``done``
-    accepted_task_ids = _emit_acceptance_changes(
-        conn, acceptance_before, source_task_id=task_id,
-    )
     _done_task = _kb.get_task(conn, task_id)
     acceptance = (
         get_lifecycle_state(conn, task_id).get("acceptance")
@@ -959,7 +960,6 @@ def request_review(
             return _ret(False, "reviewer does not match the declared lifecycle reviewer")
     if typed_code:
         reviewer = typed_code.get("reviewer")
-    acceptance_before = _capture_acceptance(conn, task_id)
 
     summary = _kb.redact_review_value(summary)
     metadata = _kb.redact_review_value(metadata)
@@ -1099,6 +1099,7 @@ def request_review(
                 task_id,
                 *((int(expected_run_id),) if expected_run_id is not None else ()),
             )
+            acceptance_before = _capture_acceptance(conn, task_id)
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -1154,8 +1155,8 @@ def request_review(
                 },
                 run_id=run_id,
             )
+            _emit_acceptance_changes(conn, acceptance_before, source_task_id=task_id)
     if contract_err is not None:
         raise contract_err
-    _emit_acceptance_changes(conn, acceptance_before, source_task_id=task_id)
     return _ret(True)
 

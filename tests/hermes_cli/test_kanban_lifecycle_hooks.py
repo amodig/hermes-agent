@@ -142,37 +142,33 @@ def test_acceptance_event_projection_holds_write_lock(kanban_home):
         writer = threading.Thread(target=mutate_task)
         writer.start()
 
-        def projected_state(connection, observed_id):
-            state = {
+        def projected_state(_connection, _observed_id):
+            return {
                 "acceptance": "accepted",
                 "review_verdict": "APPROVE",
                 "validation_verdict": None,
                 "execution_outcome": None,
             }
-            if observed_id == task_id and not connection.in_transaction:
-                writer_start.set()
-                assert writer_done.wait(timeout=5)
-            return state
 
         with patch.object(evidence, "get_lifecycle_state", side_effect=projected_state):
-            accepted = evidence._emit_acceptance_changes(
-                conn,
-                {task_id: "pending"},
-                source_task_id=task_id,
-            )
+            with kbc.write_txn(conn):
+                writer_start.set()
+                accepted = evidence._emit_acceptance_changes(
+                    conn,
+                    {task_id: "pending"},
+                    source_task_id=task_id,
+                )
+                assert accepted == [task_id]
+                assert not writer_acquired.is_set()
+                event = conn.execute(
+                    "SELECT payload FROM task_events "
+                    "WHERE task_id = ? AND kind = 'acceptance_changed' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                assert event is not None
+                assert json.loads(event["payload"])["new"] == "accepted"
 
-        assert accepted == [task_id]
-        assert not writer_acquired.is_set()
-        event = conn.execute(
-            "SELECT payload FROM task_events "
-            "WHERE task_id = ? AND kind = 'acceptance_changed' "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        assert event is not None
-        assert json.loads(event["payload"])["new"] == "accepted"
-
-        writer_start.set()
         assert writer_done.wait(timeout=5)
         writer.join(timeout=5)
         assert not writer.is_alive()
@@ -180,37 +176,6 @@ def test_acceptance_event_projection_holds_write_lock(kanban_home):
     finally:
         conn.close()
 
-def test_acceptance_event_deduplicates_stale_capture(kanban_home):
-    conn = kbc.connect()
-    try:
-        task_id = kb.create_task(conn, title="duplicate", assignee="worker")
-        with kbc.write_txn(conn):
-            kb._append_event(
-                conn,
-                task_id,
-                "acceptance_changed",
-                {"old": "pending", "new": "accepted", "phase": "review"},
-            )
-
-        with patch.object(
-            evidence,
-            "get_lifecycle_state",
-            return_value={"acceptance": "accepted"},
-        ):
-            assert evidence._emit_acceptance_changes(
-                conn,
-                {task_id: "pending"},
-                source_task_id=task_id,
-            ) == []
-
-        count = conn.execute(
-            "SELECT COUNT(*) FROM task_events "
-            "WHERE task_id = ? AND kind = 'acceptance_changed'",
-            (task_id,),
-        ).fetchone()[0]
-        assert count == 1
-    finally:
-        conn.close()
 
 
 

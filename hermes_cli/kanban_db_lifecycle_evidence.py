@@ -168,48 +168,43 @@ def _emit_acceptance_changes(
     *,
     source_task_id: Optional[str] = None,
 ) -> list[str]:
+    """Append acceptance transitions inside the caller's lifecycle txn."""
+    if not conn.in_transaction:
+        raise RuntimeError("acceptance emission requires the lifecycle write transaction")
     if not before:
         return []
-    with _kb.write_txn(conn):
-        changes: list[tuple[str, str, str, str, Any]] = []
-        for task_id, old in before.items():
-            projection = get_lifecycle_state(conn, task_id)
-            new = projection.get("acceptance", "unclassified")
-            if new == old:
-                continue
-            # ``before`` predates the lifecycle mutation.  A concurrent
-            # writer may already have committed this same transition; the
-            # serialized acceptance event is the durable transition CAS.
-            latest = _kb._latest_event(conn, task_id, "acceptance_changed")
-            latest_payload = _kb._json_dict(_kb._row_get(latest, "payload"))
-            if latest_payload.get("new") == new:
-                continue
-            phase = (
-                "validation"
-                if projection.get("validation_verdict") is not None
-                else "review"
-                if projection.get("review_verdict") is not None
-                else "implementation"
-            )
-            result = (
-                projection.get("validation_verdict")
-                or projection.get("review_verdict")
-                or projection.get("execution_outcome")
-            )
-            changes.append((task_id, old, new, phase, result))
-        for task_id, old, new, phase, result in changes:
-            _kb._append_event(
-                conn,
-                task_id,
-                "acceptance_changed",
-                {
-                    "old": old,
-                    "new": new,
-                    "phase": phase,
-                    "result": result,
-                    "source_task_id": source_task_id,
-                },
-            )
+    changes: list[tuple[str, str, str, str, Any]] = []
+    for task_id, old in before.items():
+        projection = get_lifecycle_state(conn, task_id)
+        new = projection.get("acceptance", "unclassified")
+        if new == old:
+            continue
+        phase = (
+            "validation"
+            if projection.get("validation_verdict") is not None
+            else "review"
+            if projection.get("review_verdict") is not None
+            else "implementation"
+        )
+        result = (
+            projection.get("validation_verdict")
+            or projection.get("review_verdict")
+            or projection.get("execution_outcome")
+        )
+        changes.append((task_id, old, new, phase, result))
+    for task_id, old, new, phase, result in changes:
+        _kb._append_event(
+            conn,
+            task_id,
+            "acceptance_changed",
+            {
+                "old": old,
+                "new": new,
+                "phase": phase,
+                "result": result,
+                "source_task_id": source_task_id,
+            },
+        )
     return [task_id for task_id, _old, new, _phase, _result in changes if new == "accepted"]
 
 def _handoff_children(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, str]]:

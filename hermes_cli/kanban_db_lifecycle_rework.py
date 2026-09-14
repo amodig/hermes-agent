@@ -336,7 +336,7 @@ def _typed_rework_graph(
                 "result": result,
             },
         )
-    _emit_acceptance_changes(conn, acceptance_before, source_task_id=implementation_id)
+        _emit_acceptance_changes(conn, acceptance_before, source_task_id=implementation_id)
     for entry in invalidated:
         fields = ("status", "version", "completed_at", "result")
         if entry["id"] == implementation_id and same_card:
@@ -639,7 +639,6 @@ def request_changes(
         return False, "complete the review card with REQUEST_CHANGES, then rework the lifecycle graph"
     if contract_kind == "validation":
         return False, "complete the validation card with FAIL, then rework the lifecycle graph"
-    acceptance_before = _capture_acceptance(conn, task_id)
 
     with _kb.write_txn(conn):
         task_row = conn.execute(
@@ -687,6 +686,7 @@ def request_changes(
         new_status = _landing_status_after_parents(conn, task_id)
         # consecutive_failures deliberately PRESERVED: a review transition is
         # not evidence the pathology cleared; only complete_task resets it.
+        acceptance_before = _capture_acceptance(conn, task_id)
         cur = conn.execute(
             """
             UPDATE tasks
@@ -724,5 +724,5 @@ def request_changes(
             },
             run_id=run_id,
         )
-    _emit_acceptance_changes(conn, acceptance_before, source_task_id=task_id)
+        _emit_acceptance_changes(conn, acceptance_before, source_task_id=task_id)
     return True, implementer

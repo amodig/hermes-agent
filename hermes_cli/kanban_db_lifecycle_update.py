@@ -533,7 +533,6 @@ def update_task(
         transition=transition,
     )
     actor = _kb._update_actor(author)
-    acceptance_before = _capture_acceptance(conn, task_id)
     with _kb.write_txn(conn):
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if row is None:
@@ -555,11 +554,13 @@ def update_task(
                 f"cannot update task {task_id}: currently claimed by a worker; "
                 "reclaim it before revising or requeuing"
             )
+        acceptance_before = _capture_acceptance(conn, task_id)
         goal_revision_id, goal_row = _ensure_goal_revision(conn, row)
         plan = _build_update_plan(conn, row, request, goal_revision_id)
         changed_fields, goal_invalidated, goal_terminations = _persist_update(
             conn, task_id, request, plan, actor=actor, goal_row=goal_row,
         )
+        _emit_acceptance_changes(conn, acceptance_before, source_task_id=task_id)
     for pid, claim_lock in goal_terminations:
         _kb._terminate_reclaimed_worker(pid, claim_lock)
     _kb.notify_task_updated(conn, task_id, changed_fields or ["version"])
@@ -567,5 +568,4 @@ def update_task(
         _kb.notify_task_updated(
             conn, entry["id"], ("status", "version", "completed_at", "candidate_run_id"),
         )
-    _emit_acceptance_changes(conn, acceptance_before, source_task_id=task_id)
     return True
