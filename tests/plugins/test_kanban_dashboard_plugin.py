@@ -139,6 +139,34 @@ def test_board_cards_include_lifecycle_and_dependency_projections(client):
     assert card["dependencies"]["blockers"][0]["parent_id"] == parent["id"]
 
 
+def test_lifecycle_projections_batch_shared_snapshot(client):
+    parent = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "parent"},
+    ).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "child", "parents": [parent["id"]]},
+    ).json()["task"]
+
+    with kbc.connect() as conn:
+        statements: list[str] = []
+        conn.set_trace_callback(
+            lambda statement: (
+                statements.append(statement)
+                if statement.lstrip().upper().startswith("SELECT")
+                else None
+            )
+        )
+        lifecycle, dependencies = kb.get_lifecycle_projections(
+            conn, [parent["id"], child["id"]],
+        )
+        conn.set_trace_callback(None)
+
+    assert set(lifecycle) == {parent["id"], child["id"]}
+    assert set(dependencies) == {parent["id"], child["id"]}
+    assert len(statements) <= 4
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")

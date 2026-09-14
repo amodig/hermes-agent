@@ -168,6 +168,7 @@ def _errors_to_500(prefix: str) -> Iterator[None]:
 BOARD_COLUMNS: list[str] = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done"]
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
+_ACTIVE_LIFECYCLE_PHASE_UNSET = object()
 
 
 def _task_dict(
@@ -175,7 +176,9 @@ def _task_dict(
     *,
     latest_summary: Optional[str] = None,
     conn: Optional[sqlite3.Connection] = None,
-    active_lifecycle_phase: Optional[str] = None,
+    lifecycle_state: Optional[dict[str, Any]] = None,
+    dependency_state: Optional[dict[str, Any]] = None,
+    active_lifecycle_phase: Any = _ACTIVE_LIFECYCLE_PHASE_UNSET,
 ) -> dict[str, Any]:
     d = asdict(task)
     try:
@@ -188,15 +191,27 @@ def _task_dict(
         }
     d["latest_summary"] = latest_summary
     if conn is not None:
-        d["lifecycle"] = kanban_db.get_lifecycle_state(conn, task.id)
-        d["dependencies"] = kanban_db.evaluate_dependencies(conn, task.id)
-        if task.status == "running" and task.current_run_id:
-            active_lifecycle_phase = kanban_db._retry_status_for_run(
-                conn, task.id, task.current_run_id,
-            )
-        elif task.status == "blocked":
-            active_lifecycle_phase = kanban_db._resume_status_from_events(conn, task.id)
-    if active_lifecycle_phase is not None:
+        d["lifecycle"] = (
+            lifecycle_state
+            if lifecycle_state is not None
+            else kanban_db.get_lifecycle_state(conn, task.id)
+        )
+        d["dependencies"] = (
+            dependency_state
+            if dependency_state is not None
+            else kanban_db.evaluate_dependencies(conn, task.id)
+        )
+        if active_lifecycle_phase is _ACTIVE_LIFECYCLE_PHASE_UNSET:
+            if task.status == "running" and task.current_run_id:
+                active_lifecycle_phase = kanban_db._retry_status_for_run(
+                    conn, task.id, task.current_run_id,
+                )
+            elif task.status == "blocked":
+                active_lifecycle_phase = kanban_db._resume_status_from_events(conn, task.id)
+    if (
+        active_lifecycle_phase is not _ACTIVE_LIFECYCLE_PHASE_UNSET
+        and active_lifecycle_phase is not None
+    ):
         d["active_lifecycle_phase"] = active_lifecycle_phase
     return d
 
@@ -367,12 +382,17 @@ def get_board(
         # truncated preview, the full text comes from /tasks/:id.
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
         active_lifecycle_phases = _active_lifecycle_phases(conn, tasks)
+        lifecycle_states, dependency_states = kanban_db.get_lifecycle_projections(
+            conn, [t.id for t in tasks],
+        )
         for t in tasks:
             full = summary_map.get(t.id)
             d = _task_dict(
                 t,
                 latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None),
                 active_lifecycle_phase=active_lifecycle_phases.get(t.id),
+                lifecycle_state=lifecycle_states[t.id],
+                dependency_state=dependency_states[t.id],
                 conn=conn,
             )
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})

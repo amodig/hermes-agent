@@ -146,7 +146,90 @@ def _contract_for(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, 
     return _row_contract(row) if row else None
 
 
-def _task_row(conn: sqlite3.Connection, task_id: str) -> Optional[sqlite3.Row]:
+
+
+class _ProjectionCache:
+    """Read-only board snapshot shared by lifecycle and dependency projections."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+        self.tasks = {
+            row["id"]: row for row in conn.execute("SELECT * FROM tasks").fetchall()
+        }
+        self.links_by_parent: dict[str, list[dict[str, Any]]] = {}
+        self.links_by_child: dict[str, list[dict[str, Any]]] = {}
+        self.links_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in conn.execute(
+            "SELECT parent_id, child_id, requirement FROM task_links "
+            "ORDER BY parent_id, child_id"
+        ).fetchall():
+            link = {
+                "parent_id": row["parent_id"],
+                "child_id": row["child_id"],
+                "requirement": row["requirement"],
+            }
+            self.links_by_parent.setdefault(row["parent_id"], []).append(link)
+            self.links_by_child.setdefault(row["child_id"], []).append(link)
+            self.links_by_pair[(row["parent_id"], row["child_id"])] = link
+        self.runs_by_id: dict[int, sqlite3.Row] = {}
+        self.runs_by_task: dict[str, list[sqlite3.Row]] = {}
+        for row in conn.execute(
+            "SELECT id, task_id, metadata, outcome FROM task_runs ORDER BY id DESC"
+        ).fetchall():
+            self.runs_by_id[int(row["id"])] = row
+            self.runs_by_task.setdefault(row["task_id"], []).append(row)
+        self.events_by_task: dict[str, list[sqlite3.Row]] = {}
+        for row in conn.execute(
+            "SELECT id, task_id, kind, payload FROM task_events ORDER BY id DESC"
+        ).fetchall():
+            self.events_by_task.setdefault(row["task_id"], []).append(row)
+        self.lifecycle: dict[str, dict[str, Any]] = {}
+        self.dependencies: dict[str, dict[str, Any]] = {}
+
+    def role_children(self, task_id: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": link["child_id"],
+                "lifecycle_contract": self.tasks[link["child_id"]]["lifecycle_contract"],
+            }
+            for link in self.links_by_parent.get(task_id, ())
+            if link["child_id"] in self.tasks
+        ]
+
+    def review_rows(self, task_id: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "requirement": link["requirement"],
+                "lifecycle_contract": self.tasks[link["parent_id"]]["lifecycle_contract"],
+            }
+            for link in self.links_by_child.get(task_id, ())
+            if link["parent_id"] in self.tasks
+        ]
+
+    def parent_rows(self, task_id: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "parent_id": link["parent_id"],
+                "parent_status": self.tasks[link["parent_id"]]["status"],
+                "lifecycle_contract": self.tasks[link["parent_id"]]["lifecycle_contract"],
+                "requirement": link["requirement"],
+            }
+            for link in self.links_by_child.get(task_id, ())
+            if link["parent_id"] in self.tasks
+        ]
+
+
+def _projection_cache_for(
+    conn: sqlite3.Connection, cache: Optional[_ProjectionCache],
+) -> Optional[_ProjectionCache]:
+    return cache if cache is not None and cache.conn is conn else None
+
+def _task_row(
+    conn: sqlite3.Connection, task_id: str, cache: Optional[_ProjectionCache] = None,
+) -> Optional[sqlite3.Row]:
+    cache = _projection_cache_for(conn, cache)
+    if cache is not None:
+        return cache.tasks.get(task_id)
     return conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
 
 
@@ -345,10 +428,22 @@ def _lifecycle_from_metadata(value: Any) -> Optional[dict[str, Any]]:
     return lifecycle if isinstance(lifecycle, dict) else None
 
 
-def _evidence_rows(conn: sqlite3.Connection, task_id: str, phase: Optional[str] = None) -> list[tuple[int, dict[str, Any], str]]:
-    rows = conn.execute(
-        "SELECT id, metadata, outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC", (task_id,)
-    ).fetchall()
+def _evidence_rows(
+    conn: sqlite3.Connection,
+    task_id: str,
+    phase: Optional[str] = None,
+    *,
+    cache: Optional[_ProjectionCache] = None,
+) -> list[tuple[int, dict[str, Any], str]]:
+    snapshot = _projection_cache_for(conn, cache)
+    rows = (
+        snapshot.runs_by_task.get(task_id, ())
+        if snapshot is not None
+        else conn.execute(
+            "SELECT id, metadata, outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC",
+            (task_id,),
+        ).fetchall()
+    )
     found: list[tuple[int, dict[str, Any], str]] = []
     for row in rows:
         lifecycle = _lifecycle_from_metadata(row["metadata"])
@@ -360,23 +455,36 @@ def _evidence_rows(conn: sqlite3.Connection, task_id: str, phase: Optional[str] 
     return found
 
 
-def _latest_head(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    rows = conn.execute(
-        "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC",
-        (task_id,),
-    ).fetchall()
-    for row in rows:
+def _latest_head(
+    conn: sqlite3.Connection, task_id: str, *, cache: Optional[_ProjectionCache] = None,
+) -> Optional[str]:
+    snapshot = _projection_cache_for(conn, cache)
+    run_rows = (
+        snapshot.runs_by_task.get(task_id, ())
+        if snapshot is not None
+        else conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC",
+            (task_id,),
+        ).fetchall()
+    )
+    for row in run_rows:
         metadata = _json_column(row["metadata"])
         lifecycle = metadata.get("lifecycle") if isinstance(metadata.get("lifecycle"), dict) else {}
         head = lifecycle.get("head_sha") or metadata.get("head_sha")
         if isinstance(head, str) and head.strip():
             return head.strip()
-    rows = conn.execute(
-        "SELECT payload FROM task_events WHERE task_id = ? AND kind IN ('completed', 'review_requested') "
-        "ORDER BY id DESC",
-        (task_id,),
-    ).fetchall()
-    for row in rows:
+    event_rows = (
+        snapshot.events_by_task.get(task_id, ())
+        if snapshot is not None
+        else conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind IN ('completed', 'review_requested') "
+            "ORDER BY id DESC",
+            (task_id,),
+        ).fetchall()
+    )
+    for row in event_rows:
+        if snapshot is not None and row["kind"] not in {"completed", "review_requested"}:
+            continue
         payload = _json_column(row["payload"])
         lifecycle = payload.get("lifecycle") if isinstance(payload.get("lifecycle"), dict) else {}
         head = lifecycle.get("head_sha") or payload.get("head_sha")
@@ -384,20 +492,30 @@ def _latest_head(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
             return head.strip()
     return None
 
+
 def _latest_run_id(conn: sqlite3.Connection, task_id: str, phase: str) -> Optional[int]:
     rows = _evidence_rows(conn, task_id, phase)
     return rows[0][0] if rows else None
+
+
 def _direct_role_children(
     conn: sqlite3.Connection,
     task_id: str,
     kind: str,
     *,
     candidate_id: Optional[str] = None,
+    cache: Optional[_ProjectionCache] = None,
 ) -> list[str]:
-    rows = conn.execute(
-        "SELECT t.id, t.lifecycle_contract FROM task_links l JOIN tasks t ON t.id = l.child_id "
-        "WHERE l.parent_id = ? ORDER BY t.id", (task_id,),
-    ).fetchall()
+    snapshot = _projection_cache_for(conn, cache)
+    rows = (
+        snapshot.role_children(task_id)
+        if snapshot is not None
+        else conn.execute(
+            "SELECT t.id, t.lifecycle_contract FROM task_links l JOIN tasks t ON t.id = l.child_id "
+            "WHERE l.parent_id = ? ORDER BY t.id",
+            (task_id,),
+        ).fetchall()
+    )
     expected_candidate = candidate_id or task_id
     matches: list[str] = []
     for row in rows:
@@ -417,12 +535,22 @@ def _direct_role_child(
     kind: str,
     *,
     candidate_id: Optional[str] = None,
+    cache: Optional[_ProjectionCache] = None,
 ) -> Optional[str]:
-    matches = _direct_role_children(conn, task_id, kind, candidate_id=candidate_id)
+    matches = _direct_role_children(
+        conn, task_id, kind, candidate_id=candidate_id, cache=cache,
+    )
     return matches[0] if matches else None
 
-def _candidate_snapshot(conn: sqlite3.Connection, candidate_id: str) -> dict[str, Any]:
-    row = _task_row(conn, candidate_id)
+
+def _candidate_snapshot(
+    conn: sqlite3.Connection,
+    candidate_id: str,
+    *,
+    cache: Optional[_ProjectionCache] = None,
+) -> dict[str, Any]:
+    snapshot = _projection_cache_for(conn, cache)
+    row = _task_row(conn, candidate_id, cache)
     candidate_run_id = (
         int(row["candidate_run_id"])
         if row is not None
@@ -437,33 +565,54 @@ def _candidate_snapshot(conn: sqlite3.Connection, candidate_id: str) -> dict[str
             "head_sha": None,
             "goal_revision_id": _task_goal_revision_id(row),
         }
-    run = conn.execute(
-        "SELECT metadata FROM task_runs WHERE id = ? AND task_id = ?",
-        (candidate_run_id, candidate_id),
-    ).fetchone()
+    run = (
+        snapshot.runs_by_id.get(candidate_run_id)
+        if snapshot is not None
+        else conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ? AND task_id = ?",
+            (candidate_run_id, candidate_id),
+        ).fetchone()
+    )
+    if snapshot is not None and run is not None and run["task_id"] != candidate_id:
+        run = None
     lifecycle = _lifecycle_from_metadata(run["metadata"]) if run else None
     return {
         "task_id": candidate_id,
         "run_id": candidate_run_id,
         "head_sha": (
             lifecycle.get("head_sha") if lifecycle
-            else _latest_head(conn, candidate_id)
+            else _latest_head(conn, candidate_id, cache=cache)
         ),
         "goal_revision_id": _task_goal_revision_id(row),
     }
+
+
 def _execution_outcome(
-    conn: sqlite3.Connection, task_id: str, run_id: Optional[int],
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int],
+    *,
+    cache: Optional[_ProjectionCache] = None,
 ) -> Optional[str]:
     if run_id is None:
         return None
-    row = conn.execute(
-        "SELECT outcome FROM task_runs WHERE id = ? AND task_id = ?",
-        (run_id, task_id),
-    ).fetchone()
+    snapshot = _projection_cache_for(conn, cache)
+    row = (
+        snapshot.runs_by_id.get(run_id)
+        if snapshot is not None
+        else conn.execute(
+            "SELECT outcome FROM task_runs WHERE id = ? AND task_id = ?",
+            (run_id, task_id),
+        ).fetchone()
+    )
+    if snapshot is not None and row is not None and row["task_id"] != task_id:
+        row = None
     if row is None:
         return None
     outcome = str(row["outcome"] or "").strip()
     return outcome or None
+
+
 
 
 
@@ -473,10 +622,11 @@ def _freshness(
     candidate_id: str,
     *,
     evidence_task_id: Optional[str] = None,
+    cache: Optional[_ProjectionCache] = None,
 ) -> tuple[bool, Optional[str]]:
     if not lifecycle:
         return False, "verdict_missing"
-    expected = _candidate_snapshot(conn, candidate_id)
+    expected = _candidate_snapshot(conn, candidate_id, cache=cache)
     if expected["run_id"] is None:
         return False, "candidate_missing"
     candidate_run = lifecycle.get("candidate_run_id")
@@ -489,7 +639,7 @@ def _freshness(
         return False, "candidate_head_mismatch"
     goal_ids = lifecycle.get("goal_revision_ids")
     candidate_goal = expected["goal_revision_id"]
-    task_row = _task_row(conn, evidence_task_id or candidate_id)
+    task_row = _task_row(conn, evidence_task_id or candidate_id, cache)
     task_goal = _task_goal_revision_id(task_row)
     if (
         not isinstance(goal_ids, dict)
@@ -499,8 +649,15 @@ def _freshness(
         return False, "goal_revision_stale"
     return True, None
 
-def _verdict_for(conn: sqlite3.Connection, task_id: str, phase: str) -> tuple[Optional[str], Optional[dict[str, Any]], Optional[str]]:
-    rows = _evidence_rows(conn, task_id, phase)
+
+def _verdict_for(
+    conn: sqlite3.Connection,
+    task_id: str,
+    phase: str,
+    *,
+    cache: Optional[_ProjectionCache] = None,
+) -> tuple[Optional[str], Optional[dict[str, Any]], Optional[str]]:
+    rows = _evidence_rows(conn, task_id, phase, cache=cache)
     if not rows:
         return None, None, "verdict_missing"
     _, latest, _ = rows[0]
@@ -529,9 +686,15 @@ def _verdict_for(conn: sqlite3.Connection, task_id: str, phase: str) -> tuple[Op
     return verdict, latest, None
 
 
-def get_lifecycle_state(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+
+def _get_lifecycle_state(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    cache: Optional[_ProjectionCache] = None,
+) -> dict[str, Any]:
     """Derive execution/review/validation/acceptance from runs and contracts."""
-    row = _task_row(conn, task_id)
+    row = _task_row(conn, task_id, cache)
     contract = _row_contract(row) if row else None
     state: dict[str, Any] = {
         "execution_outcome": None,
@@ -553,16 +716,16 @@ def get_lifecycle_state(conn: sqlite3.Connection, task_id: str) -> dict[str, Any
     if kind in {"review", "validation"}:
         candidate_id = str(candidate_id)
         state["candidate_task_id"] = candidate_id
-        snapshot = _candidate_snapshot(conn, candidate_id)
+        snapshot = _candidate_snapshot(conn, candidate_id, cache=cache)
         state["candidate_run_id"] = snapshot["run_id"]
         state["execution_outcome"] = _execution_outcome(
-            conn, candidate_id, snapshot["run_id"],
+            conn, candidate_id, snapshot["run_id"], cache=cache,
         )
         state["head_sha"] = snapshot["head_sha"]
         state["goal_revision_ids"] = {candidate_id: snapshot["goal_revision_id"]}
 
         phase = "review" if kind == "review" else "validation"
-        verdict, lifecycle, error = _verdict_for(conn, task_id, phase)
+        verdict, lifecycle, error = _verdict_for(conn, task_id, phase, cache=cache)
         if kind == "review":
             state["review_verdict"] = verdict
         else:
@@ -573,7 +736,7 @@ def get_lifecycle_state(conn: sqlite3.Connection, task_id: str) -> dict[str, Any
         if verdict in VALID_VERDICTS and lifecycle:
             fresh, freshness_reason = _freshness(
                 conn, lifecycle, candidate_id,
-                evidence_task_id=task_id,
+                evidence_task_id=task_id, cache=cache,
             )
             if not fresh and freshness_reason:
                 state["diagnostics"].append(freshness_reason)
@@ -589,19 +752,19 @@ def get_lifecycle_state(conn: sqlite3.Connection, task_id: str) -> dict[str, Any
 
     # Code card: implementation evidence belongs to this task; review and
     # validation evidence may be same-card or typed child cards.
-    implementation_snapshot = _candidate_snapshot(conn, task_id)
+    implementation_snapshot = _candidate_snapshot(conn, task_id, cache=cache)
     state["candidate_task_id"] = task_id
     state["candidate_run_id"] = implementation_snapshot["run_id"]
     state["head_sha"] = implementation_snapshot["head_sha"]
     state["goal_revision_ids"] = {task_id: implementation_snapshot["goal_revision_id"]}
     state["execution_outcome"] = _execution_outcome(
-        conn, task_id, implementation_snapshot["run_id"],
+        conn, task_id, implementation_snapshot["run_id"], cache=cache,
     )
     role_conflict = False
     if contract.get("review_mode") == "same_card":
         review_id = task_id
     else:
-        review_children = _direct_role_children(conn, task_id, "review")
+        review_children = _direct_role_children(conn, task_id, "review", cache=cache)
         role_conflict = len(review_children) > 1
         review_id = review_children[0] if len(review_children) == 1 else None
     validation_parent_id = task_id if contract.get("review_mode") == "same_card" else review_id
@@ -611,8 +774,8 @@ def get_lifecycle_state(conn: sqlite3.Connection, task_id: str) -> dict[str, Any
             validation_parent_id,
             "validation",
             candidate_id=task_id,
+            cache=cache,
         )
-        role_conflict = role_conflict or len(validation_children) > 1
         validation_id = validation_children[0] if len(validation_children) == 1 else None
     else:
         validation_id = None
@@ -622,16 +785,16 @@ def get_lifecycle_state(conn: sqlite3.Connection, task_id: str) -> dict[str, Any
     review_rejected = False
     if review_id:
         if review_id == task_id:
-            verdict, lifecycle, error = _verdict_for(conn, task_id, "review")
+            verdict, lifecycle, error = _verdict_for(conn, task_id, "review", cache=cache)
             review_accepted = verdict == "APPROVE" and row["status"] == "done"
             review_rejected = verdict == "REQUEST_CHANGES" and row["status"] == "done"
         else:
-            review_state = get_lifecycle_state(conn, review_id)
+            review_state = get_lifecycle_state(conn, review_id, _cache=cache)
             verdict, lifecycle, error = review_state["review_verdict"], None, None
             review_accepted = review_state["acceptance"] == "accepted"
             review_rejected = review_state["acceptance"] == "rejected"
             if verdict:
-                rows = _evidence_rows(conn, review_id, "review")
+                rows = _evidence_rows(conn, review_id, "review", cache=cache)
                 lifecycle = rows[0][1] if rows else None
         state["review_verdict"] = verdict
         if error and error != "verdict_missing":
@@ -639,7 +802,7 @@ def get_lifecycle_state(conn: sqlite3.Connection, task_id: str) -> dict[str, Any
         if verdict in {"APPROVE", "REQUEST_CHANGES"} and lifecycle:
             fresh, reason = _freshness(
                 conn, lifecycle, task_id,
-                evidence_task_id=review_id,
+                evidence_task_id=review_id, cache=cache,
             )
             if not fresh and reason:
                 state["diagnostics"].append(reason)
@@ -650,7 +813,7 @@ def get_lifecycle_state(conn: sqlite3.Connection, task_id: str) -> dict[str, Any
     validation_rejected = False
     if contract.get("validation_required"):
         if validation_id:
-            validation_state = get_lifecycle_state(conn, validation_id)
+            validation_state = get_lifecycle_state(conn, validation_id, _cache=cache)
             state["validation_verdict"] = validation_state["validation_verdict"]
             state["diagnostics"].extend(validation_state.get("diagnostics") or [])
             validation_accepted = validation_state["acceptance"] == "accepted"
@@ -675,6 +838,20 @@ def get_lifecycle_state(conn: sqlite3.Connection, task_id: str) -> dict[str, Any
         state["acceptance"] = "pending"
     return state
 
+
+
+def get_lifecycle_state(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    _cache: Optional[_ProjectionCache] = None,
+) -> dict[str, Any]:
+    cache = _projection_cache_for(conn, _cache)
+    if cache is None:
+        return _get_lifecycle_state(conn, task_id)
+    if task_id not in cache.lifecycle:
+        cache.lifecycle[task_id] = _get_lifecycle_state(conn, task_id, cache=cache)
+    return cache.lifecycle[task_id]
 def get_goal_acceptance(conn: sqlite3.Connection, root_id: str) -> dict[str, Any]:
     """Project acceptance across one deterministic root-to-leaf goal graph."""
     pending = [root_id]
@@ -720,9 +897,14 @@ def get_goal_acceptance(conn: sqlite3.Connection, root_id: str) -> dict[str, Any
     }
 
 
-def evaluate_dependencies(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+def _evaluate_dependencies(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    cache: Optional[_ProjectionCache] = None,
+) -> dict[str, Any]:
     """Evaluate direct edges while preserving historical NULL contracts."""
-    task = _task_row(conn, task_id)
+    task = _task_row(conn, task_id, cache)
     if task is None:
         return {
             "satisfied": False,
@@ -748,7 +930,7 @@ def evaluate_dependencies(conn: sqlite3.Connection, task_id: str) -> dict[str, A
     blockers: list[dict[str, Any]] = []
     if task_contract and task_contract.get("kind") in {"review", "validation"}:
         candidate_id = str(task_contract.get("candidate_task_id") or "")
-        candidate = _task_row(conn, candidate_id)
+        candidate = _task_row(conn, candidate_id, cache)
         candidate_contract = _row_contract(candidate)
         same_card_validation = (
             task_contract.get("kind") == "validation"
@@ -759,22 +941,30 @@ def evaluate_dependencies(conn: sqlite3.Connection, task_id: str) -> dict[str, A
         requires_candidate_edge = (
             task_contract.get("kind") == "review" or same_card_validation
         )
-        candidate_edge = conn.execute(
-            "SELECT requirement FROM task_links WHERE parent_id = ? AND child_id = ?",
-            (candidate_id, task_id),
-        ).fetchone()
+        candidate_edge = (
+            _projection_cache_for(conn, cache).links_by_pair.get((candidate_id, task_id))
+            if _projection_cache_for(conn, cache) is not None
+            else conn.execute(
+                "SELECT requirement FROM task_links WHERE parent_id = ? AND child_id = ?",
+                (candidate_id, task_id),
+            ).fetchone()
+        )
         review_edge = None
         if task_contract.get("kind") == "validation" and not requires_candidate_edge:
-            review_rows = conn.execute(
-                """
-                SELECT l.requirement, p.lifecycle_contract
-                FROM task_links l
-                JOIN tasks p ON p.id = l.parent_id
-                WHERE l.child_id = ?
-                ORDER BY p.id
-                """,
-                (task_id,),
-            ).fetchall()
+            review_rows = (
+                _projection_cache_for(conn, cache).review_rows(task_id)
+                if _projection_cache_for(conn, cache) is not None
+                else conn.execute(
+                    """
+                    SELECT l.requirement, p.lifecycle_contract
+                    FROM task_links l
+                    JOIN tasks p ON p.id = l.parent_id
+                    WHERE l.child_id = ?
+                    ORDER BY p.id
+                    """,
+                    (task_id,),
+                ).fetchall()
+            )
             for row in review_rows:
                 parent_contract = safe_decode_contract(row["lifecycle_contract"])
                 if (
@@ -796,11 +986,15 @@ def evaluate_dependencies(conn: sqlite3.Connection, task_id: str) -> dict[str, A
                 "message": f"role card must depend directly on {dependency}",
             })
 
-    rows = conn.execute(
-        "SELECT p.id AS parent_id, p.status AS parent_status, p.lifecycle_contract, "
-        "       l.requirement FROM task_links l JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? ORDER BY p.id", (task_id,),
-    ).fetchall()
+    rows = (
+        _projection_cache_for(conn, cache).parent_rows(task_id)
+        if _projection_cache_for(conn, cache) is not None
+        else conn.execute(
+            "SELECT p.id AS parent_id, p.status AS parent_status, p.lifecycle_contract, "
+            "       l.requirement FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? ORDER BY p.id", (task_id,),
+        ).fetchall()
+    )
     for row in rows:
         parent_id = row["parent_id"]
         requirement = row["requirement"]
@@ -846,7 +1040,7 @@ def evaluate_dependencies(conn: sqlite3.Connection, task_id: str) -> dict[str, A
                 "message": "parent lifecycle contract is unclassified",
             })
             continue
-        projection = get_lifecycle_state(conn, parent_id)
+        projection = get_lifecycle_state(conn, parent_id, _cache=cache)
         if requirement == "review_approved":
             verdict = projection.get("review_verdict")
             if verdict is None:
@@ -912,6 +1106,38 @@ def evaluate_dependencies(conn: sqlite3.Connection, task_id: str) -> dict[str, A
                     "message": "validation card is not complete",
                 })
     return {"satisfied": not blockers, "blockers": blockers}
+
+
+def evaluate_dependencies(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    _cache: Optional[_ProjectionCache] = None,
+) -> dict[str, Any]:
+    cache = _projection_cache_for(conn, _cache)
+    if cache is None:
+        return _evaluate_dependencies(conn, task_id)
+    if task_id not in cache.dependencies:
+        cache.dependencies[task_id] = _evaluate_dependencies(conn, task_id, cache=cache)
+    return cache.dependencies[task_id]
+
+
+def get_lifecycle_projections(
+    conn: sqlite3.Connection, task_ids: list[str],
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    ids = list(dict.fromkeys(task_ids))
+    if not ids:
+        return {}, {}
+    cache = _ProjectionCache(conn)
+    lifecycle = {
+        task_id: get_lifecycle_state(conn, task_id, _cache=cache)
+        for task_id in ids
+    }
+    dependencies = {
+        task_id: evaluate_dependencies(conn, task_id, _cache=cache)
+        for task_id in ids
+    }
+    return lifecycle, dependencies
 
 
 def _forceable_dependency_override(dependencies: Mapping[str, Any]) -> bool:

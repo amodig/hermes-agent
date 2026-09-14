@@ -34,6 +34,7 @@ from hermes_cli.kanban_lifecycle import (
     encode_contract,
     evaluate_dependencies,
     get_lifecycle_state,
+    get_lifecycle_projections,
     infer_edge_requirement,
     is_required_lifecycle_edge,
     lifecycle_metadata,
