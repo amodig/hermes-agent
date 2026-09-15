@@ -206,6 +206,7 @@ def export_board(
         # The snapshot is a private file with no other writers, so plain
         # commit/close is enough — no need for the board DB's WAL dance.
         with contextlib.closing(sqlite3.connect(str(staged / "kanban.db"))) as snapshot:
+            snapshot.row_factory = sqlite3.Row
             _scrub_local_state(snapshot)
             snapshot.commit()
             counts = _count_rows(snapshot)

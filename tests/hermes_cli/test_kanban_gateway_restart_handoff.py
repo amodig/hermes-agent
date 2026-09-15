@@ -1,10 +1,15 @@
-"""Managed-gateway isolation for dispatcher-owned Kanban workers."""
+"""Managed-gateway isolation for dispatcher-owned immutable Kanban workers."""
 
 from __future__ import annotations
 
 import json
+import os
+import signal
+import sqlite3
 import subprocess
 import sys
+import sysconfig
+import tempfile
 import time
 from pathlib import Path
 
@@ -12,243 +17,290 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_runtime_generation as generations
+from hermes_cli.kanban_runtime import process_start_time
+from tests.hermes_cli.test_kanban_lifecycle_conformance import (
+    _make_runtime_fixture,
+    _prepare_fixture_generation,
+    _wait_for_receipt,
+)
 
 
 @pytest.fixture
-def worker_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, kb.Task]:
+def worker_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     root = tmp_path / ".hermes"
     profile = root / "profiles" / "coder"
     profile.mkdir(parents=True)
     root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
     profile.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_BIN", raising=False)
+    monkeypatch.setenv("INVOCATION_ID", "managed-gateway-test")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr("tools.process_registry._is_supervised_gateway_process", lambda: False)
+    source = tmp_path / "install"
+    _make_runtime_fixture(source)
+    prepared = []
 
+    def prepare(_expected, *, workspace=None):
+        generation = _prepare_fixture_generation(source, workspace=workspace)
+        prepared.append(generation)
+        return generation
+
+    monkeypatch.setattr(generations, "prepare_runtime_generation", prepare)
+    monkeypatch.setenv("HERMES_TEST_RUNTIME_RECEIPT", str(tmp_path / "receipt.json"))
     workspace = tmp_path / "candidate-worktree"
     workspace.mkdir()
     task = kb.Task(
-        id="t_candidate_restart",
-        title="activate candidate",
-        body=None,
-        assignee="coder",
-        status="running",
-        priority=0,
-        created_by="test",
-        created_at=1,
-        started_at=1,
-        completed_at=None,
-        workspace_kind="worktree",
-        workspace_path=str(workspace),
-        claim_lock="host:dispatcher",
-        claim_expires=999,
-        tenant=None,
-        branch_name="wt/t_candidate_restart",
-        current_run_id=23,
+        id="t_candidate_restart", title="activate candidate", body=None,
+        assignee="coder", status="running", priority=0, created_by="test",
+        created_at=1, started_at=1, completed_at=None,
+        workspace_kind="worktree", workspace_path=str(workspace),
+        claim_lock="host:dispatcher", claim_expires=999, tenant=None,
+        branch_name="wt/t_candidate_restart", current_run_id=23,
     )
-    return workspace, task
+    with tempfile.TemporaryDirectory(prefix="runtime-storage-", dir=tmp_path) as storage:
+        monkeypatch.setattr(generations, "_runtime_storage_root", lambda: Path(storage))
+        try:
+            yield workspace, task
+        finally:
+            for generation in prepared:
+                generations.cleanup_runtime_generation(generation.root)
 
 
-@pytest.mark.linux_only
-def test_managed_gateway_worker_is_spawned_in_restart_safe_scope(
-    worker_setup: tuple[Path, kb.Task], monkeypatch: pytest.MonkeyPatch
+@pytest.fixture
+def forbid_worker_spawn(monkeypatch: pytest.MonkeyPatch):
+    real_popen = subprocess.Popen
+
+    def guarded_popen(cmd, *args, **kwargs):
+        # Runtime identity reads Git provenance before checking the worker scope.
+        if cmd[:2] == ["git", "-C"] and cmd[3:] == ["rev-parse", "HEAD"]:
+            return real_popen(cmd, *args, **kwargs)
+        pytest.fail(f"unsafe worker spawn: {cmd!r}")
+
+    monkeypatch.setattr(subprocess, "Popen", guarded_popen)
+
+
+def _finish_launch(launch) -> None:
+    if launch.cancel:
+        launch.cancel()
+    deadline = time.monotonic() + 5
+    while kbd._pid_alive(launch.pid) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    kbd.reap_worker_zombies()
+    generations.sweep_runtime_generations()
+
+
+def test_worker_generation_scopes_profile_board_and_secrets_before_grant(
+    worker_setup, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workspace, task = worker_setup
-    captured_cmd: list[str] = []
-    captured_env: dict[str, str] = {}
-    captured_cwd: str | None = None
-
-    class FakeProc:
-        pid = 4242
-
-    def fake_popen(cmd, **kwargs):
-        nonlocal captured_cwd
-        captured_cmd.extend(cmd)
-        captured_env.update(kwargs.get("env") or {})
-        captured_cwd = kwargs.get("cwd")
-        return FakeProc()
-
-    monkeypatch.setenv("INVOCATION_ID", "managed-gateway-test")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-cross-profile")
     monkeypatch.setattr("agent.secret_scope.is_multiplex_active", lambda: True)
-    monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    monkeypatch.setattr("tools.process_registry._is_supervised_gateway_process", lambda: True)
-    monkeypatch.setattr("tools.process_registry._systemd_run_user_scope_available", lambda: True)
-    monkeypatch.setattr("tools.process_registry._worker_memory_max_bytes", lambda: 536_870_912)
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
-
-    assert kbd._default_spawn(task, str(workspace)) == 4242
-    assert captured_cmd[:4] == ["/usr/bin/systemd-run", "--user", "--scope", "--quiet"]
-    unit_index = captured_cmd.index("--unit")
-    assert captured_cmd[unit_index + 1] == "hermes-worker-kanban-t_candidate_restart-run-23"
-    assert "MemoryMax=536870912" in captured_cmd
-    separator = captured_cmd.index("--")
-    assert captured_cmd[separator + 1 : separator + 4] == ["hermes", "-p", "coder"]
-    assert captured_cwd == str(workspace)
-    assert captured_env["HERMES_KANBAN_TASK"] == task.id
-    assert captured_env["HERMES_KANBAN_RUN_ID"] == "23"
-    assert "ANTHROPIC_API_KEY" not in captured_env
+    launch = kbd._default_spawn(task, str(workspace), board="review", defer_grant=True)
+    receipt = workspace.parent / "receipt.json"
+    generation = kbd._worker_runtime_snapshots[launch.launcher_pid]
+    try:
+        assert not receipt.exists()
+        launch.grant(task.current_run_id, task.claim_lock)
+        observed = _wait_for_receipt(receipt)
+        assert observed["argv"][:2] == ["-p", "coder"]
+        assert observed["argv"][-3:] == ["chat", "-q", f"work kanban task {task.id}"]
+        assert observed["cwd"] == str(workspace)
+        assert observed["profile"] == "coder"
+        assert observed["home"] == str(workspace.parent / ".hermes" / "profiles" / "coder")
+        assert observed["task"] == task.id
+        assert observed["board"] == "review"
+        assert observed["run"] == "23"
+        assert observed["claim"] == task.claim_lock
+        assert observed["secret"] is None
+        assert all(Path(location).is_relative_to(generation) for location in observed["locations"])
+    finally:
+        _finish_launch(launch)
+    assert not generation.exists()
 
 
 @pytest.mark.linux_only
 def test_managed_gateway_worker_spawn_fails_closed_without_scope(
-    worker_setup: tuple[Path, kb.Task], monkeypatch: pytest.MonkeyPatch
-) -> None:
+    worker_setup, monkeypatch, forbid_worker_spawn,
+):
     workspace, task = worker_setup
-    popen_calls: list[list[str]] = []
-    monkeypatch.setenv("INVOCATION_ID", "managed-gateway-test")
-    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: popen_calls.append(list(cmd)))
     monkeypatch.setattr("tools.process_registry._is_supervised_gateway_process", lambda: True)
     monkeypatch.setattr("tools.process_registry._systemd_run_user_scope_available", lambda: False)
-
     with pytest.raises(RuntimeError, match="restart-safe systemd scope"):
         kbd._default_spawn(task, str(workspace))
-    assert popen_calls == []
 
 
 @pytest.mark.linux_only
 def test_managed_gateway_scope_builder_fails_closed_if_binary_disappears(
-    worker_setup: tuple[Path, kb.Task], monkeypatch: pytest.MonkeyPatch
-) -> None:
+    worker_setup, monkeypatch, forbid_worker_spawn,
+):
     workspace, task = worker_setup
-    monkeypatch.setenv("INVOCATION_ID", "managed-gateway-test")
     monkeypatch.setattr("tools.process_registry._is_supervised_gateway_process", lambda: True)
     monkeypatch.setattr("tools.process_registry._systemd_run_user_scope_available", lambda: True)
     monkeypatch.setattr("shutil.which", lambda _name: None)
-    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: pytest.fail("unsafe direct spawn"))
-
     with pytest.raises(RuntimeError, match="restart-safe systemd scope"):
         kbd._default_spawn(task, str(workspace))
 
 
-def test_standalone_dispatcher_keeps_direct_worker_spawn(
-    worker_setup: tuple[Path, kb.Task], monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_generation_ignores_workspace_and_pythonpath_before_any_import(worker_setup, monkeypatch):
     workspace, task = worker_setup
-    captured_cmd: list[str] = []
-
-    class FakeProc:
-        pid = 4243
-
-    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: captured_cmd.extend(cmd) or FakeProc())
-    monkeypatch.setattr("tools.process_registry._is_supervised_gateway_process", lambda: False)
-    monkeypatch.setattr(
-        "tools.process_registry._systemd_run_user_scope_available",
-        lambda: pytest.fail("scope probe must not run outside managed gateway"),
-    )
-
-    assert kbd._default_spawn(task, str(workspace)) == 4243
-    assert captured_cmd[:3] == ["hermes", "-p", "coder"]
-
-
-@pytest.mark.linux_only
-def test_module_worker_ignores_workspace_root_module(
-    worker_setup: tuple[Path, kb.Task], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from tools import process_registry
-
-    workspace, task = worker_setup
-    marker = workspace / "workspace-bootstrap-loaded"
-    workspace.joinpath("hermes_bootstrap.py").write_text(
-        "from pathlib import Path\n"
-        "Path('workspace-bootstrap-loaded').write_text('yes')\n"
-        "raise SystemExit(42)\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: [sys.executable, "-m", "hermes_cli.main"])
-    monkeypatch.setenv("INVOCATION_ID", "managed-gateway-test")
-    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: False)
-    monkeypatch.setenv("PYTHONPATH", str(Path(kbd.__file__).resolve().parents[1]))
-
+    marker = workspace / "untrusted-import"
+    for name in ("fixture_early", "fixture_lazy", "third_party_early", "third_party_dynamic"):
+        (workspace / f"{name}.py").write_text(
+            f"from pathlib import Path\nPath({str(marker)!r}).touch()\nraise SystemExit(42)\n",
+            encoding="utf-8",
+        )
+    monkeypatch.setenv("PYTHONPATH", str(workspace))
     launch = kbd._default_spawn(task, str(workspace), defer_grant=True)
     try:
-        assert isinstance(launch, kbd.WorkerLaunch)
-        assert launch.grant is not None
-        launch.grant(task.current_run_id or 0, task.claim_lock)
-        deadline = time.monotonic() + 5
-        while kbd._pid_alive(launch.pid) and time.monotonic() < deadline:
-            time.sleep(0.05)
+        launch.grant(task.current_run_id, task.claim_lock)
+        observed = _wait_for_receipt(workspace.parent / "receipt.json")
+        assert observed["early"] == [1, 1]
+        assert observed["lazy"] == [1, 1]
+        assert not marker.exists()
     finally:
-        if launch.cancel:
-            launch.cancel()
-
-    assert not marker.exists()
+        _finish_launch(launch)
 
 
-
-@pytest.mark.linux_only
-def test_module_worker_pins_runtime_root_before_lazy_import(
-    worker_setup: tuple[Path, kb.Task], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from tools import process_registry
-
+def test_launcher_exit_does_not_delete_live_worker_generation(worker_setup, monkeypatch):
     workspace, task = worker_setup
-    marker = workspace / "workspace-model-tools-loaded"
-    workspace.joinpath("model_tools.py").write_text(
-        "from pathlib import Path\n"
-        "Path('workspace-model-tools-loaded').write_text('yes')\n"
-        "raise RuntimeError('workspace model_tools loaded')\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: [sys.executable, "-m", "hermes_cli.main"])
-    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: False)
-    monkeypatch.setenv("PYTHONPATH", str(Path(kbd.__file__).resolve().parents[1]))
-
     launch = kbd._default_spawn(task, str(workspace), defer_grant=True)
-    assert isinstance(launch, kbd.WorkerLaunch)
+    generation = kbd._worker_runtime_snapshots[launch.launcher_pid]
+    launcher = subprocess.Popen([sys.executable, "-c", "pass"])
+    launcher.wait(timeout=10)
+    kbd._worker_pid_aliases[launcher.pid] = launch.pid
+    kbd._worker_runtime_snapshots[launcher.pid] = generation
     try:
-        assert launch.grant is not None
-        launch.grant(task.current_run_id or 0, task.claim_lock)
-        deadline = time.monotonic() + 5
-        while kbd._pid_alive(launch.pid) and time.monotonic() < deadline:
-            time.sleep(0.05)
+        kbd._record_worker_exit(launcher.pid, 0)
+        assert kbd._pid_alive(launch.pid)
+        assert generation.exists()
+        generations.sweep_runtime_generations()
+        assert generation.exists()
     finally:
-        if launch.cancel:
-            launch.cancel()
+        _finish_launch(launch)
+        kbd._recent_worker_exits.pop(launch.pid, None)
+    assert not generation.exists()
 
-    assert not marker.exists()
+
+def test_explicit_current_install_entrypoint_is_sealed_and_custom_wrapper_is_refused(worker_setup, monkeypatch):
+    workspace, task = worker_setup
+    entrypoint = Path(sysconfig.get_path("scripts")) / ("hermes.exe" if os.name == "nt" else "hermes")
+    monkeypatch.setenv("HERMES_BIN", str(entrypoint))
+    launch = kbd._default_spawn(task, str(workspace), defer_grant=True)
+    try:
+        launch.grant(task.current_run_id, task.claim_lock)
+        observed = _wait_for_receipt(workspace.parent / "receipt.json")
+        assert observed["early"] == [1, 1]
+        generation = kbd._worker_runtime_snapshots[launch.launcher_pid]
+        assert all(Path(location).is_relative_to(generation) for location in observed["locations"])
+    finally:
+        _finish_launch(launch)
+    wrapper = workspace / "hermes-custom"
+    wrapper.write_text("#!/bin/sh\nexit 42\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("HERMES_BIN", str(wrapper))
+    with pytest.raises(RuntimeError, match="HERMES_BIN.*this installation"):
+        kbd._default_spawn(task, str(workspace), defer_grant=True)
+
 
 @pytest.mark.linux_only
-def test_real_user_systemd_scope_preserves_worker_context(
-    worker_setup: tuple[Path, kb.Task], monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_real_user_systemd_scope_preserves_worker_context(worker_setup, monkeypatch):
     from tools import process_registry
 
     if not process_registry._systemd_run_user_scope_available():
         pytest.skip("systemd-run --user --scope is unavailable on this host")
-
     workspace, task = worker_setup
-    receipt = workspace / "worker-receipt.json"
-    script = (
-        "import json, os, pathlib, sys, time; "
-        "from hermes_cli.kanban_runtime import worker_bootstrap_from_env, worker_bootstrap_post_import; "
-        "worker_bootstrap_from_env(); worker_bootstrap_post_import(); "
-        "pathlib.Path(sys.argv[1]).write_text(json.dumps({"
-        "'pid': os.getpid(), 'cwd': os.getcwd(), "
-        "'task': os.environ.get('HERMES_KANBAN_TASK'), "
-        "'run': os.environ.get('HERMES_KANBAN_RUN_ID'), "
-        "'cgroup': pathlib.Path('/proc/self/cgroup').read_text()})); time.sleep(0.5)"
-    )
-    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: [sys.executable, "-c", script, str(receipt)])
-    monkeypatch.setenv("INVOCATION_ID", "managed-gateway-test")
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
-    monkeypatch.setenv("PYTHONPATH", str(Path(kbd.__file__).resolve().parents[1]))
+    launch = kbd._default_spawn(task, str(workspace), defer_grant=True)
+    try:
+        launch.grant(task.current_run_id, task.claim_lock)
+        observed = _wait_for_receipt(workspace.parent / "receipt.json")
+        assert observed["identity"]["pid"] == launch.pid
+        assert observed["cwd"] == str(workspace)
+        assert observed["task"] == task.id
+        assert observed["run"] == "23"
+        assert ".scope" in observed["cgroup"]
+        assert "hermes-gateway.service" not in observed["cgroup"]
+    finally:
+        _finish_launch(launch)
 
-    launch = kbd._default_spawn(task, str(workspace))
-    pid = launch.pid if isinstance(launch, kbd.WorkerLaunch) else launch
-    deadline = time.monotonic() + 5
-    while not receipt.exists() and time.monotonic() < deadline:
-        time.sleep(0.05)
 
-    assert receipt.exists()
-    payload = json.loads(receipt.read_text(encoding="utf-8"))
-    assert payload["pid"] == pid
-    assert payload["cwd"] == str(workspace)
-    assert payload["task"] == task.id
-    assert payload["run"] == "23"
-    assert ".scope" in payload["cgroup"]
-    deadline = time.monotonic() + 5
-    while kbd._pid_alive(pid) and time.monotonic() < deadline:
-        time.sleep(0.05)
-    kbd.reap_worker_zombies()
-    assert "hermes-gateway.service" not in payload["cgroup"]
+@pytest.mark.linux_only
+@pytest.mark.live_system_guard_bypass  # cleanup signals our start-time-verified, reparented worker
+def test_worker_and_claim_survive_dispatcher_exit_and_shared_install_replacement(worker_setup, monkeypatch):
+    workspace, _task = worker_setup
+    base = workspace.parent
+    database = base / "restart.db"
+    conn = sqlite3.connect(database)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(kb.SCHEMA_SQL)
+    kb._ensure_lifecycle_schema(conn)
+    kb._ensure_goal_revision_schema(conn)
+    task_id = kb.create_task(
+        conn, title="restart survivor", assignee="coder", initial_status="blocked",
+        workspace_kind="scratch", workspace_path=str(workspace),
+    )
+    promoted, reason = kb.promote_task(conn, task_id, actor="test")
+    assert promoted, reason
+    assert kb.get_task(conn, task_id).status == "ready"
+    release = base / "release"
+    monkeypatch.setenv("HERMES_TEST_RUNTIME_RELEASE", str(release))
+    script = """
+import json, os, sqlite3, sys
+from pathlib import Path
+from unittest.mock import patch
+from hermes_cli import kanban_runtime_generation as generations
+generations._runtime_storage_root = lambda: Path(sys.argv[2])
+from hermes_cli import kanban_db_dispatch as kbd
+from tests.hermes_cli.test_kanban_lifecycle_conformance import _prepare_fixture_generation
+base = Path(sys.argv[1])
+conn = sqlite3.connect(base / 'restart.db')
+conn.row_factory = sqlite3.Row
+with patch.object(kbd, '_profile_exists_fn', return_value=None), patch.object(
+    kbd, '_restart_safe_worker_argv', side_effect=lambda task, command, preparation_id=None: command,
+), patch.object(generations, 'prepare_runtime_generation', side_effect=lambda expected, workspace=None: _prepare_fixture_generation(base / 'install', workspace=workspace)):
+    result = kbd.dispatch_once(conn, max_spawn=1, reconcile_orphans=False)
+assert len(result.spawned) == 1, result
+conn.close()
+os._exit(0)
+"""
+    launch_env = {**os.environ, "PYTHONPATH": str(Path(kbd.__file__).resolve().parents[1])}
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(base), str(generations._runtime_storage_root())],
+        env=launch_env, timeout=30,
+    )
+    assert completed.returncode == 0
+    claimed = kb.get_task(conn, task_id)
+    assert claimed.status == "running"
+    identity = json.loads(conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ?", (claimed.current_run_id,),
+    ).fetchone()["metadata"])["runtime_identity"]
+    try:
+        (base / "install" / "fixture_lazy.py").write_text("value = 2\n", encoding="utf-8")
+        (base / "site-packages" / "third_party_dynamic" / "__init__.py").write_text("value = 2\n", encoding="utf-8")
+        generations.sweep_runtime_generations()
+        assert kbd.detect_crashed_workers(conn) == []
+        assert kbd.reconcile_orphaned_running(conn) == []
+        recovered = kb.get_task(conn, task_id)
+        assert recovered.current_run_id == claimed.current_run_id
+        assert recovered.claim_lock == claimed.claim_lock
+        release.touch()
+        observed = _wait_for_receipt(base / "receipt.json")
+        assert observed["lazy"] == [1, 1]
+        assert observed["run"] == str(claimed.current_run_id)
+        assert observed["claim"] == claimed.claim_lock
+        assert observed["identity"] == identity
+    finally:
+        if kbd._pid_alive(claimed.worker_pid) and process_start_time(claimed.worker_pid) == identity["start_time"]:
+            try:
+                os.kill(claimed.worker_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass  # The released worker can exit between the identity check and signal.
+        deadline = time.monotonic() + 5
+        while kbd._pid_alive(claimed.worker_pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        conn.close()
+        generations.sweep_runtime_generations()

@@ -7,22 +7,15 @@ actual worker claim against PID reuse.
 
 from __future__ import annotations
 
-import ast
-import atexit
-import hashlib
-import importlib.metadata as importlib_metadata
-import importlib.util
 import json
 import os
 from pathlib import Path
 import queue
-import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Optional
 import uuid
 
@@ -48,8 +41,6 @@ _RUNTIME_RESOURCE_ROOTS = (
     ("plugins", "HERMES_BUNDLED_PLUGINS"),
 )
 
-_IDENTITY_ASSETS = ("skills/devops/sdlc-review/SKILL.md",)
-_RUNTIME_DEPENDENCY_ROOT_NAMES = frozenset({"site-packages", "dist-packages"})
 _BOOTSTRAP_INPUT_ENV = (
     "HERMES_KANBAN_BOOTSTRAP_PATH",
     "HERMES_KANBAN_PREPARATION_ID",
@@ -71,6 +62,8 @@ class RuntimeIdentity:
     fingerprint: str
     pid: int
     start_time: int
+    generation: str = ""
+    dependency_fingerprint: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -81,6 +74,8 @@ class RuntimeIdentity:
             "fingerprint": self.fingerprint,
             "pid": self.pid,
             "start_time": self.start_time,
+            "generation": self.generation,
+            "dependency_fingerprint": self.dependency_fingerprint,
         }
 
     @classmethod
@@ -94,6 +89,8 @@ class RuntimeIdentity:
                 fingerprint=str(value["fingerprint"]),
                 pid=int(value["pid"]),
                 start_time=int(value["start_time"]),
+                generation=str(value.get("generation", "")),
+                dependency_fingerprint=str(value.get("dependency_fingerprint", "")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeIdentityError("malformed runtime identity") from exc
@@ -101,6 +98,8 @@ class RuntimeIdentity:
             raise RuntimeIdentityError(f"unsupported runtime identity protocol {identity.protocol}")
         if identity.pid <= 0 or identity.start_time <= 0:
             raise RuntimeIdentityError("runtime identity must include a live pid and start time")
+        if bool(identity.generation) != bool(identity.dependency_fingerprint):
+            raise RuntimeIdentityError("generation identity must attest its dependencies")
         return identity
 
 
@@ -212,527 +211,11 @@ def _version(root: Path) -> str:
     start += len(marker)
     end = text.find('"', start)
     return text[start:end] if end > start else "unknown"
-def _identity_root_module_names(root: Path) -> frozenset[str]:
-    return frozenset(path.stem for path in root.glob("*.py") if path.is_file())
-
-
-def _pin_runtime_import_root(root: Path) -> None:
-    """Put the verified checkout before the worker workspace on ``sys.path``."""
-    root = root.resolve()
-    retained: list[str] = []
-    for entry in sys.path:
-        try:
-            if Path(entry or os.getcwd()).resolve() == root:
-                continue
-        except OSError:
-            pass
-        retained.append(entry)
-    sys.path[:] = [str(root), *retained]
-_FROZEN_IMPORT_ROOT: Optional[Path] = None
-
-_RUNTIME_SNAPSHOT_OWNER_FILE = ".hermes-kanban-runtime-owner.json"
-_RUNTIME_SNAPSHOT_ORPHAN_GRACE_SECONDS = 3600
-
-
-def _sweep_runtime_snapshots() -> None:
-    """Remove snapshots left by workers from an older gateway process."""
-    temp_root = Path(tempfile.gettempdir()).resolve()
-    try:
-        snapshots = temp_root.glob("hermes-kanban-runtime-*")
-    except OSError:
-        return
-    now = time.time()
-    for snapshot in snapshots:
-        try:
-            if not snapshot.is_dir():
-                continue
-            owner_path = snapshot / _RUNTIME_SNAPSHOT_OWNER_FILE
-            try:
-                owner = json.loads(owner_path.read_text(encoding="utf-8"))
-                pid = int(owner["pid"])
-                start_time = int(owner["start_time"])
-            except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
-                owner = None
-                pid = 0
-                start_time = 0
-            if owner is not None:
-                try:
-                    if pid > 0 and process_start_time(pid) == start_time:
-                        continue
-                except (RuntimeIdentityError, OSError, ValueError):
-                    pass
-                _remove_frozen_import_root(snapshot)
-                continue
-            if now - snapshot.stat().st_mtime < _RUNTIME_SNAPSHOT_ORPHAN_GRACE_SECONDS:
-                continue
-            _remove_frozen_import_root(snapshot)
-        except OSError:
-            continue
-
-
-def _write_runtime_snapshot_owner(
-    snapshot: Path,
-    *,
-    pid: Optional[int] = None,
-    start_time: Optional[int] = None,
-) -> None:
-    owner_pid = int(pid or os.getpid())
-    owner_start_time = (
-        process_start_time(owner_pid) if start_time is None else int(start_time)
-    )
-    _atomic_write(
-        snapshot / _RUNTIME_SNAPSHOT_OWNER_FILE,
-        {"pid": owner_pid, "start_time": owner_start_time},
-    )
-
-
-def _is_frozen_import_location(location: str) -> bool:
-    root = _FROZEN_IMPORT_ROOT
-    if root is None:
-        return False
-    normalized_location = str(location).replace("\\", "/")
-    normalized_root = str(root).replace("\\", "/")
-    return normalized_location.startswith(normalized_root + "/")
-
-
-def _remove_frozen_import_root(path: Path) -> None:
-    shutil.rmtree(path, ignore_errors=True)
-
-
-def cleanup_runtime_snapshot(path: Optional[os.PathLike[str] | str]) -> None:
-    """Remove a worker snapshot path previously emitted by this module."""
-    if not path:
-        return
-    snapshot = Path(path).resolve()
-    if (
-        snapshot.parent != Path(tempfile.gettempdir()).resolve()
-        or not snapshot.name.startswith("hermes-kanban-runtime-")
-    ):
-        return
-    _remove_frozen_import_root(snapshot)
-
-def _runtime_dependency_roots() -> tuple[Path, ...]:
-    """Return active interpreter package roots that can change during an update."""
-    roots: list[Path] = []
-    seen: set[Path] = set()
-    for entry in sys.path:
-        if not entry:
-            continue
-        try:
-            candidate = Path(entry)
-            if candidate.name not in _RUNTIME_DEPENDENCY_ROOT_NAMES:
-                continue
-            candidate = candidate.resolve()
-        except (OSError, RuntimeError, TypeError):
-            continue
-        if candidate.is_dir() and candidate not in seen:
-            roots.append(candidate)
-            seen.add(candidate)
-    return tuple(roots)
-
-def _runtime_lazy_import_names(members: Mapping[str, Path]) -> frozenset[str]:
-    """Find first-party import targets that may resolve after the snapshot."""
-    names: set[str] = set()
-
-    class _Visitor(ast.NodeVisitor):
-        def visit_Import(self, node: ast.Import) -> None:
-            names.update(alias.name.partition(".")[0] for alias in node.names)
-
-        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-            if node.level == 0 and node.module:
-                names.add(node.module.partition(".")[0])
-
-        def visit_Call(self, node: ast.Call) -> None:
-            if node.args:
-                function = node.func
-                is_import_module = (
-                    isinstance(function, ast.Attribute)
-                    and function.attr == "import_module"
-                    and isinstance(function.value, ast.Name)
-                    and function.value.id == "importlib"
-                )
-                is_import = isinstance(function, ast.Name) and function.id == "__import__"
-                is_lazy_importer = (
-                    isinstance(function, ast.Name)
-                    and function.id in {"_sdk_importer", "_import_sdk_names"}
-                )
-                if is_import_module or is_import or is_lazy_importer:
-                    value = node.args[0]
-                    if isinstance(value, ast.Constant) and isinstance(value.value, str):
-                        names.add(value.value.partition(".")[0])
-            self.generic_visit(node)
-
-    for path in members.values():
-        if path.suffix != ".py":
-            continue
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        except (OSError, SyntaxError, UnicodeError):
-            continue
-        _Visitor().visit(tree)
-
-    return frozenset(name for name in names if name)
-
-
-def _runtime_distribution_key(name: object) -> str:
-    return str(name or "").casefold().replace("_", "-").replace(".", "-")
-
-
-def _runtime_dependency_spec_locations(name: str, root: Path) -> set[Path]:
-    try:
-        spec = importlib.util.find_spec(name)
-    except (ImportError, AttributeError, ModuleNotFoundError, ValueError):
-        return set()
-    if spec is None:
-        return set()
-    candidates = list(spec.submodule_search_locations or ())
-    if not candidates and spec.origin:
-        candidates.append(spec.origin)
-    locations: set[Path] = set()
-    for candidate in candidates:
-        try:
-            resolved = Path(candidate).resolve()
-            resolved.relative_to(root)
-        except (OSError, RuntimeError, TypeError, ValueError):
-            continue
-        if resolved.is_dir() or resolved.is_file():
-            locations.add(resolved)
-    return locations
-
-
-def _runtime_dependency_distribution_index(
-    root: Path,
-) -> tuple[dict[str, Any], dict[str, set[str]]]:
-    try:
-        distributions = tuple(importlib_metadata.distributions(path=[str(root)]))
-    except (OSError, ValueError):
-        return {}, {}
-
-    by_name: dict[str, Any] = {}
-    owners: dict[str, set[str]] = {}
-    for distribution in distributions:
-        name = _runtime_distribution_key(distribution.metadata.get("Name"))
-        if not name:
-            continue
-        by_name[name] = distribution
-        try:
-            files = distribution.files or ()
-        except (OSError, TypeError, ValueError):
-            files = ()
-        for file in files:
-            parts = Path(str(file)).parts
-            if not parts or parts[0] in {".", ".."}:
-                continue
-            top_level = parts[0]
-            if top_level.endswith((".dist-info", ".egg-info", ".data")):
-                continue
-            if top_level.endswith(".py"):
-                top_level = Path(top_level).stem
-            owners.setdefault(top_level, set()).add(name)
-            owners.setdefault(top_level.casefold(), set()).add(name)
-
-    try:
-        package_distributions = importlib_metadata.packages_distributions()
-    except (OSError, ValueError):
-        package_distributions = {}
-    for package, distribution_names in package_distributions.items():
-        package_key = package.casefold()
-        for distribution_name in distribution_names:
-            normalized = _runtime_distribution_key(distribution_name)
-            if normalized in by_name:
-                owners.setdefault(package, set()).add(normalized)
-                owners.setdefault(package_key, set()).add(normalized)
-    return by_name, owners
-
-
-def _runtime_requirement_distribution_name(raw_requirement: str) -> Optional[str]:
-    try:
-        from packaging.requirements import Requirement
-
-        requirement = Requirement(raw_requirement)
-        if requirement.marker is not None and not requirement.marker.evaluate():
-            return None
-        return _runtime_distribution_key(requirement.name)
-    except (ImportError, TypeError, ValueError):
-        token = str(raw_requirement).lstrip()
-        for separator in ("[", "<", ">", "=", "!", "~", ";", " ", "("):
-            token = token.split(separator, 1)[0]
-        return _runtime_distribution_key(token) or None
-
-
-def _runtime_dependency_locations(
-    members: Mapping[str, Path], dependency_roots: tuple[Path, ...],
-) -> dict[Path, tuple[tuple[Any, ...], set[Path]]]:
-    """Resolve the first-party dependency closure under each import root."""
-    locations: dict[Path, tuple[tuple[Any, ...], set[Path]]] = {}
-    import_names = _runtime_lazy_import_names(members)
-    for root in dependency_roots:
-        distributions, owners = _runtime_dependency_distribution_index(root)
-        selected_names: set[str] = set()
-        fallback_locations: set[Path] = set()
-        for import_name in import_names:
-            spec_locations = _runtime_dependency_spec_locations(import_name, root)
-            if not spec_locations:
-                continue
-            owner_names = owners.get(import_name, set()) | owners.get(import_name.casefold(), set())
-            matching = {name for name in owner_names if name in distributions}
-            if matching:
-                selected_names.update(matching)
-                if any(not (distributions[name].files or ()) for name in matching):
-                    fallback_locations.update(spec_locations)
-            else:
-                fallback_locations.update(spec_locations)
-
-        pending = list(selected_names)
-        while pending:
-            distribution_name = pending.pop()
-            distribution = distributions[distribution_name]
-            try:
-                requirements = distribution.requires or ()
-            except (OSError, TypeError, ValueError):
-                requirements = ()
-            for raw_requirement in requirements:
-                dependency_name = _runtime_requirement_distribution_name(raw_requirement)
-                if dependency_name in distributions and dependency_name not in selected_names:
-                    selected_names.add(dependency_name)
-                    pending.append(dependency_name)
-        locations[root] = (
-            tuple(distributions[name] for name in sorted(selected_names)),
-            fallback_locations,
-        )
-    return locations
-
-
-def _copy_runtime_dependency_distribution(
-    source_root: Path, destination_root: Path, distribution: Any,
-) -> None:
-    try:
-        files = distribution.files or ()
-    except (OSError, TypeError, ValueError):
-        files = ()
-    for file in files:
-        try:
-            source = Path(distribution.locate_file(file)).resolve()
-            relative = source.relative_to(source_root)
-        except (OSError, RuntimeError, TypeError, ValueError):
-            continue
-        if not source.is_file():
-            continue
-        destination = destination_root / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        _copy_runtime_dependency_file(str(source), str(destination))
-
-
-def _copy_runtime_dependency_tree(
-    source_root: Path, destination_root: Path, locations: set[Path],
-) -> None:
-    for source in sorted(locations):
-        relative = source.relative_to(source_root)
-        destination = destination_root / relative
-        if source.is_dir():
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(
-                source, destination, copy_function=_copy_runtime_dependency_file, dirs_exist_ok=True,
-            )
-        elif source.is_file():
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            _copy_runtime_dependency_file(str(source), str(destination))
-
-
-def _copy_runtime_dependency_file(source: str, destination: str) -> str:
-    # Dependency installers replace non-source artifacts atomically. Hardlinks keep that
-    # snapshot cheap; Python sources are copied because an in-place edit must not leak through.
-    if Path(source).suffix in {".py", ".pyi"}:
-        shutil.copy2(source, destination)
-    else:
-        try:
-            os.link(source, destination)
-        except OSError:
-            shutil.copy2(source, destination)
-    return destination
-
-def _pin_loaded_dependency_imports(
-    source_roots: tuple[Path, ...], destinations: list[Path],
-) -> None:
-    """Point already-imported dependency packages at their frozen submodule roots."""
-    pairs = tuple(zip(source_roots, destinations))
-    if not pairs:
-        return
-
-    def snapshot_path(location: object) -> Optional[Path]:
-        try:
-            resolved = Path(location).resolve()
-        except (OSError, RuntimeError, TypeError):
-            return None
-        for source, destination in pairs:
-            try:
-                relative = resolved.relative_to(source)
-            except ValueError:
-                continue
-            return destination / relative
-        return None
-
-    for module in tuple(sys.modules.values()):
-        package_path = getattr(module, "__path__", None)
-        if package_path is None:
-            continue
-        try:
-            entries = tuple(package_path)
-        except (TypeError, ValueError):
-            continue
-        mapped_paths: list[object] = []
-        changed = False
-        for entry in entries:
-            mapped = snapshot_path(entry)
-            mapped_paths.append(str(mapped) if mapped is not None else entry)
-            changed = changed or mapped is not None
-        if not changed:
-            continue
-        try:
-            module.__path__ = mapped_paths
-            spec = getattr(module, "__spec__", None)
-            if spec is not None and spec.submodule_search_locations is not None:
-                spec.submodule_search_locations = mapped_paths
-            for attribute in ("__file__", "__cached__"):
-                mapped = snapshot_path(getattr(module, attribute, None))
-                if mapped is not None:
-                    setattr(module, attribute, str(mapped))
-            if spec is not None:
-                mapped = snapshot_path(getattr(spec, "origin", None))
-                if mapped is not None:
-                    spec.origin = str(mapped)
-        except (AttributeError, TypeError):
-            pass
-
-
-
-
-def _freeze_runtime_import_root(
-    root: Path, *, include_dependencies: bool = False,
-) -> Path:
-    """Serve future runtime imports from a pre-grant source snapshot."""
-    global _FROZEN_IMPORT_ROOT
-    if _FROZEN_IMPORT_ROOT is not None:
-        return _FROZEN_IMPORT_ROOT
-    root = root.resolve()
-    members = _runtime_snapshot_members(root)
-    dependency_roots = _runtime_dependency_roots() if include_dependencies else ()
-    dependency_locations = _runtime_dependency_locations(members, dependency_roots)
-    dependency_sources: list[Path] = []
-    dependency_destinations: list[Path] = []
-    snapshot_root = Path(tempfile.mkdtemp(prefix="hermes-kanban-runtime-")).resolve()
-    try:
-        for name, path in sorted(members.items()):
-            destination = snapshot_root / name
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, destination)
-        for index, source in enumerate(dependency_roots):
-            distributions, locations = dependency_locations[source]
-            if not distributions and not locations:
-                continue
-            destination = snapshot_root / ".third-party" / str(index)
-            for distribution in distributions:
-                _copy_runtime_dependency_distribution(source, destination, distribution)
-            _copy_runtime_dependency_tree(source, destination, locations)
-            dependency_sources.append(source)
-            dependency_destinations.append(destination)
-    except Exception:
-        _remove_frozen_import_root(snapshot_root)
-        raise
-    for directory, env_var in _RUNTIME_RESOURCE_ROOTS:
-        source = _resource_root(root, directory, env_var)
-        if not source.is_dir():
-            continue
-        destination = snapshot_root / directory
-        destination.mkdir(parents=True, exist_ok=True)
-        os.environ[env_var] = str(destination)
-
-    _FROZEN_IMPORT_ROOT = snapshot_root
-    atexit.register(_remove_frozen_import_root, snapshot_root)
-    _pin_runtime_import_root(snapshot_root)
-    for destination in reversed(dependency_destinations):
-        sys.path.insert(1, str(destination))
-    _pin_loaded_dependency_imports(tuple(dependency_sources), dependency_destinations)
-    for name, module in tuple(sys.modules.items()):
-        package_path = getattr(module, "__path__", None)
-        if package_path is None or not any(
-            name == prefix or name.startswith(f"{prefix}.") for prefix in _IDENTITY_ROOTS
-        ):
-            continue
-        try:
-            module.__path__ = [str(snapshot_root.joinpath(*name.split(".")))]
-        except (AttributeError, TypeError):
-            pass
-    return snapshot_root
-
-
-
-
-
-def _resource_root(root: Path, directory: str, env_var: str) -> Path:
-    override = os.environ.get(env_var, "").strip()
-    if override:
-        candidate = Path(override).resolve()
-        if candidate.is_dir():
-            return candidate
-    return root / directory
-
-
-def _identity_asset_path(root: Path, asset: str) -> Path:
-    if asset.startswith("skills/"):
-        path = _resource_root(root, "skills", "HERMES_BUNDLED_SKILLS")
-    else:
-        path = root
-    path = path / Path(asset).relative_to("skills") if asset.startswith("skills/") else path / asset
-    if path.is_file():
-        return path
-    raise RuntimeIdentityError(f"runtime identity asset is missing: {asset}")
-
-def _runtime_snapshot_members(root: Path) -> dict[str, Path]:
-    root = root.resolve()
-    members: dict[str, Path] = {}
-
-    for path in root.glob("*.py"):
-        if path.is_file():
-            members[path.name] = path
-
-    def add_tree(base: Path, destination_root: str) -> None:
-        for path in base.rglob("*"):
-            relative = path.relative_to(base)
-            if path.is_file() and not any(
-                part.startswith(".") or part == "__pycache__" for part in relative.parts
-            ):
-                members[(Path(destination_root) / relative).as_posix()] = path
-
-    for directory in _IDENTITY_ROOTS:
-        if directory == "plugins":
-            continue
-        base = root / directory
-        if not base.is_dir():
-            raise RuntimeIdentityError(f"runtime identity directory is missing: {directory}")
-        add_tree(base, directory)
-
-    for directory, env_var in _RUNTIME_RESOURCE_ROOTS:
-        base = _resource_root(root, directory, env_var)
-        if not base.is_dir():
-            if directory == "plugins":
-                raise RuntimeIdentityError(f"runtime identity directory is missing: {directory}")
-            continue
-        add_tree(base, directory)
-
-    for asset in _IDENTITY_ASSETS:
-        members[asset] = _identity_asset_path(root, asset)
-    return members
 
 
 def _fingerprint(root: Path) -> str:
-    digest = hashlib.sha256()
-    for name, path in sorted(_runtime_snapshot_members(root).items()):
-        digest.update(name.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest()
+    from hermes_cli.kanban_runtime_generation import _digest_members, source_members
+    return _digest_members(source_members(root))
 
 
 _FROZEN_RUNTIME_IDENTITY: Optional[RuntimeIdentity] = None
@@ -753,6 +236,11 @@ def runtime_identity(
         return _FROZEN_RUNTIME_IDENTITY
     root = _module_root(module_root)
     process_pid = int(pid or os.getpid())
+    generation = os.environ.get("HERMES_KANBAN_RUNTIME_GENERATION")
+    if generation and root == Path(generation).resolve() / "source":
+        from hermes_cli.kanban_runtime_generation import generation_manifest
+        frozen = RuntimeIdentity.from_value(generation_manifest(generation)["identity"])
+        return replace(frozen, pid=process_pid, start_time=int(start_time or process_start_time(process_pid)))
     return RuntimeIdentity(
         protocol=RUNTIME_IDENTITY_PROTOCOL,
         code_sha=_git_sha(root),
@@ -772,6 +260,8 @@ def code_identity(value: RuntimeIdentity | Mapping[str, Any]) -> tuple[Any, ...]
         identity.version,
         identity.module_root,
         identity.fingerprint,
+        identity.generation,
+        identity.dependency_fingerprint,
     )
 
 
@@ -797,52 +287,41 @@ def assert_runtime_import_root(
     expected: RuntimeIdentity | Mapping[str, Any] | None = None,
     identity: RuntimeIdentity | Mapping[str, Any] | None = None,
 ) -> RuntimeIdentity:
-    """Reject mixed checkout imports before a worker can touch the board.
-
-    Callers that already fingerprinted the same root may pass ``identity`` to
-    reuse it while retaining the import-root check.
-    """
+    """Reject mutable or mixed imports before the worker can touch the board."""
     root = _module_root(module_root)
     observed = identity or runtime_identity(root, pid=os.getpid(), start_time=process_start_time())
     if expected is not None and not same_code_identity(expected, observed):
         raise RuntimeIdentityError("runtime code changed during startup")
+    generation = os.environ.get("HERMES_KANBAN_RUNTIME_GENERATION")
+    if generation:
+        from hermes_cli.kanban_runtime_generation import generation_manifest, _is_stdlib
+        generation_root = Path(generation).resolve()
+        sealed = RuntimeIdentity.from_value(generation_manifest(generation, verify=True)["identity"])
+        if not same_code_identity(sealed, observed):
+            raise RuntimeIdentityError("runtime generation identity mismatch")
+        for module in tuple(sys.modules.values()):
+            location = getattr(module, "__file__", None)
+            if not location or str(location).startswith("<"):
+                continue
+            path = Path(location).resolve()
+            if not path.is_relative_to(generation_root) and not _is_stdlib(path):
+                raise RuntimeIdentityError(f"mutable runtime import: {location}")
+        return observed
     prefixes = _IDENTITY_ROOTS
-    root_modules = _identity_root_module_names(root)
-    mixed: list[str] = []
+    root_modules = {path.stem for path in root.glob("*.py") if path.is_file()}
     for name, module in tuple(sys.modules.items()):
-        if not (
-            name in root_modules
-            or any(name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes)
-        ):
+        if name not in root_modules and not any(name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes):
             continue
         location = getattr(module, "__file__", None)
-        if not location:
-            continue
-        if _is_frozen_import_location(str(location)):
-            continue
-        try:
-            Path(location).resolve().relative_to(root)
-        except ValueError:
-            mixed.append(f"{name}={location}")
-    if mixed:
-        raise RuntimeIdentityError(
-            "mixed runtime import roots: " + ", ".join(sorted(mixed)[:8])
-        )
+        if location and not Path(location).resolve().is_relative_to(root):
+            raise RuntimeIdentityError(f"mixed runtime import roots: {name}={location}")
     return observed
 
 def prospective_identity(module_root: Optional[os.PathLike[str] | str] = None) -> RuntimeIdentity:
     """Return the frozen code identity with the caller's live process marker."""
     if module_root is None:
         frozen = runtime_identity()
-        return RuntimeIdentity(
-            protocol=frozen.protocol,
-            code_sha=frozen.code_sha,
-            version=frozen.version,
-            module_root=frozen.module_root,
-            fingerprint=frozen.fingerprint,
-            pid=os.getpid(),
-            start_time=process_start_time(),
-        )
+        return replace(frozen, pid=os.getpid(), start_time=process_start_time())
     return runtime_identity(module_root, pid=max(os.getpid(), 1), start_time=process_start_time())
 def encode_identity(identity: RuntimeIdentity | Mapping[str, Any]) -> str:
     value = identity.as_dict() if isinstance(identity, RuntimeIdentity) else RuntimeIdentity.from_value(identity).as_dict()
@@ -925,7 +404,9 @@ def worker_bootstrap_from_env() -> Optional[dict[str, Any]]:
     if not preparation_id or not expected_raw:
         raise RuntimeIdentityError("worker bootstrap environment is incomplete")
     expected = decode_identity(expected_raw)
-    actual = runtime_identity()
+    if not expected.generation or not os.environ.get("HERMES_KANBAN_RUNTIME_GENERATION"):
+        raise RuntimeIdentityError("worker bootstrap requires a prepared runtime generation")
+    actual = assert_runtime_import_root(expected=expected)
     payload = {
         "ready": same_code_identity(expected, actual),
         "phase": "pre_import",
@@ -935,7 +416,6 @@ def worker_bootstrap_from_env() -> Optional[dict[str, Any]]:
     _atomic_write(Path(path_raw), payload)
     if not payload["ready"]:
         raise RuntimeIdentityError("worker runtime identity mismatch")
-    _pin_runtime_import_root(Path(actual.module_root))
     if os.environ.get("HERMES_KANBAN_BOOTSTRAP_WAIT", "1").lower() in {"0", "false", "no", "off"}:
         os.environ["HERMES_KANBAN_RUNTIME_GRANTED"] = "1"
         for key in _BOOTSTRAP_INPUT_ENV:
@@ -976,20 +456,9 @@ def worker_bootstrap_post_import(*, wait_for_grant: bool = True) -> Optional[dic
     if not preparation_id or not expected_raw:
         raise RuntimeIdentityError("worker bootstrap environment is incomplete")
     expected = decode_identity(expected_raw)
-    # Snapshot every runtime source file before the final grant. Lazy turn and
-    # tool imports then resolve from this immutable filesystem snapshot, not a mutable checkout.
-    snapshot_root = _freeze_runtime_import_root(_module_root(), include_dependencies=True)
-    if _fingerprint(snapshot_root) != expected.fingerprint:
-        raise RuntimeIdentityError("runtime snapshot changed during startup")
-    # ``main.py`` and ``cli.py`` defer these imports to keep ordinary CLI
-    # startup cheap. Workers must load them before the final identity check;
-    # otherwise an update can replace their source after this handshake and
-    # before the lazy import.
-    from cli import main as _cli_main  # noqa: F401
-    from run_agent import AIAgent as _worker_agent  # noqa: F401
-    from agent.agent_init import init_agent as _init_agent  # noqa: F401
-    import agent.credits_tracker as _credits_tracker  # noqa: F401
-
+    generation_root = os.environ.get("HERMES_KANBAN_RUNTIME_GENERATION")
+    if not generation_root or not expected.generation:
+        raise RuntimeIdentityError("worker bootstrap requires a prepared runtime generation")
     actual = assert_runtime_import_root(expected=expected)
     payload = {
         "ready": True,
@@ -997,7 +466,7 @@ def worker_bootstrap_post_import(*, wait_for_grant: bool = True) -> Optional[dic
         "post_import": True,
         "preparation_id": preparation_id,
         "runtime_identity": actual.as_dict(),
-        "runtime_snapshot": str(snapshot_root),
+        "runtime_generation": generation_root,
     }
     _atomic_write(Path(path_raw), payload)
     if wait_for_grant:
@@ -1044,4 +513,5 @@ def runtime_identity_json(module_root: Optional[os.PathLike[str] | str] = None) 
     return encode_identity(runtime_identity(module_root))
 
 if not os.environ.get("HERMES_KANBAN_BOOTSTRAP_PATH"):
-    _sweep_runtime_snapshots()
+    from hermes_cli.kanban_runtime_generation import sweep_runtime_generations
+    sweep_runtime_generations()

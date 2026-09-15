@@ -1972,7 +1972,6 @@ _rotated_log_path = _kwr._rotated_log_path
 _rotate_worker_log = _kwr._rotate_worker_log
 reap_worker_zombies = _kwr.reap_worker_zombies
 _module_hermes_argv = _kwr._module_hermes_argv
-_trusted_module_hermes_argv = _kwr._trusted_module_hermes_argv
 _resolve_hermes_argv = _kwr._resolve_hermes_argv
 _worker_terminal_timeout_env = _kwr._worker_terminal_timeout_env
 _resolve_worker_cli_toolsets = _kwr._resolve_worker_cli_toolsets

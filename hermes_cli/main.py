@@ -62,10 +62,12 @@ from hermes_cli import _startup_fast  # noqa: E402
 # #57828.
 from hermes_cli import _early_recovery as _early_recovery_mod
 
-try:
-    _early_recovery_mod.recover_if_needed()
-except Exception:
-    pass
+# A generation is already complete; recovery must never modify its sealed files.
+if not os.environ.get("HERMES_KANBAN_RUNTIME_GENERATION"):
+    try:
+        _early_recovery_mod.recover_if_needed()
+    except Exception:
+        pass
 
 
 if _early_runtime_argv in (["runtime-identity"], ["runtime-identity", "--json"], ["--runtime-identity"]):
@@ -3362,14 +3364,21 @@ def main():
 
     # Sweep stale ``hermes.exe.old.*`` quarantine files from previous Windows
     # updates (see ``_quarantine_running_hermes_exe``). No-op elsewhere.
-    try:
-        _cleanup_quarantined_exes()
-    except Exception:
-        pass
+    if not os.environ.get("HERMES_KANBAN_RUNTIME_GENERATION"):
+        from hermes_cli.kanban_runtime_generation import installation_mutation_lock
 
-    # Checkout changed since last launch → sweep stale __pycache__ once so no
-    # process resolves fresh source against old bytecode. Never raises.
-    _sweep_stale_bytecode_if_checkout_changed()
+        # Updater children must not wait for the parent waiting on their exit.
+        try:
+            with installation_mutation_lock(blocking=False):
+                try:
+                    _cleanup_quarantined_exes()
+                except Exception:
+                    pass
+
+                # Checkout changed → sweep stale bytecode before resolving new source.
+                _sweep_stale_bytecode_if_checkout_changed()
+        except BlockingIOError:
+            pass
 
     # Self-heal a venv left half-built by an interrupted ``hermes update``, and
     # hint (never restart) about a fleet the interrupted update never
@@ -3379,9 +3388,10 @@ def main():
     # install update``) only defers recovery one launch; under-matching
     # (``hermes -p work update``) would race. Never raises.
     # See #95294.
-    if "update" not in sys.argv[1:]:
+    if "update" not in sys.argv[1:] and not os.environ.get("HERMES_KANBAN_RUNTIME_GENERATION"):
         try:
-            _recover_from_interrupted_install()
+            with installation_mutation_lock(blocking=False):
+                _recover_from_interrupted_install()
         except Exception:
             pass
         try:

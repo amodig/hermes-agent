@@ -156,10 +156,36 @@ def _lifecycle_observed_tasks(conn: sqlite3.Connection, task_id: str) -> tuple[s
     candidate = contract.get("candidate_task_id")
     return (str(candidate),) if candidate else ()
 
-def _capture_acceptance(conn: sqlite3.Connection, task_id: str) -> dict[str, str]:
+def _capture_acceptance(
+    conn: sqlite3.Connection, task_id: str, *, include_descendants: bool = False,
+) -> dict[str, str]:
+    task_ids = (
+        (
+            row["id"]
+            for row in conn.execute(
+                """
+                WITH RECURSIVE affected(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT l.child_id FROM task_links l
+                    JOIN affected a ON a.id = l.parent_id
+                )
+                SELECT id FROM affected ORDER BY id
+                """,
+                (task_id,),
+            ).fetchall()
+        )
+        if include_descendants
+        else (task_id,)
+    )
+    observed_ids = dict.fromkeys(
+        observed_id
+        for affected_id in task_ids
+        for observed_id in _lifecycle_observed_tasks(conn, affected_id)
+    )
     return {
         observed_id: get_lifecycle_state(conn, observed_id).get("acceptance", "unclassified")
-        for observed_id in _lifecycle_observed_tasks(conn, task_id)
+        for observed_id in observed_ids
     }
 
 def _emit_acceptance_changes(

@@ -11,14 +11,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import threading
-from unittest.mock import patch
+import subprocess
 
 import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_lifecycle_evidence as evidence
-from hermes_cli.plugins import VALID_HOOKS, get_plugin_manager
+from hermes_cli.kanban_lifecycle import get_lifecycle_state
+from hermes_cli.plugins import get_plugin_manager
 
 
 @pytest.fixture
@@ -114,6 +115,105 @@ def test_general_completion_fires_hook(kanban_home, captured_hooks):
     assert completed[0][1]["task_id"] == task_id
     assert completed[0][1]["run_id"] == claimed.current_run_id
 
+
+
+@pytest.mark.parametrize(
+    ("review_mode", "validation_required"),
+    [("same_card", False), ("same_card", True), ("separate_card", False), ("separate_card", True)],
+)
+def test_typed_completion_hooks_follow_acceptance_once(
+    kanban_home, captured_hooks, tmp_path, review_mode, validation_required,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=Lifecycle Test",
+         "-c", "user.email=lifecycle@example.invalid", "commit", "--allow-empty", "-qm", "base"],
+        check=True, capture_output=True,
+    )
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    conn = kbc.connect()
+    try:
+        candidate = kb.create_task(
+            conn, title="implementation", assignee="builder", workspace_kind="dir",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code", "review_mode": review_mode,
+                "reviewer": "reviewer", "validation_required": validation_required,
+            },
+        )
+        review = candidate
+        if review_mode == "separate_card":
+            review = kb.create_task(
+                conn, title="review", assignee="reviewer", parents=[candidate],
+                lifecycle_contract={"kind": "review", "candidate_task_id": candidate},
+            )
+        if validation_required:
+            validation = kb.create_task(
+                conn, title="validation", assignee="tester", parents=[review],
+                lifecycle_contract={"kind": "validation", "candidate_task_id": candidate},
+            )
+        implementation = kb.claim_task(conn, candidate, claimer="builder")
+        assert implementation is not None
+        assert kb.complete_task(
+            conn, candidate, expected_run_id=implementation.current_run_id,
+            metadata={"base_sha": head, "head_sha": head}, summary="implementation ready",
+        )
+        assert [name for name, _kwargs in captured_hooks if name == "kanban_task_completed"] == []
+        assert any(event.kind == "review_requested" for event in kb.list_events(conn, candidate))
+        reviewer = kb.claim_review_task(conn, review, claimer="reviewer")
+        assert reviewer is not None
+        assert kb.complete_task(
+            conn, review, expected_run_id=reviewer.current_run_id,
+            verdict="APPROVE", metadata={"reviewed_head_sha": head}, summary="approved",
+        )
+        if validation_required:
+            expected_review_hooks = (
+                [(review, reviewer.current_run_id)] if review_mode == "separate_card" else []
+            )
+            assert [
+                (kwargs["task_id"], kwargs["run_id"])
+                for name, kwargs in captured_hooks if name == "kanban_task_completed"
+            ] == expected_review_hooks
+            if review_mode == "same_card":
+                assert any(event.kind == "validation_requested" for event in kb.list_events(conn, review))
+            validator = kb.claim_task(conn, validation, claimer="tester")
+            assert validator is not None
+            assert kb.complete_task(
+                conn, validation, expected_run_id=validator.current_run_id,
+                verdict="PASS", metadata={"head_sha": head}, summary="validated",
+            )
+            terminal, verdict, metadata = validation, "PASS", {"head_sha": head}
+        else:
+            terminal, verdict, metadata = review, "APPROVE", {"reviewed_head_sha": head}
+        assert get_lifecycle_state(conn, candidate)["acceptance"] == "accepted"
+        completed = [
+            (kwargs["task_id"], kwargs["run_id"])
+            for name, kwargs in captured_hooks if name == "kanban_task_completed"
+        ]
+        expected = [(candidate, implementation.current_run_id)]
+        if validation_required:
+            expected.append((validation, validator.current_run_id))
+        if review_mode == "separate_card":
+            expected.append((review, reviewer.current_run_id))
+        assert sorted(completed) == sorted(expected)
+        assert [
+            event.payload["new"] for event in kb.list_events(conn, candidate)
+            if event.kind == "acceptance_changed"
+        ] == ["accepted"]
+        assert kb.complete_task(conn, terminal, verdict=verdict, metadata=metadata)
+        assert [
+            (kwargs["task_id"], kwargs["run_id"])
+            for name, kwargs in captured_hooks if name == "kanban_task_completed"
+        ] == completed
+    finally:
+        conn.close()
+
+
 def test_completed_result_edit_rejects_handoff_metadata(kanban_home):
     conn = kbc.connect()
     try:
@@ -157,6 +257,9 @@ def test_acceptance_event_projection_holds_write_lock(kanban_home):
     writer_errors = []
     try:
         task_id = kb.create_task(conn, title="race", assignee="worker")
+        with kbc.write_txn(conn):
+            conn.execute("UPDATE tasks SET lifecycle_contract = NULL WHERE id = ?", (task_id,))
+        before = {task_id: get_lifecycle_state(conn, task_id)["acceptance"]}
 
         def mutate_task():
             competing = kbc.connect()
@@ -165,7 +268,7 @@ def test_acceptance_event_projection_holds_write_lock(kanban_home):
                 with kbc.write_txn(competing):
                     writer_acquired.set()
                     competing.execute(
-                        "UPDATE tasks SET version = version + 1 WHERE id = ?",
+                        "UPDATE tasks SET lifecycle_contract = NULL, version = version + 1 WHERE id = ?",
                         (task_id,),
                     )
             except BaseException as error:
@@ -177,37 +280,32 @@ def test_acceptance_event_projection_holds_write_lock(kanban_home):
         writer = threading.Thread(target=mutate_task)
         writer.start()
 
-        def projected_state(_connection, _observed_id):
-            return {
-                "acceptance": "accepted",
-                "review_verdict": "APPROVE",
-                "validation_verdict": None,
-                "execution_outcome": None,
-            }
-
-        with patch.object(evidence, "get_lifecycle_state", side_effect=projected_state):
-            with kbc.write_txn(conn):
-                writer_start.set()
-                accepted = evidence._emit_acceptance_changes(
-                    conn,
-                    {task_id: "pending"},
-                    source_task_id=task_id,
-                )
-                assert accepted == [task_id]
-                assert not writer_acquired.is_set()
-                event = conn.execute(
-                    "SELECT payload FROM task_events "
-                    "WHERE task_id = ? AND kind = 'acceptance_changed' "
-                    "ORDER BY id DESC LIMIT 1",
-                    (task_id,),
-                ).fetchone()
-                assert event is not None
-                assert json.loads(event["payload"])["new"] == "accepted"
+        with kbc.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET lifecycle_contract = ? WHERE id = ?",
+                (json.dumps({"kind": "general"}), task_id),
+            )
+            writer_start.set()
+            accepted = evidence._emit_acceptance_changes(
+                conn, before, source_task_id=task_id,
+            )
+            assert accepted == []
+            assert not writer_acquired.is_set()
+            event = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'acceptance_changed' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            assert event is not None
+            payload = json.loads(event["payload"])
+            assert (payload["old"], payload["new"]) == ("unclassified", "not_applicable")
 
         assert writer_done.wait(timeout=5)
         writer.join(timeout=5)
         assert not writer.is_alive()
         assert writer_errors == []
+        assert get_lifecycle_state(conn, task_id)["acceptance"] == "unclassified"
     finally:
         conn.close()
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
 import textwrap
 from pathlib import Path
 
@@ -22,6 +23,13 @@ import pytest
 from hermes_cli import _early_recovery as er
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(autouse=True)
+def isolated_installation_locks(tmp_path, monkeypatch):
+    # Parallel files share the interpreter, but not this test's installation.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +105,30 @@ def test_broken_dotenv_crashes_main_import_without_repair(tmp_path):
     assert "EARLY_RECOVERY_CALLED" in result.stdout
     assert "MAIN_IMPORTED_OK" not in result.stdout
     assert "wiped mid-install" in result.stderr
+
+
+def test_cli_child_reaches_command_parser_while_parent_holds_installation_lock(tmp_path):
+    from hermes_cli.kanban_runtime_generation import installation_mutation_lock
+
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    (home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    with installation_mutation_lock(tmp_path):
+        result = subprocess.run(
+            [sys.executable, "-m", "hermes_cli.main", "desktop", "--help"],
+            capture_output=True,
+            text=True,
+            cwd=tmp_path,
+            env={
+                **os.environ,
+                "PYTHONPATH": str(REPO_ROOT),
+                "HERMES_HOME": str(home),
+                "HOME": str(tmp_path),
+            },
+            timeout=60,
+        )
+    assert result.returncode == 0, result.stderr
+    assert "--build-only" in result.stdout
 
 
 

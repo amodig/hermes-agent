@@ -239,7 +239,7 @@ def _typed_rework_graph(
                 SELECT l.child_id FROM task_links l JOIN graph g ON g.id = l.parent_id
             )
             SELECT t.id, t.status, t.version, t.claim_lock, t.current_run_id,
-                   t.worker_pid, t.completed_at, t.result, t.block_kind
+                   t.worker_pid, t.completed_at, t.result, t.block_kind, t.assignee
             FROM graph JOIN tasks t ON t.id = graph.id ORDER BY t.id
             """,
             (implementation_id,),

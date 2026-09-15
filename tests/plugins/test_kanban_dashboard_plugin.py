@@ -703,9 +703,27 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
     with kbc.connect() as conn:
         child = kb.get_task(conn, child_id)
         assert child is not None
-        assert child.status == "review"
+        assert child.status == "ready"
+        assert kb.claim_review_task(conn, child_id) is None
+        assert not kb.complete_task(
+            conn,
+            child_id,
+            summary="stale approval",
+            expected_run_id=active_review.current_run_id,
+        )
+        replacement = kb.claim_task(conn, child_id)
+        assert replacement is not None
+        assert replacement.current_run_id != implementation.current_run_id
+        assert kb.request_review(
+            conn,
+            child_id,
+            summary="new implementation after parent stabilized",
+            expected_run_id=replacement.current_run_id,
+        )
+        assert kb.get_task(conn, grandchild_id).status == "todo"
         review = kb.claim_review_task(conn, child_id)
         assert review is not None
+        assert review.current_run_id != active_review.current_run_id
         assert kb.complete_task(
             conn,
             child_id,

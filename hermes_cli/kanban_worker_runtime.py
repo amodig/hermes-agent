@@ -1,7 +1,7 @@
 """Hermes Kanban worker launch, bootstrap, and process-runtime management.
 
 The dispatcher owns board scheduling; this module owns the subprocess boundary,
-worker identity handoff, and runtime snapshot cleanup.
+worker identity handoff, and immutable runtime generation cleanup.
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ handle; ``Popen.__del__`` then warns while the worker is still legitimately
 running.
 """
 _worker_runtime_snapshots: "dict[int, Path]" = {}
-"""Filesystem snapshots retained until their launcher process is reaped."""
+"""Runtime generations retained until their worker's actual process exits."""
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
@@ -73,9 +73,9 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
     snapshot = _worker_runtime_snapshots.pop(launcher_pid, None)
     if snapshot is not None:
         with contextlib.suppress(Exception):
-            from hermes_cli.kanban_runtime import cleanup_runtime_snapshot
+            from hermes_cli.kanban_runtime_generation import cleanup_runtime_generation
 
-            cleanup_runtime_snapshot(snapshot)
+            cleanup_runtime_generation(snapshot)
     worker_pid = _worker_pid_aliases.pop(launcher_pid, launcher_pid)
     process = _worker_processes.pop(launcher_pid, None)
     if process is not None and getattr(process, "returncode", None) is None:
@@ -123,6 +123,9 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
 
 def reap_worker_zombies() -> "list[int]":
     """Reap exited workers without blocking; poll retained handles on Windows."""
+    from hermes_cli.kanban_runtime_generation import sweep_runtime_generations
+
+    sweep_runtime_generations()
     reaped: "list[int]" = []
     if os.name != "nt":
         for launcher_pid in tuple(_worker_processes):
@@ -151,18 +154,6 @@ def _module_hermes_argv() -> list[str]:
     """Interpreter-bound Hermes CLI invocation (``hermes_cli.main`` is the
     console-script target — there is no top-level ``hermes`` package)."""
     return [sys.executable, "-m", "hermes_cli.main"]
-def _trusted_module_hermes_argv(command: list[str]) -> list[str]:
-    """Launch the module fallback from the dispatcher runtime root."""
-    module_argv = _module_hermes_argv()
-    if command[:3] != module_argv:
-        return command
-    runtime_root = str(Path(__file__).resolve().parents[1])
-    bootstrap = (
-        "import runpy,sys;"
-        f"sys.path.insert(0,{runtime_root!r});"
-        "runpy.run_module('hermes_cli.main',run_name='__main__')"
-    )
-    return [sys.executable, "-I", "-c", bootstrap, *command[3:]]
 
 
 
@@ -248,6 +239,27 @@ def _resolve_hermes_argv() -> list[str]:
     if hermes_bin:
         return _hermes_path_argv(hermes_bin)
     return _module_hermes_argv()
+
+
+def _validate_worker_entrypoint() -> None:
+    """Only an entrypoint for this installation can use its sealed generation."""
+    if not os.environ.get("HERMES_BIN", "").strip():
+        return
+    import sysconfig
+
+    command = _dispatcher()._resolve_hermes_argv()
+    canonical = {
+        (Path(sysconfig.get_path("scripts")) / name).resolve()
+        for name in ("hermes", "hermes.exe")
+    }
+    canonical.add(Path(__file__).resolve().parents[1] / "hermes")
+    if len(command) == 1 and Path(command[0]).resolve() in canonical:
+        return
+    raise RuntimeError(
+        "HERMES_BIN must select this installation's Hermes entrypoint for immutable "
+        "Kanban workers; custom wrappers and other runtimes cannot be sealed. "
+        "Unset HERMES_BIN or run the dispatcher from the intended Hermes installation."
+    )
 
 
 def _worker_terminal_timeout_env(
@@ -338,10 +350,8 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
 
 
 def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
-    """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
-    dispatcher = _dispatcher()
-    cmd = dispatcher._trusted_module_hermes_argv(dispatcher._resolve_hermes_argv())
-    cmd.extend([
+    """Build profile and task CLI arguments for the sealed runtime entrypoint."""
+    cmd = [
         "-p", profile_arg,
         # A worker must NEVER boot the interactive TUI: its no-TTY bail-out
         # exits 0 without doing the task → "protocol violation" every attempt.
@@ -350,7 +360,7 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
         # profile's shell-hook allowlist; pass --accept-hooks explicitly so
         # configured hooks still register.
         "--accept-hooks",
-    ])
+    ]
     # One `--skills X` pair per name: easier to read in `ps` and avoids quoting
     # ambiguity if a skill name contains unusual chars.
     for sk in task.skills or ():
@@ -487,15 +497,19 @@ def _default_spawn(
     env.pop("HERMES_TUI", None)
 
     from hermes_cli.kanban_runtime import (
-        _sweep_runtime_snapshots,
-        _write_runtime_snapshot_owner,
         assert_runtime_import_root,
-        cleanup_runtime_snapshot,
         decode_identity,
         encode_identity,
         prospective_identity,
         verify_worker_ready,
     )
+    from hermes_cli.kanban_runtime_generation import (
+        cleanup_runtime_generation,
+        prepare_runtime_generation,
+        sweep_runtime_generations,
+        write_runtime_generation_owner,
+    )
+    _validate_worker_entrypoint()
     expected_identity = prospective_identity()
     assert_runtime_import_root(identity=expected_identity)
     preparation_id = uuid.uuid4().hex
@@ -510,15 +524,17 @@ def _default_spawn(
     env["HERMES_KANBAN_RUNTIME_FENCE"] = "1"
 
     dispatcher = _dispatcher()
-    cmd = dispatcher._worker_argv(task, profile_arg, env.get("HERMES_HOME"))
-    # A pre-claim worker cannot have a run id yet, so use its preparation id
-    # as the temporary systemd scope. The durable grant binds the real run.
-    cmd = dispatcher._restart_safe_worker_argv(
-        task, cmd, preparation_id=preparation_id if defer_grant else None,
+    cli_args = dispatcher._worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    worker_cwd = workspace if os.path.isdir(workspace) else os.getcwd()
+    generation = prepare_runtime_generation(
+        expected_identity, workspace=worker_cwd,
     )
-    log_f = dispatcher._open_worker_log(task, board)
+    expected_identity = generation.identity
+    env.update(generation.env)
+    env["HERMES_KANBAN_EXPECTED_RUNTIME"] = encode_identity(expected_identity)
     proc = None
-    snapshot_path: Optional[Path] = None
+    log_f = None
+    actual = None
 
     def _close_resources() -> None:
         with contextlib.suppress(Exception):
@@ -530,7 +546,16 @@ def _default_spawn(
             log_f.close()
 
     def _cancel() -> None:
-        nonlocal snapshot_path
+        # A systemd scope launcher can exit while its worker survives. Signal
+        # only the verified worker identity, and let owner-aware cleanup decide
+        # when its generation is no longer in use.
+        if actual is not None and proc is not None and actual.pid != proc.pid:
+            with contextlib.suppress(Exception):
+                from hermes_cli.kanban_runtime import process_start_time
+                import signal
+
+                if process_start_time(actual.pid) == actual.start_time:
+                    os.kill(actual.pid, signal.SIGTERM)
         with contextlib.suppress(Exception):
             if proc is not None:
                 proc.terminate()
@@ -540,16 +565,22 @@ def _default_spawn(
         if proc is not None and proc.poll() is not None:
             _worker_pid_aliases.pop(proc.pid, None)
             _worker_processes.pop(proc.pid, None)
-            snapshot = _worker_runtime_snapshots.pop(proc.pid, None) or snapshot_path
+            snapshot = _worker_runtime_snapshots.pop(proc.pid, None)
             with contextlib.suppress(Exception):
-                cleanup_runtime_snapshot(snapshot)
-            snapshot_path = None
+                cleanup_runtime_generation(snapshot or generation.root)
+        elif proc is None:
+            cleanup_runtime_generation(generation.root, force=True)
         _close_resources()
 
     try:
+        cmd = dispatcher._restart_safe_worker_argv(
+            task, generation.command_prefix + cli_args,
+            preparation_id=preparation_id if defer_grant else None,
+        )
+        log_f = dispatcher._open_worker_log(task, board)
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
+            cwd=worker_cwd,
             stdin=subprocess.PIPE,
             stdout=log_f,
             stderr=subprocess.STDOUT,
@@ -563,6 +594,8 @@ def _default_spawn(
         if not hasattr(proc, "poll") or not hasattr(proc, "stdin"):
             _close_resources()
             return proc.pid
+        _worker_processes[proc.pid] = proc
+        _worker_runtime_snapshots[proc.pid] = generation.root
         log_f.close()
         deadline = time.monotonic() + 10.0
         payload = None
@@ -582,6 +615,11 @@ def _default_spawn(
         early_pid = decode_identity(payload.get("runtime_identity")).pid
         early = verify_worker_ready(
             payload, expected_identity, pid=early_pid, preparation_id=preparation_id,
+        )
+        actual = early
+        _worker_pid_aliases[proc.pid] = early.pid
+        write_runtime_generation_owner(
+            generation.root, pid=early.pid, start_time=early.start_time,
         )
         if proc.stdin is None:
             raise RuntimeError("worker bootstrap pipe unavailable")
@@ -609,21 +647,15 @@ def _default_spawn(
         if post_payload is None:
             raise RuntimeError("worker post-import verification timed out")
         ready_pid = decode_identity(post_payload.get("runtime_identity")).pid
-        actual = verify_worker_ready(
+        post_actual = verify_worker_ready(
             post_payload, expected_identity, pid=ready_pid, preparation_id=preparation_id,
         )
-        raw_snapshot = post_payload.get("runtime_snapshot")
-        if isinstance(raw_snapshot, str) and raw_snapshot:
-            snapshot_path = Path(raw_snapshot)
-        _worker_processes[proc.pid] = proc
+        if post_actual.pid != early.pid or post_actual.start_time != early.start_time:
+            raise RuntimeError("worker process identity changed during bootstrap")
+        actual = post_actual
         _worker_pid_aliases[proc.pid] = actual.pid
 
-        if snapshot_path is not None:
-            _write_runtime_snapshot_owner(
-                snapshot_path, pid=actual.pid, start_time=actual.start_time,
-            )
-            _worker_runtime_snapshots[proc.pid] = snapshot_path
-        _sweep_runtime_snapshots()
+        sweep_runtime_generations()
         def _grant(run_id: int, claim_lock: Optional[str]) -> None:
             if proc is None or proc.stdin is None:
                 raise RuntimeError("worker bootstrap pipe unavailable")

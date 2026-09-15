@@ -84,10 +84,13 @@ def _validate_lifecycle_role_identity(
 
 def _invalidate_descendants_for_parent_reopen(
     conn: sqlite3.Connection, task_id: str, *, author: str,
+    acceptance_before: dict[str, str],
 ) -> dict[str, Any]:
     from hermes_cli import kanban_db_lifecycle as lifecycle
 
-    return lifecycle.invalidate_descendants_for_parent_reopen(conn, task_id, author=author)
+    return lifecycle.invalidate_descendants_for_parent_reopen(
+        conn, task_id, author=author, acceptance_before=acceptance_before,
+    )
 
 
 def _validate_update_request(
@@ -440,6 +443,7 @@ def _persist_update(
     *,
     actor: str,
     goal_row: sqlite3.Row,
+    acceptance_before: dict[str, str],
 ) -> tuple[list[str], list[dict[str, Any]], list[tuple[Optional[int], Optional[str]]]]:
     changed_fields = list(plan.changed_fields)
     goal_invalidated: list[dict[str, Any]] = []
@@ -479,7 +483,7 @@ def _persist_update(
         )
     ):
         invalidation = _invalidate_descendants_for_parent_reopen(
-            conn, task_id, author=actor,
+            conn, task_id, author=actor, acceptance_before=acceptance_before,
         )
         goal_invalidated.extend(invalidation["invalidated"])
         goal_terminations.extend(invalidation["terminations"])
@@ -596,11 +600,12 @@ def update_task(
                 f"cannot update task {task_id}: currently claimed by a worker; "
                 "reclaim it before revising or requeuing"
             )
-        acceptance_before = _capture_acceptance(conn, task_id)
+        acceptance_before = _capture_acceptance(conn, task_id, include_descendants=True)
         goal_revision_id, goal_row = _ensure_goal_revision(conn, row)
         plan = _build_update_plan(conn, row, request, goal_revision_id)
         changed_fields, goal_invalidated, goal_terminations = _persist_update(
             conn, task_id, request, plan, actor=actor, goal_row=goal_row,
+            acceptance_before=acceptance_before,
         )
         _emit_acceptance_changes(conn, acceptance_before, source_task_id=task_id)
     for rebound_edge in plan.rebound_edges:

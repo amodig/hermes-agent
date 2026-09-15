@@ -12,7 +12,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-import stat
+import shutil
 import sqlite3
 import sys
 import subprocess
@@ -27,6 +27,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_runtime as runtime
 from hermes_cli.kanban_lifecycle import get_lifecycle_state
+from hermes_cli import kanban_runtime_generation as generations
 from hermes_cli.kanban_parser import build_parser
 from hermes_cli.kanban_runtime import (
     RuntimeIdentityError,
@@ -55,9 +56,101 @@ def _git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def _make_runtime_fixture(root: Path) -> None:
+    """Small real install: production bootstrap, dynamic imports, and resources."""
+    package = root / "hermes_cli"
+    package.mkdir(parents=True)
+    for name in ("kanban_runtime.py", "kanban_runtime_generation.py"):
+        shutil.copy2(RUNTIME_ROOT / "hermes_cli" / name, package / name)
+    (package / "__init__.py").write_text('__version__ = "fixture"\n', encoding="utf-8")
+    (root / "fixture_early.py").write_text("value = 1\n", encoding="utf-8")
+    (root / "fixture_lazy.py").write_text("value = 1\n", encoding="utf-8")
+    dependency_root = root.parent / "site-packages"
+    dependency_root.mkdir(exist_ok=True)
+    for name in ("third_party_early", "third_party_dynamic"):
+        dependency = dependency_root / name
+        dependency.mkdir()
+        (dependency / "__init__.py").write_text("value = 1\n", encoding="utf-8")
+        (dependency / "data.bin").write_bytes(b"dependency-v1")
+    for directory, _env_var in runtime._RUNTIME_RESOURCE_ROOTS:
+        resource = root / directory
+        resource.mkdir(exist_ok=True)
+        (resource / "marker.txt").write_text(f"{directory}:v1\n", encoding="utf-8")
+    executable = root / "skills" / "helper"
+    executable.write_text("#!/bin/sh\nprintf sealed-helper\n", encoding="utf-8")
+    executable.chmod(0o755)
+    (package / "main.py").write_text(
+        """
+import importlib
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from hermes_cli import kanban_runtime as runtime
+import fixture_early
+import third_party_early
+
+runtime.worker_bootstrap_from_env()
+runtime.worker_bootstrap_post_import(wait_for_grant=False)
+assert os.environ.get("HERMES_KANBAN_RUNTIME_GRANTED") != "1"
+runtime.worker_bootstrap_after_constructor()
+release = os.environ.get("HERMES_TEST_RUNTIME_RELEASE")
+while release and not Path(release).exists():
+    time.sleep(0.02)
+lazy = importlib.import_module("fixture_" + "lazy")
+sdk = importlib.import_module(os.environ.get("HERMES_TEST_SDK", "third_party_dynamic"))
+payload = {
+    "identity": runtime.runtime_identity().as_dict(),
+    "early": [fixture_early.value, third_party_early.value],
+    "lazy": [lazy.value, sdk.value],
+    "dependency_data": (Path(sdk.__file__).parent / "data.bin").read_text(),
+    "locations": [fixture_early.__file__, third_party_early.__file__, lazy.__file__, sdk.__file__],
+    "resources": {
+        directory: (Path(os.environ[env_var]) / "marker.txt").read_text()
+        for directory, env_var in runtime._RUNTIME_RESOURCE_ROOTS
+    },
+    "argv": sys.argv[1:],
+    "cwd": os.getcwd(),
+    "profile": os.environ.get("HERMES_PROFILE"),
+    "home": os.environ.get("HERMES_HOME"),
+    "task": os.environ.get("HERMES_KANBAN_TASK"),
+    "board": os.environ.get("HERMES_KANBAN_BOARD"),
+    "run": os.environ.get("HERMES_KANBAN_RUN_ID"),
+    "claim": os.environ.get("HERMES_KANBAN_CLAIM_LOCK"),
+    "granted": os.environ.get("HERMES_KANBAN_RUNTIME_GRANTED"),
+    "secret": os.environ.get("ANTHROPIC_API_KEY"),
+}
+if Path("/proc/self/cgroup").exists():
+    payload["cgroup"] = Path("/proc/self/cgroup").read_text()
+Path(os.environ["HERMES_TEST_RUNTIME_RECEIPT"]).write_text(json.dumps(payload))
+""",
+        encoding="utf-8",
+    )
+
+def _prepare_fixture_generation(root: Path, prepare=generations.prepare_runtime_generation, *, workspace=None):
+    resources = {env_var: str(root / directory) for directory, env_var in runtime._RUNTIME_RESOURCE_ROOTS}
+    with patch.dict(os.environ, resources), patch.object(
+        generations, "_runtime_import_roots", return_value=[root.parent / "site-packages"],
+    ):
+        return prepare(runtime_identity(root), workspace=workspace)
+
+
+def _wait_for_receipt(path: Path) -> dict:
+    deadline = time.monotonic() + 10
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 class KanbanLifecycleConformance(unittest.TestCase):
     def setUp(self) -> None:
         self.home = tempfile.TemporaryDirectory(prefix="kanban-conformance-home-")
+        self.storage = patch.object(
+            generations, "_runtime_storage_root",
+            return_value=Path(self.home.name) / "runtime-storage",
+        )
+        self.storage.start()
         self.env = patch.dict(
             "os.environ",
             {
@@ -77,6 +170,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
     def tearDown(self) -> None:
         self.conn.close()
         self.env.stop()
+        self.storage.stop()
         self.home.cleanup()
 
     def _task(self, task_id: str):
@@ -1698,325 +1792,185 @@ class KanbanLifecycleConformance(unittest.TestCase):
         for task_id in (implementation, review, validation, downstream, downstream_review):
             self.assertIsNone(kb.get_task(self.conn, task_id))
 
-    def test_worker_command_imports_stay_pinned_after_final_grant(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="kanban-conformance-worker-import-") as raw_root:
-            root = Path(raw_root)
-            for directory in runtime._IDENTITY_ROOTS:
-                package = root / directory
-                package.mkdir(parents=True)
-                (package / "module.py").write_text("value = 1\n", encoding="utf-8")
-            (root / "tools" / "__init__.py").write_text("", encoding="utf-8")
-            (root / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
-            for package_name, module_name in (
-                ("acp_adapter", "edit_approval.py"),
-                ("tui_gateway", "server.py"),
-            ):
-                package = root / package_name
-                (package / "__init__.py").write_text("", encoding="utf-8")
-                (package / module_name).write_text("value = 1\n", encoding="utf-8")
-            plugin = root / "plugins" / "sample"
-            plugin.mkdir(parents=True)
-            (plugin / "plugin.yaml").write_text("name: sample\n", encoding="utf-8")
-            skill = root / "skills" / "devops" / "sdlc-review" / "SKILL.md"
-            skill.parent.mkdir(parents=True)
-            skill.write_text("review instructions\n", encoding="utf-8")
-            resource_files = {
-                root / "skills" / "other" / "SKILL.md": "other skill\n",
-                root / "skills" / "category" / "DESCRIPTION.md": "category\n",
-                root / "optional-skills" / "optional" / "SKILL.md": "optional skill\n",
-                root / "locales" / "en.yaml": "locale: en\n",
-                root / "optional-mcps" / "sample" / "manifest.yaml": "name: optional\n",
+    def test_worker_generation_survives_source_and_dependency_replacement(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kanban-conformance-generation-") as raw:
+            base = Path(raw)
+            source = base / "install"
+            _make_runtime_fixture(source)
+            first = _prepare_fixture_generation(source)
+            preparation = base / "preparation.json"
+            receipt = base / "first.json"
+            release = base / "release"
+            env = {
+                **os.environ,
+                **first.env,
+                "HERMES_KANBAN_BOOTSTRAP_PATH": str(preparation),
+                "HERMES_KANBAN_PREPARATION_ID": "generation-proof",
+                "HERMES_KANBAN_EXPECTED_RUNTIME": runtime.encode_identity(first.identity),
+                "HERMES_TEST_RUNTIME_RECEIPT": str(receipt),
+                "HERMES_TEST_RUNTIME_RELEASE": str(release),
             }
-            for path, content in resource_files.items():
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(content, encoding="utf-8")
-            third_party = root / "site-packages" / "third_party_lazy"
-            third_party.mkdir(parents=True)
-            (third_party / "__init__.py").write_text("", encoding="utf-8")
-            (third_party / "lazy.py").write_text(
-                "from third_party_transitive import value\n"
-                "value = value\n",
-                encoding="utf-8",
-            )
-            transitive = root / "site-packages" / "third_party_transitive"
-            transitive.mkdir(parents=True)
-            (transitive / "__init__.py").write_text("value = 1\n", encoding="utf-8")
-            dynamic = root / "site-packages" / "third_party_dynamic"
-            dynamic.mkdir(parents=True)
-            (dynamic / "__init__.py").write_text("value = 1\n", encoding="utf-8")
-            dynamic_dist = root / "site-packages" / "third-party-dynamic-1.0.dist-info"
-            dynamic_dist.mkdir(parents=True)
-            (dynamic_dist / "METADATA").write_text(
-                "Metadata-Version: 2.1\n"
-                "Name: third-party-dynamic\n"
-                "Version: 1.0\n",
-                encoding="utf-8",
-            )
-            (dynamic_dist / "RECORD").write_text(
-                "third_party_dynamic/__init__.py,,\n"
-                "third-party-dynamic-1.0.dist-info/METADATA,,\n"
-                "third-party-dynamic-1.0.dist-info/RECORD,,\n",
-                encoding="utf-8",
-            )
-            lazy_dist = root / "site-packages" / "third-party-lazy-1.0.dist-info"
-            lazy_dist.mkdir(parents=True)
-            (lazy_dist / "METADATA").write_text(
-                "Metadata-Version: 2.1\n"
-                "Name: third-party-lazy\n"
-                "Version: 1.0\n"
-                "Requires-Dist: third-party-transitive==1.0\n",
-                encoding="utf-8",
-            )
-            (lazy_dist / "RECORD").write_text(
-                "third_party_lazy/__init__.py,,\n"
-                "third_party_lazy/lazy.py,,\n"
-                "third-party-lazy-1.0.dist-info/METADATA,,\n"
-                "third-party-lazy-1.0.dist-info/RECORD,,\n",
-                encoding="utf-8",
-            )
-            transitive_dist = root / "site-packages" / "third-party-transitive-1.0.dist-info"
-            transitive_dist.mkdir(parents=True)
-            (transitive_dist / "METADATA").write_text(
-                "Metadata-Version: 2.1\n"
-                "Name: third-party-transitive\n"
-                "Version: 1.0\n",
-                encoding="utf-8",
-            )
-            (transitive_dist / "RECORD").write_text(
-                "third_party_transitive/__init__.py,,\n"
-                "third-party-transitive-1.0.dist-info/METADATA,,\n"
-                "third-party-transitive-1.0.dist-info/RECORD,,\n",
-                encoding="utf-8",
-            )
-            unused = root / "site-packages" / "third_party_unused"
-            unused.mkdir(parents=True)
-            (unused / "__init__.py").write_text("value = 2\n", encoding="utf-8")
-            (root / "cli.py").write_text(
-                "def main():\n    return 1\n",
-                encoding="utf-8",
-            )
-            (root / "run_agent.py").write_text(
-                "from agent.agent_init import init_agent\n"
-                "from agent.turn_facade import TurnFacadeMixin\n"
-                "class AIAgent(TurnFacadeMixin):\n"
-                "    def __init__(self):\n"
-                "        init_agent(self)\n",
-                encoding="utf-8",
-            )
-            (root / "agent" / "__init__.py").write_text("", encoding="utf-8")
-            (root / "agent" / "agent_init.py").write_text(
-                "import importlib, os\n"
-                "def init_agent(agent):\n"
-                "    assert os.environ.get('HERMES_KANBAN_RUNTIME_GRANTED') != '1'\n"
-                "    agent.value = importlib.import_module('agent.empty_response_guard').value\n"
-                "    from __main__ import _after_init\n"
-                "    _after_init()\n"
-                "value = 1\n",
-                encoding="utf-8",
-            )
-            (root / "agent" / "credits_tracker.py").write_text(
-                "value = 1\n",
-                encoding="utf-8",
-            )
-            (root / "agent" / "empty_response_guard.py").write_text(
-                "value = 1\n",
-                encoding="utf-8",
-            )
-            (root / "agent" / "turn_facade.py").write_text(
-                "import importlib\n"
-                "class TurnFacadeMixin:\n"
-                "    def run_conversation(self):\n"
-                "        return importlib.import_module('agent.turn_runner').value\n"
-                "    def discover_tools(self):\n"
-                "        return importlib.import_module('tools.registry').discover()\n"
-                "    def discover_plugins(self):\n"
-                "        return importlib.import_module('hermes_cli.plugins').discover()\n"
-                "    def discover_resources(self):\n"
-                "        return importlib.import_module('hermes_cli.plugins').discover_resources()\n"
-                "    def run_dynamic_tool(self):\n"
-                "        return importlib.import_module('tools.registry').dynamic_value()\n"
-                "    def run_lazy_guards(self):\n"
-                "        return (\n"
-                "            importlib.import_module('acp_adapter.edit_approval').value,\n"
-                "            importlib.import_module('tui_gateway.server').value,\n"
-                "            importlib.import_module('third_party_lazy.lazy').value,\n"
-                "        )\n",
-                encoding="utf-8",
-            )
-            (root / "tools" / "registry.py").write_text(
-                "import importlib\n"
-                "from pathlib import Path\n"
-                "def _sdk_importer(module):\n"
-                "    def _import():\n"
-                "        return importlib.import_module(module)\n"
-                "    return _import\n"
-                "_import_dynamic = _sdk_importer('third_party_dynamic')\n"
-                "def discover():\n"
-                "    return sorted(path.name for path in Path(__file__).parent.glob('*.py'))\n"
-                "def dynamic_value():\n"
-                "    return _import_dynamic().value\n",
-                encoding="utf-8",
-            )
-            (root / "agent" / "turn_runner.py").write_text(
-                "value = 1\n",
-                encoding="utf-8",
-            )
-            (root / "hermes_cli" / "plugins.py").write_text(
-                "from pathlib import Path\n"
-                "def discover():\n"
-                "    return sorted(path.name for path in (Path(__file__).parent.parent / 'plugins').glob('*/plugin.yaml'))\n"
-                "def discover_resources():\n"
-                "    root = Path(__file__).parent.parent\n"
-                "    return {\n"
-                "        'skill': (root / 'skills' / 'other' / 'SKILL.md').read_text(),\n"
-                "        'description': (root / 'skills' / 'category' / 'DESCRIPTION.md').read_text(),\n"
-                "        'optional_skill': (root / 'optional-skills' / 'optional' / 'SKILL.md').read_text(),\n"
-                "        'locale': (root / 'locales' / 'en.yaml').read_text(),\n"
-                "        'optional_mcp': (root / 'optional-mcps' / 'sample' / 'manifest.yaml').read_text(),\n"
-                "    }\n",
-                encoding="utf-8",
-            )
-            receipt = root / "receipt.json"
-            script = (
-                "import importlib, json, os, sys; "
-                "from pathlib import Path; "
-                "from hermes_cli import kanban_runtime as runtime; "
-                "root = Path(sys.argv[1]); receipt = Path(sys.argv[2]); "
-                "runtime._module_root = lambda module_root=None: root; "
-                "runtime._FROZEN_RUNTIME_IDENTITY = None; "
-                "sys.path.insert(0, str(root)); "
-                "sys.path[:] = [entry for entry in sys.path if Path(entry or '.').name not in ('site-packages', 'dist-packages')]; "
-                "sys.path.insert(0, str(root / 'site-packages')); "
-                "importlib.import_module('third_party_lazy'); "
-                "sys.modules.pop('hermes_cli.kanban_runtime', None); "
-                "sys.modules.pop('hermes_cli', None); "
-                "expected = runtime.runtime_identity(root, pid=os.getpid(), "
-                "start_time=runtime.process_start_time()); "
-                "_after_init = runtime.worker_bootstrap_after_constructor; "
-                "os.environ['HERMES_KANBAN_BOOTSTRAP_PATH'] = str(root / 'preparation.json'); "
-                "os.environ['HERMES_KANBAN_PREPARATION_ID'] = 'race-preparation'; "
-                "os.environ['HERMES_KANBAN_EXPECTED_RUNTIME'] = runtime.encode_identity(expected); "
-                "runtime._read_bootstrap_message = lambda: {"
-                "'grant': True, 'preparation_id': 'race-preparation', "
-                "'runtime_identity': expected.as_dict()}; "
-                "runtime.worker_bootstrap_post_import(wait_for_grant=False); "
-                "assert (runtime._FROZEN_IMPORT_ROOT / '.third-party' / '0' / 'third-party-lazy-1.0.dist-info' / 'METADATA').is_file(); "
-                "assert (runtime._FROZEN_IMPORT_ROOT / '.third-party' / '0' / 'third_party_transitive' / '__init__.py').is_file(); "
-                "assert (runtime._FROZEN_IMPORT_ROOT / '.third-party' / '0' / 'third_party_dynamic' / '__init__.py').is_file(); "
-                "assert not (runtime._FROZEN_IMPORT_ROOT / '.third-party' / '0' / 'third_party_unused').exists(); "
-                "agent = importlib.import_module('run_agent').AIAgent(); "
-                "(root / 'cli.py').write_text('def main():\\n    return 2\\n', encoding='utf-8'); "
-                "(root / 'agent' / 'agent_init.py').write_text('def init_agent(*args, **kwargs):\\n    return None\\nvalue = 2\\n', encoding='utf-8'); "
-                "(root / 'agent' / 'credits_tracker.py').write_text('value = 2\\n', encoding='utf-8'); "
-                "(root / 'agent' / 'empty_response_guard.py').write_text('value = 2\\n', encoding='utf-8'); "
-                "(root / 'agent' / 'turn_runner.py').write_text('value = 2\\n', encoding='utf-8'); "
-                "(root / 'tools' / 'registry.py').write_text('def discover():\\n    return [\"changed\"]\\n', encoding='utf-8'); "
-                "(root / 'plugins' / 'sample' / 'plugin.yaml').write_text('name: changed\\n', encoding='utf-8'); "
-                "(root / 'skills' / 'other' / 'SKILL.md').write_text('changed\\n', encoding='utf-8'); "
-                "(root / 'skills' / 'category' / 'DESCRIPTION.md').write_text('changed\\n', encoding='utf-8'); "
-                "(root / 'optional-skills' / 'optional' / 'SKILL.md').write_text('changed\\n', encoding='utf-8'); "
-                "(root / 'locales' / 'en.yaml').write_text('changed\\n', encoding='utf-8'); "
-                "(root / 'optional-mcps' / 'sample' / 'manifest.yaml').write_text('changed\\n', encoding='utf-8'); "
-                "(root / 'acp_adapter' / 'edit_approval.py').write_text('value = 2\\n', encoding='utf-8'); "
-                "(root / 'site-packages' / 'third_party_transitive' / '__init__.py').write_text('value = 2\\n', encoding='utf-8'); "
-                "(root / 'site-packages' / 'third_party_dynamic' / '__init__.py').write_text('value = 2\\n', encoding='utf-8'); "
-                "(root / 'tui_gateway' / 'server.py').write_text('value = 2\\n', encoding='utf-8'); "
-                "(root / 'site-packages' / 'third_party_lazy' / 'lazy.py').write_text('value = 2\\n', encoding='utf-8'); "
-                "turn_value = agent.run_conversation(); "
-                "discovered_tools = agent.discover_tools(); "
-                "discovered_plugins = agent.discover_plugins(); "
-                "discovered_resources = agent.discover_resources(); "
-                "lazy_values = agent.run_lazy_guards(); "
-                "dynamic_value = agent.run_dynamic_tool(); "
-                "result = importlib.import_module('cli').main(); "
-                "agent_value = importlib.import_module('agent.agent_init').value; "
-                "tracker_value = importlib.import_module('agent.credits_tracker').value; "
-                "receipt.write_text(json.dumps({'result': result, 'turn_value': turn_value, 'discovered_tools': discovered_tools, 'discovered_plugins': discovered_plugins, 'discovered_resources': discovered_resources, 'lazy_values': lazy_values, 'dynamic_value': dynamic_value, 'agent_value': agent_value, 'tracker_value': tracker_value, 'constructor_value': agent.value}), encoding='utf-8')"
-            )
-            env = os.environ.copy()
-            env["PYTHONPATH"] = str(RUNTIME_ROOT)
-            completed = subprocess.run(
-                [sys.executable, "-c", script, str(root), str(receipt)],
-                text=True,
-                capture_output=True,
-                env=env,
-                check=False,
-            )
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertEqual(
-                json.loads(receipt.read_text(encoding="utf-8")),
-                {"result": 1, "turn_value": 1, "discovered_tools": ["__init__.py", "module.py", "registry.py"], "discovered_plugins": ["plugin.yaml"], "discovered_resources": {"skill": "other skill\n", "description": "category\n", "optional_skill": "optional skill\n", "locale": "locale: en\n", "optional_mcp": "name: optional\n"}, "lazy_values": [1, 1, 1], "dynamic_value": 1, "agent_value": 1, "tracker_value": 1, "constructor_value": 1},
-            )
+            child = subprocess.Popen(first.command_prefix, stdin=subprocess.PIPE, env=env)
+            try:
+                early = _wait_for_receipt(preparation)
+                actual = runtime.verify_worker_ready(
+                    early, first.identity, pid=child.pid, preparation_id="generation-proof",
+                )
+                child.stdin.write(json.dumps({
+                    "continue_imports": True, "preparation_id": "generation-proof",
+                    "runtime_identity": actual.as_dict(),
+                }).encode() + b"\n")
+                child.stdin.flush()
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    ready = _wait_for_receipt(preparation)
+                    if ready.get("post_import"):
+                        break
+                    time.sleep(0.02)
+                self.assertTrue(ready.get("post_import"))
+                self.assertFalse(receipt.exists())
+                child.stdin.write(json.dumps({
+                    "grant": True, "preparation_id": "generation-proof",
+                    "runtime_identity": actual.as_dict(), "run_id": 23, "claim_lock": "old-claim",
+                }).encode() + b"\n")
+                child.stdin.close()
+                for name in ("fixture_early.py", "fixture_lazy.py"):
+                    (source / name).write_text("value = 2\n", encoding="utf-8")
+                for name in ("third_party_early", "third_party_dynamic"):
+                    dependency = base / "site-packages" / name
+                    (dependency / "__init__.py").write_text("value = 2\n", encoding="utf-8")
+                    (dependency / "data.bin").write_bytes(b"dependency-v2")
+                for directory, _ in runtime._RUNTIME_RESOURCE_ROOTS:
+                    (source / directory / "marker.txt").write_text(f"{directory}:v2\n", encoding="utf-8")
+                generations.cleanup_runtime_generation(first.root)
+                generations.sweep_runtime_generations()
+                self.assertTrue(first.root.exists())
+                release.touch()
+                observed = _wait_for_receipt(receipt)
+                self.assertEqual(child.wait(timeout=10), 0)
+                self.assertEqual(observed["early"], [1, 1])
+                self.assertEqual(observed["lazy"], [1, 1])
+                self.assertEqual(observed["dependency_data"], "dependency-v1")
+                self.assertEqual(observed["run"], "23")
+                self.assertEqual(observed["claim"], "old-claim")
+                for location in observed["locations"]:
+                    self.assertTrue(Path(location).is_relative_to(first.root))
+                for directory, _ in runtime._RUNTIME_RESOURCE_ROOTS:
+                    self.assertEqual(observed["resources"][directory], f"{directory}:v1\n")
+                second = _prepare_fixture_generation(source)
+                try:
+                    self.assertFalse(same_code_identity(first.identity, second.identity))
+                    self.assertNotEqual(first.identity.dependency_fingerprint, second.identity.dependency_fingerprint)
+                    next_receipt = base / "second.json"
+                    next_env = {**os.environ, **second.env, "HERMES_TEST_RUNTIME_RECEIPT": str(next_receipt)}
+                    completed = subprocess.run(second.command_prefix, env=next_env, check=False, timeout=10)
+                    self.assertEqual(completed.returncode, 0)
+                    current = _wait_for_receipt(next_receipt)
+                    self.assertEqual(current["early"], [2, 2])
+                    self.assertEqual(current["lazy"], [2, 2])
+                    self.assertEqual(current["dependency_data"], "dependency-v2")
+                finally:
+                    generations.cleanup_runtime_generation(second.root)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=10)
+                generations.cleanup_runtime_generation(first.root)
+            self.assertFalse(first.root.exists())
 
     @unittest.skipUnless(os.name == "posix", "executable modes are POSIX-specific")
-    def test_runtime_snapshot_preserves_executable_skill_bits(self) -> None:
-        source = RUNTIME_ROOT / "skills" / "creative" / "manim-video" / "scripts" / "setup.sh"
-        if not source.is_file() or not (source.stat().st_mode & stat.S_IXUSR):
-            self.skipTest("repository fixture has no executable skill helper")
-        with tempfile.TemporaryDirectory(prefix="kanban-conformance-mode-") as raw_home:
-            script = """
-import os
-import stat
+    def test_generation_preserves_executable_resources(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kanban-conformance-mode-") as raw:
+            source = Path(raw) / "install"
+            _make_runtime_fixture(source)
+            prepared = _prepare_fixture_generation(source)
+            try:
+                helper = Path(prepared.env["HERMES_BUNDLED_SKILLS"]) / "helper"
+                completed = subprocess.run([str(helper)], capture_output=True, text=True, check=True)
+                self.assertEqual(completed.stdout, "sealed-helper")
+            finally:
+                generations.cleanup_runtime_generation(prepared.root, force=True)
+
+    def test_generation_sweep_preserves_live_owner_and_rejects_pid_reuse(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kanban-conformance-owner-") as raw:
+            source = Path(raw) / "install"
+            _make_runtime_fixture(source)
+            prepared = _prepare_fixture_generation(source)
+            try:
+                generations.sweep_runtime_generations()
+                self.assertTrue(prepared.root.exists())
+                generations.write_runtime_generation_owner(
+                    prepared.root, pid=os.getpid(), start_time=process_start_time() + 1,
+                )
+                generations.sweep_runtime_generations()
+                self.assertFalse(prepared.root.exists())
+            finally:
+                generations.cleanup_runtime_generation(prepared.root, force=True)
+
+    def test_sealed_main_never_runs_install_recovery(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kanban-conformance-recovery-") as raw:
+            source = Path(raw) / "install"
+            _make_runtime_fixture(source)
+            for name in ("main.py", "_subprocess_compat.py", "_startup_fast.py"):
+                shutil.copy2(RUNTIME_ROOT / "hermes_cli" / name, source / "hermes_cli" / name)
+            shutil.copy2(RUNTIME_ROOT / "hermes_bootstrap.py", source / "hermes_bootstrap.py")
+            recovery_marker = Path(raw) / "recovery-mutated-install"
+            (source / "hermes_cli" / "_early_recovery.py").write_text(
+                "from pathlib import Path\n"
+                f"def recover_if_needed():\n    Path({str(recovery_marker)!r}).touch()\n",
+                encoding="utf-8",
+            )
+            prepared = _prepare_fixture_generation(source)
+            try:
+                completed = subprocess.run(
+                    prepared.command_prefix + ["runtime-identity", "--json"],
+                    env={**os.environ, **prepared.env}, capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertTrue(same_code_identity(prepared.identity, json.loads(completed.stdout)))
+                self.assertFalse(recovery_marker.exists())
+            finally:
+                generations.cleanup_runtime_generation(prepared.root)
+
+    def test_early_recovery_defers_to_live_installation_lock(self) -> None:
+        script = """
 import sys
 from pathlib import Path
-
-from hermes_cli import kanban_runtime as runtime
-
+from hermes_cli import _early_recovery as recovery
+from hermes_cli import _install_repair as repair
 root = Path(sys.argv[1])
-home = Path(sys.argv[2])
-snapshot = runtime._freeze_runtime_import_root(root)
-os.environ["HERMES_HOME"] = str(home)
-os.environ["HERMES_BUNDLED_SKILLS"] = str(snapshot / "skills")
-from tools.skills_sync import sync_skills
-
-sync_skills(quiet=True)
-synced = home / "skills" / "creative" / "manim-video" / "scripts" / "setup.sh"
-print(synced.stat().st_mode & stat.S_IXUSR)
+def install(*args):
+    (root / "installer-ran").touch()
+    return True
+recovery._probe_broken_packages = lambda: ["PyYAML"]
+recovery._run_repair_install = install
+repair.run_core_install = install
+recovery.recover_if_needed(project_root=root, argv=[])
 """
-            env = os.environ.copy()
-            env["HERMES_HOME"] = raw_home
-            env["PYTHONPATH"] = str(RUNTIME_ROOT)
-            completed = subprocess.run(
-                [sys.executable, "-c", script, str(RUNTIME_ROOT), raw_home],
-                text=True,
-                capture_output=True,
-                env=env,
-                check=False,
-            )
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertEqual(int(completed.stdout.strip()), stat.S_IXUSR)
-
-    def test_reaped_worker_removes_runtime_snapshot(self) -> None:
-        snapshot = Path(tempfile.mkdtemp(prefix="hermes-kanban-runtime-"))
-        worker_pid = 2_147_483_000
-        try:
-            kbd._worker_runtime_snapshots[worker_pid] = snapshot
-            kbd._record_worker_exit(worker_pid, 0)
-            self.assertFalse(snapshot.exists())
-        finally:
-            kbd._worker_runtime_snapshots.pop(worker_pid, None)
-            kbd._recent_worker_exits.pop(worker_pid, None)
-
-    def test_runtime_snapshot_sweep_removes_dead_owners(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="kanban-conformance-snapshot-sweep-") as raw_root:
-            root = Path(raw_root)
-            stale = root / "hermes-kanban-runtime-stale"
-            live = root / "hermes-kanban-runtime-live"
-            stale.mkdir()
-            live.mkdir()
-            owner_file = runtime._RUNTIME_SNAPSHOT_OWNER_FILE
-            (stale / owner_file).write_text(
-                json.dumps({"pid": os.getpid(), "start_time": process_start_time() + 1}),
-                encoding="utf-8",
-            )
-            (live / owner_file).write_text(
-                json.dumps({"pid": os.getpid(), "start_time": process_start_time()}),
-                encoding="utf-8",
-            )
-            with patch.object(runtime.tempfile, "gettempdir", return_value=raw_root):
-                runtime._sweep_runtime_snapshots()
-            self.assertFalse(stale.exists())
-            self.assertTrue(live.exists())
+        for marker in (".update-incomplete", ".lazy-refresh-incomplete"):
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory(
+                prefix="kanban-conformance-recovery-lock-",
+            ) as raw:
+                source = Path(raw)
+                (source / "pyproject.toml").write_text(
+                    '[project]\nname = "recovery-fixture"\nversion = "1"\ndependencies = []\n',
+                    encoding="utf-8",
+                )
+                (source / marker).write_text("pid=0\n", encoding="utf-8")
+                env = {**os.environ, "PYTHONPATH": str(RUNTIME_ROOT)}
+                command = [sys.executable, "-c", script, raw]
+                with generations.installation_mutation_lock(source):
+                    deferred = subprocess.run(
+                        command, env=env, capture_output=True, text=True, timeout=10,
+                    )
+                self.assertEqual(deferred.returncode, 0, deferred.stderr)
+                self.assertFalse((source / "installer-ran").exists())
+                self.assertTrue((source / marker).exists())
+                recovered = subprocess.run(
+                    command, env=env, capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(recovered.returncode, 0, recovered.stderr)
+                self.assertTrue((source / "installer-ran").exists())
 
     def test_reaped_launcher_exit_uses_verified_worker_pid(self) -> None:
         launcher_pid = 2_147_482_999
@@ -2069,10 +2023,9 @@ print(synced.stat().st_mode & stat.S_IXUSR)
     def test_embedded_dispatcher_freezes_identity_before_first_tick(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-dispatcher-") as raw_root:
             root = Path(raw_root)
-            for directory in runtime._IDENTITY_ROOTS:
-                package = root / directory
-                package.mkdir(parents=True)
-                (package / "module.py").write_text("value = 1\n", encoding="utf-8")
+            package = root / "hermes_cli"
+            package.mkdir()
+            (package / "module.py").write_text("value = 1\n", encoding="utf-8")
             skill = root / "skills" / "devops" / "sdlc-review" / "SKILL.md"
             skill.parent.mkdir(parents=True)
             skill.write_text("review instructions\n", encoding="utf-8")
@@ -2093,10 +2046,9 @@ print(synced.stat().st_mode & stat.S_IXUSR)
     def test_runtime_identity_fingerprints_review_skill(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-runtime-") as raw_root:
             root = Path(raw_root)
-            for directory in runtime._IDENTITY_ROOTS:
-                package = root / directory
-                package.mkdir(parents=True)
-                (package / "module.py").write_text("value = 1\n", encoding="utf-8")
+            package = root / "hermes_cli"
+            package.mkdir()
+            (package / "module.py").write_text("value = 1\n", encoding="utf-8")
             skill = root / "skills" / "devops" / "sdlc-review" / "SKILL.md"
             skill.parent.mkdir(parents=True)
             skill.write_text("review instructions v1\n", encoding="utf-8")
@@ -2126,79 +2078,28 @@ print(synced.stat().st_mode & stat.S_IXUSR)
                 bundled_skill.write_text("packaged review instructions v2\n", encoding="utf-8")
                 self.assertNotEqual(before, _fingerprint(root))
 
-    def test_runtime_snapshot_fences_packaged_resource_roots(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="kanban-conformance-packaged-resources-") as raw_root:
-            root = Path(raw_root) / "runtime"
-            for directory in runtime._IDENTITY_ROOTS:
-                if directory == "plugins":
-                    continue
-                package = root / directory
-                package.mkdir(parents=True)
-                (package / "module.py").write_text("value = 1\n", encoding="utf-8")
-            overrides: dict[str, str] = {}
-            external_roots: dict[str, Path] = {}
+    def test_generation_fences_packaged_resource_roots(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kanban-conformance-resources-") as raw:
+            source = Path(raw) / "install"
+            _make_runtime_fixture(source)
+            overrides = {}
             for directory, env_var in runtime._RUNTIME_RESOURCE_ROOTS:
-                external = Path(raw_root) / f"packaged-{directory}"
-                external.mkdir(parents=True)
-                (external / "marker.txt").write_text(f"{directory}:v1\n", encoding="utf-8")
-                if directory == "skills":
-                    skill = external / "devops" / "sdlc-review" / "SKILL.md"
-                    skill.parent.mkdir(parents=True)
-                    skill.write_text("packaged review instructions\n", encoding="utf-8")
+                external = Path(raw) / f"packaged-{directory}"
+                shutil.move(str(source / directory), external)
                 overrides[env_var] = str(external)
-                external_roots[directory] = external
-
-            with patch.dict(os.environ, overrides, clear=False):
-                before = _fingerprint(root)
-                for directory, external in external_roots.items():
-                    (external / "marker.txt").write_text(f"{directory}:v2\n", encoding="utf-8")
-                current = _fingerprint(root)
-            self.assertNotEqual(before, current)
-
-            script = """
-import json
-import os
-import sys
-from pathlib import Path
-from hermes_cli import kanban_runtime as runtime
-
-root = Path(sys.argv[1])
-snapshot = runtime._freeze_runtime_import_root(root)
-payload = {
-    "fingerprint": runtime._fingerprint(snapshot),
-    "snapshot": str(snapshot),
-    "paths": {
-        env_var: os.environ[env_var]
-        for _directory, env_var in runtime._RUNTIME_RESOURCE_ROOTS
-    },
-    "markers": {
-        directory: (Path(os.environ[env_var]) / "marker.txt").read_text()
-        for directory, env_var in runtime._RUNTIME_RESOURCE_ROOTS
-    },
-}
-print(json.dumps(payload, sort_keys=True))
-runtime.cleanup_runtime_snapshot(snapshot)
-"""
-            env = os.environ.copy()
-            env.update(overrides)
-            env["PYTHONPATH"] = str(RUNTIME_ROOT)
-            env["PYTHONDONTWRITEBYTECODE"] = "1"
-            completed = subprocess.run(
-                [sys.executable, "-c", script, str(root)],
-                text=True,
-                capture_output=True,
-                env=env,
-                check=False,
-            )
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            payload = json.loads(completed.stdout)
-            self.assertEqual(payload["fingerprint"], current)
-            for directory, env_var in runtime._RUNTIME_RESOURCE_ROOTS:
-                self.assertEqual(
-                    Path(payload["paths"][env_var]),
-                    Path(payload["snapshot"]) / directory,
-                )
-                self.assertEqual(payload["markers"][directory], f"{directory}:v2\n")
+            with patch.dict(os.environ, overrides), patch.object(
+                generations, "_runtime_import_roots", return_value=[Path(raw) / "site-packages"],
+            ):
+                prepared = generations.prepare_runtime_generation(runtime_identity(source))
+            try:
+                for directory, env_var in runtime._RUNTIME_RESOURCE_ROOTS:
+                    original = Path(overrides[env_var]) / "marker.txt"
+                    original.write_text("replaced\n", encoding="utf-8")
+                    copied = Path(prepared.env[env_var]) / "marker.txt"
+                    self.assertEqual(copied.read_text(encoding="utf-8"), f"{directory}:v1\n")
+                    self.assertTrue(copied.is_relative_to(prepared.root))
+            finally:
+                generations.cleanup_runtime_generation(prepared.root, force=True)
 
     def test_completion_rechecks_candidate_head_at_commit_boundary(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-race-") as raw_repo:
@@ -2290,7 +2191,6 @@ runtime.cleanup_runtime_snapshot(snapshot)
 
     def test_identity_claim_and_runtime_surfaces(self) -> None:
         identity = runtime_identity(RUNTIME_ROOT)
-        self.assertEqual(identity.protocol, 1)
         self.assertEqual(identity, runtime_identity(RUNTIME_ROOT, pid=identity.pid, start_time=identity.start_time))
         self.assertEqual(code_identity(identity), code_identity(identity.as_dict()))
         self.assertTrue(same_code_identity(identity, identity.as_dict()))
@@ -2377,53 +2277,42 @@ runtime.cleanup_runtime_snapshot(snapshot)
         self.assertIsNone(stale_detail)
     def test_default_dispatch_fences_child_before_claim(self) -> None:
         task_id = kb.create_task(
-            self.conn,
-            title="default spawn identity proof",
-            assignee="implementer",
-            initial_status="blocked",
+            self.conn, title="default spawn identity proof",
+            assignee="implementer", initial_status="blocked",
         )
         self.assertTrue(kb.unblock_task(self.conn, task_id))
         with tempfile.TemporaryDirectory(prefix="kanban-worker-proof-") as raw:
+            source = Path(raw) / "install"
+            _make_runtime_fixture(source)
             receipt = Path(raw) / "grant.json"
-            script = (
-                "import json, os, sys; "
-                "from pathlib import Path; "
-                "import hermes_cli.main; "
-                "from hermes_cli.kanban_runtime import worker_bootstrap_post_import; "
-                "worker_bootstrap_post_import(); "
-                "Path(sys.argv[1]).write_text(json.dumps({"
-                "'run': os.environ.get('HERMES_KANBAN_RUN_ID'), "
-                "'claim': os.environ.get('HERMES_KANBAN_CLAIM_LOCK')}))"
-            )
             with patch.object(kbd, "_profile_exists_fn", return_value=None), patch.object(
-                kbd,
-                "_restart_safe_worker_argv",
+                kbd, "_restart_safe_worker_argv",
                 side_effect=lambda task, command, preparation_id=None: command,
             ), patch.object(
-                kbd,
-                "_worker_argv",
-                return_value=[sys.executable, "-c", script, str(receipt)],
-            ), patch.dict("os.environ", {"PYTHONPATH": str(RUNTIME_ROOT)}, clear=False):
-                result = kbd.dispatch_once(
-                    self.conn,
-                    max_spawn=1,
-                    reconcile_orphans=False,
-                )
+                generations, "prepare_runtime_generation",
+                side_effect=lambda expected, workspace=None: _prepare_fixture_generation(source, workspace=workspace),
+            ), patch.dict(os.environ, {
+                "HERMES_TEST_RUNTIME_RECEIPT": str(receipt), "HERMES_BIN": "",
+            }):
+                result = kbd.dispatch_once(self.conn, max_spawn=1, reconcile_orphans=False)
             self.assertEqual([entry[0] for entry in result.spawned], [task_id])
-            self.assertEqual(self._task(task_id).status, "running")
-            deadline = time.monotonic() + 5
-            while not receipt.exists() and time.monotonic() < deadline:
-                time.sleep(0.02)
-            self.assertTrue(receipt.exists())
-            granted = json.loads(receipt.read_text(encoding="utf-8"))
-            self.assertEqual(granted["run"], str(self._task(task_id).current_run_id))
-            self.assertTrue(granted["claim"])
-            pid = self._task(task_id).worker_pid
-            self.assertTrue(kb.reclaim_task(self.conn, task_id, reason="conformance cleanup", signal_fn=lambda pid, sig: os.kill(pid, sig)))
-            deadline = time.monotonic() + 2
-            while pid and kbd._pid_alive(pid) and time.monotonic() < deadline:
-                time.sleep(0.02)
-            kbd.reap_worker_zombies()
+            claimed = self._task(task_id)
+            process = kbd._worker_processes[claimed.worker_pid]
+            try:
+                granted = _wait_for_receipt(receipt)
+                self.assertEqual(granted["run"], str(claimed.current_run_id))
+                self.assertEqual(granted["claim"], claimed.claim_lock)
+                self.assertEqual(granted["granted"], "1")
+                metadata = json.loads(self.conn.execute(
+                    "SELECT metadata FROM task_runs WHERE id = ?", (claimed.current_run_id,),
+                ).fetchone()["metadata"])
+                self.assertEqual(metadata["runtime_identity"], granted["identity"])
+                process.wait(timeout=10)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=10)
+                kbd._record_worker_exit(process.pid, process.returncode << 8)
 
 
     def test_default_dispatch_rejects_changed_execution_snapshot(self) -> None:
@@ -2476,26 +2365,24 @@ runtime.cleanup_runtime_snapshot(snapshot)
             initial_status="blocked",
         )
         self.assertTrue(kb.unblock_task(self.conn, task_id))
-        script = (
-            "import os; "
-            "os.environ['HERMES_KANBAN_EXPECTED_RUNTIME'] = '{}'; "
-            "from hermes_cli.kanban_runtime import worker_bootstrap_from_env; "
-            "worker_bootstrap_from_env()"
-        )
-        with patch.object(kbd, "_profile_exists_fn", return_value=None), patch.object(
-            kbd,
-            "_restart_safe_worker_argv",
-            side_effect=lambda task, command, preparation_id=None: command,
-        ), patch.object(
-            kbd,
-            "_worker_argv",
-            return_value=[sys.executable, "-c", script],
-        ), patch.dict("os.environ", {"PYTHONPATH": str(RUNTIME_ROOT)}, clear=False):
-            result = kbd.dispatch_once(
-                self.conn,
-                max_spawn=1,
-                reconcile_orphans=False,
+        with tempfile.TemporaryDirectory(prefix="kanban-worker-mismatch-") as raw:
+            source = Path(raw) / "install"
+            _make_runtime_fixture(source)
+            (source / "hermes_cli" / "main.py").write_text(
+                "import os\n"
+                "os.environ['HERMES_KANBAN_EXPECTED_RUNTIME'] = '{}'\n"
+                "from hermes_cli.kanban_runtime import worker_bootstrap_from_env\n"
+                "worker_bootstrap_from_env()\n",
+                encoding="utf-8",
             )
+            with patch.object(kbd, "_profile_exists_fn", return_value=None), patch.object(
+                kbd, "_restart_safe_worker_argv",
+                side_effect=lambda task, command, preparation_id=None: command,
+            ), patch.object(
+                generations, "prepare_runtime_generation",
+                side_effect=lambda expected, workspace=None: _prepare_fixture_generation(source, workspace=workspace),
+            ), patch.dict(os.environ, {"HERMES_BIN": ""}):
+                result = kbd.dispatch_once(self.conn, max_spawn=1, reconcile_orphans=False)
         self.assertEqual(result.spawned, [])
         rejected = self._task(task_id)
         self.assertEqual(rejected.status, "ready")

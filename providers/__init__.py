@@ -102,7 +102,8 @@ def _user_plugins_dir() -> Path | None:
     try:
         from hermes_constants import get_hermes_home
 
-        d = get_hermes_home() / "plugins" / "model-providers"
+        from hermes_cli.kanban_runtime_generation import generation_runtime_path
+        d = generation_runtime_path(get_hermes_home() / "plugins" / "model-providers")
         return d if d.is_dir() else None
     except Exception:
         return None
@@ -118,7 +119,8 @@ def _installed_plugins_dir() -> Path | None:
     try:
         from hermes_constants import get_hermes_home
 
-        d = get_hermes_home() / "plugins"
+        from hermes_cli.kanban_runtime_generation import generation_runtime_path
+        d = generation_runtime_path(get_hermes_home() / "plugins")
         return d if d.is_dir() else None
     except Exception:
         return None

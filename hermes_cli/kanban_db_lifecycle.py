@@ -737,6 +737,7 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def invalidate_descendants_for_parent_reopen(
     conn: sqlite3.Connection, task_id: str, *, author: str,
+    acceptance_before: Optional[dict[str, str]] = None,
 ) -> dict[str, Any]:
     """THE done-reopen invalidation: every ``ready``/``review``/``running``/``done``
     descendant of a reopened ancestor is demoted to ``todo`` and re-gated.
@@ -750,6 +751,10 @@ def invalidate_descendants_for_parent_reopen(
     before death) — when composed, the CALLER must drain ``terminations``
     after its own commit. ``consecutive_failures`` resets (deliberate operator
     action), the opposite of :func:`reopen_review_task`.
+    A supplied acceptance snapshot belongs to the outer mutation, which emits
+    it once after all source and descendant writes. Otherwise this helper
+    captures the affected candidates before invalidating any descendant and
+    emits their transitions in the same transaction.
 
     Returns ``{"invalidated": [{id, prior_status, new_status, resume_status}],
     "terminations": [(worker_pid, claim_lock)]}``.
@@ -775,6 +780,9 @@ def invalidate_descendants_for_parent_reopen(
             """,
             (task_id,),
         ).fetchall()
+        emit_acceptance = acceptance_before is None
+        if acceptance_before is None:
+            acceptance_before = _capture_acceptance(conn, task_id, include_descendants=True)
         for row in rows:
             previous_status = row["status"]
             if previous_status not in {"ready", "review", "running", "done"}:
@@ -795,7 +803,8 @@ def invalidate_descendants_for_parent_reopen(
             conn.execute(
                 "UPDATE tasks SET status = 'todo', completed_at = NULL, result = NULL, "
                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
-                "current_run_id = NULL, candidate_run_id = NULL, consecutive_failures = 0 WHERE id = ?", (row["id"],),
+                "current_run_id = NULL, candidate_run_id = NULL, consecutive_failures = 0, "
+                "version = version + 1 WHERE id = ?", (row["id"],),
             )
             entry = {
                 "id": row["id"], "prior_status": previous_status,
@@ -822,6 +831,8 @@ def invalidate_descendants_for_parent_reopen(
                 f"(will resume via '{resume_status}').", now,
             )
             invalidated.append(entry)
+        if emit_acceptance:
+            _emit_acceptance_changes(conn, acceptance_before, source_task_id=task_id)
     if not caller_owns_txn:
         # Standalone: committed above, audit trail durable, safe to kill now.
         # Composed calls leave this to the caller post-commit.

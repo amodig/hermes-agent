@@ -357,6 +357,8 @@ def recover_if_needed(project_root: Path | None = None, argv: list[str] | None =
     Never raises: on any failure the import of main.py proceeds and surfaces the real error.
     """
     global _UPDATE_RETRY_RECOVERED
+    if os.environ.get("HERMES_KANBAN_RUNTIME_GENERATION"):
+        return
 
     try:
         args = sys.argv[1:] if argv is None else argv
@@ -393,26 +395,28 @@ def recover_if_needed(project_root: Path | None = None, argv: list[str] | None =
         if "update" in args:
             return
 
-        broken = _probe_broken_packages()
-        if not broken:
-            return  # main.py will load and run full recovery.
+        from hermes_cli.kanban_runtime_generation import installation_mutation_lock
 
-        # Single-flight: share main.py's recovery lock so an early repair never races a
-        # concurrent full recovery into the same shared venv.
-        if not _claim_recovery_lock(root):
-            return
-        try:
-            specs = _pinned_specs(broken, root)
-            print("⚠ Core package(s) broken by an interrupted update — "
-                  f"repairing before launch: {', '.join(broken)}", file=sys.stderr)
-            if _run_repair_install(specs, root) and not _probe_broken_packages():
-                print("  ✓ Core packages repaired.", file=sys.stderr)
-            else:
-                print("  ✗ Automatic repair incomplete. Recover manually with:", file=sys.stderr)
-                print(f"    {sys.executable} -m pip install --force-reinstall " + " ".join(specs),
-                      file=sys.stderr)
-        finally:
-            _release_recovery_lock(root)
+        # Diagnostic imports can be children of the updater holding this lock.
+        # Defer repairs instead of waiting for the parent that is waiting for us.
+        with installation_mutation_lock(root, blocking=False):
+            if core_marker.exists() or not lazy_marker.exists():
+                return
+            broken = _probe_broken_packages()
+            if not broken or not _claim_recovery_lock(root):
+                return
+            try:
+                specs = _pinned_specs(broken, root)
+                print("⚠ Core package(s) broken by an interrupted update — "
+                      f"repairing before launch: {', '.join(broken)}", file=sys.stderr)
+                if _run_repair_install(specs, root) and not _probe_broken_packages():
+                    print("  ✓ Core packages repaired.", file=sys.stderr)
+                else:
+                    print("  ✗ Automatic repair incomplete. Recover manually with:", file=sys.stderr)
+                    print(f"    {sys.executable} -m pip install --force-reinstall " + " ".join(specs),
+                          file=sys.stderr)
+            finally:
+                _release_recovery_lock(root)
     except Exception:
         pass  # Never block launch — the import of main.py will surface the truth.
 
@@ -473,28 +477,36 @@ def _complete_pending_core_install(root: Path, core_marker: Path) -> bool:
                   f"{attempts} times in the early pass — leaving it for the "
                   "post-import recovery path.", file=sys.stderr)
             return False
-        if not _claim_recovery_lock(root):
-            return False
-        try:
-            print("⚠ A previous `hermes update` was interrupted mid-install — "
-                  "finishing dependency installation now (before any native "
-                  "extensions load)...", file=sys.stderr)
-            ir.run_core_install(root)
-        except Exception as exc:
-            new_attempts = ir.bump_marker_attempts(core_marker)
-            print(f"  ✗ Early interrupted-install completion failed (attempt "
-                  f"{new_attempts}/{_EARLY_CORE_INSTALL_MAX_ATTEMPTS}): {exc}", file=sys.stderr)
-            print("  The next launch will retry; hermes will keep working from "
-                  "the current venv in the meantime.", file=sys.stderr)
-            return False
-        finally:
-            _release_recovery_lock(root)
+        from hermes_cli.kanban_runtime_generation import installation_mutation_lock
 
-        try:
-            core_marker.unlink()
-        except OSError:
-            pass
-        print("  ✓ Dependency installation completed in the early pass.", file=sys.stderr)
-        return True
+        with installation_mutation_lock(root, blocking=False):
+            if not core_marker.exists() or _marker_owner_is_live(core_marker):
+                return False
+            attempts = _read_marker_attempts(core_marker)
+            if attempts >= _EARLY_CORE_INSTALL_MAX_ATTEMPTS:
+                return False
+            if not _claim_recovery_lock(root):
+                return False
+            try:
+                print("⚠ A previous `hermes update` was interrupted mid-install — "
+                      "finishing dependency installation now (before any native "
+                      "extensions load)...", file=sys.stderr)
+                ir.run_core_install(root)
+            except Exception as exc:
+                new_attempts = ir.bump_marker_attempts(core_marker)
+                print(f"  ✗ Early interrupted-install completion failed (attempt "
+                      f"{new_attempts}/{_EARLY_CORE_INSTALL_MAX_ATTEMPTS}): {exc}", file=sys.stderr)
+                print("  The next launch will retry; hermes will keep working from "
+                      "the current venv in the meantime.", file=sys.stderr)
+                return False
+            finally:
+                _release_recovery_lock(root)
+
+            try:
+                core_marker.unlink()
+            except OSError:
+                pass
+            print("  ✓ Dependency installation completed in the early pass.", file=sys.stderr)
+            return True
     except Exception:
         return False  # Never block launch — the marker stays for the post-import path.

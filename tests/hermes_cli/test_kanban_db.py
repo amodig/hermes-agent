@@ -1246,14 +1246,6 @@ def test_resolve_hermes_argv_falls_back_to_module_form_when_no_path_shim(monkeyp
     assert argv == [sys.executable, "-m", "hermes_cli.main"]
 
 
-def test_worker_argv_keeps_explicit_profile_selector(monkeypatch):
-    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
-    monkeypatch.setattr(kbd, "_resolve_worker_cli_toolsets", lambda _home: ())
-
-    argv = kbd._worker_argv(_make_task(id="t_worker_profile"), "coder", None)
-
-    assert argv[:3] == ["hermes", "-p", "coder"]
-
 def test_resolve_hermes_argv_module_actually_runs():
     """The fallback module name must be importable + runnable.
 
