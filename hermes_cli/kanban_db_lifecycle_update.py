@@ -72,13 +72,14 @@ def _validate_lifecycle_role_identity(
     assignee: Optional[str],
     *,
     task_id: Optional[str] = None,
+    phase: Optional[str] = None,
 ) -> None:
     # Late import preserves the facade/sibling import boundary and the facade
     # monkeypatch seam used by callers.
     from hermes_cli import kanban_db_lifecycle as lifecycle
 
     lifecycle._validate_lifecycle_role_identity(
-        conn, contract, assignee, task_id=task_id,
+        conn, contract, assignee, task_id=task_id, phase=phase,
     )
 
 
@@ -259,10 +260,6 @@ def _build_update_plan(
     if request.lifecycle_contract is not _kb._UPDATE_UNSET:
         new_lifecycle = request.normalized_lifecycle
 
-    if request.assignee is not _kb._UPDATE_UNSET or request.lifecycle_contract is not _kb._UPDATE_UNSET:
-        _validate_lifecycle_role_identity(
-            conn, new_lifecycle, new_assignee, task_id=row["id"],
-        )
     lifecycle_changed = (
         request.lifecycle_contract is not _kb._UPDATE_UNSET and new_lifecycle != old_lifecycle
     )
@@ -373,6 +370,17 @@ def _build_update_plan(
                 ).get("implementer")
             if implementation_assignee:
                 new_assignee = _kb._canonical_assignee(str(implementation_assignee))
+
+    # Reopens must validate the destination role, not the stored review status.
+    if (
+        request.assignee is not _kb._UPDATE_UNSET
+        or request.lifecycle_contract is not _kb._UPDATE_UNSET
+        or goal_reopened
+    ):
+        _validate_lifecycle_role_identity(
+            conn, new_lifecycle, new_assignee, task_id=row["id"],
+            phase="implementation" if lifecycle_changed or goal_reopened else None,
+        )
 
     old_values = {
         "title": old_title,

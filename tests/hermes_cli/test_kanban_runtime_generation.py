@@ -127,7 +127,7 @@ print(json.dumps({
     monkeypatch.delenv("HERMES_KANBAN_BOOTSTRAP_PATH", raising=False)
     for _, variable in runtime._RUNTIME_RESOURCE_ROOTS:
         monkeypatch.delenv(variable, raising=False)
-    monkeypatch.setattr(generation, "_runtime_import_roots", lambda root: [dependencies, external, plugins])
+    monkeypatch.setattr(generation, "_runtime_import_roots", lambda root, *, profile_home=None: [dependencies, external])
     native_inputs = generation._python_runtime_inputs
     def native_with_probe():
         paths, excluded, executable = native_inputs()
@@ -137,14 +137,14 @@ print(json.dumps({
         paths[str(native_probe)] = str(Path(stdlib) / "native_probe.py")
         return paths, excluded, executable
     monkeypatch.setattr(generation, "_python_runtime_inputs", native_with_probe)
-    def prepare():
-        return generation.prepare_runtime_generation(runtime.runtime_identity(source))
+    def prepare(*, profile_home=None):
+        return generation.prepare_runtime_generation(runtime.runtime_identity(source), profile_home=profile_home)
     return source, dependencies, plugins, external, native_probe, prepare
 
 
-def _launch(prepared):
+def _launch(prepared, *, env=None):
     return subprocess.Popen(
-        prepared.command_prefix, env={**os.environ, **prepared.env},
+        prepared.command_prefix, env={**os.environ, **prepared.env, **(env or {})},
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
 
@@ -270,10 +270,17 @@ print(json.dumps({
     assert old["uncaptured_refused"] is True
 
 
-def test_fresh_home_freezes_absent_plugins_until_next_generation(installation):
+@pytest.mark.parametrize("assigned_profile", [False, True])
+def test_fresh_home_freezes_absent_plugins_until_next_generation(installation, assigned_profile):
     source, _, plugins, _, _, prepare = installation
+    home = source.parent / "assigned-home" if assigned_profile else plugins.parent
+    home.mkdir(exist_ok=True)
     pending = plugins.with_name("pending-plugins")
-    plugins.rename(pending)
+    if assigned_profile:
+        shutil.copytree(plugins, pending)
+    else:
+        plugins.rename(pending)
+    worker_env = {"HERMES_HOME": str(home)}
     _write(source / "hermes_cli" / "main.py", """
 import json
 import os
@@ -292,18 +299,18 @@ print(json.dumps({
     'provider': profile.resolve_aux_model() if profile else None,
 }), flush=True)
 """)
-    prepared = prepare()
-    child = _launch(prepared)
+    prepared = prepare(profile_home=home if assigned_profile else None)
+    child = _launch(prepared, env=worker_env)
     try:
         assert child.stdout.readline().strip() == "ready"
-        pending.rename(plugins)
+        pending.rename(home / "plugins")
         assert _finish(child) == {"directory": False, "provider": None}
     finally:
         if child.poll() is None:
             child.kill()
             child.wait()
-    following = prepare()
-    newer = _launch(following)
+    following = prepare(profile_home=home if assigned_profile else None)
+    newer = _launch(following, env=worker_env)
     try:
         assert newer.stdout.readline().strip() == "ready"
         assert _finish(newer) == {"directory": True, "provider": "old"}
@@ -378,10 +385,16 @@ print(json.dumps({
             child.wait()
 
 
-def test_partial_or_rewritten_manifest_never_reaches_worker_code(installation):
-    _, _, _, _, _, prepare = installation
-    prepared = prepare()
-    (prepared.root / "imports" / "0" / "unseeded_sdk" / "selected.py").unlink()
+@pytest.mark.parametrize("damaged_payload", ["dependency", "profile-plugin"])
+def test_partial_or_rewritten_manifest_never_reaches_worker_code(installation, damaged_payload):
+    _, dependencies, plugins, _, _, prepare = installation
+    prepared = prepare(profile_home=plugins.parent)
+    manifest = generation.generation_manifest(prepared.root)
+    original = (
+        dependencies / "unseeded_sdk" / "selected.py" if damaged_payload == "dependency"
+        else plugins / "model-providers" / "fixture" / "resource.txt"
+    )
+    generation._mapped_path(original, prepared.root, manifest["paths"]).unlink()
     child = _launch(prepared)
     output, error = child.communicate("unseeded_sdk.selected\n", timeout=60)
     assert child.returncode != 0, error

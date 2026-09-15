@@ -212,9 +212,10 @@ def _python_runtime_inputs():
     return mappings, excluded, f"python/{executable_relative.as_posix()}"
 
 
-def _optional_plugin_roots(workspace=None) -> set[Path]:
+def _optional_plugin_roots(workspace=None, *, profile_home=None) -> set[Path]:
     from hermes_constants import get_hermes_home
-    roots = {(get_hermes_home() / "plugins").resolve()}
+    home = Path(profile_home) if profile_home is not None else get_hermes_home()
+    roots = {(home / "plugins").resolve()}
     if os.environ.get("HERMES_ENABLE_PROJECT_PLUGINS", "").lower() in {"1", "true", "yes", "on"}:
         roots.update(
             (Path(directory) / ".hermes" / "plugins").resolve()
@@ -223,7 +224,7 @@ def _optional_plugin_roots(workspace=None) -> set[Path]:
     return roots
 
 
-def _runtime_import_roots(source: Path) -> list[Path]:
+def _runtime_import_roots(source: Path, *, profile_home=None) -> list[Path]:
     """All active import roots, including editable and file-loaded plugins."""
     candidates = [Path(entry or os.getcwd()).resolve() for entry in sys.path]
     for key in ("purelib", "platlib"):
@@ -231,7 +232,7 @@ def _runtime_import_roots(source: Path) -> list[Path]:
     target = os.environ.get("HERMES_LAZY_INSTALL_TARGET", "").strip()
     if target:
         candidates.append(Path(target).resolve())
-    plugin_roots = _optional_plugin_roots()
+    plugin_roots = _optional_plugin_roots(profile_home=profile_home)
     candidates.extend(plugin_roots)
     for module in tuple(sys.modules.values()):
         # Editable installers may expose packages only through a meta finder.
@@ -400,7 +401,7 @@ def _installed_resources(roots, mappings):
                 mappings.setdefault(str(path), str(Path(destination) / path.relative_to(prefix)))
 
 
-def prepare_runtime_generation(expected_identity, *, workspace=None):
+def prepare_runtime_generation(expected_identity, *, workspace=None, profile_home=None):
     from hermes_cli.kanban_runtime import RuntimeIdentity, runtime_identity, same_code_identity, _RUNTIME_RESOURCE_ROOTS
     expected = expected_identity if isinstance(expected_identity, RuntimeIdentity) else RuntimeIdentity.from_value(expected_identity)
     source = Path(expected.module_root).resolve()
@@ -411,8 +412,8 @@ def prepare_runtime_generation(expected_identity, *, workspace=None):
         current = runtime_identity(source)
         if not same_code_identity(expected, current):
             raise _error("source runtime changed before generation preparation")
-        roots = _runtime_import_roots(source)
-        optional_roots = _optional_plugin_roots(workspace)
+        roots = _runtime_import_roots(source, profile_home=profile_home)
+        optional_roots = _optional_plugin_roots(workspace, profile_home=profile_home)
         for plugins in sorted(optional_roots):
             if not any(plugins.is_relative_to(root) for root in (source, *roots)):
                 roots.append(plugins)

@@ -527,7 +527,7 @@ def _default_spawn(
     cli_args = dispatcher._worker_argv(task, profile_arg, env.get("HERMES_HOME"))
     worker_cwd = workspace if os.path.isdir(workspace) else os.getcwd()
     generation = prepare_runtime_generation(
-        expected_identity, workspace=worker_cwd,
+        expected_identity, workspace=worker_cwd, profile_home=env.get("HERMES_HOME"),
     )
     expected_identity = generation.identity
     env.update(generation.env)

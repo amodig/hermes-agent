@@ -128,12 +128,14 @@ Path(os.environ["HERMES_TEST_RUNTIME_RECEIPT"]).write_text(json.dumps(payload))
         encoding="utf-8",
     )
 
-def _prepare_fixture_generation(root: Path, prepare=generations.prepare_runtime_generation, *, workspace=None):
+def _prepare_fixture_generation(
+    root: Path, prepare=generations.prepare_runtime_generation, *, workspace=None, profile_home=None,
+):
     resources = {env_var: str(root / directory) for directory, env_var in runtime._RUNTIME_RESOURCE_ROOTS}
     with patch.dict(os.environ, resources), patch.object(
         generations, "_runtime_import_roots", return_value=[root.parent / "site-packages"],
     ):
-        return prepare(runtime_identity(root), workspace=workspace)
+        return prepare(runtime_identity(root), workspace=workspace, profile_home=profile_home)
 
 
 def _wait_for_receipt(path: Path) -> dict:
@@ -487,6 +489,61 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 candidate_completion_calls[0].args[3],
                 implementation_run.current_run_id,
             )
+
+            completed = self._task(implementation)
+            contract = completed.lifecycle_contract
+            self.assertEqual(completed.status, "done")
+            self.assertEqual(completed.assignee, "reviewer")
+            self.assertEqual(
+                get_lifecycle_state(self.conn, implementation)["acceptance"], "accepted",
+            )
+            with self.assertRaises(kb.LifecycleContractError):
+                kb.update_task(
+                    self.conn, implementation,
+                    assignee="implementer",
+                    lifecycle_contract=contract,
+                    expected_version=completed.version,
+                    reason="cannot reassign genuine review work",
+                )
+            with self.assertRaises(kb.LifecycleContractError):
+                kb.update_task(
+                    self.conn, implementation,
+                    body="revised implementation goal",
+                    lifecycle_contract={**contract, "reviewer": "other-reviewer"},
+                    expected_version=completed.version,
+                    reason="cannot change classified contract while reopening",
+                )
+            self.assertEqual(self._task(implementation).version, completed.version)
+            self.assertTrue(
+                kb.update_task(
+                    self.conn, implementation,
+                    body="revised implementation goal",
+                    assignee="implementer",
+                    lifecycle_contract=contract,
+                    expected_version=completed.version,
+                    reason="reopen completed code for an explicit goal revision",
+                )
+            )
+            reopened = self._task(implementation)
+            self.assertEqual(reopened.status, "ready")
+            self.assertEqual(reopened.assignee, "implementer")
+            self.assertEqual(reopened.lifecycle_contract, contract)
+            self.assertNotEqual(reopened.goal_revision_id, completed.goal_revision_id)
+            self.assertIsNone(reopened.candidate_run_id)
+            self.assertIsNone(reopened.completed_at)
+            self.assertIsNone(reopened.result)
+            self.assertEqual(
+                get_lifecycle_state(self.conn, implementation)["acceptance"], "stale",
+            )
+            self.assertTrue(kb.evaluate_dependencies(self.conn, implementation)["satisfied"])
+            self.assertIsNone(
+                kb.claim_review_task(self.conn, implementation, claimer="reviewer:conformance")
+            )
+            implementation_run = kb.claim_task(
+                self.conn, implementation, claimer="implementer:conformance"
+            )
+            self.assertIsNotNone(implementation_run)
+            self.assertEqual(implementation_run.assignee, "implementer")
 
 
     def test_archived_negative_role_evidence_is_pending(self) -> None:
@@ -915,6 +972,30 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "validation_required": True,
             },
         )
+        contract = self._task(candidate).lifecycle_contract
+        with kb.write_txn(self.conn):
+            self.conn.execute(
+                "UPDATE tasks SET lifecycle_contract = NULL, status = 'done', "
+                "completed_at = 123456, result = 'legacy result' WHERE id = ?",
+                (candidate,),
+            )
+        self.assertTrue(
+            kb.bind_lifecycle_contract(
+                self.conn, candidate, contract,
+                expected_version=self._task(candidate).version,
+                reason="classify completed historical implementation",
+                author="operator",
+            )
+        )
+        rebound_candidate = self._task(candidate)
+        self.assertEqual(rebound_candidate.status, "ready")
+        self.assertEqual(rebound_candidate.assignee, "implementer")
+        self.assertEqual(rebound_candidate.lifecycle_contract, contract)
+        self.assertIsNone(rebound_candidate.candidate_run_id)
+        self.assertIsNone(rebound_candidate.completed_at)
+        self.assertIsNone(rebound_candidate.result)
+        self.assertTrue(kb.evaluate_dependencies(self.conn, candidate)["satisfied"])
+        self.assertEqual(get_lifecycle_state(self.conn, candidate)["acceptance"], "stale")
         with kb.write_txn(self.conn):
             candidate_goal = int(self._task(candidate).goal_revision_id)
             handoff = {
@@ -1374,6 +1455,14 @@ class KanbanLifecycleConformance(unittest.TestCase):
 
         with self.assertRaises(kb.LifecycleContractError):
             kb.assign_task(self.conn, task_id, "builder")
+        with self.assertRaises(kb.LifecycleContractError):
+            kb.update_task(
+                self.conn, task_id,
+                assignee="builder",
+                lifecycle_contract=self._task(task_id).lifecycle_contract,
+                expected_version=self._task(task_id).version,
+                reason="cannot reroute blocked review to implementation",
+            )
         self.assertTrue(kb.assign_task(self.conn, task_id, "reviewer"))
 
 
@@ -1979,9 +2068,10 @@ recovery.recover_if_needed(project_root=root, argv=[])
                     encoding="utf-8",
                 )
                 (source / marker).write_text("pid=0\n", encoding="utf-8")
-                env = {**os.environ, "PYTHONPATH": str(RUNTIME_ROOT)}
+                env = {**os.environ, "PYTHONPATH": str(RUNTIME_ROOT), "TMPDIR": raw}
                 command = [sys.executable, "-c", script, raw]
-                with generations.installation_mutation_lock(source):
+                # Other test files share the interpreter installation, not this fixture's locks.
+                with patch.object(tempfile, "tempdir", raw), generations.installation_mutation_lock(source):
                     deferred = subprocess.run(
                         command, env=env, capture_output=True, text=True, timeout=10,
                     )
@@ -2312,7 +2402,9 @@ recovery.recover_if_needed(project_root=root, argv=[])
                 side_effect=lambda task, command, preparation_id=None: command,
             ), patch.object(
                 generations, "prepare_runtime_generation",
-                side_effect=lambda expected, workspace=None: _prepare_fixture_generation(source, workspace=workspace),
+                side_effect=lambda expected, workspace=None, profile_home=None: _prepare_fixture_generation(
+                    source, workspace=workspace, profile_home=profile_home,
+                ),
             ), patch.dict(os.environ, {
                 "HERMES_TEST_RUNTIME_RECEIPT": str(receipt), "HERMES_BIN": "",
             }):
@@ -2402,7 +2494,9 @@ recovery.recover_if_needed(project_root=root, argv=[])
                 side_effect=lambda task, command, preparation_id=None: command,
             ), patch.object(
                 generations, "prepare_runtime_generation",
-                side_effect=lambda expected, workspace=None: _prepare_fixture_generation(source, workspace=workspace),
+                side_effect=lambda expected, workspace=None, profile_home=None: _prepare_fixture_generation(
+                    source, workspace=workspace, profile_home=profile_home,
+                ),
             ), patch.dict(os.environ, {"HERMES_BIN": ""}):
                 result = kbd.dispatch_once(self.conn, max_spawn=1, reconcile_orphans=False)
         self.assertEqual(result.spawned, [])

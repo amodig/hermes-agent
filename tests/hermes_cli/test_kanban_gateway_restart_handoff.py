@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -44,8 +45,8 @@ def worker_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _make_runtime_fixture(source)
     prepared = []
 
-    def prepare(_expected, *, workspace=None):
-        generation = _prepare_fixture_generation(source, workspace=workspace)
+    def prepare(_expected, *, workspace=None, profile_home=None):
+        generation = _prepare_fixture_generation(source, workspace=workspace, profile_home=profile_home)
         prepared.append(generation)
         return generation
 
@@ -120,6 +121,81 @@ def test_worker_generation_scopes_profile_board_and_secrets_before_grant(
     finally:
         _finish_launch(launch)
     assert not generation.exists()
+
+
+@pytest.mark.parametrize("profile_change", ["mutate", "remove"])
+def test_worker_captures_assigned_profile_plugins_before_child_imports(
+    worker_setup, monkeypatch, profile_change,
+):
+    workspace, task = worker_setup
+    source = workspace.parent / "install"
+    dispatcher_home = workspace.parent / ".hermes" / "profiles" / "cto"
+    worker_home = dispatcher_home.with_name(task.assignee)
+    repository = Path(__file__).resolve().parents[2]
+    (source / "providers").mkdir()
+    for name in ("__init__.py", "base.py"):
+        shutil.copy2(repository / "providers" / name, source / "providers" / name)
+    (source / "hermes_constants.py").write_text(
+        "import os\nfrom pathlib import Path\n"
+        "def get_hermes_home(): return Path(os.environ['HERMES_HOME'])\n",
+        encoding="utf-8",
+    )
+    for home, label in ((dispatcher_home, "dispatcher"), (worker_home, "assigned")):
+        plugin = home / "plugins" / "model-providers" / "profile-fixture"
+        plugin.mkdir(parents=True)
+        (plugin / "__init__.py").write_text(
+            "from providers import register_provider\n"
+            "from providers.base import ProviderProfile\n"
+            "class Fixture(ProviderProfile):\n"
+            f"    def resolve_aux_model(self, *, vision=False): return {label!r}\n"
+            "register_provider(Fixture(name='profile-fixture'))\n",
+            encoding="utf-8",
+        )
+        (plugin / "resource.txt").write_text(f"{label} resource", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(dispatcher_home))
+    # This module loads before the first bootstrap handshake, not just after the grant.
+    (source / "fixture_early.py").write_text(
+        """
+import importlib
+import importlib.resources
+from providers import get_provider_profile
+profile = get_provider_profile('profile-fixture')
+plugin = importlib.import_module(type(profile).__module__)
+resource = importlib.resources.files(plugin).joinpath('resource.txt')
+value = {
+    'provider': profile.resolve_aux_model(),
+    'resource': resource.read_text(),
+    'locations': [plugin.__file__, str(resource)],
+}
+""",
+        encoding="utf-8",
+    )
+    restart_safe_argv = kbd._restart_safe_worker_argv
+
+    def change_profile_before_spawn(task, command, *, preparation_id=None):
+        command = restart_safe_argv(task, command, preparation_id=preparation_id)
+        if profile_change == "remove":
+            shutil.rmtree(worker_home)
+        else:
+            plugin = worker_home / "plugins" / "model-providers" / "profile-fixture"
+            (plugin / "__init__.py").write_text("raise RuntimeError('mutable plugin')\n", encoding="utf-8")
+            (plugin / "resource.txt").write_text("mutable resource", encoding="utf-8")
+        return command
+
+    monkeypatch.setattr(kbd, "_restart_safe_worker_argv", change_profile_before_spawn)
+    launch = kbd._default_spawn(task, str(workspace), defer_grant=True)
+    snapshot = kbd._worker_runtime_snapshots[launch.launcher_pid]
+    try:
+        launch.grant(task.current_run_id, task.claim_lock)
+        observed = _wait_for_receipt(workspace.parent / "receipt.json")
+        plugin = observed["early"][0]
+        assert plugin["provider"] == "assigned"
+        assert plugin["resource"] == "assigned resource"
+        assert all(Path(path).is_relative_to(snapshot) for path in plugin["locations"])
+        assert observed["home"] == str(worker_home)
+        assert os.environ["HERMES_HOME"] == str(dispatcher_home)
+    finally:
+        _finish_launch(launch)
 
 
 @pytest.mark.linux_only
@@ -261,7 +337,7 @@ conn = sqlite3.connect(base / 'restart.db')
 conn.row_factory = sqlite3.Row
 with patch.object(kbd, '_profile_exists_fn', return_value=None), patch.object(
     kbd, '_restart_safe_worker_argv', side_effect=lambda task, command, preparation_id=None: command,
-), patch.object(generations, 'prepare_runtime_generation', side_effect=lambda expected, workspace=None: _prepare_fixture_generation(base / 'install', workspace=workspace)):
+), patch.object(generations, 'prepare_runtime_generation', side_effect=lambda expected, workspace=None, profile_home=None: _prepare_fixture_generation(base / 'install', workspace=workspace, profile_home=profile_home)):
     result = kbd.dispatch_once(conn, max_spawn=1, reconcile_orphans=False)
 assert len(result.spawned) == 1, result
 conn.close()
