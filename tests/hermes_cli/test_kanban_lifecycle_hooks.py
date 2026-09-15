@@ -210,6 +210,28 @@ def test_typed_completion_hooks_follow_acceptance_once(
             (kwargs["task_id"], kwargs["run_id"])
             for name, kwargs in captured_hooks if name == "kanban_task_completed"
         ] == completed
+        if terminal == candidate:
+            assert kb.repair_archive_task(
+                conn, terminal, expected_version=kb.get_task(conn, terminal).version,
+                reason="archive completed candidate",
+            )
+        else:
+            assert kb.archive_task(conn, terminal)
+        archived_acceptance = "stale" if terminal == candidate else "pending"
+        assert get_lifecycle_state(conn, candidate)["acceptance"] == archived_acceptance
+        transitions = [
+            event.payload for event in kb.list_events(conn, candidate)
+            if event.kind == "acceptance_changed"
+        ]
+        assert [(event["old"], event["new"]) for event in transitions] == [
+            ("pending", "accepted"), ("accepted", archived_acceptance),
+        ]
+        assert transitions[-1]["source_task_id"] == terminal
+        assert not kb.archive_task(conn, terminal)
+        assert [
+            event.payload for event in kb.list_events(conn, candidate)
+            if event.kind == "acceptance_changed"
+        ] == transitions
     finally:
         conn.close()
 

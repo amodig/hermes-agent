@@ -3811,6 +3811,7 @@ def _insert_decomposed_child(
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
+        acceptance_before = _capture_acceptance(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -3824,6 +3825,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
+        _emit_acceptance_changes(conn, acceptance_before, source_task_id=task_id)
     # ``archived`` parents no longer block children; promote them now.
     recompute_ready(conn)
     # Reap the workspace on archive too (never-completed tasks kept it forever).
@@ -3873,6 +3875,7 @@ def repair_archive_task(
             raise ValueError(
                 f"cannot archive task {task_id}: detach all dependency edges first"
             )
+        acceptance_before = _capture_acceptance(conn, task_id)
         conn.execute(
             "UPDATE tasks SET status = 'archived', version = version + 1 WHERE id = ?",
             (task_id,),
@@ -3898,6 +3901,7 @@ def repair_archive_task(
                 },
             },
         )
+        _emit_acceptance_changes(conn, acceptance_before, source_task_id=task_id)
     notify_task_updated(conn, task_id, ("status", "version"))
     _cleanup_workspace(conn, task_id)
     return True

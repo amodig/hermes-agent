@@ -8,6 +8,7 @@ asserts Relay's LLM end event still records the full response.
 
 from __future__ import annotations
 
+import asyncio
 import threading
 
 import pytest
@@ -53,13 +54,11 @@ def _stream_through_relay(tmp_path, monkeypatch, response_body: bytes, *, finali
     consumer = "test.openai_relay"
     subscriber_name = "test.openai_stream"
     events = []
-    relay_finalizer_started = threading.Event()
     allow_relay_finalizer = threading.Event()
     relay_finalizer_finished = threading.Event()
     run_relay_finalizer = relay_llm.ManagedLlmStream._relay_finalizer
 
     def run_synchronized_relay_finalizer(managed_stream, attempt):
-        relay_finalizer_started.set()
         assert allow_relay_finalizer.wait(5), "consumer did not release Relay's finalizer"
         try:
             return run_relay_finalizer(managed_stream, attempt)
@@ -73,9 +72,13 @@ def _stream_through_relay(tmp_path, monkeypatch, response_body: bytes, *, finali
     def count_chunk_after_relay_finalizes(self, diag, chunk):
         # ``_count_chunk`` is the first thing the consumer does with every chunk.
         if finalize_before(chunk):
-            assert relay_finalizer_started.wait(5), "Relay's finalizer did not start"
             allow_relay_finalizer.set()
-            assert relay_finalizer_finished.wait(5), "Relay's finalizer did not finish"
+            # Relay still needs this loop to pull provider EOF. A blocking
+            # wait here can prevent the finalizer whose completion we require.
+            loop = self.managed_stream_holder["stream"]._loop
+            assert loop.run_until_complete(
+                asyncio.to_thread(relay_finalizer_finished.wait, 5)
+            ), "Relay's finalizer did not finish"
         return count_chunk(self, diag, chunk)
 
     monkeypatch.setattr(chat_completion_helpers._StreamingCall, "_count_chunk", count_chunk_after_relay_finalizes)

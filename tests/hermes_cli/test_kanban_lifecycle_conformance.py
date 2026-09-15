@@ -561,11 +561,33 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 get_lifecycle_state(self.conn, implementation)["acceptance"], "rejected"
             )
 
+            self.conn.execute(
+                "CREATE TEMP TRIGGER reject_archive_acceptance BEFORE INSERT ON task_events "
+                "WHEN NEW.kind = 'acceptance_changed' "
+                "BEGIN SELECT RAISE(ABORT, 'reject acceptance event'); END"
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                kb.archive_task(self.conn, review)
+            self.assertEqual(kb.get_task(self.conn, review).status, "done")
+            self.assertFalse(any(
+                event.kind == "archived" for event in kb.list_events(self.conn, review)
+            ))
+            self.conn.execute("DROP TRIGGER reject_archive_acceptance")
+
             self.assertTrue(kb.archive_task(self.conn, review))
             self.assertEqual(get_lifecycle_state(self.conn, review)["acceptance"], "pending")
             self.assertEqual(
                 get_lifecycle_state(self.conn, implementation)["acceptance"], "pending"
             )
+            transitions = [
+                event.payload for event in kb.list_events(self.conn, implementation)
+                if event.kind == "acceptance_changed"
+            ]
+            self.assertEqual(
+                [(event["old"], event["new"]) for event in transitions],
+                [("pending", "rejected"), ("rejected", "pending")],
+            )
+            self.assertEqual(transitions[-1]["source_task_id"], review)
 
 
     def test_cross_phase_verdicts_are_malformed(self) -> None:
