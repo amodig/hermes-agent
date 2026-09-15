@@ -428,6 +428,43 @@ def _restart_safe_worker_argv(
     )
 
 
+def _worker_project_plugins_enabled(env: dict[str, str]) -> bool:
+    """Resolve only the discovery gate, without changing the dispatcher environment."""
+    from dotenv.main import DotEnv
+    from dotenv.variables import parse_variables
+    from hermes_cli.managed_scope import get_managed_dir
+    from utils import is_truthy_value
+
+    values = dict(env)
+    home = Path(values.get("HERMES_HOME") or Path.home() / ".hermes")
+    managed = get_managed_dir()
+    # Match load_hermes_dotenv's profile/1Password/managed ordering. The sealed
+    # source excludes .env, so the CLI's installation-root fallback is absent.
+    for path, override in (
+        (home / ".env", True),
+        (home / ".op.env", False),
+        (managed / ".env" if managed is not None else None, True),
+    ):
+        if path is None or not path.is_file():
+            continue
+        if path.name == ".op.env" and values.get("OP_SERVICE_ACCOUNT_TOKEN"):
+            continue
+        try:
+            parsed = list(DotEnv(path, encoding="utf-8-sig").parse())
+        except UnicodeDecodeError:
+            parsed = list(DotEnv(path, encoding="latin-1").parse())
+        resolved = {}
+        for name, value in parsed:
+            if value is not None:
+                context = {**values, **resolved} if override else {**resolved, **values}
+                value = "".join(atom.resolve(context) for atom in parse_variables(value))
+            resolved[name] = value
+        for name, value in resolved.items():
+            if value is not None and (override or name not in values):
+                values[name] = value
+    return is_truthy_value(values.get("HERMES_ENABLE_PROJECT_PLUGINS"))
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -526,8 +563,11 @@ def _default_spawn(
     dispatcher = _dispatcher()
     cli_args = dispatcher._worker_argv(task, profile_arg, env.get("HERMES_HOME"))
     worker_cwd = workspace if os.path.isdir(workspace) else os.getcwd()
+    project_plugins_enabled = _worker_project_plugins_enabled(env)
+    env["HERMES_ENABLE_PROJECT_PLUGINS"] = "1" if project_plugins_enabled else "0"
     generation = prepare_runtime_generation(
         expected_identity, workspace=worker_cwd, profile_home=env.get("HERMES_HOME"),
+        project_plugins_enabled=project_plugins_enabled,
     )
     expected_identity = generation.identity
     env.update(generation.env)

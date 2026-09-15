@@ -24,6 +24,73 @@ def _write(path, content):
     path.write_text(content, encoding="utf-8")
 
 
+def _install_memory_loaders(source):
+    """Real discovery/bootstrap modules in the small, offline runtime fixture."""
+    for relative in (
+        "plugins/__init__.py", "plugins/plugin_loader.py",
+        "plugins/memory/__init__.py", "plugins/memory/config_schema.py",
+        "agent/memory_provider.py", "agent/secret_scope.py",
+        "hermes_cli/env_loader.py", "hermes_cli/_early_recovery.py",
+        "hermes_cli/managed_scope.py", "hermes_constants.py", "utils.py",
+    ):
+        destination = source / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPOSITORY / relative, destination)
+    _write(source / "agent" / "__init__.py", "")
+    # Only profile config I/O is synthetic; plugin discovery, imports, schemas,
+    # resources and dotenv all execute their production implementations.
+    _write(source / "hermes_cli" / "config.py", """
+import yaml
+from hermes_constants import get_hermes_home
+def load_config():
+    path = get_hermes_home() / 'config.yaml'
+    return yaml.safe_load(path.read_text()) if path.is_file() else {}
+def cfg_get(config, section, key):
+    return config.get(section, {}).get(key)
+""")
+    for name in ("yaml", "dotenv"):
+        spec = importlib.util.find_spec(name)
+        shutil.copytree(
+            Path(spec.origin).parent, source.parent / "site-packages" / name,
+            dirs_exist_ok=True,
+        )
+
+
+def _write_memory_provider(plugin, label):
+    _write(plugin / "__init__.py", f"""
+from agent.memory_provider import MemoryProvider
+from hermes_constants import get_hermes_home
+from .helper import resource
+class Provider(MemoryProvider):
+    name = {plugin.name!r}
+    def is_available(self): return True
+    def initialize(self, *args, **kwargs): pass
+    def get_tool_schemas(self): return []
+    def system_prompt_block(self): return {label!r} + ':' + resource()
+    def prefetch(self, query, **kwargs):
+        return (get_hermes_home() / 'memory-state.txt').read_text()
+def register(ctx):
+    ctx.register_memory_provider(Provider())
+""")
+    _write(plugin / "helper.py", """
+from pathlib import Path
+def resource(): return Path(__file__).with_name('resource.txt').read_text()
+""")
+    _write(plugin / "resource.txt", label + " resource")
+    _write(plugin / "plugin.yaml", "description: " + label + " memory\n")
+    _write(plugin / "cli.py", """
+from .helper import resource
+def register_cli(parser):
+    parser.set_defaults(memory_resource=resource())
+""")
+    _write(plugin / "config_schema.py", f"""
+from pathlib import Path
+from plugins.memory.config_schema import ProviderConfigSchema
+CONFIG_SCHEMA = ProviderConfigSchema(
+    name={plugin.name!r}, label=Path(__file__).with_name('resource.txt').read_text(),
+)
+""")
+
 @pytest.fixture
 def runtime_storage(tmp_path, monkeypatch):
     with tempfile.TemporaryDirectory(prefix="runtime-storage-", dir=tmp_path) as raw:
@@ -127,7 +194,10 @@ print(json.dumps({
     monkeypatch.delenv("HERMES_KANBAN_BOOTSTRAP_PATH", raising=False)
     for _, variable in runtime._RUNTIME_RESOURCE_ROOTS:
         monkeypatch.delenv(variable, raising=False)
-    monkeypatch.setattr(generation, "_runtime_import_roots", lambda root, *, profile_home=None: [dependencies, external])
+    monkeypatch.setattr(
+        generation, "_runtime_import_roots",
+        lambda root, *, profile_home=None, project_plugins_enabled=None: [dependencies, external],
+    )
     native_inputs = generation._python_runtime_inputs
     def native_with_probe():
         paths, excluded, executable = native_inputs()
@@ -137,8 +207,11 @@ print(json.dumps({
         paths[str(native_probe)] = str(Path(stdlib) / "native_probe.py")
         return paths, excluded, executable
     monkeypatch.setattr(generation, "_python_runtime_inputs", native_with_probe)
-    def prepare(*, profile_home=None):
-        return generation.prepare_runtime_generation(runtime.runtime_identity(source), profile_home=profile_home)
+    def prepare(*, profile_home=None, project_plugins_enabled=None):
+        return generation.prepare_runtime_generation(
+            runtime.runtime_identity(source), profile_home=profile_home,
+            project_plugins_enabled=project_plugins_enabled,
+        )
     return source, dependencies, plugins, external, native_probe, prepare
 
 
@@ -273,6 +346,7 @@ print(json.dumps({
 @pytest.mark.parametrize("assigned_profile", [False, True])
 def test_fresh_home_freezes_absent_plugins_until_next_generation(installation, assigned_profile):
     source, _, plugins, _, _, prepare = installation
+    _install_memory_loaders(source)
     home = source.parent / "assigned-home" if assigned_profile else plugins.parent
     home.mkdir(exist_ok=True)
     pending = plugins.with_name("pending-plugins")
@@ -280,6 +354,7 @@ def test_fresh_home_freezes_absent_plugins_until_next_generation(installation, a
         shutil.copytree(plugins, pending)
     else:
         plugins.rename(pending)
+    _write_memory_provider(pending / "generationmemory", "captured")
     worker_env = {"HERMES_HOME": str(home)}
     _write(source / "hermes_cli" / "main.py", """
 import json
@@ -291,12 +366,15 @@ sys.stdin.readline()
 from hermes_constants import get_hermes_home
 from hermes_cli.kanban_runtime_generation import generation_runtime_path
 from providers import get_provider_profile
+from plugins.memory import list_memory_provider_names, load_memory_provider
 directory = generation_runtime_path(get_hermes_home() / 'plugins')
 assert directory.is_relative_to(Path(os.environ['HERMES_KANBAN_RUNTIME_GENERATION']))
 profile = get_provider_profile('generation-fixture')
+memory = load_memory_provider('generationmemory', register_skills=False) if 'generationmemory' in list_memory_provider_names() else None
 print(json.dumps({
     'directory': directory.exists(),
     'provider': profile.resolve_aux_model() if profile else None,
+    'memory': memory.system_prompt_block() if memory else None,
 }), flush=True)
 """)
     prepared = prepare(profile_home=home if assigned_profile else None)
@@ -304,7 +382,7 @@ print(json.dumps({
     try:
         assert child.stdout.readline().strip() == "ready"
         pending.rename(home / "plugins")
-        assert _finish(child) == {"directory": False, "provider": None}
+        assert _finish(child) == {"directory": False, "provider": None, "memory": None}
     finally:
         if child.poll() is None:
             child.kill()
@@ -313,7 +391,7 @@ print(json.dumps({
     newer = _launch(following, env=worker_env)
     try:
         assert newer.stdout.readline().strip() == "ready"
-        assert _finish(newer) == {"directory": True, "provider": "old"}
+        assert _finish(newer) == {"directory": True, "provider": "old", "memory": "captured:captured resource"}
     finally:
         if newer.poll() is None:
             newer.kill()

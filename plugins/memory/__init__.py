@@ -39,11 +39,12 @@ def _get_project_plugins_dir() -> Optional[Path]:
     """``./.hermes/plugins/`` or None. Gated on HERMES_ENABLE_PROJECT_PLUGINS like the
     PluginManager scan: a repo you merely ``cd`` into must not offer a memory backend."""
     try:
-        from hermes_cli.plugins import _env_enabled
+        from hermes_cli.kanban_runtime_generation import generation_runtime_path
+        from utils import env_var_enabled
 
-        if not _env_enabled("HERMES_ENABLE_PROJECT_PLUGINS"):
+        if not env_var_enabled("HERMES_ENABLE_PROJECT_PLUGINS"):
             return None
-        d = Path.cwd() / ".hermes" / "plugins"
+        d = generation_runtime_path(Path.cwd() / ".hermes" / "plugins")
         return d if d.is_dir() else None
     except Exception:
         return None
@@ -128,12 +129,13 @@ def _entry_point_package_dir(entry_point) -> Optional[Path]:
         return None
     try:
         from hermes_cli.plugins import resolve_module_origin
+        from hermes_cli.kanban_runtime_generation import generation_runtime_path
 
         module_name = (entry_point.value or "").split(":")[0].strip()
         origin = resolve_module_origin(module_name)
         if not origin:
             return None
-        path = Path(origin)
+        path = generation_runtime_path(origin)
         return path.parent if path.name == "__init__.py" else None
     except Exception as exc:
         logger.debug("Could not resolve directory for entry point '%s': %s",

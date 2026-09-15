@@ -25,6 +25,10 @@ from tests.hermes_cli.test_kanban_lifecycle_conformance import (
     _prepare_fixture_generation,
     _wait_for_receipt,
 )
+from tests.hermes_cli.test_kanban_runtime_generation import (
+    _install_memory_loaders,
+    _write_memory_provider,
+)
 
 
 @pytest.fixture
@@ -45,8 +49,11 @@ def worker_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _make_runtime_fixture(source)
     prepared = []
 
-    def prepare(_expected, *, workspace=None, profile_home=None):
-        generation = _prepare_fixture_generation(source, workspace=workspace, profile_home=profile_home)
+    def prepare(_expected, *, workspace=None, profile_home=None, project_plugins_enabled=None):
+        generation = _prepare_fixture_generation(
+            source, workspace=workspace, profile_home=profile_home,
+            project_plugins_enabled=project_plugins_enabled,
+        )
         prepared.append(generation)
         return generation
 
@@ -198,6 +205,163 @@ value = {
         _finish_launch(launch)
 
 
+@pytest.mark.parametrize("source_change", ["mutate", "remove"])
+def test_worker_captures_assigned_profile_memory_loaders_and_resources(
+    worker_setup, monkeypatch, source_change,
+):
+    workspace, task = worker_setup
+    source = workspace.parent / "install"
+    _install_memory_loaders(source)
+    dispatcher_home = workspace.parent / ".hermes" / "profiles" / "cto"
+    worker_home = dispatcher_home.with_name(task.assignee)
+    for home, label in ((dispatcher_home, "dispatcher"), (worker_home, "assigned")):
+        _write_memory_provider(home / "plugins" / "profilememory", label)
+    worker_home.joinpath("config.yaml").write_text("memory:\n  provider: inactive\n", encoding="utf-8")
+    worker_home.joinpath("memory-state.txt").write_text("before capture", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(dispatcher_home))
+    (source / "fixture_early.py").write_text("""
+import argparse
+import importlib
+import importlib.resources
+from plugins.memory import discover_plugin_cli_commands, find_provider_dir, load_memory_provider
+from plugins.memory.config_schema import get_provider_config_schema
+schema = get_provider_config_schema('profilememory')
+command, = discover_plugin_cli_commands()
+parser = argparse.ArgumentParser()
+command['setup_fn'](parser)
+provider = load_memory_provider('profilememory')
+module = importlib.import_module(type(provider).__module__)
+cli = importlib.import_module(module.__name__ + '.cli')
+helper = importlib.import_module(module.__name__ + '.helper')
+resource = importlib.resources.files(module).joinpath('resource.txt')
+value = {
+    'provider': provider.system_prompt_block(),
+    'state': provider.prefetch('current state'),
+    'schema': schema.label,
+    'cli': parser.parse_args([]).memory_resource,
+    'description': command['description'],
+    'resource': resource.read_text(),
+    'locations': [
+        module.__file__, cli.__file__, helper.__file__, str(resource),
+        str(find_provider_dir('profilememory') / 'config_schema.py'),
+    ],
+}
+""", encoding="utf-8")
+    restart_safe_argv = kbd._restart_safe_worker_argv
+
+    def change_profile_before_spawn(task, command, *, preparation_id=None):
+        command = restart_safe_argv(task, command, preparation_id=preparation_id)
+        if source_change == "remove":
+            shutil.rmtree(worker_home / "plugins")
+        else:
+            plugin = worker_home / "plugins" / "profilememory"
+            for name in ("__init__.py", "helper.py", "cli.py", "config_schema.py"):
+                (plugin / name).write_text("raise RuntimeError('live memory code')\n", encoding="utf-8")
+            (plugin / "resource.txt").write_text("live memory resource", encoding="utf-8")
+            (plugin / "plugin.yaml").write_text("description: live manifest\n", encoding="utf-8")
+        # Config and provider data remain live even though executable resources do not.
+        worker_home.joinpath("config.yaml").write_text("memory:\n  provider: profilememory\n", encoding="utf-8")
+        worker_home.joinpath("memory-state.txt").write_text("after capture", encoding="utf-8")
+        return command
+
+    monkeypatch.setattr(kbd, "_restart_safe_worker_argv", change_profile_before_spawn)
+    launch = kbd._default_spawn(task, str(workspace), defer_grant=True)
+    snapshot = kbd._worker_runtime_snapshots[launch.launcher_pid]
+    try:
+        launch.grant(task.current_run_id, task.claim_lock)
+        observed = _wait_for_receipt(workspace.parent / "receipt.json")
+        memory = observed["early"][0]
+        assert memory["provider"] == "assigned:assigned resource"
+        assert memory["resource"] == memory["schema"] == memory["cli"] == "assigned resource"
+        assert memory["description"] == "assigned memory"
+        assert memory["state"] == "after capture"
+        assert all(Path(path).is_relative_to(snapshot) for path in memory["locations"])
+        assert observed["home"] == str(worker_home)
+        assert os.environ["HERMES_HOME"] == str(dispatcher_home)
+    finally:
+        _finish_launch(launch)
+
+
+@pytest.mark.parametrize(("dispatcher_gate", "profile_env", "enabled"), [
+    ("0", "HERMES_ENABLE_PROJECT_PLUGINS=1\n", True),
+    ("1", "HERMES_ENABLE_PROJECT_PLUGINS=0\n", False),
+    ("0", "WORKER_PROJECT_GATE=on\nHERMES_ENABLE_PROJECT_PLUGINS=${WORKER_PROJECT_GATE}\n", True),
+    ("1", "WORKER_PROJECT_GATE\nHERMES_ENABLE_PROJECT_PLUGINS=${WORKER_PROJECT_GATE:-1}\n", False),
+])
+def test_worker_project_plugin_capture_matches_profile_dotenv(
+    worker_setup, monkeypatch, dispatcher_gate, profile_env, enabled,
+):
+    workspace, task = worker_setup
+    source = workspace.parent / "install"
+    _install_memory_loaders(source)
+    worker_home = workspace.parent / ".hermes" / "profiles" / task.assignee
+    worker_home.joinpath(".env").write_text(profile_env, encoding="utf-8")
+    monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", dispatcher_gate)
+    monkeypatch.delenv("WORKER_PROJECT_GATE", raising=False)
+    plugin = workspace / ".hermes" / "plugins" / "projectmemory"
+    _write_memory_provider(plugin, "project")
+    (source / "fixture_early.py").write_text("""
+import importlib
+from pathlib import Path
+from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.kanban_runtime import RuntimeIdentityError
+from hermes_cli.kanban_runtime_generation import generation_runtime_path
+from plugins.memory import find_provider_dir, list_memory_provider_names, load_memory_provider
+from utils import env_var_enabled
+gate_before = env_var_enabled('HERMES_ENABLE_PROJECT_PLUGINS')
+discovered_before = 'projectmemory' in list_memory_provider_names()
+load_hermes_dotenv(load_external_secrets=False)
+try:
+    generation_runtime_path(Path.cwd() / '.hermes' / 'plugins')
+    captured = True
+except RuntimeIdentityError:
+    captured = False
+directory = find_provider_dir('projectmemory')
+provider = load_memory_provider('projectmemory', register_skills=False) if directory else None
+module = importlib.import_module(type(provider).__module__) if provider else None
+value = {
+    'captured': captured,
+    'gate_before': gate_before,
+    'discovered_before': discovered_before,
+    'discovered': 'projectmemory' in list_memory_provider_names(),
+    'provider': provider.system_prompt_block() if provider else None,
+    'origin': module.__file__ if module else None,
+    'gate_after': env_var_enabled('HERMES_ENABLE_PROJECT_PLUGINS'),
+}
+""", encoding="utf-8")
+    restart_safe_argv = kbd._restart_safe_worker_argv
+
+    def change_project_before_spawn(task, command, *, preparation_id=None):
+        command = restart_safe_argv(task, command, preparation_id=preparation_id)
+        if enabled:
+            shutil.rmtree(plugin.parent)
+        else:
+            # A disabled worker must not discover even a still-present plugin.
+            (plugin / "__init__.py").write_text("raise RuntimeError('disabled plugin imported')\n", encoding="utf-8")
+        return command
+
+    monkeypatch.setattr(kbd, "_restart_safe_worker_argv", change_project_before_spawn)
+    launch = kbd._default_spawn(task, str(workspace), defer_grant=True)
+    snapshot = kbd._worker_runtime_snapshots[launch.launcher_pid]
+    try:
+        launch.grant(task.current_run_id, task.claim_lock)
+        plugin = _wait_for_receipt(workspace.parent / "receipt.json")["early"][0]
+        assert plugin["discovered"] is enabled
+        assert plugin["discovered_before"] is enabled
+        assert plugin["captured"] is enabled
+        assert plugin["gate_before"] is plugin["gate_after"] is enabled
+        if enabled:
+            assert plugin["provider"] == "project:project resource"
+            assert Path(plugin["origin"]).is_relative_to(snapshot)
+        else:
+            assert plugin["provider"] is None
+            assert plugin["origin"] is None
+        assert os.environ["HERMES_ENABLE_PROJECT_PLUGINS"] == dispatcher_gate
+        assert "WORKER_PROJECT_GATE" not in os.environ
+    finally:
+        _finish_launch(launch)
+
+
 @pytest.mark.linux_only
 def test_managed_gateway_worker_spawn_fails_closed_without_scope(
     worker_setup, monkeypatch, forbid_worker_spawn,
@@ -337,7 +501,7 @@ conn = sqlite3.connect(base / 'restart.db')
 conn.row_factory = sqlite3.Row
 with patch.object(kbd, '_profile_exists_fn', return_value=None), patch.object(
     kbd, '_restart_safe_worker_argv', side_effect=lambda task, command, preparation_id=None: command,
-), patch.object(generations, 'prepare_runtime_generation', side_effect=lambda expected, workspace=None, profile_home=None: _prepare_fixture_generation(base / 'install', workspace=workspace, profile_home=profile_home)):
+), patch.object(generations, 'prepare_runtime_generation', side_effect=lambda expected, workspace=None, profile_home=None, project_plugins_enabled=None: _prepare_fixture_generation(base / 'install', workspace=workspace, profile_home=profile_home, project_plugins_enabled=project_plugins_enabled)):
     result = kbd.dispatch_once(conn, max_spawn=1, reconcile_orphans=False)
 assert len(result.spawned) == 1, result
 conn.close()

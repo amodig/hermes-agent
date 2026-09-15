@@ -360,7 +360,17 @@ def _build_update_plan(
     )
     if goal_reopened:
         new_status = _landing_status_after_parents(conn, row["id"])
-        if new_lifecycle.get("review_mode") == "same_card" and row["status"] in {"review", "done"}:
+        if (
+            request.assignee is _kb._UPDATE_UNSET
+            and new_lifecycle.get("review_mode") == "same_card"
+            and (
+                row["status"] in {"review", "done"}
+                or (
+                    row["status"] == "blocked"
+                    and _kb._resume_status_from_events(conn, row["id"]) == "review"
+                )
+            )
+        ):
             routing = _implementation_routing(conn, row["id"])
             implementation_assignee = routing.get("implementer")
             if not implementation_assignee:

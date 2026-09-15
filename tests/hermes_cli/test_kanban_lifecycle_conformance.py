@@ -130,12 +130,16 @@ Path(os.environ["HERMES_TEST_RUNTIME_RECEIPT"]).write_text(json.dumps(payload))
 
 def _prepare_fixture_generation(
     root: Path, prepare=generations.prepare_runtime_generation, *, workspace=None, profile_home=None,
+    project_plugins_enabled: bool | None = None,
 ):
     resources = {env_var: str(root / directory) for directory, env_var in runtime._RUNTIME_RESOURCE_ROOTS}
     with patch.dict(os.environ, resources), patch.object(
         generations, "_runtime_import_roots", return_value=[root.parent / "site-packages"],
     ):
-        return prepare(runtime_identity(root), workspace=workspace, profile_home=profile_home)
+        return prepare(
+            runtime_identity(root), workspace=workspace, profile_home=profile_home,
+            project_plugins_enabled=project_plugins_enabled,
+        )
 
 
 def _wait_for_receipt(path: Path) -> dict:
@@ -497,6 +501,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
             self.assertEqual(
                 get_lifecycle_state(self.conn, implementation)["acceptance"], "accepted",
             )
+            before_rejected_updates = tuple(self.conn.iterdump())
             with self.assertRaises(kb.LifecycleContractError):
                 kb.update_task(
                     self.conn, implementation,
@@ -505,6 +510,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
                     expected_version=completed.version,
                     reason="cannot reassign genuine review work",
                 )
+            self.assertEqual(tuple(self.conn.iterdump()), before_rejected_updates)
             with self.assertRaises(kb.LifecycleContractError):
                 kb.update_task(
                     self.conn, implementation,
@@ -513,12 +519,24 @@ class KanbanLifecycleConformance(unittest.TestCase):
                     expected_version=completed.version,
                     reason="cannot change classified contract while reopening",
                 )
-            self.assertEqual(self._task(implementation).version, completed.version)
+            self.assertEqual(tuple(self.conn.iterdump()), before_rejected_updates)
+            with self.assertRaises(kb.LifecycleContractError):
+                kb.update_task(
+                    self.conn, implementation,
+                    body="revised implementation goal",
+                    assignee="reviewer",
+                    lifecycle_contract=contract,
+                    expected_version=completed.version,
+                    reason="cannot assign implementation to its reviewer",
+                )
+            self.assertEqual(tuple(self.conn.iterdump()), before_rejected_updates)
             self.assertTrue(
                 kb.update_task(
                     self.conn, implementation,
                     body="revised implementation goal",
-                    assignee="implementer",
+                    assignee="replacement-builder",
+                    model="replacement-model",
+                    provider="replacement-provider",
                     lifecycle_contract=contract,
                     expected_version=completed.version,
                     reason="reopen completed code for an explicit goal revision",
@@ -526,7 +544,9 @@ class KanbanLifecycleConformance(unittest.TestCase):
             )
             reopened = self._task(implementation)
             self.assertEqual(reopened.status, "ready")
-            self.assertEqual(reopened.assignee, "implementer")
+            self.assertEqual(reopened.assignee, "replacement-builder")
+            self.assertEqual(reopened.model_override, "replacement-model")
+            self.assertEqual(reopened.provider_override, "replacement-provider")
             self.assertEqual(reopened.lifecycle_contract, contract)
             self.assertNotEqual(reopened.goal_revision_id, completed.goal_revision_id)
             self.assertIsNone(reopened.candidate_run_id)
@@ -540,10 +560,10 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 kb.claim_review_task(self.conn, implementation, claimer="reviewer:conformance")
             )
             implementation_run = kb.claim_task(
-                self.conn, implementation, claimer="implementer:conformance"
+                self.conn, implementation, claimer="replacement-builder:conformance"
             )
             self.assertIsNotNone(implementation_run)
-            self.assertEqual(implementation_run.assignee, "implementer")
+            self.assertEqual(implementation_run.assignee, "replacement-builder")
 
 
     def test_archived_negative_role_evidence_is_pending(self) -> None:
@@ -1433,11 +1453,26 @@ class KanbanLifecycleConformance(unittest.TestCase):
         self.assertEqual(self._task(validation).status, "todo")
 
     def test_blocked_same_card_review_keeps_reviewer_identity(self) -> None:
+        repo = Path(self.home.name) / "workspace"
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        _git(repo, "config", "user.email", "conformance@example.invalid")
+        _git(repo, "config", "user.name", "Kanban Conformance")
+        (repo / "README").write_text("base\n", encoding="utf-8")
+        _git(repo, "add", "README")
+        _git(repo, "commit", "-qm", "base")
+        base_sha = _git(repo, "rev-parse", "HEAD")
+        (repo / "lifecycle.py").write_text("print('proof')\n", encoding="utf-8")
+        _git(repo, "add", "lifecycle.py")
+        _git(repo, "commit", "-qm", "implementation")
+        head_sha = _git(repo, "rev-parse", "HEAD")
         task_id = kb.create_task(
             self.conn,
             title="blocked same-card review",
             assignee="builder",
             initial_status="blocked",
+            workspace_kind="dir",
+            workspace_path=str(repo),
             lifecycle_contract={
                 "kind": "code",
                 "review_mode": "same_card",
@@ -1445,25 +1480,118 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 "validation_required": False,
             },
         )
-        with kb.write_txn(self.conn):
-            kb._append_event(
-                self.conn,
-                task_id,
-                "blocked",
-                {"source_status": "review", "resume_status": "review"},
+        self.assertTrue(kb.unblock_task(self.conn, task_id))
+        implementation_run = kb.claim_task(self.conn, task_id, claimer="builder:conformance")
+        self.assertIsNotNone(implementation_run)
+        self.assertTrue(
+            kb.complete_task(
+                self.conn, task_id,
+                expected_run_id=implementation_run.current_run_id,
+                summary="Implementation evidence",
+                metadata={
+                    "base_sha": base_sha,
+                    "head_sha": head_sha,
+                    "changed_files": ["lifecycle.py"],
+                },
             )
-
+        )
+        review_run = kb.claim_review_task(self.conn, task_id, claimer="reviewer:conformance")
+        self.assertIsNotNone(review_run)
+        self.assertTrue(
+            kb.block_task(
+                self.conn, task_id, kind="needs_input",
+                reason="human decision needed for review",
+                expected_run_id=review_run.current_run_id,
+            )
+        )
+        blocked = self._task(task_id)
+        self.assertEqual(blocked.status, "blocked")
+        self.assertEqual(blocked.assignee, "reviewer")
+        self.assertEqual(blocked.candidate_run_id, implementation_run.current_run_id)
+        before_rejected_updates = tuple(self.conn.iterdump())
         with self.assertRaises(kb.LifecycleContractError):
             kb.assign_task(self.conn, task_id, "builder")
+        self.assertEqual(tuple(self.conn.iterdump()), before_rejected_updates)
         with self.assertRaises(kb.LifecycleContractError):
             kb.update_task(
                 self.conn, task_id,
                 assignee="builder",
-                lifecycle_contract=self._task(task_id).lifecycle_contract,
-                expected_version=self._task(task_id).version,
-                reason="cannot reroute blocked review to implementation",
+                lifecycle_contract=blocked.lifecycle_contract,
+                expected_version=blocked.version,
+                reason="cannot reroute blocked review without a goal revision",
             )
+        self.assertEqual(tuple(self.conn.iterdump()), before_rejected_updates)
         self.assertTrue(kb.assign_task(self.conn, task_id, "reviewer"))
+        blocked = self._task(task_id)
+        self.assertTrue(
+            kb.update_task(
+                self.conn, task_id,
+                title="revised implementation goal after human input",
+                expected_version=blocked.version,
+                reason="reopen blocked review for implementation",
+            )
+        )
+        reopened = self._task(task_id)
+        self.assertEqual(reopened.status, "ready")
+        self.assertEqual(reopened.assignee, "builder")
+        self.assertEqual(reopened.lifecycle_contract, blocked.lifecycle_contract)
+        self.assertEqual(reopened.version, blocked.version + 1)
+        self.assertNotEqual(reopened.goal_revision_id, blocked.goal_revision_id)
+        self.assertIsNone(reopened.candidate_run_id)
+        self.assertIsNone(reopened.completed_at)
+        self.assertIsNone(reopened.result)
+        self.assertIsNone(kb.claim_review_task(self.conn, task_id, claimer="reviewer:conformance"))
+        resumed = kb.claim_task(self.conn, task_id, claimer="builder:conformance")
+        self.assertIsNotNone(resumed)
+        self.assertEqual(resumed.assignee, "builder")
+        (repo / "lifecycle.py").write_text("print('revised proof')\n", encoding="utf-8")
+        _git(repo, "add", "lifecycle.py")
+        _git(repo, "commit", "-qm", "revised implementation")
+        revised_head = _git(repo, "rev-parse", "HEAD")
+        self.assertTrue(
+            kb.complete_task(
+                self.conn, task_id,
+                expected_run_id=resumed.current_run_id,
+                summary="Revised implementation evidence",
+                metadata={
+                    "base_sha": head_sha,
+                    "head_sha": revised_head,
+                    "changed_files": ["lifecycle.py"],
+                },
+            )
+        )
+        pending_review = self._task(task_id)
+        self.assertEqual(pending_review.status, "review")
+        self.assertEqual(pending_review.assignee, "reviewer")
+        self.assertEqual(pending_review.candidate_run_id, resumed.current_run_id)
+        self.assertEqual(get_lifecycle_state(self.conn, task_id)["acceptance"], "pending")
+        self.assertIsNone(kb.claim_task(self.conn, task_id, claimer="builder:conformance"))
+        fresh_review = kb.claim_review_task(self.conn, task_id, claimer="reviewer:conformance")
+        self.assertIsNotNone(fresh_review)
+        self.assertTrue(
+            kb.block_task(
+                self.conn, task_id, kind="needs_input",
+                reason="human decision needed for revised review",
+                expected_run_id=fresh_review.current_run_id,
+            )
+        )
+        self.assertEqual(self._task(task_id).status, "blocked")
+        self.assertTrue(kb.unblock_task(self.conn, task_id))
+        self.assertEqual(self._task(task_id).status, "review")
+        self.assertEqual(self._task(task_id).assignee, "reviewer")
+        fresh_review = kb.claim_review_task(self.conn, task_id, claimer="reviewer:conformance")
+        self.assertIsNotNone(fresh_review)
+        self.assertTrue(
+            kb.complete_task(
+                self.conn, task_id,
+                expected_run_id=fresh_review.current_run_id,
+                verdict="APPROVE",
+                summary="Revised implementation approved",
+                metadata={"reviewed_head_sha": revised_head},
+            )
+        )
+        self.assertEqual(self._task(task_id).status, "done")
+        self.assertEqual(get_lifecycle_state(self.conn, task_id)["acceptance"], "accepted")
 
 
     def test_deletion_protects_review_parent_of_validation(self) -> None:
@@ -2402,8 +2530,9 @@ recovery.recover_if_needed(project_root=root, argv=[])
                 side_effect=lambda task, command, preparation_id=None: command,
             ), patch.object(
                 generations, "prepare_runtime_generation",
-                side_effect=lambda expected, workspace=None, profile_home=None: _prepare_fixture_generation(
+                side_effect=lambda expected, workspace=None, profile_home=None, project_plugins_enabled=None: _prepare_fixture_generation(
                     source, workspace=workspace, profile_home=profile_home,
+                    project_plugins_enabled=project_plugins_enabled,
                 ),
             ), patch.dict(os.environ, {
                 "HERMES_TEST_RUNTIME_RECEIPT": str(receipt), "HERMES_BIN": "",
@@ -2494,8 +2623,9 @@ recovery.recover_if_needed(project_root=root, argv=[])
                 side_effect=lambda task, command, preparation_id=None: command,
             ), patch.object(
                 generations, "prepare_runtime_generation",
-                side_effect=lambda expected, workspace=None, profile_home=None: _prepare_fixture_generation(
+                side_effect=lambda expected, workspace=None, profile_home=None, project_plugins_enabled=None: _prepare_fixture_generation(
                     source, workspace=workspace, profile_home=profile_home,
+                    project_plugins_enabled=project_plugins_enabled,
                 ),
             ), patch.dict(os.environ, {"HERMES_BIN": ""}):
                 result = kbd.dispatch_once(self.conn, max_spawn=1, reconcile_orphans=False)
