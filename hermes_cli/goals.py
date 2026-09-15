@@ -1492,23 +1492,30 @@ class GoalManager:
 # back at the lifecycle contract (it already has the full task body).
 KANBAN_GOAL_CONTINUATION_TEMPLATE = (
     "[Continuing toward this kanban task — judge says it is not done yet]\n"
-    "Reason: {reason}\n\n"
+    "Judge feedback: {reason}\n\n"
     "Take the next concrete step toward completing the task. When the work "
-    "is genuinely finished, call kanban_complete with a summary. If it is a "
-    "code change that needs same-card review before counting as done, call "
-    "kanban_request_review with a summary instead. If you are blocked and "
-    "need human input, call kanban_block with a reason. Do not stop without "
-    "calling one of them."
+    "is genuinely finished, call kanban_complete with a summary. For a typed "
+    "review card, include verdict=APPROVE or REQUEST_CHANGES; for a typed "
+    "validation card, include verdict=PASS or FAIL. A review handoff is not "
+    "acceptance: the board computes acceptance from fresh execution, review, "
+    "and validation evidence. If this is a ``kind=code`` implementation "
+    "task, put direct ``base_sha`` and ``head_sha`` commit fields in "
+    "kanban_complete's ``metadata``. If you are blocked and need human input, "
+    "call kanban_block with a reason. Do not stop without calling one of them."
 )
 
 # Judge says done but the worker never called kanban_complete/kanban_block: one explicit nudge.
 KANBAN_GOAL_FINALIZE_TEMPLATE = (
     "[The work looks complete, but the task is still open]\n"
     "Reason: {reason}\n\n"
-    "If the task is genuinely done, call kanban_complete now with a short "
-    "summary of what you did. If it is a code change awaiting same-card review, "
-    "call kanban_request_review with that summary instead. If something still "
-    "blocks completion, call kanban_block with the reason instead."
+    "If this is implementation work, call kanban_complete with a short "
+    "summary (or kanban_request_review for a same-card review handoff). "
+    "For ``kind=code`` implementation work, put direct ``base_sha`` and "
+    "``head_sha`` commit fields in the handoff ``metadata``. For typed review "
+    "cards use verdict=APPROVE or REQUEST_CHANGES; for "
+    "typed validation cards use verdict=PASS or FAIL. Acceptance is a "
+    "computed projection, not a status toggle. If something still blocks "
+    "completion, call kanban_block with the reason instead."
 )
 
 
@@ -1519,6 +1526,7 @@ _KANBAN_TERMINAL_STATUSES = {
     "blocked": ("blocked_by_worker", "worker blocked the task", "task {task_id} blocked by worker after {turns} turn(s)"),
     # kanban_request_review is a legitimate terminator: implementation done, awaiting a reviewer.
     "review": ("review_requested_by_worker", "worker requested review", "task {task_id} handed off for review by worker after {turns} turn(s)"),
+    "validation": ("validation_requested_by_worker", "worker requested validation", "task {task_id} handed off for validation by worker after {turns} turn(s)"),
     "changes_requested": ("changes_requested_by_reviewer", "reviewer requested changes", "reviewer returned task {task_id} for changes after {turns} turn(s)"),
 }
 

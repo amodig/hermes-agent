@@ -193,6 +193,7 @@ gateway:
       timed_out:           "timed out; dispatcher will retry"
       blocked:             "blocked; needs attention"
       review_requested:    "handed off for review; the implementation is done"
+      validation_requested: "handed off for validation; review is approved"
       changes_requested:   "review requested changes (BLOCK); implementation is not approved"
       block_loop_detected: "routed to triage after repeated blocks; needs a decision"
       status_default:      "status changed"

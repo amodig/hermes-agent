@@ -205,12 +205,12 @@ def _discover_files(roots: List[Path]) -> List[Path]:
     ``.py`` files (included as-is, even if they don't match the
     ``test_*`` prefix — caller knows what they want).
 
-    Exclude any file whose path contains a component in ``_SKIP_PARTS``,
-    UNLESS the user explicitly named it as a root (in which case the
-    user's intent overrides the skip filter). This makes
+    Exclude any file whose path contains a component in ``_SKIP_PARTS`` and
+    the lifecycle conformance file, unless the user explicitly named it as a
+    root (in which case the user's intent overrides both filters). This makes
     ``scripts/run_tests.sh tests/docker/`` work locally the same way
-    ``pytest tests/docker/`` does — the CI-level skip exists to keep
-    the sharded matrix from blowing up, not to block targeted runs.
+    ``pytest tests/docker/`` does — the CI-level skip exists to keep the
+    sharded matrix from blowing up, not to block targeted runs.
     """
     seen: set[Path] = set()
     out: List[Path] = []
@@ -235,6 +235,13 @@ def _discover_files(roots: List[Path]) -> List[Path]:
         }
         effective_skips = _SKIP_PARTS - root_skip_overrides
         for path in root.rglob("test_*.py"):
+            if (
+                path.name == "test_kanban_lifecycle_conformance.py"
+                and path.parent.name == "hermes_cli"
+                and path.parent.parent.name == "tests"
+                and not (root.name == "hermes_cli" and root.parent.name == "tests")
+            ):
+                continue
             if any(part in effective_skips for part in path.parts):
                 continue
             real = path.resolve()

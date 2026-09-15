@@ -69,6 +69,143 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
     assert c1.assignee == "engineer"
 
 
+def test_decompose_rejects_role_without_candidate_parent_edge(kanban_home):
+    with kbc.connect() as conn:
+        root = _create_triage(conn, title="typed graph")
+        children = [
+            {"title": "implementation", "parents": []},
+            {
+                "title": "review",
+                "parents": [],
+                "lifecycle_contract": {
+                    "kind": "review",
+                    "candidate_task_index": 0,
+                },
+            },
+        ]
+        with pytest.raises(ValueError, match="candidate_task_index"):
+            kb.decompose_triage_task(
+                conn,
+                root,
+                root_assignee="orchestrator",
+                children=children,
+                author="decomposer",
+            )
+        assert kb.get_task(conn, root).status == "triage"
+        assert len(kb.list_tasks(conn, include_archived=True)) == 1
+
+
+
+@pytest.mark.parametrize(
+    "children",
+    [
+        [
+            {
+                "title": "implementation",
+                "parents": [],
+                "lifecycle_contract": {
+                    "kind": "code",
+                    "review_mode": "separate_card",
+                    "reviewer": "reviewer",
+                    "validation_required": False,
+                },
+            },
+        ],
+        [
+            {
+                "title": "implementation",
+                "parents": [],
+                "lifecycle_contract": {
+                    "kind": "code",
+                    "review_mode": "separate_card",
+                    "reviewer": "reviewer",
+                    "validation_required": True,
+                },
+            },
+            {
+                "title": "review",
+                "parents": [0],
+                "lifecycle_contract": {
+                    "kind": "review",
+                    "candidate_task_index": 0,
+                },
+            },
+        ],
+    ],
+    ids=("missing-review", "missing-validation"),
+)
+def test_decompose_requires_declared_role_children(kanban_home, children):
+    with kbc.connect() as conn:
+        root = _create_triage(conn, title="incomplete typed graph")
+        with pytest.raises(ValueError, match="requires exactly one"):
+            kb.decompose_triage_task(
+                conn,
+                root,
+                root_assignee="orchestrator",
+                children=children,
+                author="decomposer",
+            )
+        assert kb.get_task(conn, root).status == "triage"
+        assert len(kb.list_tasks(conn, include_archived=True)) == 1
+
+def test_decompose_allows_separate_card_validation_after_review(kanban_home):
+    with kbc.connect() as conn:
+        root = _create_triage(conn, title="separate card graph")
+        child_ids = kb.decompose_triage_task(
+            conn,
+            root,
+            root_assignee="orchestrator",
+            children=[
+                {
+                    "title": "implementation",
+                    "assignee": "implementer",
+                    "parents": [],
+                    "lifecycle_contract": {
+                        "kind": "code",
+                        "review_mode": "separate_card",
+                        "reviewer": "reviewer",
+                        "validation_required": True,
+                    },
+                },
+                {
+                    "title": "review",
+                    "assignee": "reviewer",
+                    "parents": [0],
+                    "lifecycle_contract": {
+                        "kind": "review",
+                        "candidate_task_index": 0,
+                    },
+                },
+                {
+                    "title": "validation",
+                    "assignee": "tester",
+                    "parents": [1],
+                    "lifecycle_contract": {
+                        "kind": "validation",
+                        "candidate_task_index": 0,
+                    },
+                },
+            ],
+            author="decomposer",
+        )
+        assert child_ids is not None
+        assert kb.parent_ids(conn, child_ids[1]) == [child_ids[0]]
+        assert kb.parent_ids(conn, child_ids[2]) == [child_ids[1]]
+
+        root_requirements = {
+            row["parent_id"]: row["requirement"]
+            for row in conn.execute(
+                "SELECT parent_id, requirement FROM task_links WHERE child_id = ?",
+                (root,),
+            )
+        }
+        assert root_requirements[child_ids[1]] == "review_approved"
+        assert root_requirements[child_ids[2]] == "validation_passed"
+
+        assert kb.unlink_tasks(conn, child_ids[1], root) is False
+        assert kb.unlink_tasks(conn, child_ids[2], root) is False
+
+
 def test_decompose_records_audit_comment_and_event(kanban_home):
     with kbc.connect() as conn:
         tid = _create_triage(conn)

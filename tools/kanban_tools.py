@@ -179,10 +179,18 @@ def _enforce_worker_task_ownership(tid: str) -> None:
             f"worker is scoped to task {env_tid}; refusing to mutate {tid}. Use kanban_comment "
             f"to hand off information to other tasks, or kanban_create to spawn follow-up work.")
 
+def _enforce_runtime_fence(tool_name: str) -> None:
+    if (
+        os.environ.get("HERMES_KANBAN_RUNTIME_FENCE") == "1"
+        and os.environ.get("HERMES_KANBAN_RUNTIME_GRANTED") != "1"
+    ):
+        raise _Reject(f"{tool_name} refused before verified worker runtime grant")
+
 
 def _worker_guard(tool_name: str, args: dict) -> str:
-    """Worker mutation preamble, in order: delegate-child rejection, task id
-    resolution, task-scope ownership. Returns the task id."""
+    """Worker mutation preamble, in order: runtime fence, delegate-child
+    rejection, task id resolution, task-scope ownership."""
+    _enforce_runtime_fence(tool_name)
     _reject_delegated_child_mutation(tool_name)
     tid = _require_task_id(args)
     _enforce_worker_task_ownership(tid)
@@ -312,11 +320,12 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override version revision goal_revision_id goal_mode".split())
+    "provider_override version revision goal_revision_id goal_mode lifecycle_contract "
+    "candidate_run_id".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
     "created_at started_at completed_at current_run_id model_override provider_override "
-    "version revision goal_revision_id goal_mode".split())
+    "version revision goal_revision_id goal_mode lifecycle_contract candidate_run_id".split())
 _RUN_FIELDS = tuple("id profile status outcome summary error metadata started_at ended_at".split())
 _COMMENT_FIELDS = ("author", "body", "created_at")
 _EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")
@@ -334,8 +343,14 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
     parents = kb.parent_ids(conn, task.id)
     children = kb.child_ids(conn, task.id)
     return {
-        **_fields(task, _TASK_SUMMARY_FIELDS), "parents": parents, "children": children,
-        "parent_count": len(parents), "child_count": len(children)}
+        **_fields(task, _TASK_SUMMARY_FIELDS),
+        "parents": parents,
+        "children": children,
+        "parent_count": len(parents),
+        "child_count": len(children),
+        "lifecycle": kb.get_lifecycle_state(conn, task.id),
+        "dependencies": kb.evaluate_dependencies(conn, task.id),
+    }
 
 
 # --- Goal-mode judge gate ---
@@ -517,6 +532,7 @@ def _handle_show(args: dict, **kw) -> str:
         return json.dumps({
             "task": _fields(task, _TASK_FIELDS),
             "effective_goal": effective_goal,
+            "lifecycle": kb.get_lifecycle_state(conn, tid),
             "parents": kb.parent_ids(conn, tid),
             "children": kb.child_ids(conn, tid),
             "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
@@ -564,6 +580,7 @@ def _handle_complete(args: dict, **kw) -> str:
     tid = _worker_guard("kanban_complete", args)
     summary = _redact_opt(args.get("summary"))
     result = _redact_opt(args.get("result"))
+    verdict = args.get("verdict")
     metadata = args.get("metadata")
     if isinstance(metadata, dict):
         # Keep the unredacted dict if the redacted JSON cannot be re-parsed.
@@ -573,7 +590,7 @@ def _handle_complete(args: dict, **kw) -> str:
     artifacts = _coerce_str_list(args.get("artifacts"), "artifacts", "file paths", strip=True)
     if artifacts:
         metadata = _merge_artifacts(metadata, artifacts)
-    _check(summary or result, "provide at least one of: summary (preferred), result")
+    _check(summary or result or verdict, "provide at least one of: summary, result, verdict")
     _require_dict_metadata(metadata)
     metadata = _stamp_worker_session_metadata(tid, metadata)
     with _board(args.get("board")) as (kb, conn):
@@ -582,12 +599,13 @@ def _handle_complete(args: dict, **kw) -> str:
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
         task = kb.get_task(conn, tid)
         effective_goal = kb.get_effective_goal(conn, tid)
-        _goal_gate("kanban_complete", task, tid, (summary or result or "").strip(),
+        _goal_gate("kanban_complete", task, tid, (summary or result or str(verdict) or "").strip(),
                    effective_goal=effective_goal)
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
-                created_cards=created_cards, expected_run_id=_worker_run_id(tid))
+                created_cards=created_cards, expected_run_id=_worker_run_id(tid),
+                verdict=verdict)
         except kb.CompletionContractError as contract_err:
             return tool_error(
                 f"kanban_complete blocked: {contract_err}. "
@@ -617,7 +635,11 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"created_cards=[] to skip the card-claim check entirely.")
         _check(ok, f"could not complete {tid} (unknown id or already terminal)")
         run = kb.latest_run(conn, tid)
-        return _ok(task_id=tid, run_id=run.id if run else None)
+        return _ok(
+            task_id=tid,
+            run_id=run.id if run else None,
+            lifecycle=kb.get_lifecycle_state(conn, tid),
+        )
 
 
 @_kanban_handler("kanban_block")
@@ -683,7 +705,10 @@ def _handle_request_review(args: dict, **kw) -> str:
             )
         _check(ok, f"could not request review for {tid}: "
                    f"{fail_reason or 'unknown id or not in running/ready'}")
-        return _ok_landed(kb, conn, tid, "review")
+        return _ok_landed(
+            kb, conn, tid, "review",
+            lifecycle=kb.get_lifecycle_state(conn, tid),
+        )
 
 
 @_kanban_handler("kanban_request_changes")
@@ -692,11 +717,21 @@ def _handle_request_changes(args: dict, **kw) -> str:
     tid = _worker_guard("kanban_request_changes", args)
     reason = _redact(
         _require_text(args, "reason", "reason is required — describe the changes needed"))
+    metadata = args.get("metadata")
+    _require_dict_metadata(metadata)
+    if metadata is not None:
+        metadata = _redact_metadata(metadata)
+        _check(metadata is not None, "metadata could not be safely serialized")
+    metadata = _stamp_worker_session_metadata(tid, metadata)
     with _board(args.get("board")) as (kb, conn):
         ok, detail = kb.request_changes(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid))
+            conn, tid, reason=reason, metadata=metadata,
+            expected_run_id=_worker_run_id(tid))
         _check(ok, f"could not request changes for {tid}: {detail or 'invalid review state'}")
-        return _ok_landed(kb, conn, tid, "ready", implementer=detail)
+        return _ok_landed(
+            kb, conn, tid, "ready", implementer=detail,
+            lifecycle=kb.get_lifecycle_state(conn, tid),
+        )
 
 
 @_kanban_handler("kanban_heartbeat")
@@ -883,10 +918,16 @@ def _handle_create(args: dict, **kw) -> str:
             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
+            lifecycle_contract=args.get("lifecycle_contract"),
             initial_status=str(args.get("initial_status") or "running"),
             created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
-        return _ok(task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid))
+        return _ok(
+            task_id=new_tid,
+            **landed,
+            lifecycle=kb.get_lifecycle_state(conn, new_tid),
+            subscribed=_maybe_auto_subscribe(conn, new_tid),
+        )
 
 
 def _resolve_notify_target() -> Optional[dict[str, Any]]:
@@ -997,6 +1038,8 @@ def _handle_update(args: dict, **kw) -> str:
             kwargs[name] = args[name]
     if "goal_mode" in args:
         kwargs["goal_mode"] = _parse_bool_arg(args, "goal_mode")
+    if "lifecycle_contract" in args:
+        kwargs["lifecycle_contract"] = args["lifecycle_contract"]
     with _board(args.get("board")) as (kb, conn):
         _check(kb.update_task(conn, tid, **kwargs), f"task {tid} not found")
         task = kb.get_task(conn, tid)
@@ -1007,17 +1050,38 @@ def _handle_update(args: dict, **kw) -> str:
             goal_revision_id=task.goal_revision_id if task else None,
             status=task.status if task else None,
             effective_goal=kb.get_effective_goal(conn, tid),
+            lifecycle=kb.get_lifecycle_state(conn, tid),
         )
+
+
 @_kanban_handler("kanban_link")
 def _handle_link(args: dict, **kw) -> str:
-    """Add a parent→child dependency edge after the fact (cycles/self-links → ValueError)."""
+    """Add or explicitly rebind a typed parent→child dependency edge."""
     _reject_delegated_child_mutation("kanban_link")
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     _check(parent_id and child_id, "both parent_id and child_id are required")
     with _board(args.get("board")) as (kb, conn):
-        kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
-        return _ok(parent_id=parent_id, child_id=child_id)
+        kb.link_tasks(
+            conn,
+            parent_id=parent_id,
+            child_id=child_id,
+            requirement=args.get("requirement"),
+            expected_parent_version=_opt_int(args.get("expected_parent_version")),
+            expected_child_version=_opt_int(args.get("expected_child_version")),
+            reason=args.get("reason"),
+            author=os.environ.get("HERMES_PROFILE") or "orchestrator",
+        )
+        edge = conn.execute(
+            "SELECT requirement FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (parent_id, child_id),
+        ).fetchone()
+        return _ok(
+            parent_id=parent_id,
+            child_id=child_id,
+            requirement=edge["requirement"] if edge else None,
+            lifecycle=kb.get_lifecycle_state(conn, child_id),
+        )
 
 
 def _repair_common(args: dict) -> tuple[str, str]:
@@ -1104,17 +1168,13 @@ def _handle_rework_review(args: dict, **kw) -> str:
     _require_orchestrator_tool("kanban_rework_review")
     board, reason = _repair_common(args)
     implementation_id = str(args.get("implementation_id") or "").strip()
-    reviewer_id = str(args.get("reviewer_id") or "").strip()
-    tester_id = str(args.get("tester_id") or "").strip()
+    reviewer_id = str(args.get("reviewer_id") or "").strip() or None
+    tester_id = str(args.get("tester_id") or "").strip() or None
     _check(implementation_id, "implementation_id is required")
-    _check(reviewer_id, "reviewer_id is required")
-    _check(tester_id, "tester_id is required")
-    for name in (
-        "expected_implementation_version",
-        "expected_reviewer_version",
-        "expected_tester_version",
-    ):
-        _check(name in args and args[name] is not None, f"{name} is required")
+    _check(
+        args.get("expected_implementation_version") is not None,
+        "expected_implementation_version is required",
+    )
     with _board(board) as (kb, conn):
         outcome = kb.rework_review_graph(
             conn,
@@ -1122,8 +1182,8 @@ def _handle_rework_review(args: dict, **kw) -> str:
             reviewer_id,
             tester_id,
             expected_implementation_version=args["expected_implementation_version"],
-            expected_reviewer_version=args["expected_reviewer_version"],
-            expected_tester_version=args["expected_tester_version"],
+            expected_reviewer_version=args.get("expected_reviewer_version"),
+            expected_tester_version=args.get("expected_tester_version"),
             reason=reason,
             author=os.environ.get("HERMES_PROFILE") or "orchestrator",
         )

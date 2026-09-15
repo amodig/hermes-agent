@@ -1,0 +1,60 @@
+{
+  "fixture_version": 0,
+  "protocol": "kanban-lifecycle-v0",
+  "goal": "A code card must release review and validation in order.",
+  "roles": {
+    "implementation": "implementer",
+    "review": "reviewer",
+    "validation": "tester"
+  },
+  "tasks": [
+    {
+      "alias": "implementation",
+      "title": "Implement lifecycle fixture",
+      "assignee": "implementer",
+      "status": "blocked",
+      "lifecycle_contract": {
+        "kind": "code",
+        "review_mode": "separate_card",
+        "reviewer": "reviewer",
+        "validation_required": true
+      }
+    },
+    {
+      "alias": "review",
+      "title": "Review lifecycle fixture",
+      "assignee": "reviewer",
+      "status": "blocked",
+      "lifecycle_contract": {
+        "kind": "review",
+        "candidate_task_id": "implementation"
+      }
+    },
+    {
+      "alias": "validation",
+      "title": "Validate lifecycle fixture",
+      "assignee": "tester",
+      "status": "blocked",
+      "lifecycle_contract": {
+        "kind": "validation",
+        "candidate_task_id": "implementation"
+      }
+    }
+  ],
+  "edges": [
+    {"parent": "implementation", "child": "review", "requirement": "phase_finished"},
+    {"parent": "review", "child": "validation", "requirement": "review_approved"}
+  ],
+  "expected_trace": [
+    "implementation:blocked->ready",
+    "implementation:ready->running",
+    "implementation:running->done",
+    "review:blocked->review",
+    "review:review->running",
+    "review:running->done",
+    "validation:blocked->ready",
+    "validation:ready->running",
+    "validation:running->done",
+    "implementation:acceptance=pending->accepted"
+  ]
+}

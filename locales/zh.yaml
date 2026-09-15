@@ -178,6 +178,7 @@ gateway:
       timed_out:           "超时，dispatcher 将重试"
       blocked:             "被阻塞，需要处理"
       review_requested:    "已交付评审；实现已完成"
+      validation_requested: "已交付验证；评审已通过"
       changes_requested:   "评审要求修改（BLOCK)，实现未获批准"
       block_loop_detected: "反复阻塞后被转入待分诊，需要做出决定"
       status_default:      "状态变化"

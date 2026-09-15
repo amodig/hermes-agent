@@ -54,7 +54,10 @@ Output a single JSON object with this exact shape:
         "title": "<concrete task title, imperative voice, <= 80 chars>",
         "body":  "<detailed spec for the worker on this child task>",
         "assignee": "<profile name from the roster, or null for default>",
-        "parents": [<int>, ...]
+        "parents": [<int>, ...],
+        "lifecycle_contract": {
+          "kind": "general"
+        }
       },
       ...
     ]
@@ -71,6 +74,11 @@ Rules:
   - Pick assignees from the roster by matching the task to the profile's
     DESCRIPTION (not just the name). When nothing matches well, use null
     and the system will route to the default_assignee.
+  - Omit "lifecycle_contract" for ordinary work, which defaults to general.
+  - A code child may declare kind=code with review_mode, reviewer, and
+    validation_required. Review/validation children must declare kind=review or
+    kind=validation plus candidate_task_index pointing to the implementation
+    child; task ids do not exist until this graph is committed.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
 
@@ -271,19 +279,43 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
         chosen = _normalize_assignee_choice(
             assignee, default_assignee=routing.default_assignee, valid_names=routing.valid_names,
         )
+        parents = entry.get("parents") or []
+        if not isinstance(parents, list):
+            parents = []
         if isinstance(assignee, str) and assignee.strip() and assignee.strip() not in routing.valid_names:
             logger.info(
                 "decompose: task %s child %d picked unknown assignee %r — "
                 "routing to default_assignee %r",
                 task_id, idx, assignee, routing.default_assignee,
             )
-        parents = entry.get("parents") or []
-        if not isinstance(parents, list):
-            parents = []
+        lifecycle_contract = entry.get("lifecycle_contract")
+        if lifecycle_contract is not None:
+            if not isinstance(lifecycle_contract, dict):
+                return [], f"tasks[{idx}].lifecycle_contract is not an object"
+            lifecycle_contract = dict(lifecycle_contract)
+            kind = str(lifecycle_contract.get("kind") or "").strip().casefold()
+            if kind in {"review", "validation"}:
+                candidate_index = lifecycle_contract.pop("candidate_task_index", None)
+                if (
+                    isinstance(candidate_index, bool)
+                    or not isinstance(candidate_index, int)
+                    or not 0 <= candidate_index < len(raw_tasks)
+                    or candidate_index == idx
+                    or set(lifecycle_contract) != {"kind"}
+                ):
+                    return [], f"tasks[{idx}].lifecycle_contract has an invalid candidate_task_index"
+                lifecycle_contract["kind"] = kind
+                lifecycle_contract["candidate_task_index"] = candidate_index
+            else:
+                try:
+                    lifecycle_contract = kb.normalize_contract(lifecycle_contract, default_on_none=True)
+                except ValueError as exc:
+                    return [], f"tasks[{idx}].lifecycle_contract is invalid: {exc}"
         children.append({
             "title": title.strip()[:200],
             "body": body.strip() if isinstance(body, str) else "",
             "assignee": chosen,
+            "lifecycle_contract": lifecycle_contract,
             # Drop non-int, out-of-range and self parent indices.
             "parents": [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx],
         })

@@ -104,6 +104,10 @@ def build_identify_payload() -> dict[str, Any]:
         "profile": _profile_label_for_home(record.get("hermes_home") or ""),
         "supervisor": _detect_supervisor(), **_get_code_identity_fields()}
     with contextlib.suppress(Exception):
+        from hermes_cli.kanban_runtime import runtime_identity
+
+        payload["runtime_identity"] = runtime_identity().as_dict()
+    with contextlib.suppress(Exception):
         # served_profiles (multiplex mode) is stamped into runtime status by the runner.
         served = (read_runtime_status() or {}).get("served_profiles")
         if isinstance(served, list) and served:
@@ -114,8 +118,13 @@ def build_identify_payload() -> dict[str, Any]:
 def build_status_payload() -> dict[str, Any]:
     """Default ``status`` answer — current runtime status, answered live."""
     from gateway.status import read_runtime_status
-    return {**(read_runtime_status() or {}), "protocol": CONTROL_PROTOCOL_VERSION,
-            "answered_at": time.time(), "answering_pid": os.getpid()}
+    payload = {**(read_runtime_status() or {}), "protocol": CONTROL_PROTOCOL_VERSION,
+               "answered_at": time.time(), "answering_pid": os.getpid()}
+    with contextlib.suppress(Exception):
+        from hermes_cli.kanban_runtime import runtime_identity
+
+        payload["runtime_identity"] = runtime_identity().as_dict()
+    return payload
 
 
 class GatewayControlServer:

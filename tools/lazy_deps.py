@@ -314,6 +314,8 @@ def _allow_lazy_installs() -> bool:
     """Whether lazy installs are permitted: (1) ``security.allow_lazy_installs: false`` blocks in BOTH
     modes; (2) the sealed venv (``HERMES_DISABLE_LAZY_INSTALLS=1``) blocks only without a durable
     target to redirect into. Unreadable config fails OPEN — blocking is an explicit opt-in."""
+    if os.environ.get("HERMES_KANBAN_RUNTIME_GENERATION"):
+        return False
     cfg = None
     with contextlib.suppress(Exception):
         from hermes_cli.config import load_config
@@ -483,6 +485,12 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
     """Install ``specs`` via the uv -> pip -> ensurepip ladder, venv-scoped or into the durable
     ``--target`` (constrained to core versions) when :data:`_LAZY_TARGET_ENV` is set. Independent of
     ``hermes_cli.tools_config._pip_install`` (no CLI dependency)."""
+    from hermes_cli.kanban_runtime_generation import installation_mutation_lock
+    with installation_mutation_lock():
+        return _install_locked(specs, timeout=timeout)
+
+
+def _install_locked(specs: tuple[str, ...], *, timeout: int) -> _InstallResult:
     if not specs:
         return _InstallResult(True, "", "")
     target = _lazy_install_target()
@@ -592,6 +600,8 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
     for spec in missing:  # belt and braces on top of the allowlist
         if not _spec_is_safe(spec):
             raise FeatureUnavailable(feature, missing, f"refusing to install unsafe spec {spec!r}")
+    if os.environ.get("HERMES_KANBAN_RUNTIME_GENERATION"):
+        raise FeatureUnavailable(feature, missing, "immutable worker generation: install dependencies in the source installation, then launch a new worker")
     if not _allow_lazy_installs():
         raise FeatureUnavailable(feature, missing, "lazy installs disabled (security.allow_lazy_installs=false)")
     if prompt and not _prompt_toolkit_active() and sys.stdin.isatty() and sys.stdout.isatty():
@@ -649,6 +659,8 @@ def install_specs(specs: list[str] | tuple[str, ...], *, timeout: int = 300) -> 
     for spec in cleaned:
         if not _spec_is_safe(spec):
             return InstallSpecsResult(ok=False, blocked=True, reason=f"refusing to install unsafe spec {spec!r}")
+    if os.environ.get("HERMES_KANBAN_RUNTIME_GENERATION"):
+        return InstallSpecsResult(ok=False, blocked=True, reason="immutable worker generation: install dependencies in the source installation, then launch a new worker")
     target = _lazy_install_target()
     if not _allow_lazy_installs():
         sealed = os.environ.get("HERMES_DISABLE_LAZY_INSTALLS") == "1" and target is None

@@ -117,6 +117,133 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_board_cards_include_lifecycle_and_dependency_projections(client):
+    parent = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "parent"},
+    ).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "child", "parents": [parent["id"]]},
+    ).json()["task"]
+
+    board = client.get("/api/plugins/kanban/board").json()
+    card = next(
+        task
+        for column in board["columns"]
+        for task in column["tasks"]
+        if task["id"] == child["id"]
+    )
+
+    assert card["lifecycle"]["acceptance"] == "not_applicable"
+    assert card["dependencies"]["satisfied"] is False
+    assert card["dependencies"]["blockers"][0]["parent_id"] == parent["id"]
+
+
+def test_lifecycle_projections_batch_shared_snapshot(client):
+    parent = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "parent"},
+    ).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "child", "parents": [parent["id"]]},
+    ).json()["task"]
+
+    with kbc.connect() as conn:
+        statements: list[str] = []
+        conn.set_trace_callback(
+            lambda statement: (
+                statements.append(statement)
+                if statement.lstrip().upper().startswith("SELECT")
+                else None
+            )
+        )
+        lifecycle, dependencies = kb.get_lifecycle_projections(
+            conn, [parent["id"], child["id"]],
+        )
+        conn.set_trace_callback(None)
+
+    assert set(lifecycle) == {parent["id"], child["id"]}
+    assert set(dependencies) == {parent["id"], child["id"]}
+    assert len(statements) <= 4
+
+
+def test_projection_cache_scopes_tasks_and_history_to_closure(client):
+    from hermes_cli import kanban_lifecycle as lifecycle
+
+    visible = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "visible"},
+    ).json()["task"]
+    unrelated = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "unrelated", "assignee": "worker"},
+    ).json()["task"]
+
+    with kbc.connect() as conn:
+        assert kb.claim_task(conn, unrelated["id"]) is not None
+        cache = lifecycle._ProjectionCache(conn, [visible["id"]])
+
+    assert set(cache.tasks) == {visible["id"]}
+    assert unrelated["id"] not in cache.runs_by_task
+    assert unrelated["id"] not in cache.events_by_task
+
+def test_projection_cache_excludes_irrelevant_linked_descendants(client):
+    from hermes_cli import kanban_lifecycle as lifecycle
+
+    with kbc.connect() as conn:
+        implementation = kb.create_task(
+            conn,
+            title="implementation",
+            assignee="implementer",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "reviewer",
+                "validation_required": True,
+            },
+        )
+        review = kb.create_task(
+            conn,
+            title="review",
+            assignee="reviewer",
+            initial_status="blocked",
+            parents=[implementation],
+            lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
+        )
+        archived_child = kb.create_task(
+            conn,
+            title="archived child",
+            initial_status="blocked",
+            parents=[implementation],
+        )
+        archived_grandchild = kb.create_task(
+            conn,
+            title="archived grandchild",
+            initial_status="blocked",
+            parents=[archived_child],
+        )
+        assert kb.archive_task(conn, archived_grandchild)
+        assert kb.archive_task(conn, archived_child)
+        validation = kb.create_task(
+            conn,
+            title="validation",
+            assignee="tester",
+            initial_status="blocked",
+            parents=[review],
+            lifecycle_contract={
+                "kind": "validation",
+                "candidate_task_id": implementation,
+            },
+        )
+        role_cache = lifecycle._ProjectionCache(conn, [validation])
+        cache = lifecycle._ProjectionCache(conn, [implementation])
+        assert set(role_cache.tasks) == {implementation, review, validation}
+
+    assert set(cache.tasks) == {implementation, review, validation}
+    assert archived_child not in cache.tasks
+    assert archived_grandchild not in cache.tasks
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")
@@ -274,6 +401,216 @@ def test_patch_review_lifecycle_preserves_handoff_and_reopens(client):
         )
 
 
+def test_patch_expected_version_rejects_side_effects(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "before", "assignee": "old"},
+    ).json()["task"]
+    stale_version = task["version"]
+
+    refreshed = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"title": "fresh title"},
+    )
+    assert refreshed.status_code == 200, refreshed.text
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "expected_version": stale_version,
+            "assignee": "new",
+            "title": "stale title",
+        },
+    )
+    assert response.status_code == 409
+    current = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
+    assert current["assignee"] == "old"
+    assert current["title"] == "fresh title"
+
+def test_patch_typed_completion_rejects_combined_goal_edit(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "typed implementation",
+            "body": "original goal",
+            "assignee": "builder",
+            "lifecycle_contract": {
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        },
+    ).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "status": "done",
+            "title": "revised goal",
+            "body": "revised body",
+            "metadata": {"base_sha": "base", "head_sha": "head"},
+        },
+    )
+    assert response.status_code == 409
+    current = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
+    assert current["status"] == "ready"
+    assert current["title"] == "typed implementation"
+    assert current["body"] == "original goal"
+
+
+def test_patch_typed_review_rejects_combined_goal_edit(client, tmp_path):
+    repo = tmp_path / "review-repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "dashboard@example.invalid")
+    git("config", "user.name", "Dashboard Test")
+    (repo / "README").write_text("base\n", encoding="utf-8")
+    git("add", "README")
+    git("commit", "-qm", "base")
+    head_sha = git("rev-parse", "HEAD")
+
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "typed implementation",
+            "body": "original goal",
+            "assignee": "builder",
+            "workspace_kind": "dir",
+            "workspace_path": str(repo),
+            "lifecycle_contract": {
+                "kind": "code",
+                "review_mode": "same_card",
+                "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        },
+    ).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "status": "review",
+            "assignee": "reviewer",
+            "title": "revised goal",
+            "body": "revised body",
+            "summary": "ready for review",
+            "metadata": {"base_sha": head_sha, "head_sha": head_sha},
+        },
+    )
+    assert response.status_code == 409
+    current = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
+    assert current["status"] == "ready"
+    assert current["assignee"] == "builder"
+    assert current["title"] == "typed implementation"
+    assert current["body"] == "original goal"
+
+
+
+def test_patch_expected_version_is_atomic_across_intervening_mutation(client, monkeypatch):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "before", "assignee": "old"},
+    ).json()["task"]
+    original_assign = kb.assign_task
+
+    def interleaved_assign(conn, task_id, profile):
+        assert kb.update_task(
+            conn,
+            task_id,
+            expected_version=task["version"],
+            reason="intervening edit",
+            title="intervening title",
+        )
+        return original_assign(conn, task_id, profile)
+
+    monkeypatch.setattr(kb, "assign_task", interleaved_assign)
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "expected_version": task["version"],
+            "assignee": "new",
+            "title": "requested title",
+        },
+    )
+
+    assert response.status_code == 409
+    current = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
+    assert current["version"] == task["version"]
+    assert current["title"] == "before"
+    assert current["assignee"] == "old"
+
+
+
+@pytest.mark.parametrize(
+    ("patch", "field", "expected"),
+    [
+        ({"assignee": "new"}, "assignee", "new"),
+        ({"status": "blocked", "block_reason": "manual"}, "status", "blocked"),
+        ({"priority": 7}, "priority", 7),
+        ({"model_override": "test-model"}, "model_override", "test-model"),
+        ({"reasoning_effort": "high"}, "reasoning_effort", "high"),
+    ],
+)
+def test_patch_expected_version_advances_direct_mutations(
+    client, patch, field, expected
+):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "versioned mutation", "assignee": "old"},
+    ).json()["task"]
+    stale_version = task["version"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json=patch,
+    )
+    assert response.status_code == 200, response.text
+    updated = response.json()["task"]
+    assert updated[field] == expected
+    assert updated["version"] == stale_version + 1
+
+    stale = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"expected_version": stale_version, "priority": 99},
+    )
+    assert stale.status_code == 409
+    current = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
+    assert current[field] == expected
+    assert current["version"] == stale_version + 1
+
+
+def test_deferred_cleanup_skips_a_reopened_task(client, tmp_path, monkeypatch):
+    workspace_root = tmp_path / "workspaces"
+    workspace = workspace_root / "task"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(workspace_root))
+
+    with kbc.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="reopened task",
+            workspace_kind="scratch",
+            workspace_path=str(workspace),
+        )
+        with kbc.composite_write_txn(conn):
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+            kb._cleanup_workspace(conn, task_id)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+
+    assert workspace.is_dir()
+
 def test_reopening_parent_demotes_ready_child(client):
     """Reopening a completed parent must invalidate ready children immediately.
 
@@ -366,9 +703,27 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
     with kbc.connect() as conn:
         child = kb.get_task(conn, child_id)
         assert child is not None
-        assert child.status == "review"
+        assert child.status == "ready"
+        assert kb.claim_review_task(conn, child_id) is None
+        assert not kb.complete_task(
+            conn,
+            child_id,
+            summary="stale approval",
+            expected_run_id=active_review.current_run_id,
+        )
+        replacement = kb.claim_task(conn, child_id)
+        assert replacement is not None
+        assert replacement.current_run_id != implementation.current_run_id
+        assert kb.request_review(
+            conn,
+            child_id,
+            summary="new implementation after parent stabilized",
+            expected_run_id=replacement.current_run_id,
+        )
+        assert kb.get_task(conn, grandchild_id).status == "todo"
         review = kb.claim_review_task(conn, child_id)
         assert review is not None
+        assert review.current_run_id != active_review.current_run_id
         assert kb.complete_task(
             conn,
             child_id,
@@ -427,6 +782,92 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
         grandchild = kb.get_task(conn, grandchild_id)
         assert child is not None and child.status == "ready"
         assert grandchild is not None and grandchild.status == "todo"
+
+
+def test_dashboard_blocked_same_card_review_uses_review_phase(client, tmp_path):
+    repo = tmp_path / "review-repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "dashboard@example.invalid")
+    git("config", "user.name", "Dashboard Test")
+    (repo / "README").write_text("base\n", encoding="utf-8")
+    git("add", "README")
+    git("commit", "-qm", "base")
+    head_sha = git("rev-parse", "HEAD")
+
+    with kbc.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="blocked dashboard review",
+            assignee="builder",
+            initial_status="blocked",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "same_card",
+                "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        )
+        with kb.write_txn(conn):
+            implementation_run_id = kb._synthesize_ended_run(
+                conn,
+                task_id,
+                outcome="review_requested",
+                summary="ready for review",
+                metadata={
+                    "base_sha": head_sha,
+                    "head_sha": head_sha,
+                    "workspace_path": str(repo),
+                },
+            )
+            conn.execute(
+                "UPDATE tasks SET assignee = 'reviewer', candidate_run_id = ? WHERE id = ?",
+                (implementation_run_id, task_id),
+            )
+            kb._append_event(
+                conn,
+                task_id,
+                "blocked",
+                {
+                    "reason": "maintainer input required",
+                    "kind": "needs_input",
+                    "source_status": "review",
+                },
+            )
+
+    board = client.get("/api/plugins/kanban/board").json()
+    blocked_card = next(
+        task
+        for column in board["columns"]
+        for task in column["tasks"]
+        if task["id"] == task_id
+    )
+    assert blocked_card["status"] == "blocked"
+    assert blocked_card["active_lifecycle_phase"] == "review"
+    detail = client.get(f"/api/plugins/kanban/tasks/{task_id}").json()["task"]
+    assert detail["active_lifecycle_phase"] == "review"
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={
+            "status": "done",
+            "summary": "approved after escalation",
+            "verdict": "APPROVE",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["task"]["status"] == "done"
 
 
 def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):

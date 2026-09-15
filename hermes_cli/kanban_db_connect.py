@@ -16,11 +16,13 @@ import shutil
 import sqlite3
 import threading
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from dataclasses import field
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from pathlib import Path
 from typing import Any
+from typing import Callable
 from typing import Optional
 
 
@@ -28,6 +30,12 @@ from typing import Optional
 # Connection helpers
 # ---------------------------------------------------------------------------
 
+_COMPOSITE_TXN_CONNECTION: ContextVar[Optional[sqlite3.Connection]] = ContextVar(
+    "hermes_kanban_composite_txn_connection", default=None,
+)
+_POST_COMMIT_ACTIONS: ContextVar[Optional[list[Callable[[], Any]]]] = ContextVar(
+    "hermes_kanban_post_commit_actions", default=None,
+)
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
@@ -1132,20 +1140,56 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
             time.sleep(random.uniform(_BUSY_RETRY_MIN_S, _BUSY_RETRY_MAX_S))
 
 
+def defer_post_commit(callback: Callable[[], Any], *, conn: Optional[sqlite3.Connection] = None) -> bool:
+    """Queue a best-effort action until the active composite write commits."""
+    actions = _POST_COMMIT_ACTIONS.get()
+    if actions is None:
+        return False
+    active_conn = _COMPOSITE_TXN_CONNECTION.get()
+    if conn is not None and active_conn is not conn:
+        return False
+    actions.append(callback)
+    return True
+
+
+@contextlib.contextmanager
+def composite_write_txn(conn: sqlite3.Connection):
+    """Hold one write lock across a multi-mutator dashboard request.
+
+    Nested ``write_txn`` calls become savepoints while this boundary is active.
+    Registered observers and host-side cleanup run only after the outer commit.
+    """
+    if _COMPOSITE_TXN_CONNECTION.get() is not None:
+        raise RuntimeError("composite_write_txn cannot be nested")
+    connection_token = _COMPOSITE_TXN_CONNECTION.set(conn)
+    actions: list[Callable[[], Any]] = []
+    actions_token = _POST_COMMIT_ACTIONS.set(actions)
+    committed = False
+    try:
+        with write_txn(conn):
+            yield conn
+        committed = True
+    finally:
+        _POST_COMMIT_ACTIONS.reset(actions_token)
+        _COMPOSITE_TXN_CONNECTION.reset(connection_token)
+    if committed:
+        for action in actions:
+            with contextlib.suppress(Exception):
+                action()
+
+
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     """IMMEDIATE write transaction; a claim CAS inside is atomic — at most one
     concurrent writer succeeds.
 
     Nesting is an explicit opt-in (``allow_nested=True`` → savepoint; otherwise
-    a loud ``RuntimeError``). Only composition primitives (``create_task``,
-    ``add_comment``) opt in — helpers with post-commit side effects
-    (``complete_task`` & co.) must never run under an open outer transaction,
-    since those side effects would fire while the outer txn can still roll back.
+    a loud ``RuntimeError``). The dashboard's composite boundary is the other
+    explicit composition path; it defers registered side effects until commit.
     """
     _kb._assert_not_delegated_child_mutation()
     if getattr(conn, "in_transaction", False):
-        if not allow_nested:
+        if not allow_nested and _COMPOSITE_TXN_CONNECTION.get() is not conn:
             raise RuntimeError(
                 "write_txn: already inside a transaction. Nested composition "
                 "must opt in explicitly with write_txn(conn, allow_nested=True) "

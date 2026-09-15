@@ -48,7 +48,9 @@ def _repo(tmp_path: Path) -> tuple[Path, str, str]:
     return repo, base, "task/immutable"
 
 
-def _lane(conn, repo: Path, branch: str) -> tuple[str, str]:
+def _lane(
+    conn, repo: Path, branch: str, *, validation_required: bool = False
+) -> tuple[str, str]:
     parent = kb.create_task(
         conn,
         title="implementation",
@@ -56,8 +58,20 @@ def _lane(conn, repo: Path, branch: str) -> tuple[str, str]:
         workspace_kind="worktree",
         workspace_path=str(repo),
         branch_name=branch,
+        lifecycle_contract={
+            "kind": "code",
+            "review_mode": "separate_card",
+            "reviewer": "reviewer",
+            "validation_required": validation_required,
+        },
     )
-    child = kb.create_task(conn, title="review", assignee="reviewer", parents=[parent])
+    child = kb.create_task(
+        conn,
+        title="review",
+        assignee="reviewer",
+        parents=[parent],
+        lifecycle_contract={"kind": "review", "candidate_task_id": parent},
+    )
     return parent, child
 
 
@@ -92,24 +106,54 @@ def test_completion_records_and_enforces_exact_head(kanban_home, tmp_path):
     repo, base, branch = _repo(tmp_path)
     with kbc.connect_closing() as conn:
         parent, child = _lane(conn, repo, branch)
+        implementation_run = kb.claim_task(conn, parent)
+        assert implementation_run is not None
         head = _commit(repo)
         with pytest.raises(kb.HandoffValidationError, match="head_sha is required"):
             kb.complete_task(conn, parent, metadata={"base_sha": base})
         assert kb.complete_task(
-            conn, parent, metadata={"base_sha": base, "head_sha": head}
+            conn,
+            parent,
+            expected_run_id=implementation_run.current_run_id,
+            metadata={"base_sha": base, "head_sha": head},
         )
         handoff = kb.latest_handoff(conn, parent)
         assert handoff["changed_files"] == ["src/changed.py"]
         context = kb.build_worker_context(conn, child)
-        assert base in context and head in context and "moving branch tip" in context
+        assert base in context and head in context
+        assert kb.get_task(conn, child).status == "review"
         (repo / "src/changed.py").write_text("value = 2\n")
         _git(repo, "add", "src/changed.py")
         _git(repo, "commit", "-m", "moved")
-        assert kb.claim_task(conn, child) is None
+        assert kb.claim_review_task(conn, child) is None
         event = [
             e for e in kb.list_events(conn, child) if e.kind == "handoff_head_moved"
         ][-1]
         assert event.payload["expected_head_sha"] == head
+
+
+def test_review_claim_aborts_after_parent_head_moves(kanban_home, tmp_path):
+    repo, base, branch = _repo(tmp_path)
+    with kbc.connect_closing() as conn:
+        parent, reviewer = _lane(conn, repo, branch)
+        head = _commit(repo)
+        assert kb.claim_task(conn, parent) is not None
+        assert kb.complete_task(
+            conn, parent, metadata={"base_sha": base, "head_sha": head}
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET lifecycle_contract = NULL, status = 'review' "
+                "WHERE id = ?", (reviewer,)
+            )
+        _commit(repo, "src/moved.py")
+
+        assert kb.claim_review_task(conn, reviewer) is None
+        assert kb.get_task(conn, reviewer).status == "review"
+        assert any(
+            event.kind == "handoff_head_moved"
+            for event in kb.list_events(conn, reviewer)
+        )
 
 
 def test_legacy_handoff_requeues_and_recompletes_same_lane(kanban_home, tmp_path):
@@ -117,9 +161,13 @@ def test_legacy_handoff_requeues_and_recompletes_same_lane(kanban_home, tmp_path
 
     repo, base, branch = _repo(tmp_path)
     with kbc.connect_closing() as conn:
-        parent, reviewer = _lane(conn, repo, branch)
+        parent, reviewer = _lane(conn, repo, branch, validation_required=True)
         tester = kb.create_task(
-            conn, title="test", assignee="tester", parents=[reviewer]
+            conn,
+            title="test",
+            assignee="tester",
+            parents=[reviewer],
+            lifecycle_contract={"kind": "validation", "candidate_task_id": parent},
         )
         kb.claim_task(conn, parent)
         kb.add_comment(conn, parent, "operator", "preserve legacy context")
@@ -129,9 +177,28 @@ def test_legacy_handoff_requeues_and_recompletes_same_lane(kanban_home, tmp_path
         patch = tmp_path / "legacy.patch"
         patch.write_text(_git(repo, "diff", "--binary"))
         _legacy_complete(conn, parent, {"changed_files": ["src/legacy.py"]})
+        # Historical role cards have no contract or typed edge requirements.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET lifecycle_contract = NULL WHERE id = ?", (reviewer,)
+            )
+            conn.execute(
+                "UPDATE task_links SET requirement = NULL "
+                "WHERE parent_id = ? OR child_id = ?", (reviewer, reviewer)
+            )
         kb.recompute_ready(conn)
-        assert kb.claim_task(conn, reviewer) is None
-        assert kb.claim_task(conn, reviewer) is None
+        assert kb.get_task(conn, reviewer).status == "ready"
+        assert kb.bind_lifecycle_contract(
+            conn,
+            reviewer,
+            {"kind": "review", "candidate_task_id": parent},
+            expected_version=kb.get_task(conn, reviewer).version,
+            reason="classify the historical review before dispatch",
+            author="operator",
+        )
+        parent_version = kb.get_task(conn, parent).version
+        assert kb.claim_review_task(conn, reviewer) is None
+        assert kb.claim_review_task(conn, reviewer) is None
         assert (
             len([
                 e
@@ -145,7 +212,7 @@ def test_legacy_handoff_requeues_and_recompletes_same_lane(kanban_home, tmp_path
         kt._handle_requeue_handoff({
             "board": "default",
             "task_id": parent,
-            "expected_version": 99,
+            "expected_version": parent_version + 1,
             "reason": "repair",
         })
     )
@@ -154,7 +221,7 @@ def test_legacy_handoff_requeues_and_recompletes_same_lane(kanban_home, tmp_path
         kt._handle_requeue_handoff({
             "board": "default",
             "task_id": parent,
-            "expected_version": 1,
+            "expected_version": parent_version,
             "reason": "repair",
             "base_sha": base,
             "branch_name": branch,
@@ -180,13 +247,14 @@ def test_legacy_handoff_requeues_and_recompletes_same_lane(kanban_home, tmp_path
         )
         handoff = kb.latest_handoff(conn, parent)
         assert handoff["provenance"]["kind"] == "legacy_handoff_recompletion"
-        review_run = kb.claim_task(conn, reviewer)
+        review_run = kb.claim_review_task(conn, reviewer)
         assert review_run is not None
         assert kb.complete_task(
             conn,
             reviewer,
             expected_run_id=review_run.current_run_id,
-            metadata={"verdict": "APPROVE", "reviewed_head_sha": head},
+            verdict="APPROVE",
+            metadata={"reviewed_head_sha": head},
         )
         assert kb.get_task(conn, tester).status == "ready"
         reviewed = kb.latest_handoff(conn, reviewer)
@@ -228,9 +296,19 @@ def _rework_graph(conn, repo: Path, base: str, branch: str) -> tuple[str, str, s
         workspace_kind="worktree",
         workspace_path=str(repo),
         branch_name=branch,
+        lifecycle_contract={
+            "kind": "code",
+            "review_mode": "separate_card",
+            "reviewer": "reviewer",
+            "validation_required": True,
+        },
     )
     reviewer = kb.create_task(
-        conn, title="review", assignee="reviewer", parents=[implementation]
+        conn,
+        title="review",
+        assignee="reviewer",
+        parents=[implementation],
+        lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
     )
     tester = kb.create_task(
         conn,
@@ -238,6 +316,7 @@ def _rework_graph(conn, repo: Path, base: str, branch: str) -> tuple[str, str, s
         assignee="tester",
         parents=[reviewer],
         initial_status="blocked",
+        lifecycle_contract={"kind": "validation", "candidate_task_id": implementation},
     )
     descendant = kb.create_task(
         conn, title="publish", assignee="publisher", parents=[tester]
@@ -252,19 +331,233 @@ def _rework_graph(conn, repo: Path, base: str, branch: str) -> tuple[str, str, s
         expected_run_id=implementation_run.current_run_id,
         metadata={"base_sha": base, "head_sha": first_head},
     )
-    reviewer_run = kb.claim_task(conn, reviewer, claimer="reviewer:1")
+    reviewer_run = kb.claim_review_task(conn, reviewer, claimer="reviewer:1")
     assert reviewer_run is not None
     assert kb.complete_task(
         conn,
         reviewer,
         expected_run_id=reviewer_run.current_run_id,
-        metadata={
-            "verdict": "REQUEST_CHANGES",
-            "reviewed_head_sha": first_head,
-        },
+        verdict="REQUEST_CHANGES",
+        metadata={"reviewed_head_sha": first_head},
     )
     kb.add_comment(conn, implementation, "operator", "rework is required")
     return implementation, reviewer, tester, descendant, first_head
+
+
+def test_typed_same_card_rework_refuses_active_implementation(kanban_home, tmp_path):
+    repo, base, _branch = _repo(tmp_path)
+    with kbc.connect_closing() as conn:
+        implementation = kb.create_task(
+            conn,
+            title="typed same-card implementation",
+            assignee="implementer",
+            initial_status="blocked",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "same_card",
+                "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        )
+        assert kb.unblock_task(conn, implementation)
+        head = _commit(repo)
+        implementation_run = kb.claim_task(conn, implementation, claimer="implementer:1")
+        assert implementation_run is not None
+        assert kb.complete_task(
+            conn,
+            implementation,
+            expected_run_id=implementation_run.current_run_id,
+            metadata={"base_sha": base, "head_sha": head},
+        )
+        review_run = kb.claim_review_task(conn, implementation, claimer="reviewer:1")
+        assert review_run is not None
+        assert kb.complete_task(
+            conn,
+            implementation,
+            expected_run_id=review_run.current_run_id,
+            verdict="REQUEST_CHANGES",
+            summary="repair required",
+            metadata={"reviewed_head_sha": head},
+        )
+        awaiting_rework = kb.get_task(conn, implementation)
+        assert awaiting_rework is not None
+        assert awaiting_rework.status == "ready"
+
+        active = kb.claim_task(conn, implementation, claimer="implementer:2")
+        assert active is not None
+        with pytest.raises(ValueError, match="is claimed"):
+            kb.rework_review_graph(
+                conn,
+                implementation,
+                expected_implementation_version=active.version,
+                reason="repair the rejected implementation",
+            )
+
+        unchanged = kb.get_task(conn, implementation)
+        assert unchanged is not None
+        assert unchanged.status == "running"
+        assert unchanged.current_run_id == active.current_run_id
+        assert unchanged.claim_lock == active.claim_lock
+
+
+def test_typed_same_card_rework_rejects_newer_review_handoff(kanban_home, tmp_path):
+    repo, base, _branch = _repo(tmp_path)
+    with kbc.connect_closing() as conn:
+        implementation = kb.create_task(
+            conn,
+            title="stale same-card implementation",
+            assignee="implementer",
+            initial_status="blocked",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "same_card",
+                "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        )
+        assert kb.unblock_task(conn, implementation)
+        first_run = kb.claim_task(conn, implementation, claimer="implementer:1")
+        assert first_run is not None
+        first_head = _commit(repo, "src/first.py")
+        assert kb.complete_task(
+            conn,
+            implementation,
+            expected_run_id=first_run.current_run_id,
+            metadata={"base_sha": base, "head_sha": first_head},
+        )
+        review_run = kb.claim_review_task(conn, implementation, claimer="reviewer:1")
+        assert review_run is not None
+        assert kb.complete_task(
+            conn,
+            implementation,
+            expected_run_id=review_run.current_run_id,
+            verdict="REQUEST_CHANGES",
+            summary="repair required",
+            metadata={"reviewed_head_sha": first_head},
+        )
+
+        second_run = kb.claim_task(conn, implementation, claimer="implementer:2")
+        assert second_run is not None
+        second_head = _commit(repo, "src/second.py")
+        assert kb.complete_task(
+            conn,
+            implementation,
+            expected_run_id=second_run.current_run_id,
+            metadata={"base_sha": base, "head_sha": second_head},
+        )
+        assert kb.get_task(conn, implementation).status == "review"
+
+        task = kb.get_task(conn, implementation)
+        assert task is not None
+        with pytest.raises(ValueError, match="evidence is stale"):
+            kb.rework_review_graph(
+                conn,
+                implementation,
+                expected_implementation_version=task.version,
+                reason="reject stale rework request",
+            )
+
+        assert kb.get_task(conn, implementation).status == "review"
+
+def test_typed_same_card_rework_rechecks_evidence_inside_transaction(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo, base, _branch = _repo(tmp_path)
+    with kbc.connect_closing() as conn:
+        implementation = kb.create_task(
+            conn,
+            title="racing same-card implementation",
+            assignee="implementer",
+            initial_status="blocked",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "same_card",
+                "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        )
+        assert kb.unblock_task(conn, implementation)
+        first_run = kb.claim_task(conn, implementation, claimer="implementer:1")
+        assert first_run is not None
+        first_head = _commit(repo, "src/first.py")
+        assert kb.complete_task(
+            conn,
+            implementation,
+            expected_run_id=first_run.current_run_id,
+            metadata={"base_sha": base, "head_sha": first_head},
+        )
+        review_run = kb.claim_review_task(conn, implementation, claimer="reviewer:1")
+        assert review_run is not None
+        assert kb.complete_task(
+            conn,
+            implementation,
+            expected_run_id=review_run.current_run_id,
+            verdict="REQUEST_CHANGES",
+            summary="repair required",
+            metadata={"reviewed_head_sha": first_head},
+        )
+        task = kb.get_task(conn, implementation)
+        assert task is not None
+
+        expected_version = task.version
+
+        import hermes_cli.kanban_db_lifecycle_rework as rework
+
+        original_implementation_routing = rework._implementation_routing
+        raced = False
+        second_review = None
+
+        def racing_implementation_routing(connection, task_id):
+            nonlocal raced, second_review
+            routing = original_implementation_routing(connection, task_id)
+            if not raced:
+                raced = True
+                second_run = kb.claim_task(conn, implementation, claimer="implementer:2")
+                assert second_run is not None
+                second_head = _commit(repo, "src/second.py")
+                assert kb.complete_task(
+                    conn,
+                    implementation,
+                    expected_run_id=second_run.current_run_id,
+                    metadata={"base_sha": base, "head_sha": second_head},
+                )
+                second_review = kb.claim_review_task(
+                    conn, implementation, claimer="reviewer:2"
+                )
+                assert second_review is not None
+                assert kb.complete_task(
+                    conn,
+                    implementation,
+                    expected_run_id=second_review.current_run_id,
+                    verdict="REQUEST_CHANGES",
+                    summary="second repair required",
+                    metadata={"reviewed_head_sha": second_head},
+                )
+            return routing
+
+        monkeypatch.setattr(
+            rework, "_implementation_routing", racing_implementation_routing
+        )
+        with pytest.raises(ValueError, match="evidence changed"):
+            kb.rework_review_graph(
+                conn,
+                implementation,
+                expected_implementation_version=expected_version,
+                reason="reject stale rework request",
+            )
+        current = kb.get_task(conn, implementation)
+        assert current is not None
+        assert raced
+        assert second_review is not None
+        assert current.status == "ready"
+        assert current.current_run_id is None
+        assert current.version == expected_version
 
 
 def test_separate_reviewer_requires_explicit_approval(kanban_home, tmp_path):
@@ -277,12 +570,26 @@ def test_separate_reviewer_requires_explicit_approval(kanban_home, tmp_path):
             workspace_kind="worktree",
             workspace_path=str(repo),
             branch_name=branch,
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "reviewer",
+                "validation_required": True,
+            },
         )
         reviewer = kb.create_task(
-            conn, title="review", assignee="reviewer", parents=[implementation]
+            conn,
+            title="review",
+            assignee="reviewer",
+            parents=[implementation],
+            lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
         )
         tester = kb.create_task(
-            conn, title="validation", assignee="tester", parents=[reviewer]
+            conn,
+            title="validation",
+            assignee="tester",
+            parents=[reviewer],
+            lifecycle_contract={"kind": "validation", "candidate_task_id": implementation},
         )
         implementation_run = kb.claim_task(conn, implementation, claimer="implementer:1")
         assert implementation_run is not None
@@ -293,16 +600,26 @@ def test_separate_reviewer_requires_explicit_approval(kanban_home, tmp_path):
             expected_run_id=implementation_run.current_run_id,
             metadata={"base_sha": base, "head_sha": head},
         )
-        reviewer_run = kb.claim_task(conn, reviewer, claimer="reviewer:1")
+        reviewer_run = kb.claim_review_task(conn, reviewer, claimer="reviewer:1")
         assert reviewer_run is not None
+        with pytest.raises(kb.LifecycleEvidenceError):
+            kb.complete_task(
+                conn,
+                reviewer,
+                expected_run_id=reviewer_run.current_run_id,
+                metadata={"reviewed_head_sha": head},
+            )
+        assert kb.get_task(conn, reviewer).current_run_id == reviewer_run.current_run_id
+        assert kb.get_task(conn, tester).status == "todo"
+        assert kb.claim_task(conn, tester) is None
         assert kb.complete_task(
             conn,
             reviewer,
             expected_run_id=reviewer_run.current_run_id,
+            verdict="APPROVE",
             metadata={"reviewed_head_sha": head},
         )
-        assert kb.get_task(conn, tester).status == "todo"
-        assert kb.claim_task(conn, tester) is None
+        assert kb.get_task(conn, tester).status == "ready"
 
 
 def test_rework_review_accepts_todo_tester_for_second_rejection(kanban_home, tmp_path):
@@ -332,16 +649,14 @@ def test_rework_review_accepts_todo_tester_for_second_rejection(kanban_home, tmp
             expected_run_id=implementation_run.current_run_id,
             metadata={"base_sha": base, "head_sha": second_head},
         )
-        reviewer_run = kb.claim_task(conn, reviewer, claimer="reviewer:2")
+        reviewer_run = kb.claim_review_task(conn, reviewer, claimer="reviewer:2")
         assert reviewer_run is not None
         assert kb.complete_task(
             conn,
             reviewer,
             expected_run_id=reviewer_run.current_run_id,
-            metadata={
-                "verdict": "REQUEST_CHANGES",
-                "reviewed_head_sha": second_head,
-            },
+            verdict="REQUEST_CHANGES",
+            metadata={"reviewed_head_sha": second_head},
         )
         versions = tuple(kb.get_task(conn, task_id).version for task_id in ids)
         result = kb.rework_review_graph(
@@ -430,6 +745,7 @@ def test_rework_review_reuses_cards_and_requires_new_head_approval(
         assert result["rejected_head_sha"] == first_head
         assert result["status"] == "ready"
         assert {entry["id"] for entry in result["invalidated"]} == {
+            implementation,
             reviewer,
             tester,
             descendant,
@@ -451,9 +767,8 @@ def test_rework_review_reuses_cards_and_requires_new_head_approval(
              if event.kind == "review_rework_requested"]
         ) == 1
 
-        # A lost response may be retried, but the original CAS versions are
-        # stale and must not append a second rework event.
-        with pytest.raises(ValueError, match="update conflict"):
+        # A different request with stale CAS versions must not apply rework twice.
+        with pytest.raises(ValueError):
             kb.rework_review_graph(
                 conn,
                 *ids,
@@ -478,23 +793,37 @@ def test_rework_review_reuses_cards_and_requires_new_head_approval(
             expected_run_id=implementation_run.current_run_id,
             metadata={"base_sha": base, "head_sha": second_head},
         )
-        reviewer_run = kb.claim_task(conn, reviewer, claimer="reviewer:2")
+        reviewer_run = kb.claim_review_task(conn, reviewer, claimer="reviewer:2")
         assert reviewer_run is not None
+        with pytest.raises(kb.HandoffValidationError):
+            kb.complete_task(
+                conn,
+                reviewer,
+                expected_run_id=reviewer_run.current_run_id,
+                verdict="APPROVE",
+                metadata={"head_sha": first_head},
+            )
+        assert kb.get_task(conn, tester).status == "todo"
+        assert kb.claim_task(conn, tester) is None
         assert kb.complete_task(
             conn,
             reviewer,
             expected_run_id=reviewer_run.current_run_id,
-            metadata={
-                "verdict": "APPROVE",
-                "reviewed_head_sha": second_head,
-            },
+            verdict="APPROVE",
+            metadata={"reviewed_head_sha": second_head},
         )
         assert kb.get_task(conn, tester).status == "ready"
         tester_run = kb.claim_task(conn, tester, claimer="tester:1")
         assert tester_run is not None
         assert kb.complete_task(
-            conn, tester, expected_run_id=tester_run.current_run_id, summary="validated"
+            conn,
+            tester,
+            expected_run_id=tester_run.current_run_id,
+            verdict="PASS",
+            metadata={"reviewed_head_sha": second_head},
+            summary="validated",
         )
         assert kb.get_task(conn, tester).status == "done"
+        assert kb.get_task(conn, descendant).status == "ready"
         assert kb.latest_handoff(conn, implementation)["head_sha"] == second_head
         assert first_head != second_head
