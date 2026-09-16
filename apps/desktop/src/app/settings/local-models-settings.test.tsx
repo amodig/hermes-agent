@@ -288,39 +288,39 @@ describe('LocalModelsSettings', () => {
     })
   })
 
-  it('renders progress for a download discovered from the store (survives pane remount)', async () => {
+  it('rediscovers backend download progress after the pane remounts', async () => {
     mocked.getLocalModelsStatus.mockResolvedValue({
       ...BASE_STATUS,
       runtime_installed: true,
       runtime_backend: 'cuda'
     })
-    // A running job already in the app-level store — as after closing and
-    // reopening the pane mid-download.
-    $localRuntimeJobs.set([
-      {
-        job_id: 'j9',
-        kind: 'model-download',
-        target: 'Qwen3.6 27B',
-        model_id: FITTING_MODEL.id,
-        status: 'running',
-        phase: 'downloading',
-        detail: '',
-        total_bytes: 100,
-        done_bytes: 62,
-        percent: 62,
-        error: null
-      }
-    ])
+    mocked.getLocalModelsJobs.mockResolvedValue({
+      jobs: [
+        {
+          job_id: 'j9',
+          kind: 'model-download',
+          target: 'Qwen3.6 27B',
+          model_id: FITTING_MODEL.id,
+          status: 'running',
+          phase: 'downloading',
+          detail: '',
+          total_bytes: 16 * 2 ** 30,
+          done_bytes: 10 * 2 ** 30,
+          percent: 62.5,
+          error: null
+        }
+      ]
+    })
 
+    const pane = await renderFullPane()
+    await screen.findByText(/10\.0 GB.*16\.0 GB/)
+    pane.unmount()
     await renderFullPane()
     await screen.findByText('Qwen3.6 27B')
 
-    // The fitting row shows byte progress; the remaining download
-    // buttons belong to the other rows (spilled + refused).
-    expect(screen.getAllByText(/0\.0 GB of 0\.0 GB|of/).length).toBeGreaterThan(0)
-    const remaining = screen.queryAllByRole('button', { name: /download · 17\.6 GB/i })
-    expect(remaining.length).toBe(2)
-    expect(remaining.some(b => (b as HTMLButtonElement).disabled)).toBe(true)
+    expect(await screen.findByText(/10\.0 GB.*16\.0 GB/)).toBeTruthy()
+    const remaining = screen.getAllByRole('button', { name: /download · 17\.6 GB/i })
+    expect(remaining.every(b => (b as HTMLButtonElement).disabled)).toBe(true)
   })
 
   it('surfaces a failed download with the backend message', async () => {
@@ -329,20 +329,22 @@ describe('LocalModelsSettings', () => {
       runtime_installed: true,
       runtime_backend: 'cuda'
     })
-    $localRuntimeJobs.set([
-      {
-        job_id: 'j2',
-        kind: 'model-download',
-        target: 'Qwen3.6 27B',
-        model_id: FITTING_MODEL.id,
-        status: 'error',
-        phase: 'verifying',
-        detail: '',
-        total_bytes: 100,
-        done_bytes: 100,
-        error: 'Downloaded file failed its integrity check and was removed — try again'
-      }
-    ])
+    mocked.getLocalModelsJobs.mockResolvedValue({
+      jobs: [
+        {
+          job_id: 'j2',
+          kind: 'model-download',
+          target: 'Qwen3.6 27B',
+          model_id: FITTING_MODEL.id,
+          status: 'error',
+          phase: 'verifying',
+          detail: '',
+          total_bytes: 100,
+          done_bytes: 100,
+          error: 'Downloaded file failed its integrity check and was removed — try again'
+        }
+      ]
+    })
 
     await renderFullPane()
     await screen.findByText('Qwen3.6 27B')
@@ -375,21 +377,23 @@ describe('quickstart', () => {
   })
 
   it('pins the quickstart progress view while the job runs', async () => {
-    $localRuntimeJobs.set([
-      {
-        job_id: 'q1',
-        kind: 'quickstart',
-        target: 'Qwen3.6 27B',
-        model_id: 'qwen3.6-27b',
-        status: 'running',
-        phase: 'downloading',
-        detail: 'Qwen3.6 27B — 17.6 GB',
-        total_bytes: 100,
-        done_bytes: 30,
-        percent: 30,
-        error: null
-      }
-    ])
+    mocked.getLocalModelsJobs.mockResolvedValue({
+      jobs: [
+        {
+          job_id: 'q1',
+          kind: 'quickstart',
+          target: 'Qwen3.6 27B',
+          model_id: 'qwen3.6-27b',
+          status: 'running',
+          phase: 'downloading',
+          detail: 'Qwen3.6 27B — 17.6 GB',
+          total_bytes: 100,
+          done_bytes: 30,
+          percent: 30,
+          error: null
+        }
+      ]
+    })
     renderPane()
 
     expect(await screen.findByText('Qwen3.6 27B — 17.6 GB')).toBeTruthy()
