@@ -1,12 +1,16 @@
 """Materialized worker runtimes, published before the worker imports Hermes.
 
 Only stdlib imports belong here: this file also runs as the isolated bootstrap.
+
+The dispatcher reuses content hashes only while filesystem signatures match
+under the installation lock. Every worker still hashes its full sealed payload
+before importing Hermes; caching never substitutes for that bootstrap check.
 """
 from __future__ import annotations
 
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, replace
-from functools import cache
+from functools import cache, lru_cache
 import errno
 import importlib.machinery
 import importlib.metadata
@@ -156,6 +160,36 @@ def _digest_members(members):
                     digest.update(block)
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def _member_signature(members):
+    """Detect input replacement, edits, permissions, and tree membership without reading payloads."""
+    digest = hashlib.sha256()
+    for name, path in members:
+        stat = path.stat()
+        digest.update(
+            f"{name}\0{stat.st_dev}:{stat.st_ino}:{stat.st_mode}:{stat.st_size}:"
+            f"{stat.st_mtime_ns}:{stat.st_ctime_ns}\0".encode()
+        )
+    return digest.hexdigest()
+
+
+@lru_cache(maxsize=256)
+def _validated_origin_digest(origin, source, exclude, signature):
+    root = Path(origin)
+    digest = _digest_members(_members(root, source=source, exclude=exclude))
+    if _member_signature(_members(root, source=source, exclude=exclude)) != signature:
+        raise _error(f"runtime changed while fingerprinting {origin}")
+    return digest
+
+
+@lru_cache(maxsize=32)
+def _validate_published_generation(root, manifest_json):
+    # Reused sealed publications need no second full read in the dispatcher.
+    # Every child independently verifies its complete lease before importing code.
+    manifest = json.loads(manifest_json)
+    if _generation_digest(root, manifest) != manifest["identity"]["generation"]:
+        raise _error("published runtime generation is corrupt")
 
 
 @cache
@@ -452,12 +486,20 @@ def prepare_runtime_generation(expected_identity, *, workspace=None, profile_hom
                     path.lstat()
                 except FileNotFoundError:
                     return None  # Freeze discovery absence, not an empty or mutable directory.
-            return _digest_members(_members(path, source=origin == str(source), exclude=exclusions.get(origin, ())))
+            first_party = origin == str(source)
+            exclude = tuple(sorted(exclusions.get(origin, ())))
+            # Windows ctime is creation time, not reliable evidence of unchanged bytes.
+            if sys.platform == "win32":
+                return _digest_members(_members(path, source=first_party, exclude=exclude))
+            signature = _member_signature(_members(path, source=first_party, exclude=exclude))
+            return _validated_origin_digest(origin, first_party, exclude, signature)
         fingerprints = {origin: fingerprint(origin) for origin in mappings}
         dependency_fingerprint = hashlib.sha256(json.dumps(
             {origin: digest for origin, digest in fingerprints.items() if origin != str(source)}, sort_keys=True
         ).encode()).hexdigest()
-        cache_key = hashlib.sha256(json.dumps({"files": fingerprints, "paths": mappings, "resources": resources}, sort_keys=True).encode()).hexdigest()
+        cache_key = hashlib.sha256(json.dumps({
+            "identity": current.as_dict(), "files": fingerprints, "paths": mappings, "resources": resources,
+        }, sort_keys=True).encode()).hexdigest()
         cache_base = storage / "generations"
         worker_base = storage / "workers"
         storage.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -492,10 +534,10 @@ def prepare_runtime_generation(expected_identity, *, workspace=None, profile_hom
             except BaseException:
                 _remove_runtime_tree(staging)
                 raise
-        manifest = json.loads((cache / _MANIFEST).read_text(encoding="utf-8"))
+        manifest_json = (cache / _MANIFEST).read_text(encoding="utf-8")
+        manifest = json.loads(manifest_json)
         identity = RuntimeIdentity.from_value(manifest["identity"])
-        if _generation_digest(cache, manifest) != identity.generation:
-            raise _error("published runtime generation is corrupt")
+        _validate_published_generation(cache, manifest_json)
         root = Path(tempfile.mkdtemp(prefix="hermes-kanban-runtime-", dir=worker_base)).resolve()
         try:
             write_runtime_generation_owner(root)

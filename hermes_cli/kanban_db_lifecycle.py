@@ -751,8 +751,8 @@ def invalidate_descendants_for_parent_reopen(
     acceptance_before: Optional[dict[str, str]] = None,
     child_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    """THE done-reopen invalidation: every ``ready``/``review``/``running``/``done``
-    descendant of a reopened ancestor is demoted to ``todo`` and re-gated.
+    """Retract descendant evidence after an ancestor or dependency changes.
+    Blocked descendants retain their block; other affected tasks return to todo.
     Every surface that reopens a done task (dashboard PATCH/drag) routes here.
     A changed dependency restricts the traversal to ``child_id`` and its
     descendants, retracting that branch without touching the parent's other children.
@@ -796,7 +796,8 @@ def invalidate_descendants_for_parent_reopen(
                 JOIN tasks parent ON parent.id = d.id
                 WHERE parent.status != 'archived'
             )
-            SELECT t.id, t.status, t.current_run_id, t.worker_pid, t.claim_lock
+            SELECT t.id, t.status, t.current_run_id, t.worker_pid, t.claim_lock,
+                   t.assignee, t.lifecycle_contract
             FROM descendants d
             JOIN tasks t ON t.id = d.id
             ORDER BY t.id
@@ -810,12 +811,27 @@ def invalidate_descendants_for_parent_reopen(
             )
         for row in rows:
             previous_status = row["status"]
-            if previous_status not in {"ready", "review", "running", "done"}:
+            if previous_status not in {"ready", "review", "running", "done", "blocked"}:
                 continue
+            new_status = "blocked" if previous_status == "blocked" else "todo"
+            contract = safe_decode_contract(row["lifecycle_contract"])
+            same_card = bool(
+                contract and contract.get("kind") == "code"
+                and contract.get("review_mode") == "same_card"
+            )
+            assignee = row["assignee"]
+            if same_card and assignee == _kb._canonical_assignee(contract.get("reviewer")):
+                assignee = _kb._canonical_assignee(
+                    _implementation_routing(conn, row["id"]).get("implementer")
+                )
+                if not assignee:
+                    raise LifecycleContractError("same-card invalidation requires original implementation routing")
             resume_status = "ready"
             run_id = None
             if previous_status == "review":
                 resume_status = "review"
+            elif previous_status == "blocked":
+                resume_status = _kb._resume_status_from_events(conn, row["id"])
             elif previous_status == "running":
                 resume_status = _kb._retry_status_for_run(conn, row["id"], row["current_run_id"])
                 terminations.append((row["worker_pid"], row["claim_lock"]))
@@ -823,17 +839,19 @@ def invalidate_descendants_for_parent_reopen(
                     conn, row["id"], outcome="reclaimed", status="todo",
                     summary=cause,
                 )
+            if same_card:
+                resume_status = "ready"
             # consecutive_failures = 0: deliberate operator reset — see
             # docstring for why this diverges from reopen_review_task.
             conn.execute(
-                "UPDATE tasks SET status = 'todo', completed_at = NULL, result = NULL, "
+                "UPDATE tasks SET status = ?, assignee = ?, completed_at = NULL, result = NULL, "
                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
                 "current_run_id = NULL, candidate_run_id = NULL, consecutive_failures = 0, "
-                "version = version + 1 WHERE id = ?", (row["id"],),
+                "version = version + 1 WHERE id = ?", (new_status, assignee, row["id"]),
             )
             entry = {
                 "id": row["id"], "prior_status": previous_status,
-                "new_status": "todo", "resume_status": resume_status,
+                "new_status": new_status, "resume_status": resume_status,
             }
             _kb._append_event(
                 conn, row["id"], "descendant_invalidated",
@@ -845,14 +863,14 @@ def invalidate_descendants_for_parent_reopen(
             _kb._append_event(
                 conn, row["id"], "status",
                 {
-                    "status": "todo", "reason": reason, "parent": task_id,
+                    "status": new_status, "reason": reason, "parent": task_id,
                     "previous_status": previous_status, "resume_status": resume_status,
                 },
                 run_id=run_id,
             )
             _kb._insert_comment(
                 conn, row["id"], author, f"Invalidated: {cause}; "
-                f"retracted from '{previous_status}' to 'todo' "
+                f"retracted from '{previous_status}' to '{new_status}' "
                 f"(will resume via '{resume_status}').", now,
             )
             invalidated.append(entry)

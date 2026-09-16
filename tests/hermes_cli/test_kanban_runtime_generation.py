@@ -494,6 +494,51 @@ def test_partial_or_rewritten_manifest_never_reaches_worker_code(installation, d
     assert not second.root.exists()
 
 
+def test_warm_generation_reuses_payload_hashes_and_detects_installation_changes(installation, monkeypatch):
+    source, dependencies, _, _, _, prepare = installation
+    first = prepare()
+    payload = dependencies / "unseeded_sdk" / "data.bin"
+    payload_reads = []
+    original_open = Path.open
+
+    def observed_open(path, mode="r", *args, **kwargs):
+        if path.name == "data.bin" and "b" in mode:
+            payload_reads.append(path)
+        return original_open(path, mode, *args, **kwargs)
+
+    with monkeypatch.context() as observed:
+        observed.setattr(Path, "open", observed_open)
+        second = prepare()
+    assert second.identity.generation == first.identity.generation
+    if sys.platform != "win32":
+        assert payload_reads == []
+
+    previous = payload.stat()
+    replacement = b"new\x00bytes"
+    with generation.installation_mutation_lock(source):
+        payload.write_bytes(replacement)
+        os.utime(payload, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+    third = prepare()
+    assert third.identity.dependency_fingerprint != first.identity.dependency_fingerprint
+    assert _finish(_launch(third))["resource"] == replacement.hex()
+
+    # Identical bytes at a new source commit must not reuse old provenance.
+    monkeypatch.setattr(runtime, "_git_sha", lambda _root: "b" * 40)
+    following = prepare()
+    assert following.identity.code_sha == "b" * 40
+    assert following.identity.generation != third.identity.generation
+
+    # Reusing validated publications never skips the child's full integrity check.
+    manifest = generation.generation_manifest(following.root)
+    captured = generation._mapped_path(payload, following.root, manifest["paths"])
+    captured.unlink()
+    captured.write_bytes(b"tampered lease")
+    child = _launch(following)
+    output, error = child.communicate("unseeded_sdk.selected\n", timeout=60)
+    assert child.returncode != 0, error
+    assert output == ""
+
+
 def test_reused_generation_cannot_be_deleted_while_another_worker_is_live(installation, runtime_storage):
     source, _, _, _, _, prepare = installation
     first, second = prepare(), prepare()

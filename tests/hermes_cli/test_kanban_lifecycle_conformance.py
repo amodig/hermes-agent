@@ -1740,6 +1740,73 @@ class KanbanLifecycleConformance(unittest.TestCase):
         self.assertIsNone(kb.claim_task(self.conn, validation, claimer="tester"))
         self.assertEqual(self._task(validation).status, "todo")
 
+    def test_ancestor_reopen_restarts_same_card_reviews_as_implementation(self) -> None:
+        repo = Path(self.home.name) / "ancestor-review-workspace"
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        _git(repo, "config", "user.email", "conformance@example.invalid")
+        _git(repo, "config", "user.name", "Kanban Conformance")
+        (repo / "README").write_text("base\n", encoding="utf-8")
+        _git(repo, "add", "README")
+        _git(repo, "commit", "-qm", "base")
+        base_sha = _git(repo, "rev-parse", "HEAD")
+        (repo / "implementation.py").write_text("print('proof')\n", encoding="utf-8")
+        _git(repo, "add", "implementation.py")
+        _git(repo, "commit", "-qm", "implementation")
+        head_sha = _git(repo, "rev-parse", "HEAD")
+        for phase in ("review", "blocked", "running"):
+            with self.subTest(phase=phase):
+                parent = kb.create_task(self.conn, title=f"{phase} ancestor")
+                self.assertTrue(kb.complete_task(self.conn, parent))
+                child = kb.create_task(
+                    self.conn, title=f"{phase} descendant", assignee="builder",
+                    parents=[parent], workspace_kind="dir", workspace_path=str(repo),
+                    lifecycle_contract={
+                        "kind": "code", "review_mode": "same_card",
+                        "reviewer": "reviewer", "validation_required": False,
+                    },
+                )
+                kb.recompute_ready(self.conn)
+                implementation = kb.claim_task(self.conn, child, claimer="builder:conformance")
+                self.assertIsNotNone(implementation)
+                self.assertTrue(kb.complete_task(
+                    self.conn, child, expected_run_id=implementation.current_run_id,
+                    summary="Implementation evidence",
+                    metadata={"base_sha": base_sha, "head_sha": head_sha, "changed_files": ["implementation.py"]},
+                ))
+                if phase != "review":
+                    review = kb.claim_review_task(self.conn, child, claimer="reviewer:conformance")
+                    self.assertIsNotNone(review)
+                    if phase == "blocked":
+                        self.assertTrue(kb.block_task(
+                            self.conn, child, kind="needs_input", reason="human decision needed",
+                            expected_run_id=review.current_run_id,
+                        ))
+                before = self._task(child)
+                self.assertEqual(before.assignee, "reviewer")
+                with patch.object(kb, "_terminate_reclaimed_worker"):
+                    with kb.write_txn(self.conn):
+                        self.conn.execute(
+                            "UPDATE tasks SET status = 'todo', completed_at = NULL WHERE id = ?", (parent,),
+                        )
+                        kb.invalidate_descendants_for_parent_reopen(self.conn, parent, author="operator")
+                invalidated = self._task(child)
+                self.assertIsNone(invalidated.candidate_run_id)
+                self.assertEqual(invalidated.assignee, "builder")
+                self.assertEqual(invalidated.version, before.version + 1)
+                self.assertEqual(invalidated.status, "blocked" if phase == "blocked" else "todo")
+                kb.recompute_ready(self.conn)
+                self.assertTrue(kb.complete_task(self.conn, parent))
+                kb.recompute_ready(self.conn)
+                if phase == "blocked":
+                    self.assertEqual(self._task(child).status, "blocked")
+                    self.assertTrue(kb.unblock_task(self.conn, child))
+                self.assertEqual(self._task(child).status, "ready")
+                self.assertIsNone(kb.claim_review_task(self.conn, child, claimer="reviewer:conformance"))
+                replacement = kb.claim_task(self.conn, child, claimer="builder:conformance")
+                self.assertIsNotNone(replacement)
+                self.assertEqual(replacement.assignee, "builder")
+
     def test_blocked_same_card_review_keeps_reviewer_identity(self) -> None:
         repo = Path(self.home.name) / "workspace"
         repo.mkdir()
