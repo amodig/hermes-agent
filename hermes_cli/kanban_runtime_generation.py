@@ -147,10 +147,6 @@ def _members(root: Path, *, source=False, exclude=()):
                 yield path.relative_to(root).as_posix(), path
 
 
-def source_members(root: Path):
-    yield from _members(root, source=True)
-
-
 def _digest_members(members):
     digest = hashlib.sha256()
     for name, path in members:

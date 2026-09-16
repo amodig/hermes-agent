@@ -228,6 +228,212 @@ def _finish(process):
     return json.loads(output.splitlines()[-1])
 
 
+def test_deployment_identity_ignores_install_artifacts_but_detects_runtime_changes(
+    tmp_path, monkeypatch, runtime_storage,
+):
+    for _, variable in runtime._RUNTIME_RESOURCE_ROOTS:
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUNTIME_GENERATION", raising=False)
+    source = tmp_path / "source"
+    worktree = tmp_path / "worktree"
+    installed = tmp_path / "installed"
+    contents = {
+        # Python modules and package data selected by setup.py/pyproject.toml.
+        "hermes_cli/__init__.py": '__version__ = "fixture"\n',
+        "hermes_cli/runtime.py": "VALUE = 'runtime package'\n",
+        "hermes_cli/scripts/__init__.py": "",
+        "hermes_cli/scripts/bridge.py": "VALUE = 'executable script'\n",
+        "hermes_cli/observability/schemas/schema.json": "{\"type\": \"object\"}\n",
+        "hermes_cli/data/catalog.json": "{\"name\": \"catalog\"}\n",
+        "hermes_cli/data/source-only.txt": "not package data\n",
+        "hermes_cli/local_runtime/catalog.json": "{\"name\": \"runtime\"}\n",
+        "hermes_cli/local_runtime/source-only.txt": "not package data\n",
+        "agent/__init__.py": "",
+        "agent/runtime.py": "VALUE = 'agent package'\n",
+        "tools/__init__.py": "",
+        "tools/kanban_tools.py": "VALUE = 'tool'\n",
+        "gateway/__init__.py": "",
+        "gateway/runtime.py": "VALUE = 'gateway package'\n",
+        "gateway/assets/status_phrases.yaml": "working: Working\n",
+        "gateway/source-only.txt": "not package data\n",
+        "plugins/__init__.py": "",
+        "plugins/sample/__init__.py": "VALUE = 'plugin package'\n",
+        "plugins/sample/plugin.py": "VALUE = 'plugin code'\n",
+        "plugins/sample/plugin.yaml": "name: sample\n",
+        "plugins/sample/source-only.txt": "bundled resource only\n",
+        # setup.py exposes root Python modules, but not setup.py itself.
+        "run_agent.py": "VALUE = 'runtime'\n",
+        "hermes_state.py": "VALUE = 'state'\n",
+        "fixture_native.so": "native extension bytes\n",
+        # Nix places these outside the Python installation and sets overrides.
+        "skills/review/SKILL.md": "Review the candidate.\n",
+        "locales/en.yaml": "ready: Ready\n",
+    }
+    source_only = {
+        # These are checkout/build metadata omitted by supported packaging.
+        "setup.py": "from setuptools import setup\n",
+        "pyproject.toml": '[project]\nname = "fixture"\n',
+        "uv.lock": "version = 1\n",
+        "package.json": "{}\n",
+        "package-lock.json": "{}\n",
+        "compat_manifest.json": "{}\n",
+        "cli-config.yaml.example": "example: true\n",
+        # Undeclared namespace/package trees and native build inputs are not
+        # part of the packaged Python runtime.
+        "fixture_package/__init__.py": "VALUE = 'package'\n",
+        "fixture_package/build/handler.py": "VALUE = 'build module'\n",
+        "fixture_package/dist/handler.py": "VALUE = 'dist module'\n",
+        "namespace_package/nested/worker.py": "VALUE = 'namespace'\n",
+        "namespace_package/nested/data.bin": "namespace package data\n",
+        "native_namespace/tokenizer.so": "namespace native extension bytes\n",
+        "native_namespace/data.bin": "native package data\n",
+        "apps/desktop/scripts/perf/gateway_attach_bench.py": "VALUE = 'perf tool'\n",
+        "website/scripts/generate-llms-txt.py": "VALUE = 'docs tool'\n",
+        "native/fts5_cjk/fts5_cjk.c": "int tokenizer(void) { return 1; }\n",
+    }
+    for name, content in {**contents, **source_only}.items():
+        _write(source / name, content)
+    shutil.copytree(source, worktree)
+
+    # A packaged install contains only discovered modules and declared data;
+    # bundled resources are supplied by the wrapper below, not copied from
+    # the checkout wholesale.
+    packaged_files = (
+        "hermes_cli/__init__.py",
+        "hermes_cli/runtime.py",
+        "hermes_cli/scripts/__init__.py",
+        "hermes_cli/scripts/bridge.py",
+        "hermes_cli/observability/schemas/schema.json",
+        "hermes_cli/data/catalog.json",
+        "hermes_cli/local_runtime/catalog.json",
+        "agent/__init__.py",
+        "agent/runtime.py",
+        "tools/__init__.py",
+        "tools/kanban_tools.py",
+        "gateway/__init__.py",
+        "gateway/runtime.py",
+        "gateway/assets/status_phrases.yaml",
+        "plugins/__init__.py",
+        "plugins/sample/__init__.py",
+        "plugins/sample/plugin.py",
+        "plugins/sample/plugin.yaml",
+        "run_agent.py",
+        "hermes_state.py",
+        "fixture_native.so",
+    )
+    for name in packaged_files:
+        _write(installed / name, contents[name])
+    # A real wheel inventory makes root-module selection use RECORD rather
+    # than treating unrelated root files as package code.
+    dist_info = installed / "hermes_agent-0.21.0.dist-info"
+    _write(
+        dist_info / "METADATA",
+        "Metadata-Version: 2.3\nName: hermes-agent\nVersion: 0.21.0\n",
+    )
+    _write(
+        dist_info / "WHEEL",
+        "Wheel-Version: 1.0\nGenerator: fixture\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+    )
+    root_records = [name for name in packaged_files if "/" not in name]
+    _write(dist_info / "RECORD", "".join(f"{name},,\n" for name in root_records))
+
+    sha = "a" * 40
+    _write(source / ".git" / "HEAD", sha)
+    git_dir = tmp_path / "git-metadata" / "worktrees" / "fixture"
+    _write(git_dir / "HEAD", sha)
+    _write(worktree / ".git", f"gitdir: {git_dir}\n")
+    _write(worktree / "test_durations.json", '{"test_fixture": 1.0}\n')
+    # Real desktop output paths must not become runtime data merely because
+    # apps/ also contains Python performance tooling.
+    for name in (
+        "apps/desktop/build/electron-types/desktop/tsconfig.electron.tsbuildinfo",
+        "apps/desktop/tsconfig.e2e.tsbuildinfo",
+        "website/build/index.html",
+    ):
+        _write(source / name, "frontend build artifact\n")
+    for name in (
+        ".install_method", "node_modules/package/index.js",
+        "build/lib/hermes_cli/main.py", "hermes_agent.egg-info/PKG-INFO",
+        "hermes_cli/web_dist/index.html", "hermes_cli/tui_dist/index.js",
+        "hermes_cli/__pycache__/main.pyc",
+        "plugins/sample/node_modules/package/index.js", ".pytest_cache/results",
+        "dist/package.py", "venv/pyvenv.cfg", "venv/lib/package.py",
+        "tests/test_generated_fixture.py",
+    ):
+        _write(installed / name, "installation artifact\n")
+    _write(installed / "unrelated_dependency.py", "VALUE = 'not owned by Hermes'\n")
+
+    packaged_resources = {}
+    for directory, variable in (
+        ("skills", "HERMES_BUNDLED_SKILLS"),
+        ("locales", "HERMES_BUNDLED_LOCALES"),
+        ("plugins", "HERMES_BUNDLED_PLUGINS"),
+    ):
+        relocated = tmp_path / f"packaged-{directory}"
+        shutil.copytree(source / directory, relocated)
+        packaged_resources[variable] = relocated
+
+    expected = runtime.runtime_identity(source)
+    for variable, relocated in packaged_resources.items():
+        monkeypatch.setenv(variable, str(relocated))
+    for root in (worktree, installed):
+        actual = runtime.runtime_identity(root)
+        assert (actual.protocol, actual.version, actual.fingerprint) == (
+            expected.protocol, expected.version, expected.fingerprint,
+        )
+        # Deployment comparability must not relax the worker's root-bound fence.
+        assert not runtime.same_code_identity(expected, actual)
+
+    for name in packaged_files:
+        original = contents[name]
+        _write(installed / name, original + "# changed\n")
+        assert runtime.runtime_identity(installed).fingerprint != expected.fingerprint, name
+        _write(installed / name, original)
+
+    # Relocated wrapper resources remain part of deployment identity.
+    relocated_skills = packaged_resources["HERMES_BUNDLED_SKILLS"]
+    _write(relocated_skills / "review" / "SKILL.md", "Different review policy.\n")
+    assert runtime.runtime_identity(installed).fingerprint != expected.fingerprint
+
+
+@pytest.mark.parametrize("override_kind", ["unset", "empty", "missing", "file"])
+def test_deployment_identity_tracks_loader_fallback_for_bundled_locales(
+    tmp_path, monkeypatch, override_kind,
+):
+    root = tmp_path / "installation"
+    _write(root / "hermes_cli" / "__init__.py", '__version__ = "fixture"\n')
+    _write(root / "agent" / "i18n.py", "")
+    locale = root / "locales" / "en.yaml"
+    _write(locale, "ready: Ready\n")
+
+    from agent import i18n
+
+    monkeypatch.setattr(i18n, "__file__", str(root / "agent" / "i18n.py"))
+    monkeypatch.delenv("HERMES_BUNDLED_LOCALES", raising=False)
+    if override_kind == "empty":
+        monkeypatch.setenv("HERMES_BUNDLED_LOCALES", "")
+    elif override_kind == "missing":
+        monkeypatch.setenv("HERMES_BUNDLED_LOCALES", str(tmp_path / "does-not-exist"))
+    elif override_kind == "file":
+        invalid = tmp_path / "not-a-directory"
+        invalid.write_text("not a directory\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_BUNDLED_LOCALES", str(invalid))
+
+    i18n.reset_language_cache()
+    try:
+        # Derive the fallback from the production loader, rather than
+        # duplicating its path-selection rule in this regression.
+        assert i18n._locales_dir() == locale.parent
+        assert i18n.t("ready", lang="en") == "Ready"
+        before = runtime._fingerprint(root)
+        locale.write_text("ready: Changed\n", encoding="utf-8")
+        i18n.reset_language_cache()
+        assert i18n.t("ready", lang="en") == "Changed"
+        assert runtime._fingerprint(root) != before
+    finally:
+        i18n.reset_language_cache()
+
+
 def test_cold_generation_preserves_dynamic_imports_plugins_and_native_runtime(installation):
     source, dependencies, plugins, external, native_probe, prepare = installation
     prepared = prepare()
@@ -463,15 +669,22 @@ print(json.dumps({
             child.wait()
 
 
-@pytest.mark.parametrize("damaged_payload", ["dependency", "profile-plugin"])
+@pytest.mark.parametrize("damaged_payload", ["dependency", "profile-plugin", "source-artifact", "desktop-artifact"])
 def test_partial_or_rewritten_manifest_never_reaches_worker_code(installation, damaged_payload):
-    _, dependencies, plugins, _, _, prepare = installation
+    source, dependencies, plugins, _, _, prepare = installation
+    artifact = source / "hermes_cli" / "web_dist" / "index.html"
+    _write(artifact, "generated installation asset\n")
+    desktop_artifact = source / "apps" / "desktop" / "tsconfig.e2e.tsbuildinfo"
+    _write(desktop_artifact, "frontend build artifact\n")
+    _write(source / "apps" / "desktop" / "scripts" / "perf" / "gateway_attach_bench.py", "pass\n")
     prepared = prepare(profile_home=plugins.parent)
     manifest = generation.generation_manifest(prepared.root)
-    original = (
-        dependencies / "unseeded_sdk" / "selected.py" if damaged_payload == "dependency"
-        else plugins / "model-providers" / "fixture" / "resource.txt"
-    )
+    original = {
+        "dependency": dependencies / "unseeded_sdk" / "selected.py",
+        "profile-plugin": plugins / "model-providers" / "fixture" / "resource.txt",
+        "source-artifact": artifact,
+        "desktop-artifact": desktop_artifact,
+    }[damaged_payload]
     generation._mapped_path(original, prepared.root, manifest["paths"]).unlink()
     child = _launch(prepared)
     output, error = child.communicate("unseeded_sdk.selected\n", timeout=60)

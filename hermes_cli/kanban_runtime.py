@@ -214,8 +214,92 @@ def _version(root: Path) -> str:
 
 
 def _fingerprint(root: Path) -> str:
-    from hermes_cli.kanban_runtime_generation import _digest_members, source_members
-    return _digest_members(source_members(root))
+    """Comparable deployed code/resources, not build inputs or sealed payloads."""
+    from importlib.metadata import PathDistribution
+
+    from hermes_constants import _packaged_dir
+    from hermes_cli.kanban_runtime_generation import _digest_members, _members, _TREE_EXCLUDES
+
+    code_suffixes = (".py", ".pyi", ".so", ".pyd", ".dll", ".dylib")
+    # Match pyproject.toml's package discovery/data and setup.py's root modules.
+    # Source-only manifests, package docs and native build inputs are not shipped.
+    # Full generation digests independently seal those bytes and dependencies.
+    package_data = {
+        "hermes_cli": ("observability/schemas/*.json", "data/*.json", "local_runtime/*.json"),
+        "gateway": ("assets/**/*",),
+        "plugins": ("**/plugin.yaml", "**/plugin.yml"),
+    }
+    data_files = {
+        member
+        for name, patterns in package_data.items()
+        for pattern in patterns
+        for member in (root / name).glob(pattern)
+        if member.is_file()
+    }
+    paths = {name: root / name for name in _IDENTITY_ROOTS}
+    # A packaged module root may be shared with third-party distributions. RECORD
+    # owns its root modules; source/editable trees use setup.py's discovery rule.
+    wheel_metadata = next(
+        (marker.parent for marker in root.glob("hermes_agent-*.dist-info/WHEEL") if marker.is_file()),
+        None,
+    )
+    installed_modules = None
+    if wheel_metadata is not None:
+        files = PathDistribution(wheel_metadata).files
+        if files is None:
+            raise RuntimeIdentityError("installed runtime has no file inventory")
+        installed_modules = {str(member) for member in files if len(member.parts) == 1}
+    for path in root.iterdir():
+        if (
+            path.is_file() and path.suffix in code_suffixes and path.name != "setup.py"
+            and (installed_modules is None or path.name in installed_modules)
+        ):
+            paths[path.name] = path
+
+    # Logical names normalize Nix's relocated bundles. Reuse the import-safe
+    # skills/catalog resolver, with a default rooted in the tree being attested.
+    # Locale/plugin helpers bind __file__ (plugins also imports runtime state),
+    # so mirror only their path selection here, without importing either loader.
+    for name, variable in _RUNTIME_RESOURCE_ROOTS:
+        default = root / name
+        if name == "locales":
+            # agent.i18n._locales_dir: strip, require a directory, no expanduser.
+            override = os.getenv(variable, "").strip()
+            path = Path(override) if override and Path(override).is_dir() else default
+        elif name == "plugins":
+            # hermes_cli.plugins.get_bundled_plugins_dir: raw override, no fallback
+            # on a missing path, no stripping or user expansion.
+            path = Path(os.getenv(variable) or default)
+        else:
+            path = _packaged_dir(variable, default, name)
+        if path.is_dir():
+            paths[f"bundled/{name}"] = path
+
+    def members():
+        for name, path in sorted(paths.items()):
+            if path.is_file():
+                yield name, path
+            elif path.is_dir():
+                # These exact frontend destinations and dependencies are build
+                # outputs; Nix also omits skill index caches from its bundles.
+                excludes = ("node_modules",)
+                if name in {"bundled/skills", "bundled/optional-skills"}:
+                    excludes += ("index-cache",)
+                for relative, member in _members(path, source=True, exclude=excludes):
+                    if name == "hermes_cli" and relative.split("/", 1)[0] in {"web_dist", "tui_dist"}:
+                        continue
+                    if name == "acp_adapter" and "/" in relative:
+                        continue  # setuptools declares this package, not acp_adapter.*.
+                    if (
+                        member.is_file() and member.name not in _TREE_EXCLUDES
+                        and (
+                            name.startswith("bundled/") or member.suffix in code_suffixes
+                            or member.name == "py.typed" or member in data_files
+                        )
+                    ):
+                        yield f"{name}/{relative}", member
+
+    return _digest_members(members())
 
 
 _FROZEN_RUNTIME_IDENTITY: Optional[RuntimeIdentity] = None

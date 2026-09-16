@@ -21,11 +21,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_runtime_generation as generations
 from hermes_cli.kanban_runtime import process_start_time
-from tests.hermes_cli.test_kanban_lifecycle_conformance import (
-    _make_runtime_fixture,
-    _prepare_fixture_generation,
-    _wait_for_receipt,
-)
+from tests.hermes_cli import kanban_conformance_fixture as MODULE
 from tests.hermes_cli.test_kanban_runtime_generation import (
     _install_memory_loaders,
     _write_memory_provider,
@@ -47,11 +43,11 @@ def worker_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr("tools.process_registry._is_supervised_gateway_process", lambda: False)
     source = tmp_path / "install"
-    _make_runtime_fixture(source)
+    MODULE._make_runtime_fixture(source)
     prepared = []
 
     def prepare(_expected, *, workspace=None, profile_home=None, project_plugins_enabled=None):
-        generation = _prepare_fixture_generation(
+        generation = MODULE._prepare_fixture_generation(
             source, workspace=workspace, profile_home=profile_home,
             project_plugins_enabled=project_plugins_enabled,
         )
@@ -114,7 +110,7 @@ def test_worker_generation_scopes_profile_board_and_secrets_before_grant(
     try:
         assert not receipt.exists()
         launch.grant(task.current_run_id, task.claim_lock)
-        observed = _wait_for_receipt(receipt)
+        observed = MODULE._wait_for_receipt(receipt)
         assert observed["argv"][:2] == ["-p", "coder"]
         assert observed["argv"][-3:] == ["chat", "-q", f"work kanban task {task.id}"]
         assert observed["cwd"] == str(workspace)
@@ -195,7 +191,7 @@ value = {
     snapshot = kbd._worker_runtime_snapshots[launch.launcher_pid]
     try:
         launch.grant(task.current_run_id, task.claim_lock)
-        observed = _wait_for_receipt(workspace.parent / "receipt.json")
+        observed = MODULE._wait_for_receipt(workspace.parent / "receipt.json")
         plugin = observed["early"][0]
         assert plugin["provider"] == "assigned"
         assert plugin["resource"] == "assigned resource"
@@ -270,7 +266,7 @@ value = {
     snapshot = kbd._worker_runtime_snapshots[launch.launcher_pid]
     try:
         launch.grant(task.current_run_id, task.claim_lock)
-        observed = _wait_for_receipt(workspace.parent / "receipt.json")
+        observed = MODULE._wait_for_receipt(workspace.parent / "receipt.json")
         memory = observed["early"][0]
         assert memory["provider"] == "assigned:assigned resource"
         assert memory["resource"] == memory["schema"] == memory["cli"] == "assigned resource"
@@ -385,7 +381,7 @@ value = {
     snapshot = kbd._worker_runtime_snapshots[launch.launcher_pid]
     try:
         launch.grant(task.current_run_id, task.claim_lock)
-        plugin = _wait_for_receipt(workspace.parent / "receipt.json")["early"][0]
+        plugin = MODULE._wait_for_receipt(workspace.parent / "receipt.json")["early"][0]
         assert plugin["discovered"] is enabled
         assert plugin["discovered_before"] is enabled
         assert plugin["captured"] is enabled
@@ -442,7 +438,7 @@ def test_generation_ignores_workspace_and_pythonpath_before_any_import(worker_se
     launch = kbd._default_spawn(task, str(workspace), defer_grant=True)
     try:
         launch.grant(task.current_run_id, task.claim_lock)
-        observed = _wait_for_receipt(workspace.parent / "receipt.json")
+        observed = MODULE._wait_for_receipt(workspace.parent / "receipt.json")
         assert observed["early"] == [1, 1]
         assert observed["lazy"] == [1, 1]
         assert not marker.exists()
@@ -477,7 +473,7 @@ def test_explicit_current_install_entrypoint_is_sealed_and_custom_wrapper_is_ref
     launch = kbd._default_spawn(task, str(workspace), defer_grant=True)
     try:
         launch.grant(task.current_run_id, task.claim_lock)
-        observed = _wait_for_receipt(workspace.parent / "receipt.json")
+        observed = MODULE._wait_for_receipt(workspace.parent / "receipt.json")
         assert observed["early"] == [1, 1]
         generation = kbd._worker_runtime_snapshots[launch.launcher_pid]
         assert all(Path(location).is_relative_to(generation) for location in observed["locations"])
@@ -502,7 +498,7 @@ def test_real_user_systemd_scope_preserves_worker_context(worker_setup, monkeypa
     launch = kbd._default_spawn(task, str(workspace), defer_grant=True)
     try:
         launch.grant(task.current_run_id, task.claim_lock)
-        observed = _wait_for_receipt(workspace.parent / "receipt.json")
+        observed = MODULE._wait_for_receipt(workspace.parent / "receipt.json")
         assert observed["identity"]["pid"] == launch.pid
         assert observed["cwd"] == str(workspace)
         assert observed["task"] == task.id
@@ -540,7 +536,7 @@ from unittest.mock import patch
 from hermes_cli import kanban_runtime_generation as generations
 generations._runtime_storage_root = lambda: Path(sys.argv[2])
 from hermes_cli import kanban_db_dispatch as kbd
-from tests.hermes_cli.test_kanban_lifecycle_conformance import _prepare_fixture_generation
+from tests.hermes_cli.kanban_conformance_fixture import _prepare_fixture_generation
 base = Path(sys.argv[1])
 conn = sqlite3.connect(base / 'restart.db')
 conn.row_factory = sqlite3.Row
@@ -573,7 +569,7 @@ os._exit(0)
         assert recovered.current_run_id == claimed.current_run_id
         assert recovered.claim_lock == claimed.claim_lock
         release.touch()
-        observed = _wait_for_receipt(base / "receipt.json")
+        observed = MODULE._wait_for_receipt(base / "receipt.json")
         assert observed["lazy"] == [1, 1]
         assert observed["run"] == str(claimed.current_run_id)
         assert observed["claim"] == claimed.claim_lock

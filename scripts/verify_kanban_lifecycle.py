@@ -3,9 +3,10 @@
 
 The source layer uses the repository's canonical per-file runner when pytest is
 available, with a stdlib unittest fallback for lean runtime installations.
-Installed runs execute the same fixture against an explicitly selected runtime
-root.  Active verification is intentionally read-only and requires a later
-control-plane probe from the layered verifier.
+The ordered canonical and upgrade suites run in every source or installed
+context.  Installed runs execute the same fixtures against an explicitly
+selected runtime root.  Active verification is intentionally read-only and
+requires a later control-plane probe from the layered verifier.
 """
 
 from __future__ import annotations
@@ -26,8 +27,14 @@ import xml.etree.ElementTree as ET
 
 PROTOCOL = 1
 REPO_ROOT = Path(__file__).resolve().parents[1]
-TEST_MODULE = "tests.hermes_cli.test_kanban_lifecycle_conformance"
-TEST_FILE = REPO_ROOT / "tests" / "hermes_cli" / "test_kanban_lifecycle_conformance.py"
+TEST_MODULES = (
+    "tests.hermes_cli.test_kanban_lifecycle_conformance",
+    "tests.hermes_cli.test_kanban_lifecycle_upgrade_conformance",
+)
+TEST_FILES = (
+    REPO_ROOT / "tests" / "hermes_cli" / "test_kanban_lifecycle_conformance.py",
+    REPO_ROOT / "tests" / "hermes_cli" / "test_kanban_lifecycle_upgrade_conformance.py",
+)
 SCENARIO_HEADER_RE = re.compile(
     r"^(?P<name>test_[^\s(]+)(?: \((?P<class>[^)]+)\))?"
 )
@@ -80,16 +87,45 @@ def _pythonpath(layer: str, runtime_root: Path) -> str:
 
 
 def _installed_unittest_runner() -> str:
-    return (
-        "import importlib.util,sys,unittest;"
-        "spec=importlib.util.spec_from_file_location('installed_conformance',sys.argv[1]);"
-        "module=importlib.util.module_from_spec(spec);"
-        "sys.modules[spec.name]=module;"
-        "spec.loader.exec_module(module);"
-        "result=unittest.TextTestRunner(verbosity=2).run("
-        "unittest.defaultTestLoader.loadTestsFromModule(module));"
-        "raise SystemExit(0 if result.wasSuccessful() else 1)"
-    )
+    return """\
+import importlib.util
+import sys
+import types
+import unittest
+from pathlib import Path
+
+paths = sys.argv[1:]
+if len(paths) != 2:
+    raise SystemExit(f"expected two conformance test files, got {len(paths)}")
+
+# The test modules live in the source checkout while production imports must
+# resolve exclusively from the selected installed runtime.  Expose only the
+# source test namespace through synthetic packages; never add the repository
+# root to sys.path.
+first = Path(paths[0]).resolve()
+tests_package = types.ModuleType("tests")
+tests_package.__path__ = [str(first.parent.parent)]
+tests_package.__package__ = "tests"
+sys.modules["tests"] = tests_package
+hermes_cli_package = types.ModuleType("tests.hermes_cli")
+hermes_cli_package.__path__ = [str(first.parent)]
+hermes_cli_package.__package__ = "tests.hermes_cli"
+sys.modules["tests.hermes_cli"] = hermes_cli_package
+
+suite = unittest.TestSuite()
+for path in paths:
+    module_name = f"tests.hermes_cli.{Path(path).stem}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load conformance test module: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    suite.addTests(unittest.defaultTestLoader.loadTestsFromModule(module))
+
+result = unittest.TextTestRunner(verbosity=2).run(suite)
+raise SystemExit(0 if result.wasSuccessful() else 1)
+"""
 
 
 def _probe_identity(runtime_root: Path, python: str, *, layer: str) -> dict:
@@ -203,15 +239,15 @@ def _run_suite(layer: str, runtime_root: Path, python: str, junit: Path | None) 
         }
     )
     if layer == "source" and _pytest_available(python):
-        command = [str(REPO_ROOT / "scripts" / "run_tests.sh"), str(TEST_FILE)]
+        command = [str(REPO_ROOT / "scripts" / "run_tests.sh"), *map(str, TEST_FILES)]
         runner = "scripts/run_tests.sh"
         cwd = REPO_ROOT
     elif layer == "installed":
-        command = [python, "-c", _installed_unittest_runner(), str(TEST_FILE)]
+        command = [python, "-c", _installed_unittest_runner(), *map(str, TEST_FILES)]
         runner = "python -c <installed conformance runner>"
         cwd = runtime_root
     else:
-        command = [python, "-m", "unittest", "-v", TEST_MODULE]
+        command = [python, "-m", "unittest", "-v", *TEST_MODULES]
         runner = "python -m unittest"
         cwd = REPO_ROOT
     result = subprocess.run(
@@ -240,9 +276,9 @@ def _run_scenario_probe(layer: str, runtime_root: Path, python: str) -> tuple[in
         }
     )
     if layer == "installed":
-        command = [python, "-c", _installed_unittest_runner(), str(TEST_FILE)]
+        command = [python, "-c", _installed_unittest_runner(), *map(str, TEST_FILES)]
     else:
-        command = [python, "-m", "unittest", "-v", TEST_MODULE]
+        command = [python, "-m", "unittest", "-v", *TEST_MODULES]
     result = subprocess.run(
         command,
         cwd=runtime_root if layer == "installed" else REPO_ROOT,
