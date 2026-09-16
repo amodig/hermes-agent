@@ -33,6 +33,21 @@ import sys
 _bootstrap_root = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pardir))
 if _bootstrap_root not in sys.path:
     sys.path.insert(0, _bootstrap_root)
+
+_early_runtime_argv = sys.argv[1:]
+if os.environ.get("HERMES_KANBAN_BOOTSTRAP_PATH") and not os.environ.get(
+    "HERMES_KANBAN_BOOTSTRAP_DONE",
+):
+    try:
+        # Worker bootstrap is the one narrow path allowed to import the
+        # runtime module before early recovery.
+        from hermes_cli.kanban_runtime import worker_bootstrap_from_env
+
+        worker_bootstrap_from_env()
+        os.environ["HERMES_KANBAN_BOOTSTRAP_DONE"] = "1"
+    except Exception as exc:
+        print(f"worker bootstrap refused: {exc}", file=sys.stderr)
+        raise SystemExit(78) from exc
 from hermes_cli import _startup_fast  # noqa: E402
 
 # Early venv self-heal — MUST run before any third-party import below. A prior
@@ -47,10 +62,19 @@ from hermes_cli import _startup_fast  # noqa: E402
 # #57828.
 from hermes_cli import _early_recovery as _early_recovery_mod
 
-try:
-    _early_recovery_mod.recover_if_needed()
-except Exception:
-    pass
+# A generation is already complete; recovery must never modify its sealed files.
+if not os.environ.get("HERMES_KANBAN_RUNTIME_GENERATION"):
+    try:
+        _early_recovery_mod.recover_if_needed()
+    except Exception:
+        pass
+
+
+if _early_runtime_argv in (["runtime-identity"], ["runtime-identity", "--json"], ["--runtime-identity"]):
+    from hermes_cli.kanban_runtime import runtime_identity_json
+
+    print(runtime_identity_json())
+    raise SystemExit(0)
 
 
 # Startup-liveness watchdog: for gateway runs, arm BEFORE the heavy import
@@ -3141,6 +3165,7 @@ def _register_plugin_cli_commands(subparsers) -> None:
         logging.getLogger(__name__).debug("Plugin CLI discovery failed: %s", _exc)
 
 
+
 def _cmd_sessions_lazy(args, **kwargs):
     """``hermes sessions`` handler; sessions_cmd imports only when the subcommand runs."""
     from hermes_cli.sessions_cmd import cmd_sessions
@@ -3306,6 +3331,27 @@ def _default_to_chat(args) -> None:
 
 def main():
     """Main entry point for hermes CLI."""
+    early_argv = sys.argv[1:]
+    if early_argv in (["runtime-identity"], ["runtime-identity", "--json"], ["--runtime-identity"]):
+        from hermes_cli.kanban_runtime import runtime_identity_json
+
+        print(runtime_identity_json())
+        return
+    if os.environ.get("HERMES_KANBAN_BOOTSTRAP_PATH") and not os.environ.get("HERMES_KANBAN_BOOTSTRAP_DONE"):
+        try:
+            from hermes_cli.kanban_runtime import worker_bootstrap_from_env
+
+            worker_bootstrap_from_env()
+        except Exception as exc:
+            print(f"worker bootstrap refused: {exc}", file=sys.stderr)
+            sys.exit(78)
+    if os.environ.get("HERMES_KANBAN_BOOTSTRAP_PATH"):
+        try:
+            from hermes_cli.kanban_runtime import worker_bootstrap_post_import
+            worker_bootstrap_post_import(wait_for_grant=False)
+        except Exception as exc:
+            print(f"worker post-import verification refused: {exc}", file=sys.stderr)
+            sys.exit(78)
     _set_process_title()
     _advertise_agent_env()
 
@@ -3318,14 +3364,21 @@ def main():
 
     # Sweep stale ``hermes.exe.old.*`` quarantine files from previous Windows
     # updates (see ``_quarantine_running_hermes_exe``). No-op elsewhere.
-    try:
-        _cleanup_quarantined_exes()
-    except Exception:
-        pass
+    if not os.environ.get("HERMES_KANBAN_RUNTIME_GENERATION"):
+        from hermes_cli.kanban_runtime_generation import installation_mutation_lock
 
-    # Checkout changed since last launch → sweep stale __pycache__ once so no
-    # process resolves fresh source against old bytecode. Never raises.
-    _sweep_stale_bytecode_if_checkout_changed()
+        # Updater children must not wait for the parent waiting on their exit.
+        try:
+            with installation_mutation_lock(blocking=False):
+                try:
+                    _cleanup_quarantined_exes()
+                except Exception:
+                    pass
+
+                # Checkout changed → sweep stale bytecode before resolving new source.
+                _sweep_stale_bytecode_if_checkout_changed()
+        except BlockingIOError:
+            pass
 
     # Self-heal a venv left half-built by an interrupted ``hermes update``, and
     # hint (never restart) about a fleet the interrupted update never
@@ -3335,9 +3388,10 @@ def main():
     # install update``) only defers recovery one launch; under-matching
     # (``hermes -p work update``) would race. Never raises.
     # See #95294.
-    if "update" not in sys.argv[1:]:
+    if "update" not in sys.argv[1:] and not os.environ.get("HERMES_KANBAN_RUNTIME_GENERATION"):
         try:
-            _recover_from_interrupted_install()
+            with installation_mutation_lock(blocking=False):
+                _recover_from_interrupted_install()
         except Exception:
             pass
         try:

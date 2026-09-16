@@ -26,8 +26,9 @@ Use this skill when all of the following are true:
 - an implementer submitted a `review_requested` handoff;
 - the task needs an independent verdict before it can be completed.
 
-Do not use it for a separate downstream review card. A downstream card is ordinary implementation work with a review-oriented specification and completes through its own lifecycle.
-
+Typed separate-card review tasks use this skill too: complete them with an
+explicit `APPROVE` or `REQUEST_CHANGES` verdict. Do not treat a typed review
+card as ordinary implementation work.
 ## Prerequisites
 
 - A Kanban worker context with the current task and run identifiers.
@@ -48,11 +49,15 @@ This skill is loaded automatically by the review dispatcher. Start with `kanban_
 
 | Verdict | When | Final action |
 |---|---|---|
-| Approve | Acceptance criteria and verification pass | `kanban_complete` |
-| Request changes | Correctable implementation defects remain | `kanban_comment`, then `kanban_request_changes` |
+| Approve | Acceptance criteria and verification pass | Typed review: `kanban_complete(verdict="APPROVE", ...)`; typed validation: `kanban_complete(verdict="PASS", ...)`; legacy card: `kanban_complete(...)` |
+| Request changes | Correctable implementation defects remain | Typed review: `kanban_complete(verdict="REQUEST_CHANGES", ...)`; typed validation: `kanban_complete(verdict="FAIL", ...)`; legacy card: `kanban_request_changes` |
 | Escalate | A human decision or external prerequisite is required | `kanban_block` |
 
-A requested-changes transition returns the task to its original implementer. When that implementer requests review again without naming a reviewer, the persisted reviewer provenance routes the re-review back to the same reviewer profile.
+A requested-changes transition returns the task to its original implementer.
+For a typed separate-card graph, the orchestrator reworks the lifecycle graph
+after the review card records `REQUEST_CHANGES`. When that implementer requests
+review again without naming a reviewer, persisted reviewer provenance routes
+the re-review back to the same reviewer profile.
 
 ## Review Lenses
 
@@ -112,10 +117,14 @@ Approve only when the acceptance criteria are satisfied and the evidence is suff
 
 ```text
 kanban_complete(
+    verdict="APPROVE",
     summary="Reviewed and approved. <what was verified>",
     metadata={"review_outcome": "approved", "reviewer_checks": [...]}
 )
 ```
+
+For a legacy/untyped review run, call `kanban_complete(...)` without a
+`verdict`; legacy cards have no typed lifecycle verdict to record.
 
 Include the exact checks that passed and any bounded caveat that does not block acceptance.
 
@@ -130,7 +139,26 @@ kanban_comment(
 )
 ```
 
-Then return the same task to its implementer:
+For a typed review card, finish with the explicit lifecycle verdict:
+
+```text
+kanban_complete(
+    verdict="REQUEST_CHANGES",
+    summary="<concise summary of the required corrections>",
+    metadata={"review_outcome": "changes_requested"},
+)
+```
+
+For a typed validation card, record a failed validation with:
+
+```text
+kanban_complete(
+    verdict="FAIL",
+    summary="<concise summary of the failed check and required correction>",
+)
+```
+
+For a legacy/untyped review run, return it to its implementer with:
 
 ```text
 kanban_request_changes(
@@ -138,7 +166,10 @@ kanban_request_changes(
 )
 ```
 
-State where the defect is, how it reproduces, why it violates the task, and what minimum outcome would resolve it. The transition does not use blocker recurrence accounting.
+Do not call `kanban_request_changes` for a typed review or validation card.
+Same-card typed code uses the typed `kanban_complete` action; a separate-card
+graph is reworked by the orchestrator after the review card is completed.
+State where the defect is, how it reproduces, why it violates the task, and the minimum outcome that would resolve it. The transition does not use blocker recurrence accounting.
 
 #### Escalate
 
@@ -163,7 +194,7 @@ Do not edit the implementation while acting as reviewer. Request changes and let
 - **Vague findings:** “Needs work” does not give the implementer a reproducible correction target.
 - **Style-only blocking:** Do not request changes for preference-level nits when behavior and repository standards are satisfied.
 - **Skipping prior rounds:** Re-review must confirm both the requested corrections and preservation of previously passing behavior.
-- **Using blockers for ordinary rework:** Correctable defects belong in `kanban_request_changes`; reserve `kanban_block` for genuine external blockers or human decisions.
+- **Using blockers for ordinary rework:** In legacy/untyped review flows, correctable defects belong in `kanban_request_changes`; typed review cards record `REQUEST_CHANGES`, and typed validation cards record `FAIL`, through `kanban_complete(verdict=...)`. Reserve `kanban_block` for genuine external blockers or human decisions.
 - **Completing without evidence:** Every approval summary must name the checks or artifacts actually inspected.
 
 ## Verification

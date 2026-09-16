@@ -355,7 +355,7 @@ def _reinstall_python_deps_after_zip(active_tool_dependencies) -> None:
     _m()._refresh_active_memory_provider_dependencies()
 
 
-def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> bool:
+def _update_via_zip(args, *, had_desktop_app_before_update: bool = False, release_installation=None) -> bool:
     """Update via ZIP archive; used on Windows when git file I/O is broken (antivirus / NTFS filter
     drivers causing 'Invalid argument'). Returns ``False`` when a Desktop rebuild ran and failed."""
     from hermes_cli.update_cmd import (
@@ -425,6 +425,8 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         _print_curator_first_run_notice()
     with _best_effort('Curator recent-run notice failed: %s'):
         _print_curator_recent_run_notice()
+    if release_installation is not None:
+        release_installation()
     # Don't stop a working dashboard when the Node refresh failed — see the git-update path for rationale.
     # See #30271.
     _finish_dashboard_update_cleanup(node_failures)

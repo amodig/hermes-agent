@@ -132,6 +132,7 @@ class _KanbanDispatcher:
         self.kb = kb
         self.settings = settings
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
+        _kbd()._freeze_runtime_identity()
 
     def _board_slugs(self) -> list:
         return _board_slugs(self.kb)

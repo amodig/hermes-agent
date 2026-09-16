@@ -118,7 +118,92 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
     assert beta_titles == ["beta-task"]
 
 
+
+def test_lifecycle_contract_cli_errors_are_concise(kanban_home, capsys):
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    kc.build_parser(parser.add_subparsers(dest="command"))
+    args = parser.parse_args(
+        [
+            "kanban",
+            "create",
+            "invalid lifecycle task",
+            "--assignee",
+            "worker",
+            "--lifecycle-contract",
+            json.dumps(
+                {
+                    "kind": "code",
+                    "review_mode": "separate_card",
+                    "reviewer": "worker",
+                    "validation_required": False,
+                }
+            ),
+        ]
+    )
+
+    assert kc.kanban_command(args) == 1
+    error = capsys.readouterr().err
+    assert "reviewer must differ from the implementation assignee" in error
+    assert "Traceback" not in error
+
+def test_lifecycle_contract_help_describes_legacy_binding_only(capsys):
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    kc.build_parser(parser.add_subparsers(dest="command"))
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["kanban", "update", "--help"])
+    help_text = " ".join(capsys.readouterr().out.split())
+
+    assert "bind a historical NULL contract" in help_text
+    assert "classification must be supplied at task creation" in help_text
+    assert "bind or replace" not in help_text
+
 # ---------------------------------------------------------------------------
+
+def test_archive_rm_purges_archived_lifecycle_graph(kanban_home):
+    with kbc.connect() as conn:
+        implementation = kb.create_task(
+            conn,
+            title="cli purge candidate",
+            assignee="builder",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "reviewer",
+                "validation_required": True,
+            },
+        )
+        review = kb.create_task(
+            conn,
+            title="cli purge review",
+            assignee="reviewer",
+            initial_status="blocked",
+            lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
+        )
+        validation = kb.create_task(
+            conn,
+            title="cli purge validation",
+            assignee="tester",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "validation",
+                "candidate_task_id": implementation,
+            },
+        )
+        kb.link_tasks(conn, implementation, review, requirement="phase_finished")
+        kb.link_tasks(conn, review, validation, requirement="review_approved")
+        for task_id in (implementation, review, validation):
+            assert kb.archive_task(conn, task_id)
+
+    output = kc.run_slash(f"archive --rm {implementation} {review} {validation}")
+    assert output.count("Deleted ") == 3
+    with kbc.connect() as conn:
+        assert all(kb.get_task(conn, task_id) is None for task_id in (
+            implementation, review, validation,
+        ))
+
+
 # Integration with the COMMAND_REGISTRY
 # ---------------------------------------------------------------------------
 

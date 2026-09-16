@@ -245,6 +245,7 @@ class GatewayKanbanWatchersMixin:
         _load_config, _kb, kanban_cfg = boot
         settings = _resolve_dispatcher_settings(kanban_cfg, _kb)
         interval = settings.interval
+        dispatcher = _KanbanDispatcher(_kb, settings)
 
         # Initial delay so adapters are wired before workers spawn (matches the notifier).
         await asyncio.sleep(5)
@@ -254,7 +255,6 @@ class GatewayKanbanWatchersMixin:
         # broken PATH, missing venv, or credential loss.
         bad_ticks = 0
         last_warn_at = 0
-        dispatcher = _KanbanDispatcher(_kb, settings)
 
         logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
         while self._running:

@@ -168,18 +168,88 @@ def _errors_to_500(prefix: str) -> Iterator[None]:
 BOARD_COLUMNS: list[str] = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done"]
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
+_ACTIVE_LIFECYCLE_PHASE_UNSET = object()
 
 
-def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None) -> dict[str, Any]:
+def _task_dict(
+    task: kanban_db.Task,
+    *,
+    latest_summary: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
+    lifecycle_state: Optional[dict[str, Any]] = None,
+    dependency_state: Optional[dict[str, Any]] = None,
+    active_lifecycle_phase: Any = _ACTIVE_LIFECYCLE_PHASE_UNSET,
+) -> dict[str, Any]:
     d = asdict(task)
-    # Derived age metrics so the UI can colour stale cards without client deltas.
     try:
         d["age"] = kanban_db.task_age(task)
     except Exception:
-        d["age"] = {"created_age_seconds": None, "started_age_seconds": None, "time_to_complete_seconds": None}
-    # Latest non-null run summary (workers hand off via ``task_runs.summary``, not ``tasks.result``).
+        d["age"] = {
+            "created_age_seconds": None,
+            "started_age_seconds": None,
+            "time_to_complete_seconds": None,
+        }
     d["latest_summary"] = latest_summary
+    if conn is not None:
+        d["lifecycle"] = (
+            lifecycle_state
+            if lifecycle_state is not None
+            else kanban_db.get_lifecycle_state(conn, task.id)
+        )
+        d["dependencies"] = (
+            dependency_state
+            if dependency_state is not None
+            else kanban_db.evaluate_dependencies(conn, task.id)
+        )
+        if active_lifecycle_phase is _ACTIVE_LIFECYCLE_PHASE_UNSET:
+            if task.status == "running" and task.current_run_id:
+                active_lifecycle_phase = kanban_db._retry_status_for_run(
+                    conn, task.id, task.current_run_id,
+                )
+            elif task.status == "blocked":
+                active_lifecycle_phase = kanban_db._resume_status_from_events(conn, task.id)
+    if (
+        active_lifecycle_phase is not _ACTIVE_LIFECYCLE_PHASE_UNSET
+        and active_lifecycle_phase is not None
+    ):
+        d["active_lifecycle_phase"] = active_lifecycle_phase
     return d
+
+
+def _active_lifecycle_phases(
+    conn: sqlite3.Connection, tasks: list[kanban_db.Task],
+) -> dict[str, str]:
+    current = {
+        task.id: int(task.current_run_id)
+        for task in tasks
+        if task.status == "running" and task.current_run_id
+    }
+    phases: dict[str, str] = {
+        task.id: "review"
+        for task in tasks
+        if (
+            task.status == "blocked"
+            and kanban_db._resume_status_from_events(conn, task.id) == "review"
+        )
+    }
+    if not current:
+        return phases
+    ids = list(current)
+    run_ids = list(current.values())
+    rows = conn.execute(
+        "SELECT task_id, run_id, payload FROM task_events "
+        f"WHERE task_id IN ({_placeholders(ids)}) "
+        f"AND run_id IN ({_placeholders(run_ids)}) "
+        "AND kind = 'claimed' ORDER BY id DESC",
+        (*ids, *run_ids),
+    ).fetchall()
+    for row in rows:
+        task_id = row["task_id"]
+        if task_id in phases or int(row["run_id"] or 0) != current.get(task_id):
+            continue
+        if kanban_db._json_dict(row["payload"]).get("source_status") == "review":
+            phases[task_id] = "review"
+    return phases
 
 
 def _attachment_dict(a: kanban_db.Attachment) -> dict[str, Any]:
@@ -254,11 +324,25 @@ def _attach_diagnostics(task_d: dict, diags: Optional[list[dict]]) -> None:
         task_d["warnings"] = _warnings_summary_from_diagnostics(diags)
 
 
-def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
-    """Return {'parents': [...], 'children': [...]} for a task."""
-    def _ids(col: str, other: str) -> list[str]:
-        return [r[col] for r in conn.execute(f"SELECT {col} FROM task_links WHERE {other} = ? ORDER BY {col}", (task_id,))]
-    return {"parents": _ids("parent_id", "child_id"), "children": _ids("child_id", "parent_id")}
+def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+    """Return ids plus typed requirement metadata for a task's graph edges."""
+    edges = [
+        {
+            "parent_id": row["parent_id"],
+            "child_id": row["child_id"],
+            "requirement": row["requirement"],
+        }
+        for row in conn.execute(
+            "SELECT parent_id, child_id, requirement FROM task_links "
+            "WHERE parent_id = ? OR child_id = ? ORDER BY parent_id, child_id",
+            (task_id, task_id),
+        )
+    ]
+    return {
+        "parents": [edge["parent_id"] for edge in edges if edge["child_id"] == task_id],
+        "children": [edge["child_id"] for edge in edges if edge["parent_id"] == task_id],
+        "edges": edges,
+    }
 
 
 # --- GET /board -------------------------------------------------------------
@@ -289,17 +373,28 @@ def get_board(
             p = progress.setdefault(row["pid"], {"done": 0, "total": 0})
             p["total"] += 1
             p["done"] += row["cstatus"] == "done"
-        diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=None)
         latest_event_id = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()["m"]
+        diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=[t.id for t in tasks])
         columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
         if include_archived:
             columns["archived"] = []
         # One window-function query for latest summaries (avoids N+1); cards get a
         # truncated preview, the full text comes from /tasks/:id.
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        active_lifecycle_phases = _active_lifecycle_phases(conn, tasks)
+        lifecycle_states, dependency_states = kanban_db.get_lifecycle_projections(
+            conn, [t.id for t in tasks],
+        )
         for t in tasks:
             full = summary_map.get(t.id)
-            d = _task_dict(t, latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None))
+            d = _task_dict(
+                t,
+                latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None),
+                active_lifecycle_phase=active_lifecycle_phases.get(t.id),
+                lifecycle_state=lifecycle_states[t.id],
+                dependency_state=dependency_states[t.id],
+                conn=conn,
+            )
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -329,8 +424,11 @@ def get_task(
         if run_state_type not in (None, "status", "outcome"):
             raise HTTPException(status_code=400, detail="run_state_type must be 'status' or 'outcome'")
         task = _require_task(conn, task_id)
-        # Drawer returns the FULL summary (cards on /board carry a 200-char preview).
-        task_d = _task_dict(task, latest_summary=kanban_db.latest_summary(conn, task_id))
+        task_d = _task_dict(
+            task,
+            latest_summary=kanban_db.latest_summary(conn, task_id),
+            conn=conn,
+        )
         links = _links_for(conn, task_id)
         child_summaries = kanban_db.latest_summaries(conn, links["children"])
         children = filter(None, (kanban_db.get_task(conn, cid) for cid in links["children"]))
@@ -366,7 +464,8 @@ class CreateTaskBody(BaseModel):
     goal_max_turns: Optional[int] = None
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
-    reasoning_effort: Optional[str] = None  # none|minimal|…|ultra; None inherits the profile's level
+    reasoning_effort: Optional[str] = None
+    lifecycle_contract: Optional[dict] = None
     project_id: Optional[str] = None  # None inherits the board's scoped project (if any)
 
 
@@ -376,7 +475,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
         # CreateTaskBody field names match create_task's keyword parameters.
         task_id = kanban_db.create_task(conn, created_by="dashboard", board=board, **payload.model_dump())
         task = kanban_db.get_task(conn, task_id)
-        body: dict[str, Any] = {"task": _task_dict(task) if task else None}
+        body: dict[str, Any] = {"task": _task_dict(task, conn=conn) if task else None}
         # Dispatcher-presence warning so the UI can banner a ready+assigned task that would
         # otherwise sit idle (no gateway / dispatch_in_gateway=false); triage/todo are expected
         # to wait, unassigned tasks can't dispatch anyway. Probe the request's active home: the
@@ -477,6 +576,10 @@ class UpdateTaskBody(BaseModel):
     # Handoff fields forwarded to complete_task on -> 'done' (parity with ``hermes kanban complete``).
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    verdict: Optional[str] = None
+    lifecycle_contract: Optional[dict] = None
+    expected_version: Optional[int] = None
+    reason: Optional[str] = None
     # In a PATCH ``None`` means "field not sent", so ``clear_*=True`` is the explicit clear signal.
     # ``reasoning_effort="none"`` is a VALUE (thinking off); it is cleared separately so
     # dropping a model override doesn't silently reset the depth.
@@ -496,6 +599,7 @@ class BulkTaskBody(BaseModel):
     result: Optional[str] = None
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    verdict: Optional[str] = None
     reclaim_first: bool = False
     # Same semantics as UpdateTaskBody.
     model_override: Optional[str] = None
@@ -528,7 +632,14 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
 # payload) -> ok. ``review`` uses request_review (never a block, so it can't trip unblock-loop
 # detection) with ``force=True``: a dashboard action is a human override of a live worker claim.
 _STATUS_HANDLERS: dict[str, Any] = {
-    "done": lambda conn, tid, p: kanban_db.complete_task(conn, tid, result=p.result, summary=p.summary, metadata=p.metadata),
+    "done": lambda conn, tid, p: kanban_db.complete_task(
+        conn,
+        tid,
+        result=p.result,
+        summary=p.summary,
+        metadata=p.metadata,
+        verdict=p.verdict,
+    ),
     "blocked": lambda conn, tid, p: kanban_db.block_task(conn, tid, reason=getattr(p, "block_reason", None)),
     "scheduled": lambda conn, tid, p: kanban_db.schedule_task(conn, tid, reason=getattr(p, "block_reason", None)),
     "review": lambda conn, tid, p: kanban_db.request_review(
@@ -543,6 +654,40 @@ def _apply_status(conn, task_id: str, s: str, p, unknown_detail: str) -> bool:
     for ``running`` or an unknown status (``unknown_detail``)."""
     if s == "running":
         raise _StatusRejected(_RUNNING_DIRECT_MSG)
+    if s == "done":
+        current = kanban_db.get_task(conn, task_id)
+        contract = (current.lifecycle_contract or {}) if current else {}
+        metadata = p.metadata if isinstance(p.metadata, dict) else {}
+        active_same_card_review = bool(
+            current
+            and contract.get("kind") == "code"
+            and contract.get("review_mode") == "same_card"
+            and (
+                current.status == "review"
+                or (
+                    current.status == "running"
+                    and current.current_run_id
+                    and kanban_db._retry_status_for_run(
+                        conn, task_id, current.current_run_id,
+                    ) == "review"
+                )
+                or (
+                    current.status == "blocked"
+                    and kanban_db._resume_status_from_events(conn, task_id) == "review"
+                )
+        )
+        )
+        if (
+            current
+            and current.status != "done"
+            and contract.get("kind") == "code"
+            and not active_same_card_review
+            and (not metadata.get("base_sha") or not metadata.get("head_sha"))
+        ):
+            raise _StatusRejected(
+                "dashboard cannot complete typed implementation cards; "
+                "use the worker or CLI with metadata.base_sha and metadata.head_sha Git evidence"
+            )
     handler = _STATUS_HANDLERS.get(s)
     if handler is None:
         raise _StatusRejected(unknown_detail)
@@ -583,7 +728,7 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     if s == "archived":
         ok = kanban_db.archive_task(conn, task_id)
     else:
-        with _map_errors(400, _StatusRejected):
+        with _map_errors(400, _StatusRejected, ValueError):
             ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
         if s == "review" and ok and review_assignee_deferred and not payload.assignee:
             ok = kanban_db.assign_task(conn, task_id, None)
@@ -596,37 +741,92 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     raise _conflict(f"status transition to {s!r} not valid from current state")
 
 
-def _patch_title_body(conn, task_id: str, payload: UpdateTaskBody, board: Optional[str]) -> None:
-    """PATCH title/body phase: one UPDATE + ``edited`` event, then the post-commit observer
-    (field names only — values never leave the DB via this payload)."""
-    with kanban_db.write_txn(conn):
-        sets, vals = [], []
-        if payload.title is not None:
-            if not payload.title.strip():
-                raise HTTPException(status_code=400, detail="title cannot be empty")
-            sets.append("title = ?")
-            vals.append(payload.title.strip())
-        if payload.body is not None:
-            sets.append("body = ?")
-            vals.append(payload.body)
-        vals.append(task_id)
-        conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals)
-        conn.execute(
-            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'edited', NULL, ?)",
-            (task_id, int(time.time())))
-    kanban_db.notify_task_updated(
-        conn, task_id, [f for f in ("title", "body") if getattr(payload, f) is not None], board=board)
+def _patch_title_body(
+    conn,
+    task_id: str,
+    payload: UpdateTaskBody,
+    board: Optional[str],
+    *,
+    expected_version: Optional[int] = None,
+) -> None:
+    """Revise goal fields through the same optimistic-concurrency API as CLI/tools."""
+    sent = getattr(payload, "model_fields_set", getattr(payload, "__fields_set__", set()))
+    wants_title = "title" in sent
+    wants_body = "body" in sent
+    wants_lifecycle = "lifecycle_contract" in sent
+    if not (wants_title or wants_body or wants_lifecycle):
+        return
+    if wants_title and (payload.title is None or not payload.title.strip()):
+        raise HTTPException(status_code=400, detail="title cannot be empty")
+    current = kanban_db.get_task(conn, task_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    expected_version = (
+        expected_version
+        if expected_version is not None
+        else payload.expected_version if payload.expected_version is not None else current.version
+    )
+    reason = (payload.reason or "dashboard task edit").strip()
+    with _map_errors(409, ValueError, RuntimeError):
+        ok = kanban_db.update_task(
+            conn,
+            task_id,
+            expected_version=expected_version,
+            reason=reason,
+            title=payload.title if wants_title else kanban_db._UPDATE_UNSET,
+            body=payload.body if wants_body else kanban_db._UPDATE_UNSET,
+            lifecycle_contract=(
+                payload.lifecycle_contract if wants_lifecycle else kanban_db._UPDATE_UNSET
+            ),
+            author="dashboard",
+        )
+    _require_ok(ok)
 
 
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
-    with _board_conn(board) as (board, conn):
-        _require_task(conn, task_id)
+    with _board_conn(board) as (board, conn), kbc.composite_write_txn(conn):
+        current = _require_task(conn, task_id)
+        request_version = (
+            payload.expected_version
+            if payload.expected_version is not None
+            else current.version
+        )
+        if (
+            payload.expected_version is not None
+            and payload.expected_version != current.version
+        ):
+            raise _conflict(
+                f"task {task_id} update conflict: expected version "
+                f"{payload.expected_version}, current version {current.version}"
+            )
+        sent = getattr(payload, "model_fields_set", getattr(payload, "__fields_set__", set()))
+        if "title" in sent and (payload.title is None or not payload.title.strip()):
+            raise HTTPException(status_code=400, detail="title cannot be empty")
+        if payload.status is not None:
+            contract = current.lifecycle_contract or {}
+            goal_changed = (
+                (
+                    "lifecycle_contract" in sent
+                    and payload.lifecycle_contract != current.lifecycle_contract
+                )
+                or (
+                    contract.get("kind") in {"code", "review", "validation"}
+                    and (
+                        ("title" in sent and payload.title.strip() != current.title)
+                        or ("body" in sent and payload.body != current.body)
+                    )
+                )
+            )
+            if goal_changed:
+                raise _conflict(
+                    "lifecycle status transitions and goal edits must be separate requests"
+                )
         # For a combined assignee+review patch, request_review must capture the
         # current implementer before the task is routed to the reviewer.
         review_assignee_deferred = payload.status == "review" and payload.assignee is not None
         if payload.assignee is not None and not review_assignee_deferred:
-            with _map_errors(409, RuntimeError):
+            with _map_errors(409, RuntimeError, ValueError):
                 _require_ok(kanban_db.assign_task(conn, task_id, payload.assignee or None))
         if payload.status is not None:
             _patch_status(conn, task_id, payload, review_assignee_deferred)
@@ -637,39 +837,82 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 _require_ok(ok)
         if payload.priority is not None:
             _set_priority(conn, task_id, payload.priority, board)
-        if payload.title is not None or payload.body is not None:
-            _patch_title_body(conn, task_id, payload, board)
+        if {"title", "body", "lifecycle_contract"} & set(sent):
+            _patch_title_body(
+                conn,
+                task_id,
+                payload,
+                board,
+                expected_version=request_version,
+            )
+        # Domain status/assignment/priority/override mutators record their own
+        # events, but this route owns the optimistic-concurrency version.
+        if (
+            not ({"title", "body", "lifecycle_contract"} & set(sent))
+            and (
+                payload.status is not None
+                or payload.assignee is not None
+                or payload.priority is not None
+                or any(wanted(payload) for wanted, _, _ in _OVERRIDE_OPS)
+            )
+        ):
+            cur = conn.execute(
+                "UPDATE tasks SET version = version + 1 "
+                "WHERE id = ? AND version = ?",
+                (task_id, request_version),
+            )
+            if cur.rowcount != 1:
+                raise _conflict(
+                    f"task {task_id} update conflict: version changed while updating"
+                )
         updated = kanban_db.get_task(conn, task_id)
-        return {"task": _task_dict(updated) if updated else None}
+        return {"task": _task_dict(updated, conn=conn) if updated else None}
 
 
 @router.delete("/tasks/{task_id}")
 def delete_task(task_id: str, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn):
-        if not kanban_db.delete_task(conn, task_id):
+        with _map_errors(409, kanban_db.LifecycleContractError):
+            ok = kanban_db.delete_task(conn, task_id)
+        if not ok:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         return {"deleted": True, "task_id": task_id}
 
-
 def _parents_blocking_ready(conn: sqlite3.Connection, task_id: str) -> list:
-    """Parent rows (id, title, status) not ``done`` that block promotion to ``ready``.
-
-    Used to enrich the 409 response from :func:`update_task` so the dashboard can show an actionable toast
-    (#26744) instead of a silent no-op. Returns ``[]`` when nothing blocks the transition (e.g. no parents,
-    or all parents already done).
-    """
+    """Return evaluator blockers with enough parent detail for dashboard errors."""
+    blockers = kanban_db.evaluate_dependencies(conn, task_id).get("blockers") or []
+    parent_ids = [b.get("parent_id") for b in blockers if b.get("parent_id")]
+    if not parent_ids:
+        return [
+            {"id": None, "title": b.get("code"), "status": None, "code": b.get("code")}
+            for b in blockers
+        ]
     rows = conn.execute(
-        "SELECT t.id, t.title, t.status FROM tasks t "
-        "JOIN task_links l ON l.parent_id = t.id "
-        "WHERE l.child_id = ? AND t.status != 'done'",
-        (task_id,)).fetchall()
-    return [{"id": r["id"], "title": r["title"], "status": r["status"]} for r in rows]
+        "SELECT id, title, status FROM tasks WHERE id IN ("
+        + ",".join("?" for _ in parent_ids)
+        + ")",
+        tuple(parent_ids),
+    ).fetchall()
+    by_id = {r["id"]: r for r in rows}
+    return [
+        {
+            "id": parent_id,
+            "title": by_id[parent_id]["title"] if parent_id in by_id else blocker.get("code"),
+            "status": by_id[parent_id]["status"] if parent_id in by_id else None,
+            "code": blocker.get("code"),
+        }
+        for blocker in blockers
+        if (parent_id := blocker.get("parent_id"))
+    ]
 
 
 def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) -> bool:
-    """Direct status write for drag-drop moves without a structured verb (todo<->ready,
-    running<->ready) + a ``status`` event. Leaving ``running`` closes the run as 'reclaimed'
-    so attempt history isn't orphaned; the worker is killed only AFTER the txn commits."""
+    """Direct status write for legacy/general drag-drop moves."""
+    task = kanban_db.get_task(conn, task_id)
+    if task is None:
+        return False
+    if task.lifecycle_contract and task.lifecycle_contract.get("kind") != "general":
+        return False
     terminations: list[tuple[Optional[int], Optional[str]]] = []
     effective_status = new_status
     with kanban_db.write_txn(conn):
@@ -738,13 +981,37 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
 class LinkBody(BaseModel):
     parent_id: str
     child_id: str
+    requirement: Optional[str] = None
+    expected_parent_version: Optional[int] = None
+    expected_child_version: Optional[int] = None
+    reason: Optional[str] = None
 
 
 @router.post("/links")
 def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
-    with _board_conn(board) as (board, conn), _value_error_400():
-        kanban_db.link_tasks(conn, payload.parent_id, payload.child_id)
-        return {"ok": True}
+    with _board_conn(board) as (board, conn), _value_error_400(), _map_errors(
+        409, kanban_db.TaskUpdateConflict,
+    ):
+        kanban_db.link_tasks(
+            conn,
+            payload.parent_id,
+            payload.child_id,
+            requirement=payload.requirement,
+            expected_parent_version=payload.expected_parent_version,
+            expected_child_version=payload.expected_child_version,
+            reason=payload.reason,
+            author="dashboard",
+        )
+        edge = conn.execute(
+            "SELECT requirement FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (payload.parent_id, payload.child_id),
+        ).fetchone()
+        return {
+            "ok": True,
+            "parent_id": payload.parent_id,
+            "child_id": payload.child_id,
+            "requirement": edge["requirement"] if edge else None,
+        }
 
 
 @router.delete("/links")

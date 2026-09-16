@@ -23,6 +23,31 @@ each gateway polls only subscriptions for profiles whose platform adapters it
 hosts. The atomic event claim prevents duplicate delivery across watcher
 processes.
 
+## Worker runtime generations
+
+Before granting a worker claim, the dispatcher prepares an immutable generation
+containing Hermes, installed dependencies and package resources, and the Python
+interpreter and standard library. The worker starts inside that generation before
+importing Hermes. Its identity records both source provenance and the captured
+dependency content.
+
+Managed updates, dependency installation, and recovery coordinate with generation
+preparation. Existing workers retain their captured runtime across updates and
+gateway restarts; new workers use the current installation. Install missing
+features in the mutable installation, then start a new worker: sealed workers
+cannot lazy-install dependencies.
+
+Published generations and worker leases share the platform's persistent cache
+(`$XDG_CACHE_HOME/hermes/kanban-runtime`, or `~/.cache/hermes/kanban-runtime`, on
+Linux). Obsolete publications can be removed without removing surviving worker
+leases. Lease cleanup checks the actual worker PID and process start time; do not
+manually delete runtime storage while workers are alive.
+
+An explicit `HERMES_BIN` must identify this installation's canonical entrypoint.
+Arbitrary wrappers and other installations are rejected rather than executed
+outside the generation. Runtime generations are not an OS sandbox: task
+workspaces and operating-system libraries remain external.
+
 ## Configuration
 
 On the dispatch-owning gateway (typically the `default` profile), no change is

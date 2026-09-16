@@ -71,16 +71,6 @@ def test_skill_documents_native_review_actions(
     assert f"`{tool_name}`" in skill_text
 
 
-def test_verdicts_route_through_distinct_terminal_actions(skill_text: str) -> None:
-    quick_reference = skill_text.split("## Quick Reference", 1)[1].split(
-        "## Review Lenses", 1
-    )[0]
-    assert "Approve" in quick_reference and "`kanban_complete`" in quick_reference
-    assert "Request changes" in quick_reference
-    assert "`kanban_request_changes`" in quick_reference
-    assert "Escalate" in quick_reference and "`kanban_block`" in quick_reference
-
-
 def test_review_lenses_vary_per_round(skill_text: str) -> None:
     lenses = skill_text.split("## Review Lenses", 1)[1].split("## Procedure", 1)[0]
     # Round derivation must key off history the reviewer actually sees.

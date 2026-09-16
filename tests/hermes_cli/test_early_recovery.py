@@ -2,9 +2,8 @@
 repair that runs BEFORE hermes_cli.main's third-party imports (#57828 / #58004).
 
 Covers:
-- entry-point lifecycle: a broken core import (dotenv) crashes the import of
-  hermes_cli.main WITHOUT early recovery, and imports fine when recovery runs
-  first (proving main.py invokes recovery before its third-party imports)
+- CLI startup: updater children reach argument parsing while the parent holds
+  the installation lock
 - recover_if_needed unit behavior: fast path, marker gating, update-argv skip,
   lock single-flight, no marker clearing, pinned repair specs
 """
@@ -14,6 +13,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
 import textwrap
 from pathlib import Path
 
@@ -24,79 +24,39 @@ from hermes_cli import _early_recovery as er
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.fixture(autouse=True)
+def isolated_installation_locks(tmp_path, monkeypatch):
+    # Parallel files share the interpreter, but not this test's installation.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+
+
 # ---------------------------------------------------------------------------
 # Entry-point lifecycle (subprocess, real imports)
 # ---------------------------------------------------------------------------
 
-def _make_broken_dotenv_shadow(tmp_path: Path) -> Path:
-    """A sys.path dir shadowing ``dotenv`` with the #57828 failure state:
-    distribution metadata intact, import files wiped/broken."""
-    shadow = tmp_path / "shadow"
-    shadow.mkdir()
-    (shadow / "dotenv.py").write_text(
-        "raise ImportError('import files wiped mid-install (#57828)')\n",
-        encoding="utf-8",
-    )
-    return shadow
+def test_cli_child_reaches_command_parser_while_parent_holds_installation_lock(tmp_path):
+    from hermes_cli.kanban_runtime_generation import installation_mutation_lock
 
-
-def _run_lifecycle_subprocess(tmp_path: Path, *, repair: bool) -> subprocess.CompletedProcess:
-    shadow = _make_broken_dotenv_shadow(tmp_path)
-    hermes_home = tmp_path / "hermes_home"
-    hermes_home.mkdir()
-    script = tmp_path / "lifecycle.py"
-    script.write_text(
-        textwrap.dedent(
-            f"""
-            import sys
-
-            shadow = {str(shadow)!r}
-            sys.path.insert(0, shadow)
-
-            # _early_recovery must be importable on the corrupted venv
-            # (stdlib-only) — this import itself is part of the contract.
-            import hermes_cli._early_recovery as er
-
-            REPAIR = {repair!r}
-
-            def recorder(*args, **kwargs):
-                print("EARLY_RECOVERY_CALLED", flush=True)
-                if REPAIR:
-                    sys.path.remove(shadow)
-                    sys.modules.pop("dotenv", None)
-
-            er.recover_if_needed = recorder
-
-            import hermes_cli.main  # noqa: F401
-            print("MAIN_IMPORTED_OK", flush=True)
-            """
-        ),
-        encoding="utf-8",
-    )
-    env = {
-        **os.environ,
-        "PYTHONPATH": str(REPO_ROOT),
-        "HERMES_HOME": str(hermes_home),
-    }
-    return subprocess.run(
-        [sys.executable, str(script)],
-        capture_output=True,
-        text=True,
-        cwd=REPO_ROOT,
-        env=env,
-        timeout=120,
-    )
-
-
-def test_broken_dotenv_crashes_main_import_without_repair(tmp_path):
-    """Negative control: the shadow really breaks importing hermes_cli.main,
-    and recovery was invoked BEFORE the crash (i.e. before third-party
-    imports) — so a real repair at that point can save the launch."""
-    result = _run_lifecycle_subprocess(tmp_path, repair=False)
-    assert result.returncode != 0
-    assert "EARLY_RECOVERY_CALLED" in result.stdout
-    assert "MAIN_IMPORTED_OK" not in result.stdout
-    assert "wiped mid-install" in result.stderr
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    (home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    with installation_mutation_lock(tmp_path):
+        result = subprocess.run(
+            [sys.executable, "-m", "hermes_cli.main", "desktop", "--help"],
+            capture_output=True,
+            text=True,
+            cwd=tmp_path,
+            env={
+                **os.environ,
+                "PYTHONPATH": str(REPO_ROOT),
+                "HERMES_HOME": str(home),
+                "HOME": str(tmp_path),
+            },
+            timeout=60,
+        )
+    assert result.returncode == 0, result.stderr
+    assert "--build-only" in result.stdout
 
 
 

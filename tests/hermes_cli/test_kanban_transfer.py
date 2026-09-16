@@ -122,13 +122,17 @@ def test_round_trip_preserves_content(kanban_root, tmp_path):
     result = kt.import_board(archive)
 
     assert result["counts"]["tasks"] == 2
-    assert result["counts"]["task_comments"] == 1
     assert result["counts"]["task_links"] == 1
 
     tasks = _tasks_by_title(result["board"])
     assert set(tasks) == {"scratch task", "worktree task"}
     assert tasks["scratch task"]["body"] == "body"
     assert tasks["scratch task"]["assignee"] == "coder"
+    with kbc.connect_closing(board=result["board"]) as conn:
+        comments = kb.list_comments(conn, tasks["scratch task"]["id"])
+    assert [(comment.author, comment.body) for comment in comments if comment.author == "brooklyn"] == [
+        ("brooklyn", "a comment"),
+    ]
 
 
 def test_attachment_blob_travels_and_is_readable(kanban_root, tmp_path):
@@ -238,6 +242,168 @@ def test_unresolvable_workspaces_are_parked_not_dispatched(kanban_root, tmp_path
     # A scratch task needs no path — it regenerates one under this board.
     assert tasks["scratch task"]["status"] == "ready"
     assert tasks["scratch task"]["workspace_path"] is None
+
+def test_import_scrubs_typed_handoff_paths_and_requeues_candidate(kanban_root, tmp_path):
+    kb.create_board("alpha", name="Alpha Board")
+    with kbc.connect_closing(board="alpha") as conn:
+        implementation = kb.create_task(
+            conn,
+            title="typed implementation",
+            assignee="implementer",
+            initial_status="blocked",
+            workspace_kind="scratch",
+            workspace_path="/exporter/repo",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "reviewer",
+                "validation_required": True,
+            },
+        )
+        review = kb.create_task(
+            conn,
+            title="typed review",
+            assignee="reviewer",
+            initial_status="blocked",
+            lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
+        )
+        kb.link_tasks(conn, implementation, review, requirement="phase_finished")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (implementation,))
+            kb._synthesize_ended_run(
+                conn,
+                implementation,
+                outcome="completed",
+                metadata={
+                    "workspace_path": "/exporter/repo",
+                    "branch_name": "feature/x",
+                    "patch_artifact": "/exporter/repo/change.patch",
+                    "patch_sha256": "abc123",
+                    "lifecycle_routing": {
+                        "implementer": "implementer",
+                        "reviewer": "reviewer",
+                        "workspace_path": "/exporter/repo",
+                        "branch_name": "feature/x",
+                        "patch_artifact": "/exporter/repo/change.patch",
+                    },
+                },
+            )
+            kb._append_event(
+                conn,
+                implementation,
+                "completed",
+                {
+                    "base_sha": "base",
+                    "head_sha": "head",
+                    "patch_artifact": "/exporter/repo/change.patch",
+                    "patch_sha256": "abc123",
+                    "branch_name": "feature/x",
+                    "workspace_path": "/exporter/repo",
+                    "legacy_handoff": {
+                        "patch_artifact": "/exporter/repo/change.patch",
+                        "patch_sha256": "abc123",
+                    },
+                },
+            )
+
+    archive = kt.export_board("alpha", str(tmp_path / "alpha"))["archive"]
+    kanban_root("target")
+    result = kt.import_board(archive)
+    tasks = _tasks_by_title(result["board"])
+
+    assert tasks["typed implementation"]["status"] == "ready"
+    assert tasks["typed review"]["status"] == "todo"
+    with kbc.connect_closing(board=result["board"]) as conn:
+        implementation_id = tasks["typed implementation"]["id"]
+        handoff = kb.latest_handoff(conn, implementation_id)
+        run_metadata = json.loads(
+            conn.execute(
+                "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                (implementation_id,),
+            ).fetchone()["metadata"]
+        )
+    assert handoff == {
+        "base_sha": "base", "head_sha": "head", "patch_sha256": "abc123",
+    }
+    assert run_metadata == {
+        "patch_sha256": "abc123",
+        "lifecycle_routing": {"implementer": "implementer", "reviewer": "reviewer"},
+    }
+
+
+def test_import_requeues_blocked_same_card_review(kanban_root, tmp_path):
+    kb.create_board("alpha", name="Alpha Board")
+    with kbc.connect_closing(board="alpha") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="blocked same-card review",
+            assignee="builder",
+            initial_status="blocked",
+            workspace_kind="scratch",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "same_card",
+                "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        )
+        with kb.write_txn(conn):
+            implementation_run_id = kb._synthesize_ended_run(
+                conn,
+                task_id,
+                outcome="review_requested",
+                summary="ready for review",
+                metadata={"base_sha": "base", "head_sha": "head"},
+            )
+            review_run_id = kb._synthesize_ended_run(
+                conn,
+                task_id,
+                outcome="blocked",
+                summary="maintainer input required",
+            )
+            conn.execute(
+                "UPDATE tasks SET assignee = 'reviewer', candidate_run_id = ? WHERE id = ?",
+                (implementation_run_id, task_id),
+            )
+            kb._append_event(
+                conn,
+                task_id,
+                "review_requested",
+                {
+                    "summary": "ready for review",
+                    "implementer": "builder",
+                    "reviewer": "reviewer",
+                    "base_sha": "base",
+                    "head_sha": "head",
+                },
+                run_id=implementation_run_id,
+            )
+            kb._append_event(
+                conn,
+                task_id,
+                "claimed",
+                {"source_status": "review"},
+                run_id=review_run_id,
+            )
+            kb._append_event(
+                conn,
+                task_id,
+                "blocked",
+                {
+                    "reason": "maintainer input required",
+                    "kind": "needs_input",
+                    "source_status": "review",
+                },
+                run_id=review_run_id,
+            )
+
+    archive = kt.export_board("alpha", str(tmp_path / "alpha"))["archive"]
+    kanban_root("target")
+    result = kt.import_board(archive)
+    task = _tasks_by_title(result["board"])["blocked same-card review"]
+
+    assert task["status"] == "ready"
+    assert any("requeued" in warning for warning in result["warnings"])
 
 
 def test_board_metadata_loses_exporter_local_paths(kanban_root, tmp_path):

@@ -106,6 +106,8 @@ def scan_directory(
     ``<root>/<cat>/<name>/plugin.yaml`` (key ``cat/name``; a manifest-less directory recurses one level, depth
     capped at two). *skip_names* ignores top-level names; portable ``plugin.json`` packages are accepted
     alongside YAML manifests."""
+    from hermes_cli.kanban_runtime_generation import generation_runtime_path
+    path = generation_runtime_path(path)
     manifests: List[PluginManifest] = []
     if not path.is_dir():
         return manifests

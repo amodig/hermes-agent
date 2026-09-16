@@ -26,6 +26,37 @@ def _board_schema_prop() -> dict[str, str]:
     """Schema fragment for the optional ``board`` parameter (one place to tweak)."""
     return _prop("string", _DESC_BOARD)
 
+_LIFECYCLE_CONTRACT_SCHEMA = {
+    "oneOf": [
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"kind": {"type": "string", "enum": ["general"]}},
+            "required": ["kind"],
+        },
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "kind": {"type": "string", "enum": ["code"]},
+                "review_mode": {"type": "string", "enum": ["same_card", "separate_card"]},
+                "reviewer": {"type": "string"},
+                "validation_required": {"type": "boolean"},
+            },
+            "required": ["kind", "review_mode", "reviewer", "validation_required"],
+        },
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "kind": {"type": "string", "enum": ["review", "validation"]},
+                "candidate_task_id": {"type": "string"},
+            },
+            "required": ["kind", "candidate_task_id"],
+        },
+    ],
+}
+
 
 def _schema(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
     """Build a tool schema; every kanban tool takes an optional trailing ``board``."""
@@ -92,8 +123,13 @@ KANBAN_COMPLETE_SCHEMA = _schema(
         "downstream workers and humans. Prefer ``summary`` for a "
         "human-readable 1-3 sentence description of what you did; put "
         "machine-readable facts in ``metadata`` (changed_files, "
-        "tests_run, decisions, findings, etc). At least one of "
-        "``summary`` or ``result`` is required. If you created new "
+        "tests_run, decisions, findings, etc). For a ``kind=code`` "
+        "implementation task, ``metadata`` MUST contain direct string "
+        "fields ``base_sha`` and ``head_sha`` for the immutable base and "
+        "resulting commits; the completion contract verifies them against "
+        "the assigned workspace. Include ``changed_files`` and other "
+        "machine-readable facts in the same metadata object. At least one "
+        "of ``summary`` or ``result`` is required. If you created new "
         "tasks via ``kanban_create`` during this run, list their ids "
         "in ``created_cards`` — the kernel verifies them so phantom "
         "references are caught before they leak into downstream "
@@ -111,18 +147,47 @@ KANBAN_COMPLETE_SCHEMA = _schema(
                 "Run History on the dashboard and in downstream "
                 "workers' context."
         )),
-        "metadata": _prop("object", (
-                "Free-form dict of structured facts about this "
-                "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
-                "\"findings\": [...]}. Surfaced to downstream "
-                "workers alongside ``summary``."
-        )),
+        "metadata": {
+            "type": "object",
+            "description": (
+                "Structured facts about this attempt, surfaced to "
+                "downstream workers alongside ``summary``. For code "
+                "implementation completion, put the immutable ``base_sha`` "
+                "and ``head_sha`` directly in this object; both are "
+                "required."
+            ),
+            "properties": {
+                "base_sha": {
+                    "type": "string",
+                    "description": "Immutable base commit for the implementation handoff.",
+                },
+                "head_sha": {
+                    "type": "string",
+                    "description": "Resulting commit at the assigned workspace branch tip.",
+                },
+                "changed_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Files changed between base_sha and head_sha.",
+                },
+            },
+            "additionalProperties": True,
+        },
         "result": _prop("string", (
                 "Short result log line (legacy field, maps to "
                 "task.result). Use ``summary`` instead when "
                 "possible; this exists for compatibility with "
                 "callers that still set --result on the CLI."
         )),
+        "verdict": {
+            "type": "string",
+            "enum": ["APPROVE", "REQUEST_CHANGES", "PASS", "FAIL"],
+            "description": (
+                "Typed lifecycle verdict. Review cards accept APPROVE or "
+                "REQUEST_CHANGES; validation cards accept PASS or FAIL. "
+                "Omit for implementation/general completion."
+            ),
+        },
         "created_cards": {
             "type": "array",
             "items": {"type": "string"},
@@ -225,8 +290,20 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
             "type": "object",
             "description": (
                 "Optional structured handoff facts for the reviewer, such "
-                "as changed_files, tests_run, commit, or decisions."
+                "as changed_files, tests_run, commit, or decisions. For "
+                "``kind=code`` implementation work, put the immutable "
+                "``base_sha`` and ``head_sha`` directly in this object."
             ),
+            "properties": {
+                "base_sha": {
+                    "type": "string",
+                    "description": "Immutable base commit for the implementation handoff.",
+                },
+                "head_sha": {
+                    "type": "string",
+                    "description": "Resulting commit at the assigned workspace branch tip.",
+                },
+            },
             "additionalProperties": True,
         },
     },
@@ -248,6 +325,10 @@ KANBAN_REQUEST_CHANGES_SCHEMA = _schema(
                 "Specific, actionable changes the implementer must make "
                 "before requesting another review."
         )),
+        "metadata": _prop(
+            "object",
+            "Optional structured evidence for the REQUEST_CHANGES verdict.",
+        ),
     },
     ["reason"],
 )
@@ -478,6 +559,14 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "the profile's provider and will fail if it belongs "
                 "to a different one. Requires 'model'."
         )),
+        "lifecycle_contract": {
+            **_LIFECYCLE_CONTRACT_SCHEMA,
+            "description": (
+                "Explicit lifecycle classification. New tasks default to "
+                "{\"kind\":\"general\"}; review and validation cards must "
+                "name their candidate task."
+            ),
+        },
     },
     ["title", "assignee"],
 )
@@ -501,6 +590,14 @@ KANBAN_UPDATE_SCHEMA = _schema(
         "model": _prop("string", "Replacement model override; empty clears it."),
         "provider": _prop("string", "Provider for the model; empty clears it."),
         "goal_mode": _prop("boolean", "Enable or disable goal-mode execution."),
+        "lifecycle_contract": {
+            **_LIFECYCLE_CONTRACT_SCHEMA,
+            "description": (
+                "Bind a lifecycle contract only on a historical unclassified "
+                "task; classification is immutable after binding. New tasks "
+                "must receive their lifecycle classification at creation."
+            ),
+        },
         "expected_version": _prop(
             "integer", "Current task version required for the CAS update."
         ),
@@ -531,12 +628,24 @@ KANBAN_LINK_SCHEMA = _schema(
     "kanban_link",
     (
         "Add a parent→child dependency edge after both tasks already "
-        "exist. The child won't promote to 'ready' until all parents "
-        "are 'done'. Cycles and self-links are rejected."
+        "exist. The child cannot promote until its typed requirement is "
+        "satisfied; cycles, self-links, and weakened lifecycle edges are rejected."
     ),
     {
         "parent_id": {"type": "string", "description": "Parent task id."},
-        "child_id":  {"type": "string", "description": "Child task id."},
+        "child_id": {"type": "string", "description": "Child task id."},
+        "requirement": {
+            "type": "string",
+            "enum": ["phase_finished", "review_approved", "validation_passed"],
+            "description": "Typed edge requirement; omit to infer the only legal requirement.",
+        },
+        "expected_parent_version": _prop(
+            "integer", "Required with expected_child_version when rebinding an edge."
+        ),
+        "expected_child_version": _prop(
+            "integer", "Required with expected_parent_version when rebinding an edge."
+        ),
+        "reason": _prop("string", "Required when rebinding an existing edge."),
     },
     ["parent_id", "child_id"],
 )
@@ -611,31 +720,40 @@ KANBAN_REQUEUE_HANDOFF_SCHEMA = _schema(
 KANBAN_REWORK_REVIEW_SCHEMA = _schema(
     "kanban_rework_review",
     (
-        "Atomically reopen an existing implementation -> reviewer -> tester chain "
-        "after the completed reviewer recorded REQUEST_CHANGES. Preserves all cards, "
-        "edges, runs, comments, goal history, and old handoffs while invalidating stale "
-        "review/validation scheduling. Orchestrator-only."
+        "Atomically reopen an existing typed implementation lifecycle after "
+        "REQUEST_CHANGES or FAIL. Same-card review uses the implementation "
+        "card; separate-card review requires explicit reviewer/tester cards. "
+        "Preserves cards, edges, runs, comments, goal history, and old "
+        "handoffs while invalidating stale scheduling. Orchestrator-only."
     ),
     {
         "board": _prop("string", "Explicit board slug."),
-        "implementation_id": _prop("string", "Completed implementation task id."),
-        "reviewer_id": _prop("string", "Completed separate reviewer task id."),
-        "tester_id": _prop("string", "Blocked separate tester task id."),
+        "implementation_id": _prop("string", "Implementation code task id."),
+        "reviewer_id": _prop(
+            "string",
+            "Separate reviewer card id; omit for same-card review, or pass "
+            "the implementation id together with tester_id.",
+        ),
+        "tester_id": _prop(
+            "string",
+            "Separate validation card id; required for separate-card "
+            "validation and optional when the kernel can derive the same-card child.",
+        ),
         "expected_implementation_version": _prop(
             "integer", "Current implementation task version."
         ),
-        "expected_reviewer_version": _prop("integer", "Current reviewer task version."),
-        "expected_tester_version": _prop("integer", "Current tester task version."),
+        "expected_reviewer_version": _prop(
+            "integer", "Current separate reviewer task version."
+        ),
+        "expected_tester_version": _prop(
+            "integer", "Current validation task version."
+        ),
         "reason": _prop("string", "Concrete rework reason and verdict provenance."),
     },
     [
         "board",
         "implementation_id",
-        "reviewer_id",
-        "tester_id",
         "expected_implementation_version",
-        "expected_reviewer_version",
-        "expected_tester_version",
         "reason",
     ],
 )

@@ -200,10 +200,6 @@ const mountLayout = (overlay: Partial<OverlayState> = {}, ui: Partial<UiState> =
   )
 }
 
-// Give React's scheduler a turn so a store-driven re-render (and the effect
-// re-arm that follows it) lands before we assert.
-const flush = () => new Promise(resolve => setTimeout(resolve, 20))
-
 let intervalSpy: IntervalSpy
 let nowSpy: ReturnType<typeof vi.spyOn<typeof Date, 'now'>>
 
@@ -304,17 +300,17 @@ describe('status-chrome timers under an occluding overlay', () => {
     nowSpy.mockReturnValue(T0 + 300_000)
     rule.clear()
     resetOverlayState()
-    await flush()
+    await vi.waitFor(() => {
+      const resumed = rule.output()
 
-    const resumed = rule.output()
+      // Caught up to real elapsed time, not stuck on the pre-overlay values.
+      expect(resumed).toContain('6m 0s')
+      expect(resumed).toContain('✓ 5m 5s')
+      expect(resumed).not.toContain('1m 0s')
 
-    // Caught up to real elapsed time, not stuck on the pre-overlay values.
-    expect(resumed).toContain('6m 0s')
-    expect(resumed).toContain('✓ 5m 5s')
-    expect(resumed).not.toContain('1m 0s')
-
-    // …and the clocks are running again.
-    expect(oneSecondTimers(intervalSpy)).toBe(2)
+      // …and the clocks are running again.
+      expect(oneSecondTimers(intervalSpy)).toBe(2)
+    })
   })
 
   it('tears the clocks down when an overlay opens over an already-running status rule', async () => {
@@ -330,15 +326,15 @@ describe('status-chrome timers under an occluding overlay', () => {
     const clearSpy = vi.spyOn(globalThis, 'clearInterval')
 
     patchOverlayState({ pluginsHub: true })
-    await flush()
+    await vi.waitFor(() => {
+      // Each running clock is cleared as the overlay goes up …
+      for (const handle of clocks) {
+        expect(clearSpy).toHaveBeenCalledWith(handle)
+      }
 
-    // Each running clock is cleared as the overlay goes up …
-    for (const handle of clocks) {
-      expect(clearSpy).toHaveBeenCalledWith(handle)
-    }
-
-    // … and the occluded re-run arms no replacement (still just the original two).
-    expect(oneSecondTimers(intervalSpy)).toBe(2)
+      // … and the occluded re-run arms no replacement (still just the original two).
+      expect(oneSecondTimers(intervalSpy)).toBe(2)
+    })
 
     clearSpy.mockRestore()
   })
@@ -411,13 +407,13 @@ describe('AppLayout status-rule visibility', () => {
   it('keeps the status rule on screen AND its clock advancing under a flow-layout approval prompt', async () => {
     const layout = mountLayout({ approval: { command: 'rm -rf /', requestId: 'a-1' } as OverlayState['approval'] })
 
-    await flush()
-
-    // The rule is genuinely rendered — the approval prompt pushed it, it did
-    // not cover it — so freezing its clock would freeze something visible.
-    expect(layout.output()).toContain('~/repo')
-    expect(layout.output()).toContain('1m 0s')
-    expect(oneSecondTimers(intervalSpy)).toBe(2)
+    await vi.waitFor(() => {
+      // The rule is genuinely rendered — the approval prompt pushed it, it did
+      // not cover it — so freezing its clock would freeze something visible.
+      expect(layout.output()).toContain('~/repo')
+      expect(layout.output()).toContain('1m 0s')
+      expect(oneSecondTimers(intervalSpy)).toBe(2)
+    })
 
     // …and it really advances: drive the armed 1s handlers forward.
     nowSpy.mockReturnValue(T0 + 30_000)
@@ -426,34 +422,27 @@ describe('AppLayout status-rule visibility', () => {
       tick()
     }
 
-    await flush()
-    await flush()
-
-    expect(layout.output()).toContain('1m 30s')
+    await vi.waitFor(() => expect(layout.output()).toContain('1m 30s'))
   })
 
   it('keeps the status rule on screen AND its clock advancing under a flow-layout sudo prompt', async () => {
     const layout = mountLayout({ sudo: { requestId: 'sudo-1' } as OverlayState['sudo'] })
 
-    await flush()
-
-    expect(layout.output()).toContain('1m 0s')
-    expect(oneSecondTimers(intervalSpy)).toBe(2)
+    await vi.waitFor(() => {
+      expect(layout.output()).toContain('1m 0s')
+      expect(oneSecondTimers(intervalSpy)).toBe(2)
+    })
   })
 
   it('arms no clock under a floating model picker while the rule is at the top', async () => {
     mountLayout({ modelPicker: true }, { statusBar: 'top' })
 
-    await flush()
-
-    expect(oneSecondTimers(intervalSpy)).toBe(0)
+    await vi.waitFor(() => expect(oneSecondTimers(intervalSpy)).toBe(0))
   })
 
   it('keeps the clocks armed under a floating model picker while the rule is at the bottom', async () => {
     mountLayout({ modelPicker: true }, { statusBar: 'bottom' })
 
-    await flush()
-
-    expect(oneSecondTimers(intervalSpy)).toBe(2)
+    await vi.waitFor(() => expect(oneSecondTimers(intervalSpy)).toBe(2))
   })
 })

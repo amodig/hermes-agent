@@ -32,8 +32,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import hermes_cli.main as cli_main
-import hermes_cli.update_cmd as update_cmd
 from hermes_cli import _early_recovery
+from hermes_cli import update_cmd
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -228,41 +228,36 @@ def test_abort_helper_resumes_paused_gateways_before_exit():
 
 
 # ---------------------------------------------------------------------------
-# Placement: the deferral must NOT fire before the fetch (#86735 / #86780)
+# ZIP path: guard runs after the code swap, before dependency reinstall
 # ---------------------------------------------------------------------------
 
 
-def test_pre_fetch_flow_has_no_self_lock_preflight():
-    """#86780 regression: a loaded native module must not block the git fetch.
+def test_zip_path_checks_self_lock_after_swap_before_reinstall(monkeypatch):
+    """A mapped native module must abort only the dependency rewrite, not the swap."""
+    from hermes_cli import update_cmd_zip
 
-    The old preflight sat between the venv-holder sweep and the fetch, so a
-    universally-loaded module (bitwarden's module-level cryptography import)
-    deferred every update before any code was pulled — the Windows infinite
-    update loop.  The deferral now lives at the dependency-sync boundaries
-    only; the stretch of _cmd_update_impl between the venv-holder sweep and
-    the fetch must not consult the detector at all.
-    """
-    import inspect
+    calls: list[str] = []
+    monkeypatch.setattr(update_cmd_zip, "_abort_zip_update_if_dirty_tree", lambda: calls.append("dirty"))
+    monkeypatch.setattr(update_cmd_zip, "_download_and_swap_zip", lambda branch, url: calls.append("swap"))
+    monkeypatch.setattr(update_cmd, "_sweep_bytecode_after_update", lambda branch: calls.append("sweep"))
+    monkeypatch.setattr(cli_main, "_abort_dependency_sync_if_self_locked", lambda: calls.append("guard"))
+    monkeypatch.setattr(update_cmd_zip, "_reinstall_python_deps_after_zip", lambda deps: calls.append("deps"))
+    monkeypatch.setattr(update_cmd, "_validate_critical_modules_import", lambda root: (True, None, None))
+    monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
+    monkeypatch.setattr(cli_main, "_build_web_ui", lambda root: None)
+    monkeypatch.setattr(update_cmd, "_rebuild_desktop_after_update", lambda root, **kwargs: True)
+    monkeypatch.setattr(update_cmd, "_print_bundled_skills_sync_report", lambda: None)
+    monkeypatch.setattr(update_cmd, "_verify_and_restore_state_dbs_post_update", lambda: None)
+    monkeypatch.setattr(update_cmd, "_print_update_summary", lambda **kwargs: True)
+    monkeypatch.setattr(update_cmd, "_print_curator_first_run_notice", lambda: None)
+    monkeypatch.setattr(update_cmd, "_print_curator_recent_run_notice", lambda: None)
+    monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda failures: None)
+    monkeypatch.setattr(update_cmd, "_read_project_version", lambda: "old")
+    monkeypatch.setattr(cli_main, "_capture_active_tool_dependencies", lambda: [])
+    monkeypatch.setattr(cli_main, "_resolve_update_branch", lambda args: "main")
 
-    src = inspect.getsource(update_cmd._cmd_update_impl)
-    fetch_idx = src.index("Fetching updates")
-    pre_fetch = src[:fetch_idx]
-    assert "_detect_self_loaded_native_modules()" not in pre_fetch
-    assert "_m()._abort_dependency_sync_if_self_locked" not in pre_fetch
-    # ... and it must still guard the dependency sync after the code swap
-    # (the sync itself lives in _sync_python_dependencies_after_pull).
-    post_fetch = src[fetch_idx:] + inspect.getsource(update_cmd._apply_pulled_update)
-    assert "_sync_python_dependencies_after_pull(" in post_fetch
-    sync_src = inspect.getsource(update_cmd._sync_python_dependencies_after_pull)
-    assert "_m()._abort_dependency_sync_if_self_locked" in sync_src
-
-
-def test_zip_update_guards_dependency_sync():
-    import inspect
-
-    src = inspect.getsource(update_cmd._update_via_zip)
-    swap_idx = src.index("Updating Python dependencies")
-    assert "_abort_dependency_sync_if_self_locked" in src[:swap_idx]
+    assert update_cmd_zip._update_via_zip(object()) is True
+    assert calls.index("swap") < calls.index("guard") < calls.index("deps")
 
 
 # ---------------------------------------------------------------------------

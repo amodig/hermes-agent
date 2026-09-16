@@ -191,7 +191,7 @@ VALID_HOOKS: Set[str] = {
 # the shell-hook allow-list, so these are refused loudly instead of having output silently ignored.
 SHELL_UNSUPPORTED_HOOKS: Set[str] = {"transform_api_error_classification"}
 
-_env_enabled = env_var_enabled  # imported by plugins/memory
+_env_enabled = env_var_enabled
 _UNSET = object()
 
 

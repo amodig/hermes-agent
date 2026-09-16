@@ -1083,7 +1083,7 @@ def _current_branch_name(git_cmd, *, check: bool = False) -> str:
 
 
 def _handle_update_called_process_error(
-    e, args, gateway_mode: bool, had_desktop_app_before_update: bool) -> None:
+    e, args, gateway_mode: bool, had_desktop_app_before_update: bool, *, release_installation=None) -> None:
     """Git/installer failure: ZIP-fallback when safe, else report and ``sys.exit(1)``."""
     stage = _format_update_failure_stage(e)
     if _should_zip_fallback_on_update_error(e):
@@ -1091,7 +1091,8 @@ def _handle_update_called_process_error(
         print("→ Falling back to ZIP download...")
         print()
         desktop_build_ok = _update_via_zip(
-            args, had_desktop_app_before_update=had_desktop_app_before_update)
+            args, had_desktop_app_before_update=had_desktop_app_before_update,
+            release_installation=release_installation)
         if gateway_mode:
             _write_gateway_update_exit_code(desktop_build_ok)
     else:
@@ -1120,7 +1121,7 @@ def _finalize_receipt(status: str, debug_message: str) -> None:
 def _finish_already_up_to_date(
     git_cmd, branch: str, current_branch: str, _plan, *, assume_yes: bool, gateway_mode: bool,
     gw_input_fn, pre_update_snapshot_id, desktop_dir, had_desktop_app_before_update: bool,
-    active_lazy_features, active_tool_dependencies, _windows_gateway_resume) -> None:
+    active_lazy_features, active_tool_dependencies, _windows_gateway_resume, release_installation=None) -> None:
     """"Already up to date" path: restore stash/branch, repair the checkout, catch up the fleet.
     ``sys.exit(1)`` when the repair is incomplete (after gateway exit code + partial receipt)."""
     _invalidate_update_cache()
@@ -1149,6 +1150,8 @@ def _finish_already_up_to_date(
         active_lazy_features=active_lazy_features,
         active_tool_dependencies=active_tool_dependencies, upstream_checked=_plan.upstream_checked,
         _windows_gateway_resume=_windows_gateway_resume)
+    if release_installation is not None:
+        release_installation()
     _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
     # A prior pull may still owe the fleet a restart; catch up here too, BEFORE the exit
     # gate so a partial outcome can't strand the fleet on stale code.
@@ -1167,7 +1170,7 @@ def _finish_already_up_to_date(
 def _apply_pulled_update(
     git_cmd, branch, pre_pull_sha, _plan, opts, *, gateway_mode, is_fork, desktop_dir,
     had_desktop_app_before_update, pre_update_snapshot_id, _pre_update_plan,
-    _windows_gateway_resume) -> None:
+    _windows_gateway_resume, release_installation=None) -> None:
     """Post-pull phase: verify HEAD, sync Python/Node/web/Desktop, maintenance, fleet restart."""
     _invalidate_update_cache()
     post_pull_sha = _verify_head_after_pull(
@@ -1213,6 +1216,8 @@ def _apply_pulled_update(
     # the marker would never land and the new gateway's watcher would time out spuriously.
     if gateway_mode:
         _write_gateway_update_exit_code(update_complete)
+    if release_installation is not None:
+        release_installation()
 
     _restart = _restart_gateway_fleet_after_update(_pre_update_plan, gateway_mode)
     _resume_windows_gateways_and_merge_outcome(_restart, _windows_gateway_resume, gateway_mode)
@@ -1225,6 +1230,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always restore stdio even on
     ``sys.exit``. Self-lock deferral deliberately does NOT run here (pre-fetch it stranded users
     on the OLD checkout in an exit-2 loop); it runs right before the dependency sync."""
+    from hermes_cli.kanban_runtime_generation import installation_mutation_lock
+    with installation_mutation_lock(_m().PROJECT_ROOT) as release:
+        return _cmd_update_locked(args, gateway_mode, release)
+
+
+def _cmd_update_locked(args, gateway_mode: bool, release_installation):
     opts = _resolve_update_options(args, gateway_mode)
     gw_input_fn, assume_yes = opts.gw_input_fn, opts.assume_yes
 
@@ -1268,8 +1279,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
     if use_zip_update:
         try:
             desktop_build_ok = _update_via_zip(
-                args, had_desktop_app_before_update=had_desktop_app_before_update)
+                args, had_desktop_app_before_update=had_desktop_app_before_update,
+                release_installation=release_installation)
         finally:
+            release_installation()
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
         if gateway_mode:
             _write_gateway_update_exit_code(desktop_build_ok)
@@ -1314,7 +1327,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 had_desktop_app_before_update=had_desktop_app_before_update,
                 active_lazy_features=opts.active_lazy_features,
                 active_tool_dependencies=opts.active_tool_dependencies,
-                _windows_gateway_resume=_windows_gateway_resume)
+                _windows_gateway_resume=_windows_gateway_resume,
+                release_installation=release_installation)
             return
 
         if commit_count > 0:
@@ -1333,13 +1347,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
             is_fork=is_fork, desktop_dir=desktop_dir,
             had_desktop_app_before_update=had_desktop_app_before_update,
             pre_update_snapshot_id=pre_update_snapshot_id, _pre_update_plan=_pre_update_plan,
-            _windows_gateway_resume=_windows_gateway_resume)
+            _windows_gateway_resume=_windows_gateway_resume,
+            release_installation=release_installation)
     except _shim_quarantine_error_type() as e:
         # Strict quarantine refused BEFORE any installer ran — defer via marker, exit 2, no ZIP.
         # See #87331.
         _refuse_update_for_contended_shims(e)
     except subprocess.CalledProcessError as e:
-        _handle_update_called_process_error(e, args, gateway_mode, had_desktop_app_before_update)
+        _handle_update_called_process_error(
+            e, args, gateway_mode, had_desktop_app_before_update,
+            release_installation=release_installation)
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

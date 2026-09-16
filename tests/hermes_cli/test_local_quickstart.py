@@ -52,7 +52,7 @@ def test_quickstart_refuses_when_nothing_fits(client, monkeypatch):
     assert "Local Models" in r.json()["detail"]
 
 
-def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
+def test_quickstart_runs_all_three_legs(client, monkeypatch, quickstart_ready, tmp_path):
     """Fresh machine: install runtime -> download recommended -> activate.
     Each leg is asserted by its observable call, in order."""
     calls: list[str] = []
@@ -85,7 +85,7 @@ def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
         lambda *a, **k: calls.append("assign"))
 
     r = client.post("/api/local-models/quickstart", json={})
-    assert r.status_code == 200
+    assert r.status_code == 200, r.text
     body = r.json()
     assert body["needs_runtime"] is True
     assert body["needs_download"] is True
@@ -105,7 +105,7 @@ def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
     assert load_config()["local_runtime"]["enabled"] is True
 
 
-def test_quickstart_skips_satisfied_legs(client, monkeypatch):
+def test_quickstart_skips_satisfied_legs(client, monkeypatch, quickstart_ready):
     """Runtime present and model already staged: the response says so and
     the job goes straight to activation."""
     calls: list[str] = []
@@ -136,7 +136,7 @@ def test_quickstart_skips_satisfied_legs(client, monkeypatch):
         lambda *a, **k: calls.append("assign"))
 
     r = client.post("/api/local-models/quickstart", json={})
-    assert r.status_code == 200
+    assert r.status_code == 200, r.text
     body = r.json()
     assert body["needs_runtime"] is False
     assert body["needs_download"] is False
@@ -155,6 +155,10 @@ def quickstart_ready(monkeypatch):
     reaches the single-flight lock instead of 409ing at fit/engine
     preflight on machines where nothing fits."""
     from hermes_cli.local_runtime.catalog import VariantChoice
+
+    # Keep real asset validation without inheriting an unsupported host GPU backend.
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.bootstrap._detect_gpu_vendor", lambda: None)
 
     monkeypatch.setattr(
         "hermes_cli.local_runtime.binaries.installed_tags", lambda: ["b10362"])

@@ -199,6 +199,10 @@ _SPECS = [
                   "that require immediate human ops (R3 gate) "
                   "to skip the brief running-to-blocked transition."),
         _json_flag(help="Emit JSON output"),
+        _arg("--lifecycle-contract",
+             help='JSON lifecycle contract, e.g. \'{"kind":"general"}\' or '
+                  '\'{"kind":"code","review_mode":"same_card","reviewer":"reviewer",'
+                  '"validation_required":false}\'.'),
     ], help="Create a new task"),
     _cmd("swarm", [
         _arg("goal", help="Swarm goal / final outcome"),
@@ -248,6 +252,9 @@ _SPECS = [
              help="Promote a triage task to todo/ready after updating it"),
         _arg("--author", help=argparse.SUPPRESS),
         _json_flag(help="Emit JSON output"),
+        _arg("--lifecycle-contract",
+             help="JSON lifecycle contract to bind a historical NULL contract; "
+                  "classification must be supplied at task creation."),
     ], help="Atomically revise a task with optimistic concurrency"),
     _cmd("assign", [_TASK_ID, _arg("profile", help="Profile name (or 'none' to unassign)")],
          help="Assign or reassign a task"),
@@ -268,11 +275,21 @@ _SPECS = [
     ], help="Reassign a task to a different profile, optionally reclaiming first"),
     _cmd("diagnostics", [
         _arg("--severity", choices=["warning", "error", "critical"],
-             help="Only show diagnostics at or above this severity"),
+             help="Only show diagnostics at or above the selected severity"),
         _arg("--task", help="Only show diagnostics for one task id"),
         _json_flag(help="Emit JSON (structured) instead of the default human table"),
     ], aliases=["diag"], help="List active diagnostics on the current board"),
-    _cmd("link", [_arg("parent_id"), _arg("child_id")], help="Add a parent->child dependency"),
+    _cmd("link", [
+        _arg("parent_id"),
+        _arg("child_id"),
+        _arg("--requirement", choices=("phase_finished", "review_approved", "validation_passed"),
+             help="Typed dependency requirement; omit to infer the legal edge."),
+        _arg("--expected-parent-version", type=int,
+             help="Current parent version, required when rebinding an existing edge."),
+        _arg("--expected-child-version", type=int,
+             help="Current child version, required when rebinding an existing edge."),
+        _arg("--reason", help="Audit reason required when rebinding an existing edge."),
+    ], help="Add or explicitly rebind a parent->child dependency"),
     _cmd("unlink", [_arg("parent_id"), _arg("child_id")], help="Remove a parent->child dependency"),
     _cmd("claim", [
         _TASK_ID,
@@ -301,6 +318,8 @@ _SPECS = [
         _arg("--metadata",
              help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                   '"tests_run": 12}\'). Stored on the closing run.'),
+        _arg("--verdict", choices=("APPROVE", "REQUEST_CHANGES", "PASS", "FAIL"),
+             help="Typed review/validation verdict; omit for implementation/general completion."),
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,
@@ -336,22 +355,25 @@ _SPECS = [
              help="Override the live-claim guard: move a running, claimed "
                   "task to review even without owning its run (clears the worker's claim)."),
     ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
-    _cmd("request-changes", [_TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review")],
-         help="Reviewer verdict: return the active review run to its implementer"),
+    _cmd("request-changes", [
+        _TASK_ID,
+        _arg("reason", nargs="+", help="Concrete changes required before re-review"),
+        _arg("--metadata", help="JSON object with structured REQUEST_CHANGES evidence."),
+    ], help="Reviewer verdict: return the active review run to its implementer"),
     _cmd("rework-review", [
-        _arg("--implementation-id", required=True, help="Completed implementation task id"),
-        _arg("--reviewer-id", required=True, help="Completed separate reviewer task id"),
-        _arg("--tester-id", required=True, help="Blocked separate tester task id"),
+        _arg("--implementation-id", required=True, help="Typed code implementation task id"),
+        _arg("--reviewer-id", help="Separate reviewer card id; omit for same-card review"),
+        _arg("--tester-id", help="Separate validation card id; omit when same-card child is derivable"),
         _arg("--expected-implementation-version", required=True, type=int,
              help="Current implementation task version required for this atomic transition"),
-        _arg("--expected-reviewer-version", required=True, type=int,
-             help="Current reviewer task version required for this atomic transition"),
-        _arg("--expected-tester-version", required=True, type=int,
-             help="Current tester task version required for this atomic transition"),
+        _arg("--expected-reviewer-version", type=int,
+             help="Current separate reviewer task version"),
+        _arg("--expected-tester-version", type=int,
+             help="Current validation task version"),
         _arg("--reason", required=True, nargs="+",
              help="Why the rejected review is being reworked"),
         _json_flag(help="Emit JSON output"),
-    ], help="Atomically requeue a rejected implementation/reviewer/tester chain"),
+    ], help="Atomically requeue a rejected typed lifecycle chain"),
     _cmd("reopen-review", [
         _TASK_IDS,
         _reason("Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons."),
@@ -367,7 +389,7 @@ _SPECS = [
     _cmd("archive", [
         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
         _arg("--rm", dest="purge_ids", nargs="+",
-             help="Permanently delete already-archived task ids from the board"),
+             help="Permanently delete archived task ids; list every connected candidate id"),
     ], help="Archive one or more tasks"),
     _cmd("tail", [_TASK_ID, _arg("--interval", type=float, default=1.0)], help="Follow a task's event stream"),
     _cmd("dispatch", [

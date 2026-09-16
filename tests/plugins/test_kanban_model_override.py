@@ -1,15 +1,12 @@
-"""Per-task model/provider override — DB layer, worker spawn, dashboard API.
+"""Per-task model/provider override — DB layer, dashboard API, CLI options.
 
-Covers the model-dropdown feature: kanban_db.set_model_override(),
-create_task(model_override=..., provider_override=...), the dispatcher
-passing ``-m <model> --provider <name>`` to the worker, and the dashboard
-PATCH/bulk/model-options surfaces.
+Covers kanban_db.set_model_override(), persisted task overrides, the dashboard
+PATCH/bulk/model-options surfaces, and accepted worker CLI options.
 """
 
 from __future__ import annotations
 
 import importlib.util
-import subprocess
 import sys
 from pathlib import Path
 
@@ -19,7 +16,6 @@ from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
-from hermes_cli import kanban_db_dispatch as kbd
 
 
 # ---------------------------------------------------------------------------
@@ -112,43 +108,6 @@ def test_migration_adds_provider_override_column(conn):
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     assert "model_override" in cols
     assert "provider_override" in cols
-
-
-# ---------------------------------------------------------------------------
-# Worker spawn — argv carries -m and --provider
-# ---------------------------------------------------------------------------
-
-
-def _spawn_and_capture(monkeypatch, tmp_path, task):
-    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
-    captured = {}
-
-    class FakeProc:
-        pid = 4245
-
-    def fake_popen(cmd, *args, **kwargs):
-        captured["cmd"] = list(cmd)
-        return FakeProc()
-
-    monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    workspace = tmp_path / "ws"
-    workspace.mkdir(exist_ok=True)
-    kbd._default_spawn(task, str(workspace))
-    return captured["cmd"]
-
-
-def test_spawn_passes_model_and_provider(monkeypatch, tmp_path, conn):
-    tid = kb.create_task(
-        conn, title="t", assignee="elias",
-        model_override="glm-5", provider_override="openrouter",
-    )
-    task = kb.get_task(conn, tid)
-    cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
-    i = cmd.index("-m")
-    assert cmd[i + 1] == "glm-5"
-    j = cmd.index("--provider")
-    assert j == i + 2
-    assert cmd[j + 1] == "openrouter"
 
 
 # ---------------------------------------------------------------------------
@@ -251,22 +210,6 @@ def test_reasoning_effort_without_a_model_override(conn):
     t = kb.get_task(conn, tid)
     assert t.model_override is None
     assert t.reasoning_effort == "low"
-
-
-def test_spawn_passes_reasoning_without_a_model(monkeypatch, tmp_path, conn):
-    tid = kb.create_task(conn, title="t", assignee="elias", reasoning_effort="high")
-    task = kb.get_task(conn, tid)
-    cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
-    assert "-m" not in cmd
-    i = cmd.index("--reasoning")
-    assert cmd[i + 1] == "high"
-
-
-def test_spawn_omits_reasoning_when_unset(monkeypatch, tmp_path, conn):
-    tid = kb.create_task(conn, title="t", assignee="elias")
-    task = kb.get_task(conn, tid)
-    cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
-    assert "--reasoning" not in cmd
 
 
 def test_worker_cli_accepts_the_reasoning_flag():

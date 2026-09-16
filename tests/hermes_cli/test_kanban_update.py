@@ -183,6 +183,49 @@ def test_triage_transition_recomputes_ready_or_todo_from_parents(kanban_home):
         assert kb.get_task(conn, ready_child).status == "ready"
 
 
+
+def test_binding_historical_null_contract_preserves_blocked_status(kanban_home):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn, title="historical blocked", assignee="coder", initial_status="blocked"
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET lifecycle_contract = NULL WHERE id = ?", (task_id,))
+
+        assert kb.update_task(
+            conn,
+            task_id,
+            expected_version=1,
+            reason="classify historical task",
+            goal_mode=False,
+            lifecycle_contract={"kind": "general"},
+        )
+        assert kb.get_task(conn, task_id).status == "blocked"
+
+
+
+def test_binding_historical_null_contract_preserves_parent_gate(kanban_home):
+    with kbc.connect_closing() as conn:
+        parent_id = kb.create_task(conn, title="open parent")
+        child_id = kb.create_task(conn, title="historical child", parents=[parent_id])
+        assert kb.get_task(conn, child_id).status == "todo"
+
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET lifecycle_contract = NULL WHERE id = ?", (child_id,))
+
+        assert kb.update_task(
+            conn,
+            child_id,
+            expected_version=1,
+            reason="classify historical task",
+            lifecycle_contract={"kind": "general"},
+        )
+        assert kb.get_task(conn, child_id).status == "todo"
+
+        assert kb.complete_task(conn, parent_id, summary="finished")
+        assert kb.get_task(conn, child_id).status == "ready"
+
+
 def test_claimed_update_is_rejected_and_run_history_links_and_comments_survive(
     kanban_home,
 ):
@@ -263,6 +306,42 @@ def test_non_goal_fields_do_not_create_a_goal_revision(kanban_home):
         assert goal_after_body["prior_version"] == 1
 
 
+def test_goal_reopen_clears_terminal_result(kanban_home):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="completed code goal",
+            assignee="implementer",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "same_card",
+                "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = 123, result = ? "
+                "WHERE id = ?",
+                ("obsolete result", task_id),
+            )
+
+        assert kb.update_task(
+            conn,
+            task_id,
+            title="revised code goal",
+            expected_version=1,
+            reason="revise completed goal",
+        )
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.result is None
+        assert task.completed_at is None
+        event = [entry for entry in kb.list_events(conn, task_id) if entry.kind == "goal_revised"][-1]
+        assert "result" in event.payload["changed_fields"]
 def test_tool_update_matches_cli_and_tool_show_effective_goal(
     kanban_home, monkeypatch, capsys
 ):

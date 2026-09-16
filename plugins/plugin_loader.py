@@ -29,7 +29,8 @@ def user_plugins_dir() -> Optional[Path]:
     """Return ``$HERMES_HOME/plugins/`` or None if unavailable."""
     try:
         from hermes_constants import get_hermes_home
-        d = get_hermes_home() / "plugins"
+        from hermes_cli.kanban_runtime_generation import generation_runtime_path
+        d = generation_runtime_path(get_hermes_home() / "plugins")
         return d if d.is_dir() else None
     except Exception:
         return None
@@ -85,6 +86,8 @@ def load_plugin_module(module_name: str, plugin_dir: Path, *, parents: Tuple[str
     Order matters: parents first (relative imports need them), then siblings as ``module_name.<stem>``
     (so ``from ._x import Y`` resolves), then the module. Finally child is bound onto parent and
     siblings onto module — the shape normal imports produce, which monkeypatch relies on."""
+    from hermes_cli.kanban_runtime_generation import generation_runtime_path
+    plugin_dir = generation_runtime_path(plugin_dir)
     init_file = plugin_dir / "__init__.py"
     if not init_file.exists():
         return None
