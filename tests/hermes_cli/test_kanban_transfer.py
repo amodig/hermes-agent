@@ -122,13 +122,17 @@ def test_round_trip_preserves_content(kanban_root, tmp_path):
     result = kt.import_board(archive)
 
     assert result["counts"]["tasks"] == 2
-    assert result["counts"]["task_comments"] == 1
     assert result["counts"]["task_links"] == 1
 
     tasks = _tasks_by_title(result["board"])
     assert set(tasks) == {"scratch task", "worktree task"}
     assert tasks["scratch task"]["body"] == "body"
     assert tasks["scratch task"]["assignee"] == "coder"
+    with kbc.connect_closing(board=result["board"]) as conn:
+        comments = kb.list_comments(conn, tasks["scratch task"]["id"])
+    assert [(comment.author, comment.body) for comment in comments if comment.author == "brooklyn"] == [
+        ("brooklyn", "a comment"),
+    ]
 
 
 def test_attachment_blob_travels_and_is_readable(kanban_root, tmp_path):

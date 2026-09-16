@@ -166,20 +166,11 @@ def _update_args(**overrides):
     return SimpleNamespace(**defaults)
 
 
-def _run_update_until_guard(args):
-    """Drive _cmd_update_impl just far enough to hit the venv-holder guard.
-
-    Everything before the guard is stubbed; the guard firing is observed via
-    SystemExit(2). The first statement AFTER the guard is
-    ``git_dir = PROJECT_ROOT / ".git"`` — a PROJECT_ROOT sentinel whose
-    ``__truediv__`` raises marks 'guard passed'."""
+def _run_update_until_guard(tmp_path, args):
+    """Run the real installation lock and holder guard, stopping before git setup."""
 
     class _PastGuard(Exception):
         pass
-
-    class _RootSentinel:
-        def __truediv__(self, _other):
-            raise _PastGuard
 
     with patch.object(cli_main, "_is_windows", return_value=True), patch.object(
         cli_main, "_venv_scripts_dir", return_value=None
@@ -198,7 +189,9 @@ def _run_update_until_guard(args):
         # → the guard refuses exactly as before the orphan-reap addition.
         cli_main, "_orphaned_desktop_backend_pids", return_value=None
     ), patch.object(
-        cli_main, "PROJECT_ROOT", _RootSentinel()
+        cli_main, "PROJECT_ROOT", tmp_path
+    ), patch.object(
+        update_cmd, "_prepare_git_command", side_effect=_PastGuard
     ):
         try:
             update_cmd._cmd_update_impl(args, gateway_mode=False)
@@ -218,6 +211,8 @@ def _run_update_until_guard(args):
         (True, True, "past_guard"),
     ],
 )
-def test_venv_holder_guard_force_semantics(force, force_venv, expected, capsys):
-    result = _run_update_until_guard(_update_args(force=force, force_venv=force_venv))
+def test_venv_holder_guard_force_semantics(force, force_venv, expected, capsys, tmp_path):
+    result = _run_update_until_guard(
+        tmp_path, _update_args(force=force, force_venv=force_venv)
+    )
     assert result == expected, capsys.readouterr().out
