@@ -49,7 +49,7 @@ def _policy_files(policy_root: Path) -> list[Path]:
     files = [policy_root / relative for relative in policy_files]
     profiles_root = policy_root / "profiles"
     for profile in sorted(path for path in profiles_root.iterdir() if path.is_dir()):
-        files.extend(path for path in sorted(profile.iterdir()) if path.is_file())
+        files.extend(path for path in (profile / "SOUL.md", profile / "config.yaml") if path.is_file())
     architecture = policy_root / "docs" / "ARCHITECTURE.md"
     if architecture.is_file():
         files.append(architecture)

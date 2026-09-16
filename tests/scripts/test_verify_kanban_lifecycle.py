@@ -63,3 +63,35 @@ def test_installed_suite_does_not_expose_source_runtime_fallback(tmp_path: Path,
     assert pythonpath == str(runtime_root)
     assert "FAILED (errors=1)" in output
     assert runner == "python -c <installed conformance runner>"
+
+
+def test_policy_digest_excludes_untracked_profile_state(tmp_path: Path) -> None:
+    for relative in (
+        "scripts/apply.sh",
+        "scripts/verify.sh",
+        "scripts/verify_lifecycle.py",
+        "scripts/remnic_plugin.py",
+        "scripts/remnic-project-context",
+        "scripts/hermes-github",
+        "omp/remnic-project-context.ts",
+        "admin/loota-dnf",
+        "admin/install-package-helper",
+        "plugins/consequence_guard/plugin.yaml",
+        "plugins/consequence_guard/__init__.py",
+        "profiles/cto/SOUL.md",
+        "profiles/cto/config.yaml",
+    ):
+        artifact = tmp_path / relative
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(relative, encoding="utf-8")
+    digest = verify_kanban_lifecycle._policy_digest(tmp_path)
+    for relative in (
+        ".env", "profiles/cto/.env", "profiles/cto/sessions.json",
+        "profiles/cto/sessions/session.json", "profiles/cto/untracked.txt",
+    ):
+        state = tmp_path / relative
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text("untracked fixture state", encoding="utf-8")
+    assert verify_kanban_lifecycle._policy_digest(tmp_path) == digest
+    (tmp_path / "profiles/cto/config.yaml").write_text("changed policy", encoding="utf-8")
+    assert verify_kanban_lifecycle._policy_digest(tmp_path) != digest

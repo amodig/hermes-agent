@@ -28,6 +28,7 @@ from hermes_cli.colors import Colors, color
 from hermes_cli import managed_scope
 from hermes_cli.default_soul import DEFAULT_SOUL_MD, is_legacy_template_soul
 from hermes_cli.secret_prompt import masked_secret_prompt
+from hermes_cli.env_loader import _sanitize_env_lines
 # Re-export from hermes_constants — canonical definition lives there.
 from hermes_constants import get_hermes_home, get_process_hermes_home  # noqa: F401
 from utils import atomic_replace, atomic_yaml_write, fast_safe_load
@@ -2424,17 +2425,6 @@ def invalidate_env_cache() -> None:
     _env_cache = None
 
 
-def _sanitize_env_lines(lines: list) -> list:
-    """Normalize .env line endings/whitespace without changing assignment semantics.
-    Content after the first ``=`` is opaque value data: a known variable name embedded in a value
-    must never be reinterpreted as another assignment, so concatenated lines stay on one line."""
-    sanitized: list[str] = []
-    for line in lines:
-        raw = line.rstrip("\r\n")
-        stripped = raw.strip()
-        # Blank lines and comments are preserved verbatim.
-        sanitized.append((raw if not stripped or stripped.startswith("#") else stripped) + "\n")
-    return sanitized
 
 
 def sanitize_env_file() -> int:

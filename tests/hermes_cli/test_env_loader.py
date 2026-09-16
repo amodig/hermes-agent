@@ -3,6 +3,8 @@ import importlib
 import os
 import sys
 
+import pytest
+
 from hermes_cli.env_loader import load_hermes_dotenv
 
 
@@ -195,6 +197,65 @@ def test_latin1_fallback_stream_preserves_interpolation(tmp_path, monkeypatch):
     assert os.getenv("BAR") == "bar"
     assert os.getenv("LATIN1_VALUE") == "café"
 
+
+@pytest.mark.parametrize("filename", [".env", ".op.env"])
+def test_worker_gate_matches_bom_latin1_fallback_without_parent_mutation(
+    tmp_path, monkeypatch, filename,
+):
+    from hermes_cli.kanban_worker_runtime import _worker_project_plugins_enabled
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    path = home / filename
+    raw = codecs.BOM_UTF8 + (
+        b"WORKER_PROJECT_GATE=on\n"
+        b"HERMES_ENABLE_PROJECT_PLUGINS=${WORKER_PROJECT_GATE}\n"
+        b"LATIN1_VALUE=caf\xe9\n"
+    )
+    path.write_bytes(raw)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "unmanaged"))
+    for key in (
+        "OP_SERVICE_ACCOUNT_TOKEN", "HERMES_ENABLE_PROJECT_PLUGINS",
+        "WORKER_PROJECT_GATE", "LATIN1_VALUE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    ambient = dict(os.environ)
+    child_env = dict(ambient)
+
+    assert _worker_project_plugins_enabled(child_env) is True
+    assert child_env == ambient == dict(os.environ)
+    assert path.read_bytes() == raw
+
+    load_hermes_dotenv(hermes_home=home, load_external_secrets=False)
+
+    assert os.environ["HERMES_ENABLE_PROJECT_PLUGINS"] == "on"
+    assert os.environ["LATIN1_VALUE"] == "café"
+    assert path.read_bytes() == raw
+
+
+def test_worker_gate_does_not_sanitize_onepassword_dotenv(tmp_path, monkeypatch):
+    from hermes_cli.kanban_worker_runtime import _worker_project_plugins_enabled
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    path = home / ".op.env"
+    raw = b"HERMES_ENABLE_PROJECT_PLUGINS=\x001\n"
+    path.write_bytes(raw)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "unmanaged"))
+    monkeypatch.delenv("OP_SERVICE_ACCOUNT_TOKEN", raising=False)
+    monkeypatch.delenv("HERMES_ENABLE_PROJECT_PLUGINS", raising=False)
+    ambient = dict(os.environ)
+
+    assert _worker_project_plugins_enabled(ambient) is False
+    assert dict(os.environ) == ambient
+    # Unlike .env, the child does not repair a NUL-containing .op.env.
+    with pytest.raises(ValueError, match="embedded null"):
+        load_hermes_dotenv(hermes_home=home, load_external_secrets=False)
+    assert path.read_bytes() == raw
+
+
 # ---------------------------------------------------------------------------
 # UTF-16 / UTF-32 .env sanitizer coverage
 #
@@ -218,8 +279,12 @@ def _assert_clean_utf8_env_on_disk(env_file, *, first_key: str) -> None:
 
 
 
-def test_utf16_le_bom_preserves_non_ascii_values(tmp_path, monkeypatch):
-    """UTF-16-LE+BOM rewrite must preserve non-ASCII values (not just ASCII keys).
+@pytest.mark.parametrize(("bom", "encoding"), [
+    (codecs.BOM_UTF16_LE, "utf-16-le"),
+    (codecs.BOM_UTF16_BE, "utf-16-be"),
+])
+def test_utf16_bom_preserves_non_ascii_values(tmp_path, monkeypatch, bom, encoding):
+    """UTF-16+BOM rewrite must preserve non-ASCII values (not just ASCII keys).
 
     Uses non-credential var names so _sanitize_loaded_credentials does not
     strip non-ASCII from values (that path only targets *_KEY/*_TOKEN/etc.).
@@ -228,7 +293,7 @@ def test_utf16_le_bom_preserves_non_ascii_values(tmp_path, monkeypatch):
     home.mkdir()
     env_file = home / ".env"
     content = "GREETING=café\nCJK_LABEL=日本語\n"
-    env_file.write_bytes(codecs.BOM_UTF16_LE + content.encode("utf-16-le"))
+    env_file.write_bytes(bom + content.encode(encoding))
 
     monkeypatch.delenv("GREETING", raising=False)
     monkeypatch.delenv("CJK_LABEL", raising=False)
@@ -245,8 +310,12 @@ def test_utf16_le_bom_preserves_non_ascii_values(tmp_path, monkeypatch):
     assert b"\xef\xbf\xbd" not in after
 
 
-def test_utf32_le_bom_leaves_file_untouched(tmp_path, caplog):
-    """UTF-32-LE BOM: refuse-to-mangle (leave bytes untouched + warning).
+@pytest.mark.parametrize(("bom", "encoding"), [
+    (codecs.BOM_UTF32_LE, "utf-32-le"),
+    (codecs.BOM_UTF32_BE, "utf-32-be"),
+])
+def test_utf32_bom_leaves_file_untouched(tmp_path, caplog, bom, encoding):
+    """UTF-32 BOM: refuse-to-mangle (leave bytes untouched + warning).
 
     UTF-32-LE's BOM starts with UTF-16-LE's FF FE; sniff order must check
     UTF-32 first so we never misdetect and corrupt.
@@ -256,12 +325,13 @@ def test_utf32_le_bom_leaves_file_untouched(tmp_path, caplog):
     """
     import logging
 
-    from hermes_cli.env_loader import _sanitize_env_file_if_needed
+    from hermes_cli.env_loader import _sanitize_env_file_if_needed, _sanitized_env_content
 
     env_file = tmp_path / ".env"
     content = "HERMES_TEST_KEY=hello_utf32\nSECOND_KEY=world\n"
-    raw = codecs.BOM_UTF32_LE + content.encode("utf-32-le")
+    raw = bom + content.encode(encoding)
     env_file.write_bytes(raw)
+    assert _sanitized_env_content(raw) is None
 
     with caplog.at_level(logging.WARNING, logger="hermes_cli.env_loader"):
         _sanitize_env_file_if_needed(env_file)

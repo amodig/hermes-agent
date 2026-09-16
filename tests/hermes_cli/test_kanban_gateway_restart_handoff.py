@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import signal
@@ -282,26 +283,59 @@ value = {
         _finish_launch(launch)
 
 
-@pytest.mark.parametrize(("dispatcher_gate", "profile_env", "enabled"), [
-    ("0", "HERMES_ENABLE_PROJECT_PLUGINS=1\n", True),
-    ("1", "HERMES_ENABLE_PROJECT_PLUGINS=0\n", False),
-    ("0", "WORKER_PROJECT_GATE=on\nHERMES_ENABLE_PROJECT_PLUGINS=${WORKER_PROJECT_GATE}\n", True),
-    ("1", "WORKER_PROJECT_GATE\nHERMES_ENABLE_PROJECT_PLUGINS=${WORKER_PROJECT_GATE:-1}\n", False),
+@pytest.mark.parametrize(("dispatcher_gate", "scope", "encoding", "profile_env", "enabled"), [
+    ("0", "profile", "utf-8", "HERMES_ENABLE_PROJECT_PLUGINS=1\n", True),
+    ("1", "profile", "utf-8", "HERMES_ENABLE_PROJECT_PLUGINS=0\n", False),
+    ("0", "profile", "utf-8", "WORKER_PROJECT_GATE=on\nHERMES_ENABLE_PROJECT_PLUGINS=${WORKER_PROJECT_GATE}\n", True),
+    ("1", "profile", "utf-8", "WORKER_PROJECT_GATE\nHERMES_ENABLE_PROJECT_PLUGINS=${WORKER_PROJECT_GATE:-1}\n", False),
+    ("1", "profile", "utf-8", "HERMES_ENABLE_PROJECT_PLUGINS\n", True),
+    (None, "profile", "utf-8", "HERMES_ENABLE_PROJECT_PLUGINS\n", False),
+    ("0", "profile", "utf-16", "HERMES_ENABLE_PROJECT_PLUGINS=1\n", True),
+    ("1", "profile", "utf-16-be", "HERMES_ENABLE_PROJECT_PLUGINS=0\n", False),
+    ("0", "profile", "utf-16-le", "WORKER_PROJECT_GATE=on\nHERMES_ENABLE_PROJECT_PLUGINS=${WORKER_PROJECT_GATE}\n", True),
+    ("1", "profile", "utf-16-le", "HERMES_ENABLE_PROJECT_PLUGINS=0\n", False),
+    ("0", "managed", "utf-16-be", "HERMES_ENABLE_PROJECT_PLUGINS=1\n", True),
+    ("1", "managed", "utf-16", "HERMES_ENABLE_PROJECT_PLUGINS=0\n", False),
+    ("0", "managed", "utf-16-le", "HERMES_ENABLE_PROJECT_PLUGINS=1\n", True),
+    ("1", "managed", "utf-16-le", "HERMES_ENABLE_PROJECT_PLUGINS=0\n", False),
+    ("0", "managed", "utf-8-sig", "HERMES_ENABLE_PROJECT_PLUGINS=1\n", True),
 ])
 def test_worker_project_plugin_capture_matches_profile_dotenv(
-    worker_setup, monkeypatch, dispatcher_gate, profile_env, enabled,
+    worker_setup, monkeypatch, dispatcher_gate, scope, encoding, profile_env, enabled,
 ):
     workspace, task = worker_setup
     source = workspace.parent / "install"
     _install_memory_loaders(source)
     worker_home = workspace.parent / ".hermes" / "profiles" / task.assignee
-    worker_home.joinpath(".env").write_text(profile_env, encoding="utf-8")
-    monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", dispatcher_gate)
+    managed = workspace.parent / "managed"
+    managed.mkdir()
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    if scope == "managed":
+        worker_home.joinpath(".env").write_text(
+            f"HERMES_ENABLE_PROJECT_PLUGINS={dispatcher_gate}\n", encoding="utf-8",
+        )
+    env_file = (worker_home if scope == "profile" else managed) / ".env"
+    secret = "dotenv-parity-secret-must-not-be-captured"
+    content = profile_env + f"DOTENV_PARITY_SECRET={secret}\n"
+    raw = content.encode(encoding)  # utf-16-le without a BOM exercises NUL-padded ASCII.
+    if encoding == "utf-16-be":
+        raw = codecs.BOM_UTF16_BE + raw
+    env_file.write_bytes(raw)
+    originals = {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in (worker_home / ".env", managed / ".env") if path.exists()
+    }
+    if dispatcher_gate is None:
+        monkeypatch.delenv("HERMES_ENABLE_PROJECT_PLUGINS", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", dispatcher_gate)
+    monkeypatch.delenv("DOTENV_PARITY_SECRET", raising=False)
     monkeypatch.delenv("WORKER_PROJECT_GATE", raising=False)
     plugin = workspace / ".hermes" / "plugins" / "projectmemory"
     _write_memory_provider(plugin, "project")
     (source / "fixture_early.py").write_text("""
 import importlib
+import os
 from pathlib import Path
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_cli.kanban_runtime import RuntimeIdentityError
@@ -327,12 +361,17 @@ value = {
     'provider': provider.system_prompt_block() if provider else None,
     'origin': module.__file__ if module else None,
     'gate_after': env_var_enabled('HERMES_ENABLE_PROJECT_PLUGINS'),
+    'secret_loaded': bool(os.getenv('DOTENV_PARITY_SECRET')),
 }
 """, encoding="utf-8")
     restart_safe_argv = kbd._restart_safe_worker_argv
 
     def change_project_before_spawn(task, command, *, preparation_id=None):
         command = restart_safe_argv(task, command, preparation_id=preparation_id)
+        # This hook runs after capture but before any child can normalize the live files.
+        assert dict(os.environ) == ambient
+        for path, original in originals.items():
+            assert (path.read_bytes(), path.stat().st_mtime_ns) == original
         if enabled:
             shutil.rmtree(plugin.parent)
         else:
@@ -341,6 +380,7 @@ value = {
         return command
 
     monkeypatch.setattr(kbd, "_restart_safe_worker_argv", change_project_before_spawn)
+    ambient = dict(os.environ)
     launch = kbd._default_spawn(task, str(workspace), defer_grant=True)
     snapshot = kbd._worker_runtime_snapshots[launch.launcher_pid]
     try:
@@ -350,14 +390,19 @@ value = {
         assert plugin["discovered_before"] is enabled
         assert plugin["captured"] is enabled
         assert plugin["gate_before"] is plugin["gate_after"] is enabled
+        assert plugin["secret_loaded"] is True
+        assert not any(path.name in {".env", ".op.env"} for path in snapshot.rglob("*"))
+        assert all(
+            secret.encode() not in path.read_bytes()
+            for path in snapshot.rglob("*") if path.is_file()
+        )
         if enabled:
             assert plugin["provider"] == "project:project resource"
             assert Path(plugin["origin"]).is_relative_to(snapshot)
         else:
             assert plugin["provider"] is None
             assert plugin["origin"] is None
-        assert os.environ["HERMES_ENABLE_PROJECT_PLUGINS"] == dispatcher_gate
-        assert "WORKER_PROJECT_GATE" not in os.environ
+        assert dict(os.environ) == ambient
     finally:
         _finish_launch(launch)
 

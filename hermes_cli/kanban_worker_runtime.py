@@ -430,8 +430,12 @@ def _restart_safe_worker_argv(
 
 def _worker_project_plugins_enabled(env: dict[str, str]) -> bool:
     """Resolve only the discovery gate, without changing the dispatcher environment."""
+    import codecs
+    import io
+
     from dotenv.main import DotEnv
     from dotenv.variables import parse_variables
+    from hermes_cli.env_loader import _sanitized_env_content
     from hermes_cli.managed_scope import get_managed_dir
     from utils import is_truthy_value
 
@@ -449,10 +453,16 @@ def _worker_project_plugins_enabled(env: dict[str, str]) -> bool:
             continue
         if path.name == ".op.env" and values.get("OP_SERVICE_ACCOUNT_TOKEN"):
             continue
-        try:
-            parsed = list(DotEnv(path, encoding="utf-8-sig").parse())
-        except UnicodeDecodeError:
-            parsed = list(DotEnv(path, encoding="latin-1").parse())
+        raw = path.read_bytes()
+        # .op.env is intentionally not sanitized by the child.
+        content = _sanitized_env_content(raw) if path.name == ".env" else None
+        if content is None:
+            try:
+                with io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8-sig") as stream:
+                    content = stream.read()
+            except UnicodeDecodeError:
+                content = raw.removeprefix(codecs.BOM_UTF8).decode("latin-1")
+        parsed = DotEnv(None, stream=io.StringIO(content)).parse()
         resolved = {}
         for name, value in parsed:
             if value is not None:
