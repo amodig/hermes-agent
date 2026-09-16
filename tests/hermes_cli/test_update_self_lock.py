@@ -33,6 +33,7 @@ import pytest
 
 import hermes_cli.main as cli_main
 from hermes_cli import _early_recovery
+from hermes_cli import update_cmd
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -224,6 +225,39 @@ def test_abort_helper_resumes_paused_gateways_before_exit():
     ), pytest.raises(SystemExit):
         cli_main._abort_dependency_sync_if_self_locked(sentinel)
     assert resume_calls == [sentinel]
+
+
+# ---------------------------------------------------------------------------
+# ZIP path: guard runs after the code swap, before dependency reinstall
+# ---------------------------------------------------------------------------
+
+
+def test_zip_path_checks_self_lock_after_swap_before_reinstall(monkeypatch):
+    """A mapped native module must abort only the dependency rewrite, not the swap."""
+    from hermes_cli import update_cmd_zip
+
+    calls: list[str] = []
+    monkeypatch.setattr(update_cmd_zip, "_abort_zip_update_if_dirty_tree", lambda: calls.append("dirty"))
+    monkeypatch.setattr(update_cmd_zip, "_download_and_swap_zip", lambda branch, url: calls.append("swap"))
+    monkeypatch.setattr(update_cmd, "_sweep_bytecode_after_update", lambda branch: calls.append("sweep"))
+    monkeypatch.setattr(cli_main, "_abort_dependency_sync_if_self_locked", lambda: calls.append("guard"))
+    monkeypatch.setattr(update_cmd_zip, "_reinstall_python_deps_after_zip", lambda deps: calls.append("deps"))
+    monkeypatch.setattr(update_cmd, "_validate_critical_modules_import", lambda root: (True, None, None))
+    monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
+    monkeypatch.setattr(cli_main, "_build_web_ui", lambda root: None)
+    monkeypatch.setattr(update_cmd, "_rebuild_desktop_after_update", lambda root, **kwargs: True)
+    monkeypatch.setattr(update_cmd, "_print_bundled_skills_sync_report", lambda: None)
+    monkeypatch.setattr(update_cmd, "_verify_and_restore_state_dbs_post_update", lambda: None)
+    monkeypatch.setattr(update_cmd, "_print_update_summary", lambda **kwargs: True)
+    monkeypatch.setattr(update_cmd, "_print_curator_first_run_notice", lambda: None)
+    monkeypatch.setattr(update_cmd, "_print_curator_recent_run_notice", lambda: None)
+    monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda failures: None)
+    monkeypatch.setattr(update_cmd, "_read_project_version", lambda: "old")
+    monkeypatch.setattr(cli_main, "_capture_active_tool_dependencies", lambda: [])
+    monkeypatch.setattr(cli_main, "_resolve_update_branch", lambda args: "main")
+
+    assert update_cmd_zip._update_via_zip(object()) is True
+    assert calls.index("swap") < calls.index("guard") < calls.index("deps")
 
 
 # ---------------------------------------------------------------------------

@@ -89,6 +89,8 @@ def test_worker_model_override_survives_real_cli_parse(monkeypatch, tmp_path):
 
     task = _make_task(kb, assignee="elias")
     task.model_override = "gpt-5.6-sol"
+    task.provider_override = "openrouter"
+    task.reasoning_effort = "high"
     argv = kbd._worker_argv(task, "elias", root / "profiles" / "elias")
 
     parser, _subparsers, _chat_parser = build_top_level_parser()
@@ -98,8 +100,9 @@ def test_worker_model_override_survives_real_cli_parse(monkeypatch, tmp_path):
     assert argv[:2] == ["-p", "elias"]
     args = parser.parse_args(argv[2:])
 
-    assert args.command == "chat"
     assert args.model == "gpt-5.6-sol"
+    assert args.provider == "openrouter"
+    assert args.reasoning == "high"
     assert args.query == "work kanban task t_spawn_tools"
 
 
