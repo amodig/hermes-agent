@@ -214,8 +214,62 @@ def _version(root: Path) -> str:
 
 
 def _fingerprint(root: Path) -> str:
-    from hermes_cli.kanban_runtime_generation import _digest_members, source_members
-    return _digest_members(source_members(root))
+    """Comparable deployment bytes, not the complete sealed worker payload."""
+    from hermes_cli.kanban_runtime_generation import _digest_members, _members, _TREE_EXCLUDES
+
+    code_suffixes = (".py", ".so", ".pyd", ".dll", ".dylib")
+    # Packaging/test trees are excluded only at the repository root.
+    # A package's own build/ or dist/ directory can contain executable source.
+    root_artifacts = ("node_modules", "build", "dist", "tests", "evals")
+    # These are the package roots in pyproject.toml's setuptools discovery.
+    paths = {name: root / name for name in (*_IDENTITY_ROOTS, "native")}
+    resource_names = {name for name, _ in _RUNTIME_RESOURCE_ROOTS}
+    # Undeclared packages own data only at directories that directly define a
+    # Python/native module. Namespace-only ancestors do not make unrelated
+    # sibling trees package data (e.g. apps/desktop/scripts/perf is not apps/).
+    for path in root.iterdir():
+        if path.is_file() and path.suffix in code_suffixes:
+            paths[path.name] = path
+        elif (
+            path.is_dir() and path.name.isidentifier()
+            and path.name not in paths and path.name not in resource_names
+            and path.name not in root_artifacts
+            and not (path / "pyvenv.cfg").is_file()
+        ):
+            packages = {
+                member.parent
+                for _, member in _members(path, source=True, exclude=("node_modules",))
+                if member.is_file() and member.suffix in code_suffixes
+            }
+            for package in packages:
+                if not any(parent in packages for parent in package.parents):
+                    paths[package.relative_to(root).as_posix()] = package
+    paths.update((name, root / name) for name in (
+        "pyproject.toml", "uv.lock", "package.json", "package-lock.json",
+        "compat_manifest.json", "cli-config.yaml.example",
+    ))
+    # Logical names make relocated bundled resources comparable across installs.
+    # Plugins are both importable code and bundled resources; attest both roots.
+    paths.update(
+        (f"bundled/{name}", Path(os.environ.get(variable) or root / name))
+        for name, variable in _RUNTIME_RESOURCE_ROOTS
+    )
+
+    def members():
+        for name, path in sorted(paths.items()):
+            if path.is_file():
+                yield name, path
+            elif path.is_dir():
+                # Node dependencies and these exact frontend build destinations
+                # are installation outputs, not deployment source. The complete
+                # generation payload still attests every captured byte.
+                for relative, member in _members(path, source=True, exclude=("node_modules",)):
+                    if name == "hermes_cli" and relative.split("/", 1)[0] in {"web_dist", "tui_dist"}:
+                        continue
+                    if member.is_file() and member.name not in _TREE_EXCLUDES:
+                        yield f"{name}/{relative}", member
+
+    return _digest_members(members())
 
 
 _FROZEN_RUNTIME_IDENTITY: Optional[RuntimeIdentity] = None

@@ -1240,9 +1240,10 @@ def _evaluate_dependencies(
                 "message": "parent lifecycle contract is unclassified",
             })
             continue
-        projection = get_lifecycle_state(conn, parent_id, _cache=cache)
         if requirement == "review_approved":
-            verdict = projection.get("review_verdict")
+            # A stale prior validation must not block the fresh review that
+            # releases its replacement. Gate this phase, not aggregate acceptance.
+            verdict, lifecycle, _ = _verdict_for(conn, parent_id, "review", cache=cache)
             if verdict is None:
                 blockers.append({
                     **base,
@@ -1261,7 +1262,13 @@ def _evaluate_dependencies(
                     "code": "verdict_malformed",
                     "message": "review verdict is invalid",
                 })
-            elif projection.get("acceptance") == "stale":
+            elif not _freshness(
+                conn,
+                lifecycle,
+                parent_contract.get("candidate_task_id") or parent_id,
+                evidence_task_id=parent_id,
+                cache=cache,
+            )[0]:
                 blockers.append({
                     **base,
                     "code": "candidate_head_mismatch",
@@ -1274,6 +1281,7 @@ def _evaluate_dependencies(
                     "message": "approved review card is not complete",
                 })
         elif requirement == "validation_passed":
+            projection = get_lifecycle_state(conn, parent_id, _cache=cache)
             verdict = projection.get("validation_verdict")
             if verdict is None:
                 blockers.append({
