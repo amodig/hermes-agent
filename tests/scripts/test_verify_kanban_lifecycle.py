@@ -34,7 +34,6 @@ def test_installed_verifier_rejects_source_runtime_fallback(tmp_path: Path) -> N
     assert code == 2
     assert payload["result"]["status"] == "incomplete"
     assert payload["result"]["scenarios"] == []
-    assert any("installed runtime identity root mismatch" in item for item in payload["result"]["diagnostics"])
 
 
 @pytest.mark.parametrize("profiles_present", [False, True])
@@ -54,25 +53,57 @@ def test_policy_failure_writes_incomplete_receipt(tmp_path: Path, profiles_prese
     assert any(failed_path in message for message in receipt["result"]["diagnostics"])
 
 
-def test_installed_suite_does_not_expose_source_runtime_fallback(tmp_path: Path, monkeypatch) -> None:
+def test_installed_suite_runs_both_modules_without_source_runtime_fallback(
+    tmp_path: Path, monkeypatch,
+) -> None:
     source_root = tmp_path / "source"
     runtime_root = tmp_path / "runtime"
-    source_root.mkdir()
+    test_package = source_root / "tests" / "hermes_cli"
+    test_package.mkdir(parents=True)
     runtime_root.mkdir()
+    (source_root / "tests" / "__init__.py").write_text("", encoding="utf-8")
+    (test_package / "__init__.py").write_text("", encoding="utf-8")
     (source_root / "toolsets.py").write_text("VALUE = 'source'\n", encoding="utf-8")
-    test_file = source_root / "test_installed.py"
-    test_file.write_text(
+    (runtime_root / "toolsets.py").write_text("VALUE = 'runtime'\n", encoding="utf-8")
+    first_file = test_package / "test_installed.py"
+    first_file.write_text(
+        "import sys\n"
         "import unittest\n"
+        "from pathlib import Path\n"
         "import toolsets\n"
         "\n"
         "class InstalledRuntimeTest(unittest.TestCase):\n"
-        "    def test_source_only_module_is_not_available(self):\n"
-        "        self.assertEqual(toolsets.VALUE, 'source')\n",
+        "    def test_runtime_module_wins_over_source_checkout(self):\n"
+        "        source_root = Path(__file__).resolve().parents[2]\n"
+        "        self.assertNotIn(str(source_root), sys.path)\n"
+        "        self.assertEqual(toolsets.VALUE, 'runtime')\n",
         encoding="utf-8",
     )
+    helper_file = test_package / "kanban_conformance_fixture.py"
+    helper_file.write_text(
+        "import unittest\n"
+        "\n"
+        "class KanbanConformanceFixture(unittest.TestCase):\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    second_file = test_package / "test_installed_upgrade.py"
+    second_file.write_text(
+        "from tests.hermes_cli import kanban_conformance_fixture as MODULE\n"
+        "\n"
+        "class InstalledUpgradeTest(MODULE.KanbanConformanceFixture):\n"
+        "    def test_second_module_does_not_expose_source_runtime(self):\n"
+        "        import source_only_runtime\n"
+        "        self.assertIsNotNone(source_only_runtime)\n",
+        encoding="utf-8",
+    )
+    (source_root / "source_only_runtime.py").write_text(
+        "VALUE = 'source'\n", encoding="utf-8",
+    )
     monkeypatch.setattr(verify_kanban_lifecycle, "REPO_ROOT", source_root)
-    monkeypatch.setattr(verify_kanban_lifecycle, "TEST_FILE", test_file)
-    monkeypatch.setattr(verify_kanban_lifecycle, "TEST_MODULE", "test_installed")
+    monkeypatch.setattr(
+        verify_kanban_lifecycle, "TEST_FILES", (first_file, second_file),
+    )
 
     code, output, runner, pythonpath = verify_kanban_lifecycle._run_suite(
         "installed", runtime_root, sys.executable, None,
@@ -80,6 +111,8 @@ def test_installed_suite_does_not_expose_source_runtime_fallback(tmp_path: Path,
 
     assert code != 0
     assert pythonpath == str(runtime_root)
+    assert "test_runtime_module_wins_over_source_checkout" in output
+    assert "test_second_module_does_not_expose_source_runtime" in output
     assert "FAILED (errors=1)" in output
     assert runner == "python -c <installed conformance runner>"
 

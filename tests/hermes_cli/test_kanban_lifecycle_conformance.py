@@ -39,150 +39,10 @@ from hermes_cli.kanban_runtime import (
     runtime_identity,
     same_code_identity,
 )
+from tests.hermes_cli import kanban_conformance_fixture as MODULE
 
 
-ROOT = Path(__file__).resolve().parents[2]
-RUNTIME_ROOT = Path(os.environ.get("HERMES_CONFORMANCE_RUNTIME_ROOT", ROOT)).resolve()
-FIXTURE = ROOT / "tests" / "fixtures" / "kanban_lifecycle_v0.json"
-
-
-def _git(repo: Path, *args: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(repo), *args],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return result.stdout.strip()
-
-
-def _make_runtime_fixture(root: Path) -> None:
-    """Small real install: production bootstrap, dynamic imports, and resources."""
-    package = root / "hermes_cli"
-    package.mkdir(parents=True)
-    for name in ("kanban_runtime.py", "kanban_runtime_generation.py"):
-        shutil.copy2(RUNTIME_ROOT / "hermes_cli" / name, package / name)
-    (package / "__init__.py").write_text('__version__ = "fixture"\n', encoding="utf-8")
-    (root / "fixture_early.py").write_text("value = 1\n", encoding="utf-8")
-    (root / "fixture_lazy.py").write_text("value = 1\n", encoding="utf-8")
-    dependency_root = root.parent / "site-packages"
-    dependency_root.mkdir(exist_ok=True)
-    for name in ("third_party_early", "third_party_dynamic"):
-        dependency = dependency_root / name
-        dependency.mkdir()
-        (dependency / "__init__.py").write_text("value = 1\n", encoding="utf-8")
-        (dependency / "data.bin").write_bytes(b"dependency-v1")
-    for directory, _env_var in runtime._RUNTIME_RESOURCE_ROOTS:
-        resource = root / directory
-        resource.mkdir(exist_ok=True)
-        (resource / "marker.txt").write_text(f"{directory}:v1\n", encoding="utf-8")
-    executable = root / "skills" / "helper"
-    executable.write_text("#!/bin/sh\nprintf sealed-helper\n", encoding="utf-8")
-    executable.chmod(0o755)
-    (package / "main.py").write_text(
-        """
-import importlib
-import json
-import os
-import sys
-import time
-from pathlib import Path
-from hermes_cli import kanban_runtime as runtime
-import fixture_early
-import third_party_early
-
-runtime.worker_bootstrap_from_env()
-runtime.worker_bootstrap_post_import(wait_for_grant=False)
-assert os.environ.get("HERMES_KANBAN_RUNTIME_GRANTED") != "1"
-runtime.worker_bootstrap_after_constructor()
-release = os.environ.get("HERMES_TEST_RUNTIME_RELEASE")
-while release and not Path(release).exists():
-    time.sleep(0.02)
-lazy = importlib.import_module("fixture_" + "lazy")
-sdk = importlib.import_module(os.environ.get("HERMES_TEST_SDK", "third_party_dynamic"))
-payload = {
-    "identity": runtime.runtime_identity().as_dict(),
-    "early": [fixture_early.value, third_party_early.value],
-    "lazy": [lazy.value, sdk.value],
-    "dependency_data": (Path(sdk.__file__).parent / "data.bin").read_text(),
-    "locations": [fixture_early.__file__, third_party_early.__file__, lazy.__file__, sdk.__file__],
-    "resources": {
-        directory: (Path(os.environ[env_var]) / "marker.txt").read_text()
-        for directory, env_var in runtime._RUNTIME_RESOURCE_ROOTS
-    },
-    "argv": sys.argv[1:],
-    "cwd": os.getcwd(),
-    "profile": os.environ.get("HERMES_PROFILE"),
-    "home": os.environ.get("HERMES_HOME"),
-    "task": os.environ.get("HERMES_KANBAN_TASK"),
-    "board": os.environ.get("HERMES_KANBAN_BOARD"),
-    "run": os.environ.get("HERMES_KANBAN_RUN_ID"),
-    "claim": os.environ.get("HERMES_KANBAN_CLAIM_LOCK"),
-    "granted": os.environ.get("HERMES_KANBAN_RUNTIME_GRANTED"),
-    "secret": os.environ.get("ANTHROPIC_API_KEY"),
-}
-if Path("/proc/self/cgroup").exists():
-    payload["cgroup"] = Path("/proc/self/cgroup").read_text()
-Path(os.environ["HERMES_TEST_RUNTIME_RECEIPT"]).write_text(json.dumps(payload))
-""",
-        encoding="utf-8",
-    )
-
-def _prepare_fixture_generation(
-    root: Path, prepare=generations.prepare_runtime_generation, *, workspace=None, profile_home=None,
-    project_plugins_enabled: bool | None = None,
-):
-    resources = {env_var: str(root / directory) for directory, env_var in runtime._RUNTIME_RESOURCE_ROOTS}
-    with patch.dict(os.environ, resources), patch.object(
-        generations, "_runtime_import_roots", return_value=[root.parent / "site-packages"],
-    ):
-        return prepare(
-            runtime_identity(root), workspace=workspace, profile_home=profile_home,
-            project_plugins_enabled=project_plugins_enabled,
-        )
-
-
-def _wait_for_receipt(path: Path) -> dict:
-    deadline = time.monotonic() + 10
-    while not path.exists() and time.monotonic() < deadline:
-        time.sleep(0.02)
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-class KanbanLifecycleConformance(unittest.TestCase):
-    def setUp(self) -> None:
-        self.home = tempfile.TemporaryDirectory(prefix="kanban-conformance-home-")
-        self.storage = patch.object(
-            generations, "_runtime_storage_root",
-            return_value=Path(self.home.name) / "runtime-storage",
-        )
-        self.storage.start()
-        self.env = patch.dict(
-            "os.environ",
-            {
-                "HERMES_HOME": self.home.name,
-                "HERMES_KANBAN_HOME": self.home.name,
-                "HERMES_PROFILE": "cto",
-            },
-            clear=False,
-        )
-        self.env.start()
-        self.conn = sqlite3.connect(":memory:")
-        self.conn.row_factory = sqlite3.Row
-        self.conn.executescript(kb.SCHEMA_SQL)
-        kb._ensure_lifecycle_schema(self.conn)
-        kb._ensure_goal_revision_schema(self.conn)
-
-    def tearDown(self) -> None:
-        self.conn.close()
-        self.env.stop()
-        self.storage.stop()
-        self.home.cleanup()
-
-    def _task(self, task_id: str):
-        task = kb.get_task(self.conn, task_id)
-        self.assertIsNotNone(task)
-        return task
+class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
 
     def _move(self, trace: list[str], alias: str, operation) -> None:
         before = self._task(self.ids[alias]).status
@@ -192,7 +52,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
         trace.append(f"{alias}:{before}->{after}")
 
     def _load_fixture(self) -> dict:
-        fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        fixture = json.loads(MODULE.FIXTURE.read_text(encoding="utf-8"))
         self.assertEqual(fixture["fixture_version"], 0)
         return fixture
 
@@ -200,17 +60,17 @@ class KanbanLifecycleConformance(unittest.TestCase):
         fixture = self._load_fixture()
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-git-") as raw_repo:
             repo = Path(raw_repo)
-            _git(repo, "init", "-q")
-            _git(repo, "config", "user.email", "conformance@example.invalid")
-            _git(repo, "config", "user.name", "Kanban Conformance")
+            MODULE._git(repo, "init", "-q")
+            MODULE._git(repo, "config", "user.email", "conformance@example.invalid")
+            MODULE._git(repo, "config", "user.name", "Kanban Conformance")
             (repo / "README").write_text("base\n", encoding="utf-8")
-            _git(repo, "add", "README")
-            _git(repo, "commit", "-qm", "base")
-            base_sha = _git(repo, "rev-parse", "HEAD")
+            MODULE._git(repo, "add", "README")
+            MODULE._git(repo, "commit", "-qm", "base")
+            base_sha = MODULE._git(repo, "rev-parse", "HEAD")
             (repo / "lifecycle.py").write_text("print('proof')\n", encoding="utf-8")
-            _git(repo, "add", "lifecycle.py")
-            _git(repo, "commit", "-qm", "implementation")
-            head_sha = _git(repo, "rev-parse", "HEAD")
+            MODULE._git(repo, "add", "lifecycle.py")
+            MODULE._git(repo, "commit", "-qm", "implementation")
+            head_sha = MODULE._git(repo, "rev-parse", "HEAD")
 
             implementation_spec = fixture["tasks"][0]
             implementation = kb.create_task(
@@ -334,17 +194,17 @@ class KanbanLifecycleConformance(unittest.TestCase):
     def test_same_card_review_waits_for_validation_before_terminal_completion(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-validation-") as raw_repo:
             repo = Path(raw_repo)
-            _git(repo, "init", "-q")
-            _git(repo, "config", "user.email", "conformance@example.invalid")
-            _git(repo, "config", "user.name", "Kanban Conformance")
+            MODULE._git(repo, "init", "-q")
+            MODULE._git(repo, "config", "user.email", "conformance@example.invalid")
+            MODULE._git(repo, "config", "user.name", "Kanban Conformance")
             (repo / "README").write_text("base\n", encoding="utf-8")
-            _git(repo, "add", "README")
-            _git(repo, "commit", "-qm", "base")
-            base_sha = _git(repo, "rev-parse", "HEAD")
+            MODULE._git(repo, "add", "README")
+            MODULE._git(repo, "commit", "-qm", "base")
+            base_sha = MODULE._git(repo, "rev-parse", "HEAD")
             (repo / "lifecycle.py").write_text("print('proof')\n", encoding="utf-8")
-            _git(repo, "add", "lifecycle.py")
-            _git(repo, "commit", "-qm", "implementation")
-            head_sha = _git(repo, "rev-parse", "HEAD")
+            MODULE._git(repo, "add", "lifecycle.py")
+            MODULE._git(repo, "commit", "-qm", "implementation")
+            head_sha = MODULE._git(repo, "rev-parse", "HEAD")
 
             implementation = kb.create_task(
                 self.conn,
@@ -419,17 +279,17 @@ class KanbanLifecycleConformance(unittest.TestCase):
     def test_same_card_acceptance_fires_candidate_hook_once(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-same-card-") as raw_repo:
             repo = Path(raw_repo)
-            _git(repo, "init", "-q")
-            _git(repo, "config", "user.email", "conformance@example.invalid")
-            _git(repo, "config", "user.name", "Kanban Conformance")
+            MODULE._git(repo, "init", "-q")
+            MODULE._git(repo, "config", "user.email", "conformance@example.invalid")
+            MODULE._git(repo, "config", "user.name", "Kanban Conformance")
             (repo / "README").write_text("base\n", encoding="utf-8")
-            _git(repo, "add", "README")
-            _git(repo, "commit", "-qm", "base")
-            base_sha = _git(repo, "rev-parse", "HEAD")
+            MODULE._git(repo, "add", "README")
+            MODULE._git(repo, "commit", "-qm", "base")
+            base_sha = MODULE._git(repo, "rev-parse", "HEAD")
             (repo / "lifecycle.py").write_text("print('proof')\n", encoding="utf-8")
-            _git(repo, "add", "lifecycle.py")
-            _git(repo, "commit", "-qm", "implementation")
-            head_sha = _git(repo, "rev-parse", "HEAD")
+            MODULE._git(repo, "add", "lifecycle.py")
+            MODULE._git(repo, "commit", "-qm", "implementation")
+            head_sha = MODULE._git(repo, "rev-parse", "HEAD")
 
             implementation = kb.create_task(
                 self.conn,
@@ -569,17 +429,17 @@ class KanbanLifecycleConformance(unittest.TestCase):
     def test_archived_negative_role_evidence_is_pending(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-archive-") as raw_repo:
             repo = Path(raw_repo)
-            _git(repo, "init", "-q")
-            _git(repo, "config", "user.email", "conformance@example.invalid")
-            _git(repo, "config", "user.name", "Kanban Conformance")
+            MODULE._git(repo, "init", "-q")
+            MODULE._git(repo, "config", "user.email", "conformance@example.invalid")
+            MODULE._git(repo, "config", "user.name", "Kanban Conformance")
             (repo / "README").write_text("base\n", encoding="utf-8")
-            _git(repo, "add", "README")
-            _git(repo, "commit", "-qm", "base")
-            base_sha = _git(repo, "rev-parse", "HEAD")
+            MODULE._git(repo, "add", "README")
+            MODULE._git(repo, "commit", "-qm", "base")
+            base_sha = MODULE._git(repo, "rev-parse", "HEAD")
             (repo / "lifecycle.py").write_text("print('proof')\n", encoding="utf-8")
-            _git(repo, "add", "lifecycle.py")
-            _git(repo, "commit", "-qm", "implementation")
-            head_sha = _git(repo, "rev-parse", "HEAD")
+            MODULE._git(repo, "add", "lifecycle.py")
+            MODULE._git(repo, "commit", "-qm", "implementation")
+            head_sha = MODULE._git(repo, "rev-parse", "HEAD")
 
             implementation = kb.create_task(
                 self.conn,
@@ -785,17 +645,17 @@ class KanbanLifecycleConformance(unittest.TestCase):
     def test_separate_card_validator_preserves_implementer_identity(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-identity-") as raw_repo:
             repo = Path(raw_repo)
-            _git(repo, "init", "-q")
-            _git(repo, "config", "user.email", "conformance@example.invalid")
-            _git(repo, "config", "user.name", "Kanban Conformance")
+            MODULE._git(repo, "init", "-q")
+            MODULE._git(repo, "config", "user.email", "conformance@example.invalid")
+            MODULE._git(repo, "config", "user.name", "Kanban Conformance")
             (repo / "README").write_text("base\n", encoding="utf-8")
-            _git(repo, "add", "README")
-            _git(repo, "commit", "-qm", "base")
-            base_sha = _git(repo, "rev-parse", "HEAD")
+            MODULE._git(repo, "add", "README")
+            MODULE._git(repo, "commit", "-qm", "base")
+            base_sha = MODULE._git(repo, "rev-parse", "HEAD")
             (repo / "lifecycle.py").write_text("print('proof')\n", encoding="utf-8")
-            _git(repo, "add", "lifecycle.py")
-            _git(repo, "commit", "-qm", "implementation")
-            head_sha = _git(repo, "rev-parse", "HEAD")
+            MODULE._git(repo, "add", "lifecycle.py")
+            MODULE._git(repo, "commit", "-qm", "implementation")
+            head_sha = MODULE._git(repo, "rev-parse", "HEAD")
 
             implementation = kb.create_task(
                 self.conn,
@@ -1259,14 +1119,14 @@ class KanbanLifecycleConformance(unittest.TestCase):
         repo_home = tempfile.TemporaryDirectory(prefix="kanban-binding-git-")
         self.addCleanup(repo_home.cleanup)
         repo = Path(repo_home.name)
-        _git(repo, "init", "-q")
-        _git(repo, "config", "user.email", "conformance@example.invalid")
-        _git(repo, "config", "user.name", "Kanban Conformance")
+        MODULE._git(repo, "init", "-q")
+        MODULE._git(repo, "config", "user.email", "conformance@example.invalid")
+        MODULE._git(repo, "config", "user.name", "Kanban Conformance")
         (repo / "README").write_text("legacy\n", encoding="utf-8")
-        _git(repo, "add", "README")
-        _git(repo, "commit", "-qm", "legacy")
-        branch = _git(repo, "branch", "--show-current")
-        head = _git(repo, "rev-parse", "HEAD")
+        MODULE._git(repo, "add", "README")
+        MODULE._git(repo, "commit", "-qm", "legacy")
+        branch = MODULE._git(repo, "branch", "--show-current")
+        head = MODULE._git(repo, "rev-parse", "HEAD")
 
         candidate = kb.create_task(
             self.conn,
@@ -1647,7 +1507,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
             initial_status="blocked",
         )
         self.assertTrue(kb.unblock_task(self.conn, task_id))
-        identity = runtime_identity(RUNTIME_ROOT)
+        identity = runtime_identity(MODULE.RUNTIME_ROOT)
         order: list[str] = []
 
         def fake_default_spawn(task, workspace, *, board=None, defer_grant=False):
@@ -1797,17 +1657,17 @@ class KanbanLifecycleConformance(unittest.TestCase):
     def test_ancestor_reopen_restarts_same_card_reviews_as_implementation(self) -> None:
         repo = Path(self.home.name) / "ancestor-review-workspace"
         repo.mkdir()
-        _git(repo, "init", "-q")
-        _git(repo, "config", "user.email", "conformance@example.invalid")
-        _git(repo, "config", "user.name", "Kanban Conformance")
+        MODULE._git(repo, "init", "-q")
+        MODULE._git(repo, "config", "user.email", "conformance@example.invalid")
+        MODULE._git(repo, "config", "user.name", "Kanban Conformance")
         (repo / "README").write_text("base\n", encoding="utf-8")
-        _git(repo, "add", "README")
-        _git(repo, "commit", "-qm", "base")
-        base_sha = _git(repo, "rev-parse", "HEAD")
+        MODULE._git(repo, "add", "README")
+        MODULE._git(repo, "commit", "-qm", "base")
+        base_sha = MODULE._git(repo, "rev-parse", "HEAD")
         (repo / "implementation.py").write_text("print('proof')\n", encoding="utf-8")
-        _git(repo, "add", "implementation.py")
-        _git(repo, "commit", "-qm", "implementation")
-        head_sha = _git(repo, "rev-parse", "HEAD")
+        MODULE._git(repo, "add", "implementation.py")
+        MODULE._git(repo, "commit", "-qm", "implementation")
+        head_sha = MODULE._git(repo, "rev-parse", "HEAD")
         for phase in ("review", "blocked", "running"):
             with self.subTest(phase=phase):
                 parent = kb.create_task(self.conn, title=f"{phase} ancestor")
@@ -1864,17 +1724,17 @@ class KanbanLifecycleConformance(unittest.TestCase):
     def test_blocked_same_card_review_keeps_reviewer_identity(self) -> None:
         repo = Path(self.home.name) / "workspace"
         repo.mkdir()
-        _git(repo, "init", "-q")
-        _git(repo, "config", "user.email", "conformance@example.invalid")
-        _git(repo, "config", "user.name", "Kanban Conformance")
+        MODULE._git(repo, "init", "-q")
+        MODULE._git(repo, "config", "user.email", "conformance@example.invalid")
+        MODULE._git(repo, "config", "user.name", "Kanban Conformance")
         (repo / "README").write_text("base\n", encoding="utf-8")
-        _git(repo, "add", "README")
-        _git(repo, "commit", "-qm", "base")
-        base_sha = _git(repo, "rev-parse", "HEAD")
+        MODULE._git(repo, "add", "README")
+        MODULE._git(repo, "commit", "-qm", "base")
+        base_sha = MODULE._git(repo, "rev-parse", "HEAD")
         (repo / "lifecycle.py").write_text("print('proof')\n", encoding="utf-8")
-        _git(repo, "add", "lifecycle.py")
-        _git(repo, "commit", "-qm", "implementation")
-        head_sha = _git(repo, "rev-parse", "HEAD")
+        MODULE._git(repo, "add", "lifecycle.py")
+        MODULE._git(repo, "commit", "-qm", "implementation")
+        head_sha = MODULE._git(repo, "rev-parse", "HEAD")
         task_id = kb.create_task(
             self.conn,
             title="blocked same-card review",
@@ -1954,9 +1814,9 @@ class KanbanLifecycleConformance(unittest.TestCase):
         self.assertIsNotNone(resumed)
         self.assertEqual(resumed.assignee, "builder")
         (repo / "lifecycle.py").write_text("print('revised proof')\n", encoding="utf-8")
-        _git(repo, "add", "lifecycle.py")
-        _git(repo, "commit", "-qm", "revised implementation")
-        revised_head = _git(repo, "rev-parse", "HEAD")
+        MODULE._git(repo, "add", "lifecycle.py")
+        MODULE._git(repo, "commit", "-qm", "revised implementation")
+        revised_head = MODULE._git(repo, "rev-parse", "HEAD")
         self.assertTrue(
             kb.complete_task(
                 self.conn, task_id,
@@ -2444,8 +2304,8 @@ class KanbanLifecycleConformance(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-generation-") as raw:
             base = Path(raw)
             source = base / "install"
-            _make_runtime_fixture(source)
-            first = _prepare_fixture_generation(source)
+            MODULE._make_runtime_fixture(source)
+            first = MODULE._prepare_fixture_generation(source)
             preparation = base / "preparation.json"
             receipt = base / "first.json"
             release = base / "release"
@@ -2460,7 +2320,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
             }
             child = subprocess.Popen(first.command_prefix, stdin=subprocess.PIPE, env=env)
             try:
-                early = _wait_for_receipt(preparation)
+                early = MODULE._wait_for_receipt(preparation)
                 actual = runtime.verify_worker_ready(
                     early, first.identity, pid=child.pid, preparation_id="generation-proof",
                 )
@@ -2471,7 +2331,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 child.stdin.flush()
                 deadline = time.monotonic() + 10
                 while time.monotonic() < deadline:
-                    ready = _wait_for_receipt(preparation)
+                    ready = MODULE._wait_for_receipt(preparation)
                     if ready.get("post_import"):
                         break
                     time.sleep(0.02)
@@ -2494,7 +2354,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
                 generations.sweep_runtime_generations()
                 self.assertTrue(first.root.exists())
                 release.touch()
-                observed = _wait_for_receipt(receipt)
+                observed = MODULE._wait_for_receipt(receipt)
                 self.assertEqual(child.wait(timeout=10), 0)
                 self.assertEqual(observed["early"], [1, 1])
                 self.assertEqual(observed["lazy"], [1, 1])
@@ -2505,7 +2365,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
                     self.assertTrue(Path(location).is_relative_to(first.root))
                 for directory, _ in runtime._RUNTIME_RESOURCE_ROOTS:
                     self.assertEqual(observed["resources"][directory], f"{directory}:v1\n")
-                second = _prepare_fixture_generation(source)
+                second = MODULE._prepare_fixture_generation(source)
                 try:
                     self.assertFalse(same_code_identity(first.identity, second.identity))
                     self.assertNotEqual(first.identity.dependency_fingerprint, second.identity.dependency_fingerprint)
@@ -2513,7 +2373,7 @@ class KanbanLifecycleConformance(unittest.TestCase):
                     next_env = {**os.environ, **second.env, "HERMES_TEST_RUNTIME_RECEIPT": str(next_receipt)}
                     completed = subprocess.run(second.command_prefix, env=next_env, check=False, timeout=10)
                     self.assertEqual(completed.returncode, 0)
-                    current = _wait_for_receipt(next_receipt)
+                    current = MODULE._wait_for_receipt(next_receipt)
                     self.assertEqual(current["early"], [2, 2])
                     self.assertEqual(current["lazy"], [2, 2])
                     self.assertEqual(current["dependency_data"], "dependency-v2")
@@ -2530,8 +2390,8 @@ class KanbanLifecycleConformance(unittest.TestCase):
     def test_generation_preserves_executable_resources(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-mode-") as raw:
             source = Path(raw) / "install"
-            _make_runtime_fixture(source)
-            prepared = _prepare_fixture_generation(source)
+            MODULE._make_runtime_fixture(source)
+            prepared = MODULE._prepare_fixture_generation(source)
             try:
                 helper = Path(prepared.env["HERMES_BUNDLED_SKILLS"]) / "helper"
                 completed = subprocess.run([str(helper)], capture_output=True, text=True, check=True)
@@ -2542,8 +2402,8 @@ class KanbanLifecycleConformance(unittest.TestCase):
     def test_generation_sweep_preserves_live_owner_and_rejects_pid_reuse(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-owner-") as raw:
             source = Path(raw) / "install"
-            _make_runtime_fixture(source)
-            prepared = _prepare_fixture_generation(source)
+            MODULE._make_runtime_fixture(source)
+            prepared = MODULE._prepare_fixture_generation(source)
             try:
                 generations.sweep_runtime_generations()
                 self.assertTrue(prepared.root.exists())
@@ -2558,17 +2418,17 @@ class KanbanLifecycleConformance(unittest.TestCase):
     def test_sealed_main_never_runs_install_recovery(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-recovery-") as raw:
             source = Path(raw) / "install"
-            _make_runtime_fixture(source)
+            MODULE._make_runtime_fixture(source)
             for name in ("main.py", "_subprocess_compat.py", "_startup_fast.py"):
-                shutil.copy2(RUNTIME_ROOT / "hermes_cli" / name, source / "hermes_cli" / name)
-            shutil.copy2(RUNTIME_ROOT / "hermes_bootstrap.py", source / "hermes_bootstrap.py")
+                shutil.copy2(MODULE.RUNTIME_ROOT / "hermes_cli" / name, source / "hermes_cli" / name)
+            shutil.copy2(MODULE.RUNTIME_ROOT / "hermes_bootstrap.py", source / "hermes_bootstrap.py")
             recovery_marker = Path(raw) / "recovery-mutated-install"
             (source / "hermes_cli" / "_early_recovery.py").write_text(
                 "from pathlib import Path\n"
                 f"def recover_if_needed():\n    Path({str(recovery_marker)!r}).touch()\n",
                 encoding="utf-8",
             )
-            prepared = _prepare_fixture_generation(source)
+            prepared = MODULE._prepare_fixture_generation(source)
             try:
                 completed = subprocess.run(
                     prepared.command_prefix + ["runtime-identity", "--json"],
@@ -2605,7 +2465,7 @@ recovery.recover_if_needed(project_root=root, argv=[])
                     encoding="utf-8",
                 )
                 (source / marker).write_text("pid=0\n", encoding="utf-8")
-                env = {**os.environ, "PYTHONPATH": str(RUNTIME_ROOT), "TMPDIR": raw}
+                env = {**os.environ, "PYTHONPATH": str(MODULE.RUNTIME_ROOT), "TMPDIR": raw}
                 command = [sys.executable, "-c", script, raw]
                 # Other test files share the interpreter installation, not this fixture's locks.
                 with patch.object(tempfile, "tempdir", raw), generations.installation_mutation_lock(source):
@@ -2730,7 +2590,7 @@ recovery.recover_if_needed(project_root=root, argv=[])
     def test_generation_fences_packaged_resource_roots(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-resources-") as raw:
             source = Path(raw) / "install"
-            _make_runtime_fixture(source)
+            MODULE._make_runtime_fixture(source)
             overrides = {}
             for directory, env_var in runtime._RUNTIME_RESOURCE_ROOTS:
                 external = Path(raw) / f"packaged-{directory}"
@@ -2753,17 +2613,17 @@ recovery.recover_if_needed(project_root=root, argv=[])
     def test_completion_rechecks_candidate_head_at_commit_boundary(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-race-") as raw_repo:
             repo = Path(raw_repo)
-            _git(repo, "init", "-q")
-            _git(repo, "config", "user.email", "conformance@example.invalid")
-            _git(repo, "config", "user.name", "Kanban Conformance")
+            MODULE._git(repo, "init", "-q")
+            MODULE._git(repo, "config", "user.email", "conformance@example.invalid")
+            MODULE._git(repo, "config", "user.name", "Kanban Conformance")
             (repo / "README").write_text("base\n", encoding="utf-8")
-            _git(repo, "add", "README")
-            _git(repo, "commit", "-qm", "base")
-            base_sha = _git(repo, "rev-parse", "HEAD")
+            MODULE._git(repo, "add", "README")
+            MODULE._git(repo, "commit", "-qm", "base")
+            base_sha = MODULE._git(repo, "rev-parse", "HEAD")
             (repo / "lifecycle.py").write_text("print('proof')\n", encoding="utf-8")
-            _git(repo, "add", "lifecycle.py")
-            _git(repo, "commit", "-qm", "implementation")
-            head_sha = _git(repo, "rev-parse", "HEAD")
+            MODULE._git(repo, "add", "lifecycle.py")
+            MODULE._git(repo, "commit", "-qm", "implementation")
+            head_sha = MODULE._git(repo, "rev-parse", "HEAD")
 
             implementation = kb.create_task(
                 self.conn,
@@ -2822,8 +2682,8 @@ recovery.recover_if_needed(project_root=root, argv=[])
                 if not raced:
                     raced = True
                     (repo / "race.py").write_text("print('moved')\n", encoding="utf-8")
-                    _git(repo, "add", "race.py")
-                    _git(repo, "commit", "-qm", "candidate advanced")
+                    MODULE._git(repo, "add", "race.py")
+                    MODULE._git(repo, "commit", "-qm", "candidate advanced")
                 return prepared
 
             with patch.object(kb, "_stamp_lifecycle_metadata", side_effect=stamp):
@@ -2839,8 +2699,8 @@ recovery.recover_if_needed(project_root=root, argv=[])
             self.assertEqual(self._task(review).status, "running")
 
     def test_identity_claim_and_runtime_surfaces(self) -> None:
-        identity = runtime_identity(RUNTIME_ROOT)
-        self.assertEqual(identity, runtime_identity(RUNTIME_ROOT, pid=identity.pid, start_time=identity.start_time))
+        identity = runtime_identity(MODULE.RUNTIME_ROOT)
+        self.assertEqual(identity, runtime_identity(MODULE.RUNTIME_ROOT, pid=identity.pid, start_time=identity.start_time))
         self.assertEqual(code_identity(identity), code_identity(identity.as_dict()))
         self.assertTrue(same_code_identity(identity, identity.as_dict()))
         self.assertEqual(process_start_time(identity.pid), identity.start_time)
@@ -2851,7 +2711,7 @@ recovery.recover_if_needed(project_root=root, argv=[])
             sys.modules[mixed_name] = SimpleNamespace(__file__="/tmp/mixed-hermes-runtime.py")
             try:
                 with self.assertRaises(RuntimeIdentityError):
-                    assert_runtime_import_root(RUNTIME_ROOT)
+                    assert_runtime_import_root(MODULE.RUNTIME_ROOT)
             finally:
                 sys.modules.pop(mixed_name, None)
 
@@ -2932,14 +2792,14 @@ recovery.recover_if_needed(project_root=root, argv=[])
         self.assertTrue(kb.unblock_task(self.conn, task_id))
         with tempfile.TemporaryDirectory(prefix="kanban-worker-proof-") as raw:
             source = Path(raw) / "install"
-            _make_runtime_fixture(source)
+            MODULE._make_runtime_fixture(source)
             receipt = Path(raw) / "grant.json"
             with patch.object(kbd, "_profile_exists_fn", return_value=None), patch.object(
                 kbd, "_restart_safe_worker_argv",
                 side_effect=lambda task, command, preparation_id=None: command,
             ), patch.object(
                 generations, "prepare_runtime_generation",
-                side_effect=lambda expected, workspace=None, profile_home=None, project_plugins_enabled=None: _prepare_fixture_generation(
+                side_effect=lambda expected, workspace=None, profile_home=None, project_plugins_enabled=None: MODULE._prepare_fixture_generation(
                     source, workspace=workspace, profile_home=profile_home,
                     project_plugins_enabled=project_plugins_enabled,
                 ),
@@ -2951,7 +2811,7 @@ recovery.recover_if_needed(project_root=root, argv=[])
             claimed = self._task(task_id)
             process = kbd._worker_processes[claimed.worker_pid]
             try:
-                granted = _wait_for_receipt(receipt)
+                granted = MODULE._wait_for_receipt(receipt)
                 self.assertEqual(granted["run"], str(claimed.current_run_id))
                 self.assertEqual(granted["claim"], claimed.claim_lock)
                 self.assertEqual(granted["granted"], "1")
@@ -2975,7 +2835,7 @@ recovery.recover_if_needed(project_root=root, argv=[])
             initial_status="blocked",
         )
         self.assertTrue(kb.unblock_task(self.conn, task_id))
-        identity = runtime_identity(RUNTIME_ROOT)
+        identity = runtime_identity(MODULE.RUNTIME_ROOT)
         cancelled: list[bool] = []
 
         def fake_default_spawn(task, workspace, *, board=None, defer_grant=False):
@@ -3019,7 +2879,7 @@ recovery.recover_if_needed(project_root=root, argv=[])
         self.assertTrue(kb.unblock_task(self.conn, task_id))
         with tempfile.TemporaryDirectory(prefix="kanban-worker-mismatch-") as raw:
             source = Path(raw) / "install"
-            _make_runtime_fixture(source)
+            MODULE._make_runtime_fixture(source)
             (source / "hermes_cli" / "main.py").write_text(
                 "import os\n"
                 "os.environ['HERMES_KANBAN_EXPECTED_RUNTIME'] = '{}'\n"
@@ -3032,7 +2892,7 @@ recovery.recover_if_needed(project_root=root, argv=[])
                 side_effect=lambda task, command, preparation_id=None: command,
             ), patch.object(
                 generations, "prepare_runtime_generation",
-                side_effect=lambda expected, workspace=None, profile_home=None, project_plugins_enabled=None: _prepare_fixture_generation(
+                side_effect=lambda expected, workspace=None, profile_home=None, project_plugins_enabled=None: MODULE._prepare_fixture_generation(
                     source, workspace=workspace, profile_home=profile_home,
                     project_plugins_enabled=project_plugins_enabled,
                 ),
@@ -3144,377 +3004,6 @@ recovery.recover_if_needed(project_root=root, argv=[])
         self.assertTrue(kb.reclaim_task(self.conn, task_id, reason="conformance cleanup"))
         self.assertIn(kb.get_task(self.conn, task_id).status, {"ready", "todo"})
 
-
-    def _repo_with_head(self, repo: Path) -> tuple[str, str]:
-        _git(repo, "init", "-q")
-        _git(repo, "config", "user.email", "conformance@example.invalid")
-        _git(repo, "config", "user.name", "Kanban Conformance")
-        (repo / "README").write_text("base\n", encoding="utf-8")
-        _git(repo, "add", "README")
-        _git(repo, "commit", "-qm", "base")
-        base = _git(repo, "rev-parse", "HEAD")
-        (repo / "lifecycle.py").write_text("version 1\n", encoding="utf-8")
-        _git(repo, "add", "lifecycle.py")
-        _git(repo, "commit", "-qm", "implementation H1")
-        return base, _git(repo, "rev-parse", "HEAD")
-
-    def _new_head(self, repo: Path, marker: str) -> str:
-        (repo / "lifecycle.py").write_text(f"{marker}\n", encoding="utf-8")
-        _git(repo, "add", "lifecycle.py")
-        _git(repo, "commit", "-qm", marker)
-        return _git(repo, "rev-parse", "HEAD")
-
-    def _typed_graph(self, repo: Path, mode: str) -> tuple[str, str | None, str]:
-        implementation = kb.create_task(
-            self.conn,
-            title=f"{mode} implementation",
-            assignee="implementer",
-            initial_status="blocked",
-            workspace_kind="dir",
-            workspace_path=str(repo),
-            lifecycle_contract={
-                "kind": "code",
-                "review_mode": mode,
-                "reviewer": "reviewer",
-                "validation_required": True,
-            },
-        )
-        reviewer = None
-        if mode == "separate_card":
-            reviewer = kb.create_task(
-                self.conn,
-                title="separate reviewer",
-                assignee="reviewer",
-                initial_status="blocked",
-                lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
-            )
-            kb.link_tasks(self.conn, implementation, reviewer, requirement="phase_finished")
-        tester = kb.create_task(
-            self.conn,
-            title="acceptance tester",
-            assignee="tester",
-            initial_status="blocked",
-            lifecycle_contract={"kind": "validation", "candidate_task_id": implementation},
-        )
-        if mode == "same_card":
-            kb.link_tasks(self.conn, implementation, tester, requirement="review_approved")
-        else:
-            kb.link_tasks(self.conn, reviewer, tester, requirement="review_approved")
-        return implementation, reviewer, tester
-
-    def _run_implementation(self, implementation: str, base: str, head: str):
-        if self._task(implementation).status == "blocked":
-            self.assertTrue(kb.unblock_task(self.conn, implementation))
-        run = kb.claim_task(self.conn, implementation, claimer="implementer:conformance")
-        self.assertIsNotNone(run)
-        self.assertTrue(
-            kb.complete_task(
-                self.conn,
-                implementation,
-                expected_run_id=run.current_run_id,
-                summary="implementation fixture",
-                metadata={
-                    "base_sha": base,
-                    "head_sha": head,
-                    "changed_files": ["lifecycle.py"],
-                },
-            )
-        )
-        return run
-    def _run_review(
-        self,
-        implementation: str,
-        reviewer: str | None,
-        head: str,
-        verdict: str,
-        finding: str | None = None,
-    ):
-        review_id = implementation if reviewer is None else reviewer
-        run = kb.claim_review_task(self.conn, review_id, claimer="reviewer:conformance")
-        self.assertIsNotNone(run)
-        self.assertTrue(
-            kb.complete_task(
-                self.conn,
-                review_id,
-                expected_run_id=run.current_run_id,
-                verdict=verdict,
-                summary=finding or f"review {verdict.lower()}",
-                metadata={"reviewed_head_sha": head},
-            )
-        )
-        return run
-
-
-    def _rework_typed_graph(
-        self, implementation: str, reviewer: str | None, tester: str,
-    ) -> dict:
-        versions = {
-            task_id: self._task(task_id).version
-            for task_id in (implementation, reviewer, tester)
-            if task_id is not None
-        }
-        return kb.rework_review_graph(
-            self.conn,
-            implementation,
-            implementation if reviewer is None else reviewer,
-            tester,
-            expected_implementation_version=versions[implementation],
-            expected_reviewer_version=None if reviewer is None else versions[reviewer],
-            expected_tester_version=versions[tester],
-            reason="repair the rejected lifecycle evidence",
-            author="conformance",
-        )
-
-    def _assert_final_pass(
-        self, implementation: str, reviewer: str | None, tester: str, head: str,
-    ) -> None:
-        self.assertEqual(self._task(tester).status, "ready")
-        validation_run = kb.claim_task(self.conn, tester, claimer="tester:conformance")
-        self.assertIsNotNone(validation_run)
-        self.assertTrue(
-            kb.complete_task(
-                self.conn,
-                tester,
-                expected_run_id=validation_run.current_run_id,
-                verdict="PASS",
-                summary="validation passed on newest head",
-                metadata={"head_sha": head},
-            )
-        )
-        state = get_lifecycle_state(self.conn, implementation)
-        self.assertEqual(state["acceptance"], "accepted")
-        self.assertEqual(state["validation_verdict"], "PASS")
-        self.assertEqual(state["head_sha"], head)
-        if reviewer is not None:
-            self.assertEqual(get_lifecycle_state(self.conn, reviewer)["review_verdict"], "APPROVE")
-
-    def _exercise_two_rejections(self, mode: str) -> None:
-        with tempfile.TemporaryDirectory(prefix=f"kanban-conformance-{mode}-rejections-") as raw:
-            repo = Path(raw)
-            base, head = self._repo_with_head(repo)
-            implementation, reviewer, tester = self._typed_graph(repo, mode)
-            ids = (implementation, reviewer, tester)
-            implementation_heads = []
-            for finding, marker in (("finding A", "version 2"), ("finding B", "version 3")):
-                implementation_heads.append(head)
-                self._run_implementation(implementation, base, head)
-                self._run_review(implementation, reviewer, head, "REQUEST_CHANGES", finding)
-                self.assertNotEqual(
-                    get_lifecycle_state(self.conn, implementation)["acceptance"], "accepted",
-                )
-                self.assertIn(self._task(tester).status, {"todo", "blocked"})
-                self.assertIsNone(kb.claim_task(self.conn, tester, claimer="tester:too-early"))
-                outcome = self._rework_typed_graph(implementation, reviewer, tester)
-                self.assertEqual(
-                    (outcome["implementation_id"], outcome["reviewer_id"], outcome["tester_id"]),
-                    (implementation, reviewer, tester),
-                )
-                head = self._new_head(repo, marker)
-            implementation_heads.append(head)
-            self._run_implementation(implementation, base, head)
-            self._run_review(implementation, reviewer, head, "APPROVE")
-            self._assert_final_pass(implementation, reviewer, tester, head)
-            rejected_reviews = []
-            for row in self.conn.execute(
-                "SELECT summary, metadata FROM task_runs WHERE task_id = ? ORDER BY id",
-                (implementation if reviewer is None else reviewer,),
-            ):
-                lifecycle = json.loads(row["metadata"] or "{}").get("lifecycle", {})
-                if (
-                    lifecycle.get("phase") == "review"
-                    and lifecycle.get("verdict") == "REQUEST_CHANGES"
-                ):
-                    rejected_reviews.append((row["summary"], lifecycle["head_sha"]))
-            self.assertEqual(
-                rejected_reviews,
-                [("finding A", implementation_heads[0]), ("finding B", implementation_heads[1])],
-            )
-            self.assertEqual((implementation, reviewer, tester), ids)
-            runs = self.conn.execute(
-                "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id",
-                (implementation,),
-            ).fetchall()
-            heads = {json.loads(row["metadata"] or "{}").get("head_sha") for row in runs}
-            self.assertTrue(set(implementation_heads).issubset(heads))
-            self.assertEqual(
-                kb.child_ids(self.conn, implementation),
-                [tester] if mode == "same_card" else [reviewer],
-            )
-
-    def test_same_card_two_distinct_rejections_then_final_pass(self) -> None:
-        self._exercise_two_rejections("same_card")
-
-    def test_separate_card_two_distinct_rejections_then_final_pass(self) -> None:
-        self._exercise_two_rejections("separate_card")
-
-    def _exercise_validator_failure_rework(self, mode: str) -> None:
-        with tempfile.TemporaryDirectory(prefix=f"kanban-conformance-{mode}-validator-") as raw:
-            repo = Path(raw)
-            base, first_head = self._repo_with_head(repo)
-            implementation, reviewer, tester = self._typed_graph(repo, mode)
-            self._run_implementation(implementation, base, first_head)
-            self._run_review(implementation, reviewer, first_head, "APPROVE")
-            validation_run = kb.claim_task(self.conn, tester, claimer="tester:conformance")
-            self.assertIsNotNone(validation_run)
-            self.assertTrue(
-                kb.complete_task(
-                    self.conn,
-                    tester,
-                    expected_run_id=validation_run.current_run_id,
-                    verdict="FAIL",
-                    summary="validator found a regression",
-                    metadata={"head_sha": first_head},
-                )
-            )
-            failed = get_lifecycle_state(self.conn, implementation)
-            self.assertNotEqual(failed["acceptance"], "accepted")
-            self.assertEqual(failed["validation_verdict"], "FAIL")
-            self.assertIsNone(kb.claim_task(self.conn, tester, claimer="tester:retry"))
-            outcome = self._rework_typed_graph(implementation, reviewer, tester)
-            self.assertEqual(outcome["rejected_head_sha"], first_head)
-            second_head = self._new_head(repo, "validator repair")
-            self._run_implementation(implementation, base, second_head)
-            self.assertFalse(evaluate_dependencies(self.conn, tester)["satisfied"])
-            self.assertEqual(self._task(tester).status, "todo")
-            self.assertIsNone(kb.claim_task(self.conn, tester, claimer="tester:before-rereview"))
-            self._run_review(implementation, reviewer, second_head, "APPROVE")
-            self.assertTrue(evaluate_dependencies(self.conn, tester)["satisfied"])
-            self.assertNotEqual(
-                get_lifecycle_state(self.conn, implementation)["acceptance"], "accepted",
-            )
-            self._assert_final_pass(implementation, reviewer, tester, second_head)
-            self.assertNotEqual(first_head, second_head)
-            historical_heads = {
-                json.loads(row["metadata"] or "{}").get("head_sha")
-                for row in self.conn.execute(
-                    "SELECT metadata FROM task_runs WHERE task_id = ?", (implementation,)
-                )
-            }
-            self.assertIn(first_head, historical_heads)
-            self.assertIn(second_head, historical_heads)
-            validation_history = [
-                json.loads(row["metadata"])["lifecycle"]
-                for row in self.conn.execute(
-                    "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id", (tester,)
-                )
-            ]
-            self.assertEqual(
-                [(entry["verdict"], entry["head_sha"]) for entry in validation_history],
-                [("FAIL", first_head), ("PASS", second_head)],
-            )
-
-    def test_same_card_validator_fail_repairs_and_retests(self) -> None:
-        self._exercise_validator_failure_rework("same_card")
-
-    def test_separate_card_validator_fail_repairs_and_retests(self) -> None:
-        self._exercise_validator_failure_rework("separate_card")
-
-    def test_effective_goal_survives_reopened_process(self) -> None:
-        db_path = Path(self.home.name) / "persistent-goal.db"
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        conn.executescript(kb.SCHEMA_SQL)
-        kb._ensure_lifecycle_schema(conn)
-        kb._ensure_goal_revision_schema(conn)
-        task_id = kb.create_task(
-            conn,
-            title="draft goal",
-            body="draft body",
-            assignee="implementer",
-            initial_status="blocked",
-        )
-        self.assertTrue(kb.unblock_task(conn, task_id))
-        task = kb.get_task(conn, task_id)
-        self.assertIsNotNone(task)
-        self.assertTrue(
-            kb.update_task(
-                conn,
-                task_id,
-                title="authorized goal",
-                body="authorized body",
-                goal_mode=True,
-                expected_version=task.version,
-                reason="persist authorized goal",
-                author="cto",
-            )
-        )
-        expected = kb.get_effective_goal(conn, task_id)
-        conn.close()
-        script = (
-            "import json, sys\n"
-            "from pathlib import Path\n"
-            "from hermes_cli import kanban_db as kb\n"
-            "from hermes_cli import kanban_db_connect as kbc\n"
-            "with kbc.connect(Path(sys.argv[1])) as conn:\n"
-            "    print(json.dumps(kb.get_effective_goal(conn, sys.argv[2])))\n"
-        )
-        env = {
-            **os.environ,
-            "HERMES_HOME": self.home.name,
-            "HERMES_KANBAN_HOME": self.home.name,
-            "PYTHONPATH": os.pathsep.join(
-                [str(RUNTIME_ROOT), os.environ.get("PYTHONPATH", "")]
-            ),
-        }
-        child = subprocess.run(
-            [sys.executable, "-c", script, str(db_path), task_id],
-            cwd=str(RUNTIME_ROOT),
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(child.returncode, 0, child.stderr)
-        self.assertEqual(json.loads(child.stdout), expected)
-
-    def test_fresh_registry_discovers_describes_and_invokes_kanban_handler(self) -> None:
-        (Path(self.home.name) / "config.yaml").write_text(
-            "toolsets: [kanban]\n", encoding="utf-8",
-        )
-        script = (
-            "import json\n"
-            "from hermes_cli import kanban_db as kb\n"
-            "from hermes_cli import kanban_db_connect as kbc\n"
-            "from tools.registry import discover_builtin_tools, registry\n"
-            "kb.init_db()\n"
-            "with kbc.connect() as conn:\n"
-            "    tid = kb.create_task(conn, title='fresh registry task', assignee='worker', "
-            "initial_status='blocked')\n"
-            "modules = discover_builtin_tools()\n"
-            "definitions = registry.get_definitions({'kanban_show', 'kanban_unblock'}, quiet=True)\n"
-            "unblocked = json.loads(registry.dispatch('kanban_unblock', {'task_id': tid}))\n"
-            "shown = json.loads(registry.dispatch('kanban_show', {'task_id': tid}))\n"
-            "print(json.dumps({'module': 'tools.kanban_tools' in modules, "
-            "'schemas': [entry['function']['name'] for entry in definitions], "
-            "'unblocked': unblocked, 'task_id': shown['task']['id'], "
-            "'status': shown['task']['status']}))\n"
-        )
-        env = {
-            **{key: value for key, value in os.environ.items() if not key.startswith("HERMES_KANBAN_")},
-            "HERMES_HOME": self.home.name,
-            "HERMES_KANBAN_HOME": self.home.name,
-            "HERMES_PROFILE": "cto",
-            "PYTHONPATH": os.pathsep.join(
-                [str(RUNTIME_ROOT), os.environ.get("PYTHONPATH", "")]
-            ),
-        }
-        child = subprocess.run(
-            [sys.executable, "-c", script],
-            cwd=str(RUNTIME_ROOT),
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(child.returncode, 0, child.stderr)
-        result = json.loads(child.stdout.strip().splitlines()[-1])
-        self.assertTrue(result["module"])
-        self.assertEqual(set(result["schemas"]), {"kanban_show", "kanban_unblock"})
-        self.assertEqual(
-            result["unblocked"],
-            {"ok": True, "task_id": result["task_id"], "status": "ready"},
-        )
-        self.assertEqual(result["status"], "ready")
 
 if __name__ == "__main__":
     unittest.main()
