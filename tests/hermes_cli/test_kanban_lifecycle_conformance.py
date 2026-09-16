@@ -26,7 +26,7 @@ from gateway import kanban_watchers_notifier as notifier
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_runtime as runtime
-from hermes_cli.kanban_lifecycle import get_lifecycle_state, lifecycle_metadata
+from hermes_cli.kanban_lifecycle import evaluate_dependencies, get_lifecycle_state, lifecycle_metadata
 from hermes_cli import kanban_runtime_generation as generations
 from hermes_cli.kanban_parser import build_parser
 from hermes_cli.kanban_runtime import (
@@ -1190,6 +1190,70 @@ class KanbanLifecycleConformance(unittest.TestCase):
                     )
                 if claimed is not None:
                     self.assertEqual(kb.latest_run(self.conn, child).outcome, "reclaimed")
+
+    def test_archived_children_reject_changed_dependencies(self) -> None:
+        parent = kb.create_task(self.conn, title="completed dependency")
+        self.assertTrue(kb.complete_task(self.conn, parent))
+        archived = kb.create_task(self.conn, title="archived child", parents=[parent])
+        self.assertTrue(kb.archive_task(self.conn, archived))
+        candidate, _ = self._completed_candidate(parents=[archived])
+        before = {task_id: self._task(task_id) for task_id in (parent, archived, candidate)}
+        requirement = self.conn.execute(
+            "SELECT requirement FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (parent, archived),
+        ).fetchone()["requirement"]
+        kb.link_tasks(self.conn, parent, archived, requirement=requirement)
+        self.assertEqual({task_id: self._task(task_id) for task_id in before}, before)
+        for rebind in (False, True):
+            with self.subTest(rebind=rebind):
+                gate = kb.create_task(self.conn, title="unfinished dependency")
+                if rebind:
+                    with kb.write_txn(self.conn):
+                        self.conn.execute(
+                            "INSERT INTO task_links (parent_id, child_id, requirement) VALUES (?, ?, NULL)",
+                            (gate, archived),
+                        )
+                events = kb.list_events(self.conn, archived)
+                with self.assertRaises(kb.LifecycleContractError):
+                    kb.link_tasks(
+                        self.conn, gate, archived, requirement="phase_finished",
+                        expected_parent_version=self._task(gate).version,
+                        expected_child_version=before[archived].version,
+                        reason="archived dependency edit",
+                    )
+                self.assertEqual({task_id: self._task(task_id) for task_id in before}, before)
+                self.assertEqual(kb.list_events(self.conn, archived), events)
+                edge = self.conn.execute(
+                    "SELECT requirement FROM task_links WHERE parent_id = ? AND child_id = ?",
+                    (gate, archived),
+                ).fetchone()
+                self.assertEqual(None if edge is None else dict(edge), {"requirement": None} if rebind else None)
+
+    def test_dependency_invalidation_stops_at_unchanged_archived_boundary(self) -> None:
+        parent = kb.create_task(self.conn, title="completed branch")
+        self.assertTrue(kb.complete_task(self.conn, parent))
+        archived = kb.create_task(self.conn, title="archived boundary", parents=[parent])
+        self.assertTrue(kb.archive_task(self.conn, archived))
+        candidate, _ = self._completed_candidate(parents=[archived])
+        running = kb.create_task(
+            self.conn, title="running beyond archive", parents=[archived], assignee="worker",
+        )
+        kb.recompute_ready(self.conn)
+        claim = kb.claim_task(self.conn, running)
+        self.assertIsNotNone(claim)
+        kbd._set_worker_pid(self.conn, running, 424242)
+        before = {task_id: self._task(task_id) for task_id in (archived, candidate, running)}
+        events = {task_id: kb.list_events(self.conn, task_id) for task_id in before}
+        gate = kb.create_task(self.conn, title="unfinished dependency")
+        with patch.object(kb, "_terminate_reclaimed_worker") as terminate:
+            kb.link_tasks(self.conn, gate, parent, requirement="phase_finished")
+            terminate.assert_not_called()
+        self.assertEqual(self._task(parent).status, "todo")
+        self.assertEqual({task_id: self._task(task_id) for task_id in before}, before)
+        self.assertEqual({task_id: kb.list_events(self.conn, task_id) for task_id in before}, events)
+        self.assertTrue(evaluate_dependencies(self.conn, candidate)["satisfied"])
+        self.assertEqual(get_lifecycle_state(self.conn, candidate)["acceptance"], "accepted")
+        self.assertEqual(self._task(running).claim_lock, claim.claim_lock)
 
     def test_binding_repairs_legacy_edges_and_clears_terminal_fields(self) -> None:
         repo_home = tempfile.TemporaryDirectory(prefix="kanban-binding-git-")

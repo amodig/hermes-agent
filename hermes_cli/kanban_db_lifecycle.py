@@ -487,6 +487,8 @@ def link_tasks(
         ).fetchone()
         if existing is not None and existing["requirement"] == requested:
             return
+        if conn.execute("SELECT status FROM tasks WHERE id = ?", (child_id,)).fetchone()["status"] == "archived":
+            raise LifecycleContractError("cannot change dependencies of an archived task")
         acceptance_before = _capture_acceptance(conn, child_id, include_descendants=True)
         if existing is not None:
             current = existing["requirement"]
@@ -754,6 +756,7 @@ def invalidate_descendants_for_parent_reopen(
     Every surface that reopens a done task (dashboard PATCH/drag) routes here.
     A changed dependency restricts the traversal to ``child_id`` and its
     descendants, retracting that branch without touching the parent's other children.
+    Archived nodes remain unchanged and stop invalidation of that branch.
 
     Composes under the caller's txn (``allow_nested=True``) so the flip and the
     retractions commit atomically. Each descendant gets a
@@ -790,6 +793,8 @@ def invalidate_descendants_for_parent_reopen(
                 SELECT l.child_id
                 FROM task_links l
                 JOIN descendants d ON d.id = l.parent_id
+                JOIN tasks parent ON parent.id = d.id
+                WHERE parent.status != 'archived'
             )
             SELECT t.id, t.status, t.current_run_id, t.worker_pid, t.claim_lock
             FROM descendants d
