@@ -215,7 +215,7 @@ def _version(root: Path) -> str:
 
 def _fingerprint(root: Path) -> str:
     """Comparable deployed code/resources, not build inputs or sealed payloads."""
-    from importlib.metadata import distributions
+    from importlib.metadata import PathDistribution
 
     from hermes_constants import _packaged_dir
     from hermes_cli.kanban_runtime_generation import _digest_members, _members, _TREE_EXCLUDES
@@ -239,10 +239,13 @@ def _fingerprint(root: Path) -> str:
     paths = {name: root / name for name in _IDENTITY_ROOTS}
     # A packaged module root may be shared with third-party distributions. RECORD
     # owns its root modules; source/editable trees use setup.py's discovery rule.
-    distribution = next(distributions(path=[str(root)], name="hermes-agent"), None)
+    wheel_metadata = next(
+        (marker.parent for marker in root.glob("hermes_agent-*.dist-info/WHEEL") if marker.is_file()),
+        None,
+    )
     installed_modules = None
-    if distribution is not None and distribution.read_text("WHEEL") is not None:
-        files = distribution.files
+    if wheel_metadata is not None:
+        files = PathDistribution(wheel_metadata).files
         if files is None:
             raise RuntimeIdentityError("installed runtime has no file inventory")
         installed_modules = {str(member) for member in files if len(member.parts) == 1}

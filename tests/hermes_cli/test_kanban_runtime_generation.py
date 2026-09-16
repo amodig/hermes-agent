@@ -361,6 +361,7 @@ def test_deployment_identity_ignores_install_artifacts_but_detects_runtime_chang
         "tests/test_generated_fixture.py",
     ):
         _write(installed / name, "installation artifact\n")
+    _write(installed / "unrelated_dependency.py", "VALUE = 'not owned by Hermes'\n")
 
     packaged_resources = {}
     for directory, variable in (
