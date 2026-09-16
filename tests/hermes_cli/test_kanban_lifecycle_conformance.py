@@ -1441,6 +1441,60 @@ class KanbanLifecycleConformance(unittest.TestCase):
         self.assertEqual(dependency_state["blockers"][0]["requirement"], "validation_passed")
         self.assertEqual(dependency_state["blockers"][0]["code"], "verdict_conflict")
 
+        _, rejected_review = self._completed_candidate(
+            review_mode="separate_card", verdict="REQUEST_CHANGES",
+        )
+        _, approved_review = self._completed_candidate(review_mode="separate_card")
+        for gate, requirement, satisfied in (
+            (validation, "validation_passed", False),
+            (rejected_review, "review_approved", False),
+            (approved_review, "review_approved", True),
+        ):
+            with self.subTest(incoming_requirement=requirement, satisfied=satisfied):
+                child = kb.create_task(self.conn, title="historical completed general task")
+                self.assertTrue(kb.complete_task(self.conn, child, result="historical output"))
+                descendant, _ = self._completed_candidate()
+                with kb.write_txn(self.conn):
+                    self.conn.execute(
+                        "UPDATE tasks SET lifecycle_contract = NULL WHERE id = ?", (child,),
+                    )
+                    self.conn.executemany(
+                        "INSERT INTO task_links (parent_id, child_id, requirement) VALUES (?, ?, NULL)",
+                        ((gate, child), (child, descendant)),
+                    )
+                before_child, before_descendant = self._task(child), self._task(descendant)
+                self.assertTrue(kb.bind_lifecycle_contract(
+                    self.conn, child, {"kind": "general"},
+                    expected_version=before_child.version,
+                    reason="classify historical general work",
+                ))
+                rebound_child = self._task(child)
+                self.assertEqual(rebound_child.version, before_child.version + 1)
+                self.assertEqual(rebound_child.status, "done" if satisfied else "todo")
+                self.assertEqual(
+                    rebound_child.result, before_child.result if satisfied else None,
+                )
+                self.assertEqual(
+                    rebound_child.completed_at, before_child.completed_at if satisfied else None,
+                )
+                self.assertEqual(evaluate_dependencies(self.conn, child)["satisfied"], satisfied)
+                edge = self.conn.execute(
+                    "SELECT requirement FROM task_links WHERE parent_id = ? AND child_id = ?",
+                    (gate, child),
+                ).fetchone()
+                self.assertEqual(edge["requirement"], requirement)
+                self.assertEqual(
+                    get_lifecycle_state(self.conn, descendant)["acceptance"],
+                    "accepted" if satisfied else "stale",
+                )
+                rebound_descendant = self._task(descendant)
+                self.assertGreater(rebound_descendant.version, before_descendant.version)
+                self.assertEqual(rebound_descendant.status, "done" if satisfied else "todo")
+                self.assertEqual(
+                    rebound_descendant.candidate_run_id,
+                    before_descendant.candidate_run_id if satisfied else None,
+                )
+
     def test_legacy_triage_root_can_be_decomposed(self) -> None:
         root = kb.create_task(
             self.conn,

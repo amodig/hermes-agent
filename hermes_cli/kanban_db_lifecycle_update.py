@@ -323,9 +323,7 @@ def _build_update_plan(
             new_status = _kb._lifecycle_ready_status(conn, row["id"]) if _parents_satisfied(conn, row["id"]) else "todo"
         elif new_lifecycle and new_lifecycle.get("kind") == "general":
             new_status = (
-                "done"
-                if row["status"] == "done"
-                else "ready"
+                ("done" if row["status"] == "done" else "ready")
                 if _parents_satisfied(conn, row["id"])
                 else "todo"
             )
