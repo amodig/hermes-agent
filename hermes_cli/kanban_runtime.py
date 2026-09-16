@@ -214,59 +214,86 @@ def _version(root: Path) -> str:
 
 
 def _fingerprint(root: Path) -> str:
-    """Comparable deployment bytes, not the complete sealed worker payload."""
+    """Comparable deployed code/resources, not build inputs or sealed payloads."""
+    from importlib.metadata import distributions
+
+    from hermes_constants import _packaged_dir
     from hermes_cli.kanban_runtime_generation import _digest_members, _members, _TREE_EXCLUDES
 
-    code_suffixes = (".py", ".so", ".pyd", ".dll", ".dylib")
-    # Packaging/test trees are excluded only at the repository root.
-    # A package's own build/ or dist/ directory can contain executable source.
-    root_artifacts = ("node_modules", "build", "dist", "tests", "evals")
-    # These are the package roots in pyproject.toml's setuptools discovery.
-    paths = {name: root / name for name in (*_IDENTITY_ROOTS, "native")}
-    resource_names = {name for name, _ in _RUNTIME_RESOURCE_ROOTS}
-    # Undeclared packages own data only at directories that directly define a
-    # Python/native module. Namespace-only ancestors do not make unrelated
-    # sibling trees package data (e.g. apps/desktop/scripts/perf is not apps/).
+    code_suffixes = (".py", ".pyi", ".so", ".pyd", ".dll", ".dylib")
+    # Match pyproject.toml's package discovery/data and setup.py's root modules.
+    # Source-only manifests, package docs and native build inputs are not shipped.
+    # Full generation digests independently seal those bytes and dependencies.
+    package_data = {
+        "hermes_cli": ("observability/schemas/*.json", "data/*.json", "local_runtime/*.json"),
+        "gateway": ("assets/**/*",),
+        "plugins": ("**/plugin.yaml", "**/plugin.yml"),
+    }
+    data_files = {
+        member
+        for name, patterns in package_data.items()
+        for pattern in patterns
+        for member in (root / name).glob(pattern)
+        if member.is_file()
+    }
+    paths = {name: root / name for name in _IDENTITY_ROOTS}
+    # A packaged module root may be shared with third-party distributions. RECORD
+    # owns its root modules; source/editable trees use setup.py's discovery rule.
+    distribution = next(distributions(path=[str(root)], name="hermes-agent"), None)
+    installed_modules = None
+    if distribution is not None and distribution.read_text("WHEEL") is not None:
+        files = distribution.files
+        if files is None:
+            raise RuntimeIdentityError("installed runtime has no file inventory")
+        installed_modules = {str(member) for member in files if len(member.parts) == 1}
     for path in root.iterdir():
-        if path.is_file() and path.suffix in code_suffixes:
-            paths[path.name] = path
-        elif (
-            path.is_dir() and path.name.isidentifier()
-            and path.name not in paths and path.name not in resource_names
-            and path.name not in root_artifacts
-            and not (path / "pyvenv.cfg").is_file()
+        if (
+            path.is_file() and path.suffix in code_suffixes and path.name != "setup.py"
+            and (installed_modules is None or path.name in installed_modules)
         ):
-            packages = {
-                member.parent
-                for _, member in _members(path, source=True, exclude=("node_modules",))
-                if member.is_file() and member.suffix in code_suffixes
-            }
-            for package in packages:
-                if not any(parent in packages for parent in package.parents):
-                    paths[package.relative_to(root).as_posix()] = package
-    paths.update((name, root / name) for name in (
-        "pyproject.toml", "uv.lock", "package.json", "package-lock.json",
-        "compat_manifest.json", "cli-config.yaml.example",
-    ))
-    # Logical names make relocated bundled resources comparable across installs.
-    # Plugins are both importable code and bundled resources; attest both roots.
-    paths.update(
-        (f"bundled/{name}", Path(os.environ.get(variable) or root / name))
-        for name, variable in _RUNTIME_RESOURCE_ROOTS
-    )
+            paths[path.name] = path
+
+    # Logical names normalize Nix's relocated bundles. Reuse the import-safe
+    # skills/catalog resolver, with a default rooted in the tree being attested.
+    # Locale/plugin helpers bind __file__ (plugins also imports runtime state),
+    # so mirror only their path selection here, without importing either loader.
+    for name, variable in _RUNTIME_RESOURCE_ROOTS:
+        default = root / name
+        if name == "locales":
+            # agent.i18n._locales_dir: strip, require a directory, no expanduser.
+            override = os.getenv(variable, "").strip()
+            path = Path(override) if override and Path(override).is_dir() else default
+        elif name == "plugins":
+            # hermes_cli.plugins.get_bundled_plugins_dir: raw override, no fallback
+            # on a missing path, no stripping or user expansion.
+            path = Path(os.getenv(variable) or default)
+        else:
+            path = _packaged_dir(variable, default, name)
+        if path.is_dir():
+            paths[f"bundled/{name}"] = path
 
     def members():
         for name, path in sorted(paths.items()):
             if path.is_file():
                 yield name, path
             elif path.is_dir():
-                # Node dependencies and these exact frontend build destinations
-                # are installation outputs, not deployment source. The complete
-                # generation payload still attests every captured byte.
-                for relative, member in _members(path, source=True, exclude=("node_modules",)):
+                # These exact frontend destinations and dependencies are build
+                # outputs; Nix also omits skill index caches from its bundles.
+                excludes = ("node_modules",)
+                if name in {"bundled/skills", "bundled/optional-skills"}:
+                    excludes += ("index-cache",)
+                for relative, member in _members(path, source=True, exclude=excludes):
                     if name == "hermes_cli" and relative.split("/", 1)[0] in {"web_dist", "tui_dist"}:
                         continue
-                    if member.is_file() and member.name not in _TREE_EXCLUDES:
+                    if name == "acp_adapter" and "/" in relative:
+                        continue  # setuptools declares this package, not acp_adapter.*.
+                    if (
+                        member.is_file() and member.name not in _TREE_EXCLUDES
+                        and (
+                            name.startswith("bundled/") or member.suffix in code_suffixes
+                            or member.name == "py.typed" or member in data_files
+                        )
+                    ):
                         yield f"{name}/{relative}", member
 
     return _digest_members(members())
