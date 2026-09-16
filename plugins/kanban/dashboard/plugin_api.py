@@ -803,7 +803,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         sent = getattr(payload, "model_fields_set", getattr(payload, "__fields_set__", set()))
         if "title" in sent and (payload.title is None or not payload.title.strip()):
             raise HTTPException(status_code=400, detail="title cannot be empty")
-        if payload.status in {"done", "review"}:
+        if payload.status is not None:
             contract = current.lifecycle_contract or {}
             goal_changed = (
                 (

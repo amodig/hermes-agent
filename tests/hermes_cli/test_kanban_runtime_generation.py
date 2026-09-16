@@ -494,8 +494,10 @@ def test_partial_or_rewritten_manifest_never_reaches_worker_code(installation, d
     assert not second.root.exists()
 
 
-def test_warm_generation_reuses_payload_hashes_and_detects_installation_changes(installation, monkeypatch):
-    source, dependencies, _, _, _, prepare = installation
+def test_warm_generation_reuses_payload_hashes_and_detects_installation_changes(
+    installation, monkeypatch, runtime_storage,
+):
+    source, dependencies, _, _, native_probe, prepare = installation
     first = prepare()
     payload = dependencies / "unseeded_sdk" / "data.bin"
     payload_reads = []
@@ -537,6 +539,22 @@ def test_warm_generation_reuses_payload_hashes_and_detects_installation_changes(
     output, error = child.communicate("unseeded_sdk.selected\n", timeout=60)
     assert child.returncode != 0, error
     assert output == ""
+
+    # The bootstrap cannot be trusted to detect its own corruption after execution.
+    published, = (runtime_storage / "generations").iterdir()
+    for bootstrap in (
+        published / "bootstrap.py",
+        generation._mapped_path(native_probe, published, manifest["paths"]),
+    ):
+        original, mode = bootstrap.read_bytes(), bootstrap.stat().st_mode
+        bootstrap.chmod(mode | 0o200)
+        try:
+            bootstrap.write_text("raise RuntimeError('tampered bootstrap')\n", encoding="utf-8")
+            with pytest.raises(runtime.RuntimeIdentityError):
+                prepare()
+        finally:
+            bootstrap.write_bytes(original)
+            bootstrap.chmod(mode)
 
 
 def test_reused_generation_cannot_be_deleted_while_another_worker_is_live(installation, runtime_storage):

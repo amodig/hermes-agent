@@ -2,15 +2,17 @@
 
 Only stdlib imports belong here: this file also runs as the isolated bootstrap.
 
-The dispatcher reuses content hashes only while filesystem signatures match
+The dispatcher reuses input content hashes only while filesystem signatures match
 under the installation lock. Every worker still hashes its full sealed payload
 before importing Hermes; caching never substitutes for that bootstrap check.
+The interpreter and bootstrap are revalidated by the dispatcher before execution.
 """
 from __future__ import annotations
 
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, replace
 from functools import cache, lru_cache
+from itertools import chain
 import errno
 import importlib.machinery
 import importlib.metadata
@@ -183,13 +185,23 @@ def _validated_origin_digest(origin, source, exclude, signature):
     return digest
 
 
+def _bootstrap_digest(root):
+    """Bytes executed before the child's full payload verification can be trusted."""
+    return _digest_members(chain(
+        (("bootstrap.py", root / "bootstrap.py"),),
+        ((f"python/{name}", path) for name, path in _members(root / "python")),
+    ))
+
+
 @lru_cache(maxsize=32)
 def _validate_published_generation(root, manifest_json):
     # Reused sealed publications need no second full read in the dispatcher.
     # Every child independently verifies its complete lease before importing code.
     manifest = json.loads(manifest_json)
+    bootstrap_digest = _bootstrap_digest(root)
     if _generation_digest(root, manifest) != manifest["identity"]["generation"]:
         raise _error("published runtime generation is corrupt")
+    return bootstrap_digest
 
 
 @cache
@@ -537,7 +549,8 @@ def prepare_runtime_generation(expected_identity, *, workspace=None, profile_hom
         manifest_json = (cache / _MANIFEST).read_text(encoding="utf-8")
         manifest = json.loads(manifest_json)
         identity = RuntimeIdentity.from_value(manifest["identity"])
-        _validate_published_generation(cache, manifest_json)
+        if _bootstrap_digest(cache) != _validate_published_generation(cache, manifest_json):
+            raise _error("published runtime bootstrap is corrupt")
         root = Path(tempfile.mkdtemp(prefix="hermes-kanban-runtime-", dir=worker_base)).resolve()
         try:
             write_runtime_generation_owner(root)

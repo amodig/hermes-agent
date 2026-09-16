@@ -622,6 +622,36 @@ def test_patch_typed_review_rejects_combined_goal_edit(client, tmp_path):
     assert current["title"] == "typed implementation"
     assert current["body"] == "original goal"
 
+    url = f"/api/plugins/kanban/tasks/{task['id']}"
+    review = client.patch(
+        url, json={
+            "status": "review", "assignee": "reviewer",
+            "summary": "ready for review",
+            "metadata": {"base_sha": head_sha, "head_sha": head_sha},
+        },
+    )
+    assert review.status_code == 200, review.text
+    with kbc.connect() as conn:
+        claimed = kb.claim_review_task(conn, task["id"], claimer="reviewer:test")
+        assert claimed is not None
+        before = tuple(conn.iterdump())
+    response = client.patch(
+        url, json={
+            "status": "blocked", "block_reason": "human decision needed",
+            "title": "revised implementation goal", "expected_version": claimed.version,
+        },
+    )
+    assert response.status_code == 409
+    with kbc.connect() as conn:
+        assert tuple(conn.iterdump()) == before
+    blocked = client.patch(
+        url, json={"status": "blocked", "block_reason": "human decision needed"},
+    )
+    assert blocked.status_code == 200, blocked.text
+    assert blocked.json()["task"]["status"] == "blocked"
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, task["id"]).candidate_run_id == claimed.candidate_run_id
+
 
 
 def test_patch_expected_version_is_atomic_across_intervening_mutation(client, monkeypatch):
