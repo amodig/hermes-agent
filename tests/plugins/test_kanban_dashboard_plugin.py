@@ -427,6 +427,114 @@ def test_patch_expected_version_rejects_side_effects(client):
     assert current["assignee"] == "old"
     assert current["title"] == "fresh title"
 
+@pytest.mark.parametrize("status", ["done", "review"])
+@pytest.mark.parametrize("kind", ["code", "general"])
+def test_patch_terminal_status_requires_separate_initial_contract_binding(
+    client, tmp_path, status, kind,
+):
+    repo = tmp_path / "binding-repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "dashboard@example.invalid")
+    git("config", "user.name", "Dashboard Test")
+    (repo / "README").write_text("base\n", encoding="utf-8")
+    git("add", "README")
+    git("commit", "-qm", "base")
+    head_sha = git("rev-parse", "HEAD")
+    contract = {"kind": kind}
+    if kind == "code":
+        contract.update(
+            review_mode="same_card" if status == "review" else "separate_card",
+            reviewer="reviewer",
+            validation_required=False,
+        )
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "historical task",
+            "body": "original goal",
+            "assignee": "builder",
+            "workspace_kind": "dir",
+            "workspace_path": str(repo),
+        },
+    )
+    assert response.status_code == 200, response.text
+    task_id = response.json()["task"]["id"]
+    url = f"/api/plugins/kanban/tasks/{task_id}"
+    with kbc.connect() as conn:
+        with kb.write_txn(conn):
+            # Historical rows predate the explicit general-contract default.
+            conn.execute(
+                "UPDATE tasks SET lifecycle_contract = NULL WHERE id = ?", (task_id,),
+            )
+        before_task = kb.get_task(conn, task_id)
+    before = client.get(url).json()
+
+    response = client.patch(
+        url,
+        json={
+            "expected_version": before_task.version,
+            "status": status,
+            "lifecycle_contract": contract,
+            "assignee": "new-builder",
+            "priority": 7,
+            "summary": "handoff",
+        },
+    )
+    assert response.status_code == 409, response.text
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, task_id) == before_task
+    refused = client.get(url).json()
+    assert refused["task"]["version"] == before_task.version
+    assert refused["events"] == before["events"]
+    assert refused["runs"] == before["runs"]
+
+    response = client.patch(
+        url,
+        json={
+            "expected_version": before_task.version,
+            "lifecycle_contract": contract,
+            "reason": "classify historical task",
+        },
+    )
+    assert response.status_code == 200, response.text
+    bound = response.json()["task"]
+    assert bound["lifecycle_contract"] == contract
+    assert bound["status"] == "ready"
+    assert bound["version"] == before_task.version + 1
+
+    # Resending unchanged goal/contract fields is not another binding or edit.
+    response = client.patch(
+        url,
+        json={
+            "expected_version": bound["version"],
+            "status": status,
+            "lifecycle_contract": bound["lifecycle_contract"],
+            "title": bound["title"],
+            "body": bound["body"],
+            "summary": "handoff",
+            "metadata": {"base_sha": head_sha, "head_sha": head_sha},
+        },
+    )
+    assert response.status_code == 200, response.text
+    updated = response.json()["task"]
+    assert updated["status"] == status
+    assert updated["lifecycle_contract"] == contract
+    assert updated["version"] == bound["version"] + 1
+    persisted = client.get(url).json()["task"]
+    assert persisted["status"] == status
+    assert persisted["version"] == updated["version"]
+
+
 def test_patch_typed_completion_rejects_combined_goal_edit(client):
     task = client.post(
         "/api/plugins/kanban/tasks",

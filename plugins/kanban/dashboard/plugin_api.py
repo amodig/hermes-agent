@@ -805,19 +805,23 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             raise HTTPException(status_code=400, detail="title cannot be empty")
         if payload.status in {"done", "review"}:
             contract = current.lifecycle_contract or {}
-            if contract.get("kind") in {"code", "review", "validation"}:
-                goal_changed = (
-                    ("title" in sent and payload.title.strip() != current.title)
-                    or ("body" in sent and payload.body != current.body)
-                    or (
-                        "lifecycle_contract" in sent
-                        and payload.lifecycle_contract != current.lifecycle_contract
+            goal_changed = (
+                (
+                    "lifecycle_contract" in sent
+                    and payload.lifecycle_contract != current.lifecycle_contract
+                )
+                or (
+                    contract.get("kind") in {"code", "review", "validation"}
+                    and (
+                        ("title" in sent and payload.title.strip() != current.title)
+                        or ("body" in sent and payload.body != current.body)
                     )
                 )
-                if goal_changed:
-                    raise _conflict(
-                        "typed lifecycle status transitions and goal edits must be separate requests"
-                    )
+            )
+            if goal_changed:
+                raise _conflict(
+                    "lifecycle status transitions and goal edits must be separate requests"
+                )
         # For a combined assignee+review patch, request_review must capture the
         # current implementer before the task is routed to the reviewer.
         review_assignee_deferred = payload.status == "review" and payload.assignee is not None

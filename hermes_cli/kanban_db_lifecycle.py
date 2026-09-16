@@ -472,6 +472,7 @@ def link_tasks(
 ) -> None:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
+    terminations: list[tuple[Optional[int], Optional[str]]] = []
     with _kb.write_txn(conn):
         missing = _kb._missing_task_ids(conn, [parent_id, child_id])
         if missing:
@@ -484,11 +485,11 @@ def link_tasks(
             "SELECT requirement FROM task_links WHERE parent_id = ? AND child_id = ?",
             (parent_id, child_id),
         ).fetchone()
-        acceptance_before = _capture_acceptance(conn, child_id)
+        if existing is not None and existing["requirement"] == requested:
+            return
+        acceptance_before = _capture_acceptance(conn, child_id, include_descendants=True)
         if existing is not None:
             current = existing["requirement"]
-            if current == requested:
-                return
             if expected_parent_version is None or expected_child_version is None or not str(reason or "").strip():
                 raise LifecycleContractError(
                     "rebinding an existing dependency requires both expected versions and a reason"
@@ -539,12 +540,20 @@ def link_tasks(
                 {"parent": parent_id, "child": child_id, "requirement": requested},
             )
             _kb._inherit_notify_subs(conn, child_id, (parent_id,))
-        # A child is ready only when every typed parent requirement is satisfied.
-        if not _parents_satisfied(conn, child_id):
+        dependencies = evaluate_dependencies(conn, child_id)
+        if any(blocker["parent_id"] == parent_id for blocker in dependencies["blockers"]):
+            invalidation = invalidate_descendants_for_parent_reopen(
+                conn, parent_id, author=_kb._update_actor(author),
+                acceptance_before=acceptance_before, child_id=child_id,
+            )
+            terminations.extend(invalidation["terminations"])
+        elif not dependencies["satisfied"]:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'", (child_id,),
             )
         _emit_acceptance_changes(conn, acceptance_before, source_task_id=child_id)
+    for pid, claim_lock in terminations:
+        _kb._terminate_reclaimed_worker(pid, claim_lock)
 
 def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     """Promote ``todo``/``blocked`` tasks whose parents are all done/archived;
@@ -738,10 +747,13 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
 def invalidate_descendants_for_parent_reopen(
     conn: sqlite3.Connection, task_id: str, *, author: str,
     acceptance_before: Optional[dict[str, str]] = None,
+    child_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """THE done-reopen invalidation: every ``ready``/``review``/``running``/``done``
     descendant of a reopened ancestor is demoted to ``todo`` and re-gated.
     Every surface that reopens a done task (dashboard PATCH/drag) routes here.
+    A changed dependency restricts the traversal to ``child_id`` and its
+    descendants, retracting that branch without touching the parent's other children.
 
     Composes under the caller's txn (``allow_nested=True``) so the flip and the
     retractions commit atomically. Each descendant gets a
@@ -763,11 +775,17 @@ def invalidate_descendants_for_parent_reopen(
     now = int(time.time())
     invalidated: list[dict[str, Any]] = []
     terminations: list[tuple[Optional[int], Optional[str]]] = []
+    cause = (
+        f"dependency {task_id} -> {child_id} changed"
+        if child_id is not None else f"ancestor {task_id} reopened"
+    )
+    reason = "dependency_changed" if child_id is not None else "ancestor_reopened"
     with _kb.write_txn(conn, allow_nested=True):
         rows = conn.execute(
             """
             WITH RECURSIVE descendants(id) AS (
                 SELECT child_id FROM task_links WHERE parent_id = ?
+                AND (? IS NULL OR child_id = ?)
                 UNION
                 SELECT l.child_id
                 FROM task_links l
@@ -778,11 +796,13 @@ def invalidate_descendants_for_parent_reopen(
             JOIN tasks t ON t.id = d.id
             ORDER BY t.id
             """,
-            (task_id,),
+            (task_id, child_id, child_id),
         ).fetchall()
         emit_acceptance = acceptance_before is None
         if acceptance_before is None:
-            acceptance_before = _capture_acceptance(conn, task_id, include_descendants=True)
+            acceptance_before = _capture_acceptance(
+                conn, child_id or task_id, include_descendants=True,
+            )
         for row in rows:
             previous_status = row["status"]
             if previous_status not in {"ready", "review", "running", "done"}:
@@ -796,7 +816,7 @@ def invalidate_descendants_for_parent_reopen(
                 terminations.append((row["worker_pid"], row["claim_lock"]))
                 run_id = _kb._end_run(
                     conn, row["id"], outcome="reclaimed", status="todo",
-                    summary=f"ancestor {task_id} reopened",
+                    summary=cause,
                 )
             # consecutive_failures = 0: deliberate operator reset — see
             # docstring for why this diverges from reopen_review_task.
@@ -820,13 +840,13 @@ def invalidate_descendants_for_parent_reopen(
             _kb._append_event(
                 conn, row["id"], "status",
                 {
-                    "status": "todo", "reason": "ancestor_reopened", "parent": task_id,
+                    "status": "todo", "reason": reason, "parent": task_id,
                     "previous_status": previous_status, "resume_status": resume_status,
                 },
                 run_id=run_id,
             )
             _kb._insert_comment(
-                conn, row["id"], author, f"Invalidated: ancestor {task_id} was reopened; "
+                conn, row["id"], author, f"Invalidated: {cause}; "
                 f"retracted from '{previous_status}' to 'todo' "
                 f"(will resume via '{resume_status}').", now,
             )

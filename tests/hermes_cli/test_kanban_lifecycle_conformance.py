@@ -26,7 +26,7 @@ from gateway import kanban_watchers_notifier as notifier
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_runtime as runtime
-from hermes_cli.kanban_lifecycle import get_lifecycle_state
+from hermes_cli.kanban_lifecycle import get_lifecycle_state, lifecycle_metadata
 from hermes_cli import kanban_runtime_generation as generations
 from hermes_cli.kanban_parser import build_parser
 from hermes_cli.kanban_runtime import (
@@ -966,6 +966,230 @@ class KanbanLifecycleConformance(unittest.TestCase):
             )
         )
         self.assertEqual(get_lifecycle_state(self.conn, child)["acceptance"], "unclassified")
+
+    def _completed_candidate(
+        self, *, parents=(), review_mode="same_card", verdict="APPROVE",
+    ) -> tuple[str, str]:
+        """Historical evidence using the same envelopes as live completion."""
+        candidate = kb.create_task(
+            self.conn, title="completed candidate", assignee="builder", parents=parents,
+            lifecycle_contract={
+                "kind": "code", "review_mode": review_mode,
+                "reviewer": "reviewer", "validation_required": False,
+            },
+        )
+        review = candidate
+        if review_mode == "separate_card":
+            review = kb.create_task(
+                self.conn, title="completed review", assignee="reviewer", parents=[candidate],
+                lifecycle_contract={"kind": "review", "candidate_task_id": candidate},
+            )
+        with kb.write_txn(self.conn):
+            run_id = kb._synthesize_ended_run(self.conn, candidate, outcome="completed")
+            implementation = lifecycle_metadata(
+                self.conn, candidate, phase="implementation", run_id=run_id,
+                verdict=None, head_sha="a" * 40,
+            )
+            self.conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps({"lifecycle": implementation}), run_id),
+            )
+            self.conn.execute(
+                "UPDATE tasks SET candidate_run_id = ? WHERE id = ?", (run_id, candidate),
+            )
+            kb._synthesize_ended_run(
+                self.conn, review, outcome="completed",
+                metadata={"lifecycle": lifecycle_metadata(
+                    self.conn, review, phase="review", run_id=run_id,
+                    verdict=verdict, head_sha="a" * 40,
+                )},
+            )
+            self.conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = 123456, result = 'obsolete' "
+                "WHERE id IN (?, ?)", (candidate, review),
+            )
+        self.assertEqual(
+            get_lifecycle_state(self.conn, candidate)["acceptance"],
+            "accepted" if verdict == "APPROVE" else "rejected",
+        )
+        return candidate, review
+
+    def test_link_rebind_retracts_completed_branch_atomically(self) -> None:
+        upstream, gate = self._completed_candidate(
+            review_mode="separate_card", verdict="REQUEST_CHANGES",
+        )
+        child = kb.create_task(self.conn, title="historical general child")
+        sibling = kb.create_task(self.conn, title="unrelated sibling")
+        for task_id in (child, sibling):
+            self.assertTrue(kb.complete_task(self.conn, task_id, result="historical output"))
+        with kb.write_txn(self.conn):
+            self.conn.executemany(
+                "INSERT INTO task_links (parent_id, child_id, requirement) VALUES (?, ?, NULL)",
+                ((gate, child), (gate, sibling)),
+            )
+        candidate, review = self._completed_candidate(
+            parents=[child], review_mode="separate_card",
+        )
+        bridge = kb.create_task(self.conn, title="nested bridge", parents=[review])
+        self.assertTrue(kb.complete_task(self.conn, bridge, result="bridge output"))
+        nested, _ = self._completed_candidate(parents=[bridge])
+        untouched, _ = self._completed_candidate(parents=[sibling])
+        ready = kb.create_task(self.conn, title="ready descendant", parents=[nested])
+        in_review = kb.create_task(
+            self.conn, title="review descendant", parents=[nested], assignee="builder",
+        )
+        self.assertTrue(kb.request_review(self.conn, in_review, reviewer="reviewer"))
+        running = kb.create_task(
+            self.conn, title="running descendant", parents=[nested], assignee="worker",
+        )
+        claimed = kb.claim_task(self.conn, running)
+        self.assertIsNotNone(claimed)
+        kbd._set_worker_pid(self.conn, running, 424242)
+        affected = (child, candidate, review, bridge, nested, ready, in_review, running)
+        before = {tid: self._task(tid) for tid in (upstream, gate, sibling, untouched, *affected)}
+        tables = ("tasks", "task_links", "task_runs", "task_events", "task_comments")
+        snapshot = {
+            table: [tuple(row) for row in self.conn.execute(f"SELECT * FROM {table} ORDER BY rowid")]
+            for table in tables
+        }
+
+        def rebind():
+            kb.link_tasks(
+                self.conn, gate, child, requirement="review_approved",
+                expected_parent_version=before[gate].version,
+                expected_child_version=before[child].version,
+                reason="require review approval for historical output", author="operator",
+            )
+
+        self.conn.execute(
+            "CREATE TEMP TRIGGER reject_link_acceptance BEFORE INSERT ON task_events "
+            "WHEN NEW.kind = 'acceptance_changed' "
+            "BEGIN SELECT RAISE(ABORT, 'reject acceptance event'); END"
+        )
+        with patch.object(kb, "_terminate_reclaimed_worker") as terminate:
+            with self.assertRaises(sqlite3.IntegrityError):
+                rebind()
+            terminate.assert_not_called()
+        self.assertEqual(snapshot, {
+            table: [tuple(row) for row in self.conn.execute(f"SELECT * FROM {table} ORDER BY rowid")]
+            for table in tables
+        })
+        self.conn.execute("DROP TRIGGER reject_link_acceptance")
+
+        def terminate_after_commit(pid, claim_lock):
+            self.assertFalse(self.conn.in_transaction)
+            self.assertEqual((pid, claim_lock), (424242, claimed.claim_lock))
+            self.assertEqual(kb.latest_run(self.conn, running).outcome, "reclaimed")
+            for tid in (candidate, nested):
+                changes = [e for e in kb.list_events(self.conn, tid) if e.kind == "acceptance_changed"]
+                self.assertEqual(len(changes), 1)
+
+        with patch.object(kb, "_terminate_reclaimed_worker", side_effect=terminate_after_commit) as terminate:
+            rebind()
+            terminate.assert_called_once()
+        dependencies = kb.evaluate_dependencies(self.conn, child)
+        self.assertFalse(dependencies["satisfied"])
+        self.assertEqual(dependencies["blockers"][0]["code"], "verdict_conflict")
+        self.assertEqual(self._task(gate).version, before[gate].version + 1)
+        for tid in affected:
+            task = self._task(tid)
+            self.assertEqual(task.status, "todo")
+            self.assertEqual(task.version, before[tid].version + (2 if tid == child else 1))
+            self.assertEqual((
+                task.completed_at, task.result, task.candidate_run_id, task.current_run_id,
+                task.claim_lock, task.claim_expires, task.worker_pid,
+            ), (None,) * 7)
+            with self.assertRaises(kb.TaskUpdateConflict):
+                kb.update_task(
+                    self.conn, tid, expected_version=before[tid].version,
+                    reason="stale editor", body="must not overwrite retracted work",
+                )
+        for tid in (candidate, nested):
+            acceptance = get_lifecycle_state(self.conn, tid)["acceptance"]
+            self.assertIn(acceptance, {"pending", "stale"})
+            changes = [e.payload for e in kb.list_events(self.conn, tid) if e.kind == "acceptance_changed"]
+            self.assertEqual(
+                [(e["old"], e["new"], e["source_task_id"]) for e in changes],
+                [("accepted", acceptance, child)],
+            )
+        for tid in (upstream, sibling, untouched):
+            self.assertEqual(self._task(tid), before[tid])
+        self.assertEqual(get_lifecycle_state(self.conn, untouched)["acceptance"], "accepted")
+        self.assertFalse(kb.complete_task(
+            self.conn, running, expected_run_id=claimed.current_run_id, result="late worker result",
+        ))
+
+    def test_new_typed_link_reclaims_produced_work_but_satisfied_links_do_not(self) -> None:
+        gate = kb.create_task(self.conn, title="new unfinished dependency")
+        other_gate = kb.create_task(self.conn, title="existing unfinished dependency")
+        satisfied = kb.create_task(self.conn, title="completed dependency")
+        self.assertTrue(kb.complete_task(self.conn, satisfied))
+        for status in ("done", "review", "running"):
+            with self.subTest(status=status):
+                claimed = None
+                if status == "done":
+                    child, _ = self._completed_candidate()
+                else:
+                    child = kb.create_task(
+                        self.conn, title=f"{status} child", assignee="worker",
+                    )
+                    if status == "review":
+                        self.assertTrue(kb.request_review(self.conn, child, reviewer="reviewer"))
+                    else:
+                        claimed = kb.claim_task(self.conn, child)
+                        self.assertIsNotNone(claimed)
+                        kbd._set_worker_pid(self.conn, child, 424242)
+                # Existing historical blockers must not make a satisfied new link
+                # retract unrelated work, nor make an identical link non-idempotent.
+                with kb.write_txn(self.conn):
+                    self.conn.execute(
+                        "INSERT INTO task_links (parent_id, child_id, requirement) VALUES (?, ?, NULL)",
+                        (other_gate, child),
+                    )
+                before = self._task(child)
+                kb.link_tasks(self.conn, satisfied, child)
+                self.assertEqual(self._task(child), before)
+                events = kb.list_events(self.conn, child)
+                kb.link_tasks(self.conn, satisfied, child)
+                self.assertEqual(self._task(child), before)
+                self.assertEqual(kb.list_events(self.conn, child), events)
+                if claimed is not None:
+                    with self.assertRaises(kb.TaskUpdateConflict):
+                        kb.link_tasks(
+                            self.conn, other_gate, child,
+                            expected_parent_version=self._task(other_gate).version,
+                            expected_child_version=before.version, reason="cannot rebind a claim",
+                        )
+                    self.assertEqual(self._task(child), before)
+                    self.assertIsNone(self.conn.execute(
+                        "SELECT requirement FROM task_links WHERE parent_id = ? AND child_id = ?",
+                        (other_gate, child),
+                    ).fetchone()["requirement"])
+                with patch.object(kb, "_terminate_reclaimed_worker") as terminate:
+                    kb.link_tasks(self.conn, gate, child, requirement="phase_finished")
+                    if claimed is None:
+                        terminate.assert_not_called()
+                    else:
+                        terminate.assert_called_once_with(424242, claimed.claim_lock)
+                task = self._task(child)
+                self.assertEqual(task.status, "todo")
+                self.assertEqual(task.version, before.version + 1)
+                self.assertEqual((
+                    task.completed_at, task.result, task.candidate_run_id, task.current_run_id,
+                    task.claim_lock, task.claim_expires, task.worker_pid,
+                ), (None,) * 7)
+                if status == "done":
+                    acceptance = get_lifecycle_state(self.conn, child)["acceptance"]
+                    self.assertIn(acceptance, {"pending", "stale"})
+                    changes = [
+                        e.payload for e in kb.list_events(self.conn, child)
+                        if e.kind == "acceptance_changed"
+                    ]
+                    self.assertEqual(
+                        [(e["old"], e["new"]) for e in changes], [("accepted", acceptance)],
+                    )
+                if claimed is not None:
+                    self.assertEqual(kb.latest_run(self.conn, child).outcome, "reclaimed")
 
     def test_binding_repairs_legacy_edges_and_clears_terminal_fields(self) -> None:
         repo_home = tempfile.TemporaryDirectory(prefix="kanban-binding-git-")
