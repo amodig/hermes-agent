@@ -277,7 +277,6 @@ def main(argv: list[str] | None = None) -> int:
 
     runtime_root = (args.runtime_root or REPO_ROOT).resolve()
     created = datetime.now(timezone.utc).isoformat()
-    policy_digest = _policy_digest(args.policy_root.resolve() if args.policy_root else None)
     receipt = {
         "schema_version": 1,
         "created_at": created,
@@ -285,12 +284,15 @@ def main(argv: list[str] | None = None) -> int:
             "layer": args.layer,
             "protocol": PROTOCOL,
             "runtime_root": str(runtime_root),
-            "policy_digest": policy_digest,
+            "policy_digest": None,
         },
         "result": {"status": "incomplete", "scenarios": [], "diagnostics": []},
     }
     receipt_path = args.receipt or args.receipt_dir / f"kanban-lifecycle-{args.layer}-{int(time.time())}.json"
     try:
+        receipt["reference"]["policy_digest"] = _policy_digest(
+            args.policy_root.resolve() if args.policy_root else None
+        )
         if args.layer == "active":
             receipt["result"]["diagnostics"].append(
                 "active verification requires the layered verifier's live control-plane probe"

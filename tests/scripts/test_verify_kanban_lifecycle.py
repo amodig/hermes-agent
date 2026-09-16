@@ -7,6 +7,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "verify_kanban_lifecycle.py"
 _SPEC = importlib.util.spec_from_file_location("verify_kanban_lifecycle", SCRIPT)
@@ -33,6 +35,23 @@ def test_installed_verifier_rejects_source_runtime_fallback(tmp_path: Path) -> N
     assert payload["result"]["status"] == "incomplete"
     assert payload["result"]["scenarios"] == []
     assert any("installed runtime identity root mismatch" in item for item in payload["result"]["diagnostics"])
+
+
+@pytest.mark.parametrize("profiles_present", [False, True])
+def test_policy_failure_writes_incomplete_receipt(tmp_path: Path, profiles_present: bool) -> None:
+    if profiles_present:
+        (tmp_path / "profiles").mkdir()
+    receipt_path = tmp_path / "receipt.json"
+    code = verify_kanban_lifecycle.main([
+        "--layer", "source", "--policy-root", str(tmp_path), "--receipt", str(receipt_path),
+    ])
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert code == 2
+    assert receipt["result"]["status"] == "incomplete"
+    assert receipt["result"]["scenarios"] == []
+    assert receipt["reference"]["policy_digest"] is None
+    failed_path = "scripts/apply.sh" if profiles_present else "profiles"
+    assert any(failed_path in message for message in receipt["result"]["diagnostics"])
 
 
 def test_installed_suite_does_not_expose_source_runtime_fallback(tmp_path: Path, monkeypatch) -> None:
