@@ -190,53 +190,86 @@ def _emit(payload):
     print("__HERMES_DISPATCHER_PROBE__" + json.dumps(payload, sort_keys=True))
 
 
-profile = Path(os.environ["HERMES_HOME"]).resolve()
+gateway_profile = Path(os.environ["HERMES_HOME"]).resolve()
+profile = gateway_profile
 board_home = Path(os.environ["HERMES_KANBAN_HOME"]).resolve()
 runtime_root = Path(sys.argv[1]).resolve()
 expected = runtime.RuntimeIdentity.from_value(
     json.loads(os.environ["HERMES_VERIFY_EXPECTED_IDENTITY"])
 )
-profile.mkdir(parents=True, exist_ok=True)
+gateway_profile.mkdir(parents=True, exist_ok=True)
+worker_profile = gateway_profile.parent / "verify"
+worker_profile.mkdir(parents=True, exist_ok=True)
+from hermes_cli.profiles import resolve_profile_env
+if Path(resolve_profile_env("verify")).resolve() != worker_profile:
+    raise RuntimeError("native worker profile selection did not resolve the child profile")
 board_home.mkdir(parents=True, exist_ok=True)
-sentinel_token = f"synthetic-token-{uuid.uuid4().hex}"
-state_marker = f"synthetic-state-db-{uuid.uuid4().hex}"
-env_marker = f"SYNTHETIC_TOKEN={uuid.uuid4().hex}"
-for directory in ("sessions", "logs", "state", "cache"):
-    target = profile / directory
-    target.mkdir(parents=True, exist_ok=True)
-    for index in range(64):
-        (target / f"seed-{index:03d}.dat").write_text("synthetic profile state\n", encoding="utf-8")
-(profile / "state" / "fingerprint-race.bin").write_bytes(b"state" * 2_000_000)
-(profile / "sessions" / "secret-sentinel.txt").write_text(
-    sentinel_token + "\n", encoding="utf-8"
-)
-(profile / "state.db").write_bytes(state_marker.encode("ascii"))
-(profile / "kanban.db").write_bytes(b"synthetic-kanban-db")
-(profile / ".env.sentinel").write_text(env_marker + "\n", encoding="utf-8")
+if "" not in sys.path:
+    sys.path.insert(0, "")
+if str(gateway_profile) not in sys.path:
+    sys.path.append(str(gateway_profile))
+profile_markers = {
+    "gateway": {
+        "credential": f"synthetic-gateway-token-{uuid.uuid4().hex}",
+        "state": f"synthetic-gateway-state-{uuid.uuid4().hex}",
+        "env": f"SYNTHETIC_GATEWAY_TOKEN={uuid.uuid4().hex}",
+    },
+    "worker": {
+        "credential": f"synthetic-worker-token-{uuid.uuid4().hex}",
+        "state": f"synthetic-worker-state-{uuid.uuid4().hex}",
+        "env": f"SYNTHETIC_WORKER_TOKEN={uuid.uuid4().hex}",
+    },
+}
+for label, home in (("gateway", gateway_profile), ("worker", worker_profile)):
+    markers = profile_markers[label]
+    for directory in ("sessions", "logs", "state", "cache"):
+        target = home / directory
+        target.mkdir(parents=True, exist_ok=True)
+        for index in range(64):
+            (target / f"seed-{index:03d}.dat").write_text(
+                "synthetic profile state\n", encoding="utf-8",
+            )
+    (home / "state" / "fingerprint-race.bin").write_bytes(b"state" * 2_000_000)
+    (home / "sessions" / "secret-sentinel.txt").write_text(
+        markers["credential"] + "\n", encoding="utf-8",
+    )
+    (home / "credentials.sentinel").write_text(
+        markers["credential"] + "\n", encoding="utf-8",
+    )
+    (home / "state.db").write_bytes(markers["state"].encode("ascii"))
+    (home / "kanban.db").write_bytes(b"synthetic-kanban-db")
+    (home / ".env.sentinel").write_text(markers["env"] + "\n", encoding="utf-8")
 
 churn_stop = threading.Event()
-churn_count = 0
+churn_counts = {"gateway": 0, "worker": 0}
 
 
 def _churn_profile():
-    global churn_count
     tick = 0
     while not churn_stop.is_set():
         tick += 1
-        try:
-            (profile / "sessions" / f"live-{tick % 32:02d}.log").write_text(
-                f"synthetic session update {tick}\n", encoding="utf-8"
-            )
-            with (profile / "logs" / "gateway.log").open("ab") as stream:
-                stream.write(f"synthetic log update {tick}\n".encode("ascii"))
-            (profile / "state.db").write_bytes(f"synthetic-state-{tick}".encode("ascii"))
-            (profile / "kanban.db").write_bytes(f"synthetic-kanban-{tick}".encode("ascii"))
-            with (profile / "state" / "fingerprint-race.bin").open("ab") as stream:
-                stream.write(b"x")
-            (profile / "cache" / "board.cache").write_bytes(f"cache-{tick}".encode("ascii"))
-            churn_count += 1
-        except OSError:
-            break
+        for label, home in (("gateway", gateway_profile), ("worker", worker_profile)):
+            markers = profile_markers[label]
+            try:
+                (home / "sessions" / f"live-{tick % 32:02d}.log").write_text(
+                    f"synthetic session update {tick}\n", encoding="utf-8",
+                )
+                with (home / "logs" / "gateway.log").open("ab") as stream:
+                    stream.write(f"synthetic log update {tick}\n".encode("ascii"))
+                (home / "state.db").write_bytes(
+                    f"{markers['state']}-{tick}".encode("ascii"),
+                )
+                (home / "kanban.db").write_bytes(
+                    f"synthetic-kanban-{label}-{tick}".encode("ascii"),
+                )
+                with (home / "state" / "fingerprint-race.bin").open("ab") as stream:
+                    stream.write(b"x")
+                (home / "cache" / "board.cache").write_bytes(
+                    f"cache-{label}-{tick}".encode("ascii"),
+                )
+                churn_counts[label] += 1
+            except OSError:
+                break
         time.sleep(0.001)
 
 
@@ -270,16 +303,18 @@ try:
             nonlocal_generation = None
             worker = None
             try:
+                if Path(os.environ["HERMES_HOME"]).resolve() != gateway_profile:
+                    raise RuntimeError("dispatcher HERMES_HOME changed before generation")
                 nonlocal_generation = generations.prepare_runtime_generation(
                     source_identity,
                     workspace=workspace,
-                    profile_home=profile,
+                    profile_home=worker_profile,
                     project_plugins_enabled=False,
                 )
                 worker_env = {**os.environ, **nonlocal_generation.env}
                 worker_env.update(
                     {
-                        "HERMES_HOME": str(profile),
+                        "HERMES_HOME": str(worker_profile),
                         "HERMES_KANBAN_HOME": str(board_home),
                         "HERMES_PROFILE": "verify",
                     }
@@ -296,7 +331,7 @@ try:
                         "HERMES_KANBAN_BOOTSTRAP_WAIT": "1",
                     }
                 )
-                worker_args = dispatcher._worker_argv(task, "verify", str(profile))
+                worker_args = dispatcher._worker_argv(task, "verify", str(worker_profile))
                 if worker_args[:2] == ["-p", "verify"]:
                     del worker_args[:2]
                 # Keep the real worker command, but let argparse's help path
@@ -330,8 +365,11 @@ try:
                 if not isinstance(pre_import, dict):
                     raise RuntimeError("worker did not report pre-import bootstrap")
                 early = pre_import.get("runtime_identity")
-                if not isinstance(early, dict) or not runtime.same_code_identity(
-                    nonlocal_generation.identity, early,
+                if (
+                    pre_import.get("ready") is not True
+                    or str(pre_import.get("preparation_id")) != preparation_id
+                    or not isinstance(early, dict)
+                    or not runtime.same_code_identity(nonlocal_generation.identity, early)
                 ):
                     raise RuntimeError("worker pre-import identity did not match the sealed runtime")
                 if worker.stdin is None:
@@ -365,6 +403,7 @@ try:
                 }
                 sentinels = (
                     "sessions/secret-sentinel.txt",
+                    "credentials.sentinel",
                     "state.db",
                     "kanban.db",
                     ".env.sentinel",
@@ -379,19 +418,27 @@ try:
                     for path in nonlocal_generation.root.rglob("*")
                     if path.is_file()
                 )
+                profile_marker_values = tuple(
+                    marker
+                    for markers in profile_markers.values()
+                    for marker in markers.values()
+                )
                 no_profile_state = no_profile_state and not any(
-                    marker in content
+                    marker.encode("utf-8") in content
                     for content in payload_bytes
-                    for marker in (
-                        sentinel_token.encode("utf-8"),
-                        state_marker.encode("ascii"),
-                        env_marker.encode("ascii"),
-                    )
+                    for marker in profile_marker_values
                 )
                 worker_ready = (
                     bootstrap.get("ready") is True
                     and bootstrap.get("phase") == "post_import"
                     and bootstrap.get("post_import") is True
+                    and str(bootstrap.get("preparation_id")) == preparation_id
+                    and str(bootstrap.get("runtime_generation"))
+                    == str(nonlocal_generation.root)
+                    and isinstance(bootstrap.get("runtime_identity"), dict)
+                    and runtime.same_code_identity(
+                        nonlocal_generation.identity, bootstrap["runtime_identity"],
+                    )
                 )
                 proof.update(
                     {
@@ -455,7 +502,7 @@ finally:
     churn_thread.join(timeout=5)
 
 evidence = {
-    "profile_churn": bool(churn_count),
+    "profile_churn": all(churn_counts.values()),
     "worker_bootstrap": bool(proof.get("worker_bootstrap")),
     "runtime_identity": proof.get("runtime_identity") or expected.as_dict(),
 }
@@ -492,8 +539,8 @@ def _dispatcher_materialization_check(
         dir=str(temp_root) if temp_root is not None else None,
     ) as raw:
         proof_root = Path(raw)
-        profile = proof_root / "profile"
-        profile.mkdir()
+        profile = proof_root / "profiles" / "gateway"
+        profile.mkdir(parents=True)
         board = proof_root / "board"
         env = os.environ.copy()
         env.update(
@@ -501,7 +548,7 @@ def _dispatcher_materialization_check(
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "HERMES_HOME": str(profile),
                 "HERMES_KANBAN_HOME": str(board),
-                "HERMES_PROFILE": "verify",
+                "HERMES_PROFILE": "gateway",
                 "HERMES_ENABLE_PROJECT_PLUGINS": "0",
                 "HERMES_VERIFY_EXPECTED_IDENTITY": json.dumps(identity, sort_keys=True),
                 "PYTHONPATH": _pythonpath(layer, runtime_root),

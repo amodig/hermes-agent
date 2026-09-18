@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import types
 
 import pytest
 
@@ -58,27 +59,129 @@ def test_dispatcher_materialization_ignores_churning_profile_state(tmp_path: Pat
     assert check["evidence"]["runtime_identity"]["module_root"] == str(REPOSITORY)
 
 
-def test_profile_home_module_parent_is_filtered_and_plugins_still_import(
+def test_distinct_profile_parents_are_filtered_but_plugins_and_resources_survive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    profile = tmp_path / "profile"
-    plugin_root = profile / "plugins"
-    plugin_root.mkdir(parents=True)
-    (profile / "issue22_direct.py").write_text("value = 'profile'\n", encoding="utf-8")
-    (plugin_root / "issue22_plugin.py").write_text("value = 'plugin'\n", encoding="utf-8")
-    monkeypatch.chdir(profile)
-    monkeypatch.setenv("HERMES_HOME", str(profile))
-    monkeypatch.setattr(sys, "path", ["", str(tmp_path), str(plugin_root), *sys.path])
-    direct = importlib.import_module("issue22_direct")
-    plugin = importlib.import_module("issue22_plugin")
-    roots = generation._runtime_import_roots(
-        REPOSITORY, profile_home=profile, project_plugins_enabled=False,
-    )
+    root = tmp_path / "hermes-root"
+    gateway = root / "profiles" / "gateway"
+    child = root / "profiles" / "verify"
+    gateway.mkdir(parents=True)
+    child.mkdir(parents=True)
+    gateway_plugin = gateway / "plugins"
+    child_plugin = child / "plugins"
+    project_plugin = gateway / ".hermes" / "plugins"
+    _write_plugin(gateway_plugin, "issue22_gateway_plugin", "gateway")
+    _write_plugin(child_plugin, "issue22_child_plugin", "child")
+    _write_plugin(project_plugin, "issue22_project_plugin", "project")
+    (root / "issue22_broad_module.py").write_text("value = 'broad'\n", encoding="utf-8")
+    for home, label in ((gateway, "gateway"), (child, "child")):
+        (home / f"issue22_{label}_direct.py").write_text(
+            f"value = {label!r}\n", encoding="utf-8",
+        )
+        (home / f"issue22_{label}_module.py").write_text(
+            "value = 'module-parent'\n", encoding="utf-8",
+        )
+        (home / f"issue22_{label}_namespace").mkdir()
+        (home / f"issue22_{label}_package").mkdir()
 
-    assert direct.value == "profile"
-    assert plugin.value == "plugin"
-    assert profile not in roots
-    assert plugin_root in roots
+    route_modules = {
+        "issue22_gateway_file_route": types.SimpleNamespace(
+            __file__=str(gateway / "issue22_gateway_module.py"),
+        ),
+        "issue22_gateway_path_route": types.SimpleNamespace(
+            __path__=[str(gateway / "issue22_gateway_package")],
+        ),
+        "issue22_gateway_mapping_route": types.SimpleNamespace(
+            MAPPING={"gateway": str(gateway / "issue22_gateway_module.py")},
+        ),
+        "issue22_gateway_namespace_route": types.SimpleNamespace(
+            NAMESPACES={"gateway": [str(gateway / "issue22_gateway_namespace")]},
+        ),
+        "issue22_child_file_route": types.SimpleNamespace(
+            __file__=str(child / "issue22_child_module.py"),
+        ),
+        "issue22_child_path_route": types.SimpleNamespace(
+            __path__=[str(child / "issue22_child_package")],
+        ),
+        "issue22_child_mapping_route": types.SimpleNamespace(
+            MAPPING={"child": str(child / "issue22_child_module.py")},
+        ),
+        "issue22_child_namespace_route": types.SimpleNamespace(
+            NAMESPACES={"child": [str(child / "issue22_child_namespace")]},
+        ),
+        "issue22_broad_parent_route": types.SimpleNamespace(
+            __file__=str(root / "issue22_broad_module.py"),
+        ),
+    }
+    plugin_modules = tuple(
+        name
+        for name in (
+            "issue22_gateway_plugin",
+            "issue22_child_plugin",
+            "issue22_project_plugin",
+        )
+    )
+    route_names = tuple(route_modules) + plugin_modules
+    for name in route_names:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    for name, module in route_modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.chdir(gateway)
+    monkeypatch.setenv("HERMES_HOME", str(gateway))
+    monkeypatch.setattr(
+        sys,
+        "path",
+        [
+            "",
+            str(gateway),
+            str(child),
+            str(gateway_plugin),
+            str(child_plugin),
+            str(project_plugin),
+            *sys.path,
+        ],
+    )
+    try:
+        plugins = [
+            importlib.import_module(name)
+            for name in plugin_modules
+        ]
+        roots = generation._runtime_import_roots(
+            REPOSITORY,
+            profile_home=child,
+            project_plugins_enabled=True,
+        )
+    finally:
+        for name in plugin_modules:
+            sys.modules.pop(name, None)
+
+    assert [plugin.VALUE for plugin in plugins] == ["gateway", "child", "project"]
+    assert [
+        plugin.RESOURCE
+        for plugin in plugins
+    ] == [
+        "issue22_gateway_plugin-sealed\n",
+        "issue22_child_plugin-sealed\n",
+        "issue22_project_plugin-sealed\n",
+    ]
+    assert gateway not in roots
+    assert child not in roots
+    assert root not in roots
+    assert gateway_plugin in roots
+    assert child_plugin in roots
+    assert project_plugin in roots
+    assert not any(
+        path.is_relative_to(gateway)
+        and not any(
+            path.is_relative_to(allowed)
+            for allowed in (gateway_plugin, project_plugin)
+        )
+        for path in roots
+    )
+    assert not any(
+        path.is_relative_to(child) and not path.is_relative_to(child_plugin)
+        for path in roots
+    )
 
 
 def test_managed_venv_dependency_root_survives_profile_filter(
@@ -109,6 +212,38 @@ def test_managed_venv_dependency_root_survives_profile_filter(
     assert site_packages in roots
     assert profile not in roots
     assert not any(root in roots for root in state_roots)
+
+
+def test_declared_profile_resource_root_is_sealed_and_usable(
+    installation, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, _dependencies, plugins, _external, _native_probe, prepare = installation
+    resource_root = plugins.parent / "profile-locale-assets"
+    resource_root.mkdir()
+    (resource_root / "sentinel.txt").write_text("profile-resource-sealed\n", encoding="utf-8")
+    (source / "hermes_cli" / "main.py").write_text(
+        "import json\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "resource = Path(os.environ['HERMES_BUNDLED_LOCALES'])\n"
+        "print(json.dumps({'resource': (resource / 'sentinel.txt').read_text(), "
+        "'sealed': str(resource).startswith(os.environ['HERMES_KANBAN_RUNTIME_GENERATION'])}))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_BUNDLED_LOCALES", str(resource_root))
+    prepared = prepare(profile_home=plugins.parent, project_plugins_enabled=False)
+    try:
+        shutil.rmtree(resource_root)
+        worker = _run_generation_worker(prepared, cwd=source.parent)
+        assert worker.returncode == 0, worker.stderr
+        assert json.loads(worker.stdout.splitlines()[-1]) == {
+            "resource": "profile-resource-sealed\n",
+            "sealed": True,
+        }
+    finally:
+        generation.cleanup_runtime_generation(prepared.root, force=True)
+
+
 
 
 def test_profile_and_project_plugins_and_dependencies_are_sealed(
