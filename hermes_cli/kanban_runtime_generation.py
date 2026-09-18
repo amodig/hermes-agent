@@ -185,11 +185,16 @@ def _digest_members(members):
     return digest.hexdigest()
 
 
-def _member_signature(members):
+def _member_signature(members, *, snapshot=None):
     """Detect input replacement, edits, permissions, and tree membership without reading payloads."""
     digest = hashlib.sha256()
     for name, path in members:
         stat = path.stat()
+        if snapshot is not None:
+            snapshot[name] = (
+                stat.st_dev, stat.st_ino, stat.st_mode, stat.st_size,
+                stat.st_mtime_ns, stat.st_ctime_ns,
+            )
         digest.update(
             f"{name}\0{stat.st_dev}:{stat.st_ino}:{stat.st_mode}:{stat.st_size}:"
             f"{stat.st_mtime_ns}:{stat.st_ctime_ns}\0".encode()
@@ -212,43 +217,27 @@ def _member_class(name: str) -> str:
     return "resource"
 
 
-def _changed_member(before, after) -> tuple[str, str]:
-    before_names = {name: path for name, path in before}
-    after_names = {name: path for name, path in after}
-    for name in sorted(set(before_names) | set(after_names)):
-        if name not in before_names:
-            return "member-added", name
-        if name not in after_names:
-            return "member-removed", name
-        try:
-            left = before_names[name].stat()
-            right = after_names[name].stat()
-            if (
-                left.st_dev,
-                left.st_ino,
-                left.st_mode,
-                left.st_size,
-                left.st_mtime_ns,
-                left.st_ctime_ns,
-            ) != (
-                right.st_dev,
-                right.st_ino,
-                right.st_mode,
-                right.st_size,
-                right.st_mtime_ns,
-                right.st_ctime_ns,
-            ):
-                return _member_class(name), name
-        except OSError:
-            return "member-unavailable", name
-    return "member-set", next(iter(sorted(after_names or before_names)), ".")
+def _changed_member(before, after) -> tuple[str, str | None]:
+    if before is None or after is None:
+        return "signature-mismatch", None
+    for name in sorted(before.keys() ^ after.keys()):
+        return ("member-added" if name in after else "member-removed"), name
+    # Prefer a changed file to the directory metadata changed by the same write.
+    for name in sorted(before, key=lambda name: (name.endswith("/"), name)):
+        if before[name] != after[name]:
+            return "metadata-changed", name
+    return "signature-mismatch", None
 
 
-def _fingerprint_change_error(provenance: str, before, after) -> Exception:
+def _fingerprint_change_error(origin, provenance: str, before=None, after=None) -> Exception:
     kind, relative = _changed_member(before, after)
-    label = provenance or "runtime import root"
+    detail = (
+        f"{_member_class(relative)} {json.dumps(relative)}"
+        if relative is not None else "member detail unavailable"
+    )
     return _error(
-        f"runtime changed while fingerprinting {label}: {kind} {relative}"
+        f"runtime changed while fingerprinting {json.dumps(provenance or 'runtime import root')} "
+        f"(origin={json.dumps(str(origin))}): {kind} {detail}"
     )
 
 
@@ -256,12 +245,16 @@ def _fingerprint_change_error(provenance: str, before, after) -> Exception:
 def _validated_origin_digest(origin, source, exclude, signature, provenance=""):
     root = Path(origin)
     before = tuple(_members(root, source=source, exclude=exclude))
-    if _member_signature(before) != signature:
-        raise _fingerprint_change_error(provenance, before, ())
+    before_stats = {}
+    if _member_signature(before, snapshot=before_stats) != signature:
+        # The cache key preserves only the prior digest, not its member metadata.
+        raise _fingerprint_change_error(origin, provenance)
     digest = _digest_members(before)
-    after = tuple(_members(root, source=source, exclude=exclude))
-    if _member_signature(after) != signature:
-        raise _fingerprint_change_error(provenance, before, after)
+    after_stats = {}
+    if _member_signature(
+        _members(root, source=source, exclude=exclude), snapshot=after_stats,
+    ) != signature:
+        raise _fingerprint_change_error(origin, provenance, before_stats, after_stats)
     return digest
 
 
@@ -337,9 +330,7 @@ def _python_runtime_inputs():
 
 
 def _optional_plugin_roots(workspace=None, *, profile_home=None, project_plugins_enabled: bool | None = None) -> set[Path]:
-    from hermes_constants import get_hermes_home
-    home = Path(profile_home) if profile_home is not None else get_hermes_home()
-    roots = {(home / "plugins").resolve()}
+    roots = {(home / "plugins").resolve() for home in _profile_home_paths(profile_home)}
     if project_plugins_enabled is None:
         from utils import env_var_enabled
         project_plugins_enabled = env_var_enabled("HERMES_ENABLE_PROJECT_PLUGINS")
@@ -354,25 +345,32 @@ def _optional_plugin_roots(workspace=None, *, profile_home=None, project_plugins
 _RUNTIME_ROOT_PROVENANCE: dict[str, str] = {}
 
 
-def _profile_home_path(profile_home=None) -> Path:
-    if profile_home is not None:
-        return Path(profile_home).resolve()
+def _profile_home_paths(profile_home=None) -> set[Path]:
     from hermes_constants import get_hermes_home
-    return Path(get_hermes_home()).resolve()
+    homes = {Path(get_hermes_home()).resolve()}
+    if profile_home is not None:
+        homes.add(Path(profile_home).resolve())
+    return homes
 
 
 def _is_sanctioned_plugin_root(path: Path, plugin_roots: set[Path]) -> bool:
     return any(path == root or path.is_relative_to(root) for root in plugin_roots)
 
-def _is_interpreter_or_install_root(path: Path, source: Path) -> bool:
-    """Keep interpreter, dependency, and source-installation roots in the seal."""
+def _is_interpreter_or_install_root(path: Path, source: Path, *, profile_home=None) -> bool:
+    """Keep installation subtrees, without treating a nested profile as an install."""
     roots = {
+        source,
         Path(sys.prefix).resolve(),
         Path(sys.base_prefix).resolve(),
         *(Path(sysconfig.get_path(key)).resolve() for key in ("purelib", "platlib")),
     }
-    return path.is_relative_to(source) or any(
-        path == root or path.is_relative_to(root) for root in roots
+    target = os.environ.get("HERMES_LAZY_INSTALL_TARGET", "").strip()
+    if target:
+        roots.add(Path(target).resolve())
+    return any(
+        path.is_relative_to(root)
+        and not (profile_home is not None and profile_home.is_relative_to(root))
+        for root in roots
     )
 
 
@@ -381,21 +379,33 @@ def _is_interpreter_or_install_root(path: Path, source: Path) -> bool:
 def _profile_state_exclusions(
     origin: Path,
     *,
-    profile_home: Path,
+    profile_homes: set[Path],
     plugin_roots: set[Path],
+    source: Path,
+    resource_roots=(),
 ) -> set[str]:
-    if _is_sanctioned_plugin_root(origin, plugin_roots):
-        return set()
-    if profile_home == origin or profile_home.is_relative_to(origin):
-        return {profile_home.relative_to(origin).as_posix() or "."}
-    return set()
+    exclusions = set()
+    for home in profile_homes:
+        if home.is_relative_to(origin):
+            exclusions.add(home.relative_to(origin).as_posix())
+        elif (
+            origin.is_relative_to(home)
+            and not _is_sanctioned_plugin_root(origin, plugin_roots)
+            and not _is_interpreter_or_install_root(origin, source, profile_home=home)
+            and not any(
+                origin.is_relative_to(root) and not home.is_relative_to(root)
+                for root in resource_roots
+            )
+        ):
+            return {"."}
+    return exclusions
 
 
 def _runtime_import_roots(source: Path, *, profile_home=None, project_plugins_enabled: bool | None = None) -> list[Path]:
     """All active import roots, excluding mutable profile state."""
     global _RUNTIME_ROOT_PROVENANCE
     _RUNTIME_ROOT_PROVENANCE = {}
-    profile = _profile_home_path(profile_home)
+    profiles = _profile_home_paths(profile_home)
     plugin_roots = _optional_plugin_roots(
         profile_home=profile_home, project_plugins_enabled=project_plugins_enabled,
     )
@@ -411,7 +421,7 @@ def _runtime_import_roots(source: Path, *, profile_home=None, project_plugins_en
     if target:
         candidates.append((Path(target).resolve(), "lazy install target"))
     candidates.extend(
-        (root, "profile plugins" if root == profile / "plugins" else "project plugins")
+        (root, "profile plugins" if any(root == (home / "plugins").resolve() for home in profiles) else "project plugins")
         for root in sorted(plugin_roots)
     )
     for module in tuple(sys.modules.values()):
@@ -446,12 +456,13 @@ def _runtime_import_roots(source: Path, *, profile_home=None, project_plugins_en
         )
         if in_source or _is_stdlib(path) or (not path.exists() and path not in plugin_roots):
             continue
-        exempt = _is_interpreter_or_install_root(path, source)
-        if path == profile:
+        if "." in _profile_state_exclusions(
+            path, profile_homes=profiles, plugin_roots=plugin_roots, source=source,
+        ):
             continue
         if (
-            (path.is_relative_to(profile) or profile.is_relative_to(path))
-            and not exempt
+            any(profile.is_relative_to(path) for profile in profiles)
+            and not _is_interpreter_or_install_root(path, source)
             and not _is_sanctioned_plugin_root(path, plugin_roots)
         ):
             continue
@@ -612,7 +623,7 @@ def prepare_runtime_generation(expected_identity, *, workspace=None, profile_hom
         current = runtime_identity(source)
         if not same_code_identity(expected, current):
             raise _error("source runtime changed before generation preparation")
-        profile = _profile_home_path(profile_home)
+        profiles = _profile_home_paths(profile_home)
         roots = _runtime_import_roots(
             source, profile_home=profile_home, project_plugins_enabled=project_plugins_enabled,
         )
@@ -626,19 +637,13 @@ def prepare_runtime_generation(expected_identity, *, workspace=None, profile_hom
                     covered = True
                     break
                 if plugins.is_relative_to(root) and not _profile_state_exclusions(
-                    Path(root), profile_home=profile, plugin_roots=optional_roots,
+                    Path(root), profile_homes=profiles, plugin_roots=optional_roots, source=source,
                 ):
                     covered = True
                     break
             if not covered:
                 roots.append(plugins)
         native_paths, exclusions, executable = _python_runtime_inputs()
-        for root in roots:
-            extra = _profile_state_exclusions(
-                Path(root), profile_home=profile, plugin_roots=optional_roots,
-            )
-            if extra:
-                exclusions.setdefault(str(root), set()).update(extra)
         mappings = {**native_paths, str(source): "source"}
         mappings.update((str(root), _installed_root_location(root, index)[2]) for index, root in enumerate(roots))
         _installed_resources(roots, mappings)
@@ -646,9 +651,27 @@ def prepare_runtime_generation(expected_identity, *, workspace=None, profile_hom
         for directory, variable in _RUNTIME_RESOURCE_ROOTS:
             origin = Path(os.environ.get(variable) or source / directory).resolve()
             if origin.is_dir():
-                if not origin.is_relative_to(source):
+                if origin in profiles:
+                    raise _error(
+                        f"runtime resource {variable} cannot capture an entire profile home "
+                        f"(origin={json.dumps(str(origin))})"
+                    )
+                if not origin.is_relative_to(source) or any(
+                    origin.is_relative_to(home) and home.is_relative_to(source)
+                    for home in profiles
+                ):
                     mappings.setdefault(str(origin), f"resources/{directory}")
                 resources[variable] = str(origin)
+        resource_roots = {Path(origin) for origin in resources.values()}
+        # Apply the same boundary after every mapping source, including native
+        # layouts, installed RECORD resources, and explicit bundled resources.
+        for origin in mappings:
+            extra = _profile_state_exclusions(
+                Path(origin).resolve(), profile_homes=profiles,
+                plugin_roots=optional_roots, source=source, resource_roots=resource_roots,
+            )
+            if extra:
+                exclusions.setdefault(origin, set()).update(extra)
         storage = _runtime_storage_root().resolve()
         for origin in mappings:
             if storage.is_relative_to(Path(origin).resolve()):
@@ -723,8 +746,8 @@ def prepare_runtime_generation(expected_identity, *, workspace=None, profile_hom
                             else _RUNTIME_ROOT_PROVENANCE.get(origin, "runtime input")
                         )
                         raise _error(
-                            f"runtime changed while copying {provenance}: "
-                            "member-set payload"
+                            f"runtime changed while copying {json.dumps(provenance)} "
+                            f"(origin={json.dumps(origin)}): payload differs; member detail unavailable"
                         )
                 shutil.copy2(__file__, staging / "bootstrap.py")
                 identity = replace(current, dependency_fingerprint=dependency_fingerprint)
@@ -745,7 +768,8 @@ def prepare_runtime_generation(expected_identity, *, workspace=None, profile_hom
                         )
                         raise _error(
                             f"runtime changed before generation publication: "
-                            f"{provenance} member-set payload"
+                            f"{json.dumps(provenance)} (origin={json.dumps(origin)}): "
+                            "payload differs; member detail unavailable"
                         )
                 os.replace(staging, cache)
             except BaseException:
