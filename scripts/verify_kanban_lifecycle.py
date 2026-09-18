@@ -267,6 +267,7 @@ try:
 
         def spawn(task, workspace, *, board=None):
             nonlocal_generation = None
+            worker = None
             try:
                 nonlocal_generation = generations.prepare_runtime_generation(
                     source_identity,
@@ -291,26 +292,65 @@ try:
                         "HERMES_KANBAN_EXPECTED_RUNTIME": json.dumps(
                             nonlocal_generation.identity.as_dict(), sort_keys=True,
                         ),
-                        "HERMES_KANBAN_BOOTSTRAP_WAIT": "0",
+                        "HERMES_KANBAN_BOOTSTRAP_WAIT": "1",
                     }
                 )
-                worker = subprocess.run(
-                    [*nonlocal_generation.command_prefix, "--runtime-identity"],
+                worker_args = dispatcher._worker_argv(task, "verify", str(profile))
+                if worker_args[:2] == ["-p", "verify"]:
+                    del worker_args[:2]
+                # Keep the real worker command, but let argparse's help path
+                # exit before model/provider startup.
+                worker_args.append("--help")
+                worker = subprocess.Popen(
+                    [*nonlocal_generation.command_prefix, *worker_args],
                     cwd=workspace,
                     env=worker_env,
-                    capture_output=True,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
-                    timeout=60,
                 )
-                lines = [line.strip() for line in worker.stdout.splitlines() if line.strip()]
-                observed = json.loads(lines[-1]) if lines else {}
+                deadline = time.monotonic() + 60
+                pre_import = None
+                while time.monotonic() < deadline:
+                    if bootstrap_path.is_file():
+                        try:
+                            candidate = json.loads(bootstrap_path.read_text(encoding="utf-8"))
+                        except (OSError, json.JSONDecodeError):
+                            candidate = None
+                        if isinstance(candidate, dict) and candidate.get("phase") == "pre_import":
+                            pre_import = candidate
+                            break
+                    if worker.poll() is not None:
+                        break
+                    time.sleep(0.05)
+                if not isinstance(pre_import, dict):
+                    raise RuntimeError("worker did not report pre-import bootstrap")
+                early = pre_import.get("runtime_identity")
+                if not isinstance(early, dict) or not runtime.same_code_identity(
+                    nonlocal_generation.identity, early,
+                ):
+                    raise RuntimeError("worker pre-import identity did not match the sealed runtime")
+                if worker.stdin is None:
+                    raise RuntimeError("worker bootstrap pipe unavailable")
+                worker.stdin.write(json.dumps(
+                    {
+                        "continue_imports": True,
+                        "preparation_id": preparation_id,
+                        "runtime_identity": early,
+                    },
+                    sort_keys=True,
+                ) + "\n")
+                worker.stdin.flush()
+                _worker_stdout, worker_stderr = worker.communicate(timeout=60)
                 bootstrap = (
                     json.loads(bootstrap_path.read_text(encoding="utf-8"))
                     if bootstrap_path.is_file()
                     else {}
                 )
+                observed = bootstrap.get("runtime_identity")
                 same_generation = (
                     worker.returncode == 0
                     and isinstance(observed, dict)
@@ -347,7 +387,11 @@ try:
                         env_marker.encode("ascii"),
                     )
                 )
-                worker_ready = bootstrap.get("ready") is True
+                worker_ready = (
+                    bootstrap.get("ready") is True
+                    and bootstrap.get("phase") == "post_import"
+                    and bootstrap.get("post_import") is True
+                )
                 proof.update(
                     {
                         "worker_bootstrap": bool(same_generation and worker_ready and no_profile_state),
@@ -360,12 +404,14 @@ try:
                         "manifest_identity": manifest.get("identity", {}),
                     }
                 )
+                if worker.returncode != 0 and worker_stderr:
+                    proof["diagnostics"].append(worker_stderr[-500:])
                 with contextlib.suppress(OSError):
                     bootstrap_path.unlink()
                 if not same_generation:
                     proof["diagnostics"].append("worker did not report the frozen runtime identity")
                 if not worker_ready:
-                    proof["diagnostics"].append("worker bootstrap did not report ready")
+                    proof["diagnostics"].append("worker post-import bootstrap did not report ready")
                 if not no_profile_state:
                     proof["diagnostics"].append("profile-state sentinel appeared in the sealed payload")
                 return dispatcher.WorkerLaunch(
@@ -385,6 +431,10 @@ try:
                 ]
                 raise
             finally:
+                if worker is not None and worker.poll() is None:
+                    worker.terminate()
+                    with contextlib.suppress(Exception):
+                        worker.communicate(timeout=5)
                 if nonlocal_generation is not None:
                     generations.cleanup_runtime_generation(nonlocal_generation.root, force=True)
 
@@ -787,18 +837,19 @@ def main(argv: list[str] | None = None) -> int:
         receipt["reference"]["pythonpath"] = pythonpath
         receipt["result"]["scenarios"] = scenarios
         materialization = receipt["result"]["checks"]["dispatcher_materialization"]
-        receipt["result"]["status"] = (
-            "pass"
+        combined_exit_code = (
+            0
             if return_code == 0 and materialization["status"] == "pass"
-            else "failed"
+            else 1
         )
+        receipt["result"]["status"] = "pass" if combined_exit_code == 0 else "failed"
         if return_code != 0:
             receipt["result"]["diagnostics"].append(output[-4000:])
         elif materialization["status"] != "pass":
             receipt["result"]["diagnostics"].append(
                 "dispatcher materialization check failed"
             )
-        receipt["result"]["exit_code"] = return_code
+        receipt["result"]["exit_code"] = combined_exit_code
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         receipt["result"]["diagnostics"].append(str(exc))
     _write_receipt(receipt_path, receipt)

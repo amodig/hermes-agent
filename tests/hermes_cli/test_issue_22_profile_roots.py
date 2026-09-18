@@ -81,6 +81,36 @@ def test_profile_home_module_parent_is_filtered_and_plugins_still_import(
     assert plugin_root in roots
 
 
+def test_managed_venv_dependency_root_survives_profile_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = tmp_path / ".hermes"
+    venv = profile / "hermes-agent" / "venv"
+    site_packages = venv / "lib" / "python3.11" / "site-packages"
+    site_packages.mkdir(parents=True)
+    state_roots = [profile / name for name in ("sessions", "logs", "state", "cache")]
+    for root in state_roots:
+        root.mkdir()
+    monkeypatch.chdir(profile)
+    monkeypatch.setattr(sys, "path", ["", str(profile), *(str(root) for root in state_roots), str(site_packages)])
+    monkeypatch.setattr(sys, "prefix", str(venv))
+    monkeypatch.setattr(sys, "base_prefix", str(venv))
+    original_get_path = generation.sysconfig.get_path
+    monkeypatch.setattr(
+        generation.sysconfig,
+        "get_path",
+        lambda key: str(site_packages) if key in {"purelib", "platlib"} else original_get_path(key),
+    )
+
+    roots = generation._runtime_import_roots(
+        REPOSITORY, profile_home=profile, project_plugins_enabled=False,
+    )
+
+    assert site_packages in roots
+    assert profile not in roots
+    assert not any(root in roots for root in state_roots)
+
+
 def test_profile_and_project_plugins_and_dependencies_are_sealed(
     installation, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

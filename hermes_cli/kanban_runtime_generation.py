@@ -364,6 +364,19 @@ def _profile_home_path(profile_home=None) -> Path:
 def _is_sanctioned_plugin_root(path: Path, plugin_roots: set[Path]) -> bool:
     return any(path == root or path.is_relative_to(root) for root in plugin_roots)
 
+def _is_interpreter_or_install_root(path: Path, source: Path) -> bool:
+    """Keep interpreter, dependency, and source-installation roots in the seal."""
+    roots = {
+        Path(sys.prefix).resolve(),
+        Path(sys.base_prefix).resolve(),
+        *(Path(sysconfig.get_path(key)).resolve() for key in ("purelib", "platlib")),
+    }
+    return path.is_relative_to(source) or any(
+        path == root or path.is_relative_to(root) for root in roots
+    )
+
+
+
 
 def _profile_state_exclusions(
     origin: Path,
@@ -433,10 +446,14 @@ def _runtime_import_roots(source: Path, *, profile_home=None, project_plugins_en
         )
         if in_source or _is_stdlib(path) or (not path.exists() and path not in plugin_roots):
             continue
-        if path == profile or path.is_relative_to(profile):
-            if not _is_sanctioned_plugin_root(path, plugin_roots):
-                continue
-        if profile.is_relative_to(path) and not _is_sanctioned_plugin_root(path, plugin_roots):
+        exempt = _is_interpreter_or_install_root(path, source)
+        if path == profile:
+            continue
+        if (
+            (path.is_relative_to(profile) or profile.is_relative_to(path))
+            and not exempt
+            and not _is_sanctioned_plugin_root(path, plugin_roots)
+        ):
             continue
         if not any(path == root or path.is_relative_to(root) for root in roots):
             roots.append(path)
