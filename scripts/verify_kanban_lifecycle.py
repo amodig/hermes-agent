@@ -174,6 +174,7 @@ import uuid
 import contextlib
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_db_connect import connect
 from hermes_cli import kanban_db_dispatch as dispatcher
 from hermes_cli import kanban_runtime as runtime
 from hermes_cli import kanban_runtime_generation as generations
@@ -254,7 +255,7 @@ try:
     db_path = board_home / "kanban.db"
     os.environ["HERMES_KANBAN_DB"] = str(db_path)
     os.environ["HERMES_KANBAN_WORKSPACES_ROOT"] = str(board_home / "workspaces")
-    conn = kb.connect(db_path)
+    conn = connect(db_path)
     try:
         task_id = kb.create_task(
             conn,
