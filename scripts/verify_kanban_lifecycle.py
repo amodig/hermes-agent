@@ -159,6 +159,404 @@ def _probe_identity(runtime_root: Path, python: str, *, layer: str) -> dict:
     return identity
 
 
+def _dispatcher_probe_script() -> str:
+    """Return the isolated dispatcher/materialization proof program."""
+    return r"""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+import contextlib
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as dispatcher
+from hermes_cli import kanban_runtime as runtime
+from hermes_cli import kanban_runtime_generation as generations
+for finder in tuple(sys.meta_path):
+    if getattr(finder, "__module__", "").startswith("__editable__"):
+        sys.meta_path.remove(finder)
+for name, module in tuple(sys.modules.items()):
+    if name.startswith("__editable__") and isinstance(getattr(module, "MAPPING", None), dict):
+        sys.modules.pop(name, None)
+
+
+def _emit(payload):
+    print("__HERMES_DISPATCHER_PROBE__" + json.dumps(payload, sort_keys=True))
+
+
+profile = Path(os.environ["HERMES_HOME"]).resolve()
+board_home = Path(os.environ["HERMES_KANBAN_HOME"]).resolve()
+runtime_root = Path(sys.argv[1]).resolve()
+expected = runtime.RuntimeIdentity.from_value(
+    json.loads(os.environ["HERMES_VERIFY_EXPECTED_IDENTITY"])
+)
+profile.mkdir(parents=True, exist_ok=True)
+board_home.mkdir(parents=True, exist_ok=True)
+sentinel_token = f"synthetic-token-{uuid.uuid4().hex}"
+state_marker = f"synthetic-state-db-{uuid.uuid4().hex}"
+env_marker = f"SYNTHETIC_TOKEN={uuid.uuid4().hex}"
+for directory in ("sessions", "logs", "state", "cache"):
+    target = profile / directory
+    target.mkdir(parents=True, exist_ok=True)
+    for index in range(64):
+        (target / f"seed-{index:03d}.dat").write_text("synthetic profile state\n", encoding="utf-8")
+(profile / "state" / "fingerprint-race.bin").write_bytes(b"state" * 2_000_000)
+(profile / "sessions" / "secret-sentinel.txt").write_text(
+    sentinel_token + "\n", encoding="utf-8"
+)
+(profile / "state.db").write_bytes(state_marker.encode("ascii"))
+(profile / "kanban.db").write_bytes(b"synthetic-kanban-db")
+(profile / ".env.sentinel").write_text(env_marker + "\n", encoding="utf-8")
+
+churn_stop = threading.Event()
+churn_count = 0
+
+
+def _churn_profile():
+    global churn_count
+    tick = 0
+    while not churn_stop.is_set():
+        tick += 1
+        try:
+            (profile / "sessions" / f"live-{tick % 32:02d}.log").write_text(
+                f"synthetic session update {tick}\n", encoding="utf-8"
+            )
+            with (profile / "logs" / "gateway.log").open("ab") as stream:
+                stream.write(f"synthetic log update {tick}\n".encode("ascii"))
+            (profile / "state.db").write_bytes(f"synthetic-state-{tick}".encode("ascii"))
+            (profile / "kanban.db").write_bytes(f"synthetic-kanban-{tick}".encode("ascii"))
+            with (profile / "state" / "fingerprint-race.bin").open("ab") as stream:
+                stream.write(b"x")
+            (profile / "cache" / "board.cache").write_bytes(f"cache-{tick}".encode("ascii"))
+            churn_count += 1
+        except OSError:
+            break
+        time.sleep(0.001)
+
+
+storage = profile.parent / "runtime-storage"
+generations._runtime_storage_root = lambda: storage
+dispatcher._profile_exists_fn = lambda: (lambda _name: True)
+proof = {}
+generation = None
+churn_thread = threading.Thread(target=_churn_profile, daemon=True)
+churn_thread.start()
+try:
+    source_identity = runtime.runtime_identity(runtime_root)
+    if not runtime.same_code_identity(expected, source_identity):
+        raise RuntimeError("layer runtime identity changed before materialization")
+
+    db_path = board_home / "kanban.db"
+    os.environ["HERMES_KANBAN_DB"] = str(db_path)
+    os.environ["HERMES_KANBAN_WORKSPACES_ROOT"] = str(board_home / "workspaces")
+    conn = kb.connect(db_path)
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="layer dispatcher materialization proof",
+            assignee="verify",
+            initial_status="blocked",
+            workspace_kind="scratch",
+        )
+        kb.unblock_task(conn, task_id)
+
+        def spawn(task, workspace, *, board=None):
+            nonlocal_generation = None
+            try:
+                nonlocal_generation = generations.prepare_runtime_generation(
+                    source_identity,
+                    workspace=workspace,
+                    profile_home=profile,
+                    project_plugins_enabled=False,
+                )
+                worker_env = {**os.environ, **nonlocal_generation.env}
+                worker_env.update(
+                    {
+                        "HERMES_HOME": str(profile),
+                        "HERMES_KANBAN_HOME": str(board_home),
+                        "HERMES_PROFILE": "verify",
+                    }
+                )
+                bootstrap_path = profile.parent / f"bootstrap-{uuid.uuid4().hex}.json"
+                preparation_id = f"verify-{uuid.uuid4().hex}"
+                worker_env.update(
+                    {
+                        "HERMES_KANBAN_BOOTSTRAP_PATH": str(bootstrap_path),
+                        "HERMES_KANBAN_PREPARATION_ID": preparation_id,
+                        "HERMES_KANBAN_EXPECTED_RUNTIME": json.dumps(
+                            nonlocal_generation.identity.as_dict(), sort_keys=True,
+                        ),
+                        "HERMES_KANBAN_BOOTSTRAP_WAIT": "0",
+                    }
+                )
+                worker = subprocess.run(
+                    [*nonlocal_generation.command_prefix, "--runtime-identity"],
+                    cwd=workspace,
+                    env=worker_env,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=60,
+                )
+                lines = [line.strip() for line in worker.stdout.splitlines() if line.strip()]
+                observed = json.loads(lines[-1]) if lines else {}
+                bootstrap = (
+                    json.loads(bootstrap_path.read_text(encoding="utf-8"))
+                    if bootstrap_path.is_file()
+                    else {}
+                )
+                same_generation = (
+                    worker.returncode == 0
+                    and isinstance(observed, dict)
+                    and runtime.same_code_identity(nonlocal_generation.identity, observed)
+                    and observed.get("module_root") == str(runtime_root)
+                )
+                manifest = generations.generation_manifest(nonlocal_generation.root)
+                payload_names = {
+                    path.relative_to(nonlocal_generation.root).as_posix()
+                    for path in nonlocal_generation.root.rglob("*")
+                }
+                sentinels = (
+                    "sessions/secret-sentinel.txt",
+                    "state.db",
+                    "kanban.db",
+                    ".env.sentinel",
+                )
+                no_profile_state = not any(
+                    name == sentinel or name.endswith("/" + sentinel)
+                    for sentinel in sentinels
+                    for name in payload_names
+                )
+                payload_bytes = (
+                    path.read_bytes()
+                    for path in nonlocal_generation.root.rglob("*")
+                    if path.is_file()
+                )
+                no_profile_state = no_profile_state and not any(
+                    marker in content
+                    for content in payload_bytes
+                    for marker in (
+                        sentinel_token.encode("utf-8"),
+                        state_marker.encode("ascii"),
+                        env_marker.encode("ascii"),
+                    )
+                )
+                worker_ready = bootstrap.get("ready") is True
+                proof.update(
+                    {
+                        "worker_bootstrap": bool(same_generation and worker_ready and no_profile_state),
+                        "runtime_identity": observed
+                        if isinstance(observed, dict)
+                        else nonlocal_generation.identity.as_dict(),
+                        "diagnostics": []
+                        if same_generation and worker_ready and no_profile_state
+                        else ["worker identity or sealed payload proof failed"],
+                        "manifest_identity": manifest.get("identity", {}),
+                    }
+                )
+                with contextlib.suppress(OSError):
+                    bootstrap_path.unlink()
+                if not same_generation:
+                    proof["diagnostics"].append("worker did not report the frozen runtime identity")
+                if not worker_ready:
+                    proof["diagnostics"].append("worker bootstrap did not report ready")
+                if not no_profile_state:
+                    proof["diagnostics"].append("profile-state sentinel appeared in the sealed payload")
+                return dispatcher.WorkerLaunch(
+                    pid=int(observed["pid"]),
+                    runtime_identity=observed,
+                    preparation_id=preparation_id,
+                )
+            except Exception as exc:
+                proof["worker_bootstrap"] = False
+                proof["runtime_identity"] = (
+                    nonlocal_generation.identity.as_dict()
+                    if nonlocal_generation is not None
+                    else source_identity.as_dict()
+                )
+                proof["diagnostics"] = [
+                    f"materialization raised {type(exc).__name__}: {str(exc)[:500]}",
+                ]
+                raise
+            finally:
+                if nonlocal_generation is not None:
+                    generations.cleanup_runtime_generation(nonlocal_generation.root, force=True)
+
+        result = dispatcher.dispatch_once(
+            conn,
+            spawn_fn=spawn,
+            max_spawn=1,
+            reconcile_orphans=False,
+        )
+        proof["dispatcher_spawned"] = any(
+            entry[0] == task_id for entry in result.spawned
+        )
+    finally:
+        conn.close()
+finally:
+    churn_stop.set()
+    churn_thread.join(timeout=5)
+
+evidence = {
+    "profile_churn": bool(churn_count),
+    "worker_bootstrap": bool(proof.get("worker_bootstrap")),
+    "runtime_identity": proof.get("runtime_identity") or expected.as_dict(),
+}
+diagnostics = list(proof.get("diagnostics") or [])
+if not proof.get("dispatcher_spawned"):
+    diagnostics.append("dispatcher did not materialize a worker launch")
+ok = (
+    evidence["profile_churn"]
+    and evidence["worker_bootstrap"]
+    and bool(proof.get("dispatcher_spawned"))
+)
+_emit({"ok": ok, "diagnostics": diagnostics, "evidence": evidence})
+raise SystemExit(0 if ok else 1)
+"""
+
+
+def _dispatcher_materialization_check(
+    layer: str,
+    runtime_root: Path,
+    python: str,
+    identity: dict,
+    *,
+    temp_root: Path | None = None,
+) -> dict:
+    """Exercise dispatch_once, sealed generation publication, and a worker."""
+    evidence = {
+        "profile_churn": False,
+        "worker_bootstrap": False,
+        "runtime_identity": dict(identity),
+    }
+    diagnostics: list[str] = []
+    with tempfile.TemporaryDirectory(
+        prefix="kanban-dispatch-proof-",
+        dir=str(temp_root) if temp_root is not None else None,
+    ) as raw:
+        proof_root = Path(raw)
+        profile = proof_root / "profile"
+        profile.mkdir()
+        board = proof_root / "board"
+        env = os.environ.copy()
+        env.update(
+            {
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "HERMES_HOME": str(profile),
+                "HERMES_KANBAN_HOME": str(board),
+                "HERMES_PROFILE": "verify",
+                "HERMES_ENABLE_PROJECT_PLUGINS": "0",
+                "HERMES_VERIFY_EXPECTED_IDENTITY": json.dumps(identity, sort_keys=True),
+                "PYTHONPATH": _pythonpath(layer, runtime_root),
+            }
+        )
+        for name in (
+            "HERMES_KANBAN_RUNTIME_GENERATION",
+            "HERMES_KANBAN_BOOTSTRAP_PATH",
+            "HERMES_KANBAN_PREPARATION_ID",
+            "HERMES_KANBAN_EXPECTED_RUNTIME",
+            "HERMES_KANBAN_BOOTSTRAP_WAIT",
+        ):
+            env.pop(name, None)
+        try:
+            result = subprocess.run(
+                [python, "-c", _dispatcher_probe_script(), str(runtime_root)],
+                cwd=profile,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=180,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            diagnostics.append(f"dispatcher materialization probe raised {type(exc).__name__}")
+            return {
+                "status": "failed",
+                "diagnostics": diagnostics,
+                "evidence": evidence,
+            }
+        marker = "__HERMES_DISPATCHER_PROBE__"
+        payload = None
+        for line in reversed(result.stdout.splitlines()):
+            if line.startswith(marker):
+                try:
+                    payload = json.loads(line[len(marker):])
+                except json.JSONDecodeError:
+                    payload = None
+                break
+        if not isinstance(payload, dict):
+            diagnostics.append(
+                f"dispatcher materialization probe exited with status {result.returncode}"
+            )
+            return {
+                "status": "failed",
+                "diagnostics": diagnostics,
+                "evidence": evidence,
+            }
+        raw_evidence = payload.get("evidence")
+        if isinstance(raw_evidence, dict):
+            evidence["profile_churn"] = bool(raw_evidence.get("profile_churn"))
+            evidence["worker_bootstrap"] = bool(raw_evidence.get("worker_bootstrap"))
+            if isinstance(raw_evidence.get("runtime_identity"), dict):
+                evidence["runtime_identity"] = dict(raw_evidence["runtime_identity"])
+        diagnostics.extend(
+            value for value in payload.get("diagnostics", ())
+            if isinstance(value, str)
+        )
+        required_identity = (
+            "protocol",
+            "code_sha",
+            "version",
+            "module_root",
+            "fingerprint",
+            "generation",
+            "dependency_fingerprint",
+        )
+        observed = evidence["runtime_identity"]
+        if any(key not in observed for key in required_identity):
+            diagnostics.append("worker evidence omitted runtime identity fields")
+        elif any(observed[key] != identity.get(key) for key in required_identity[:5]):
+            diagnostics.append("worker evidence does not match the selected layer identity")
+        if result.returncode != 0:
+            diagnostics.append(
+                f"dispatcher materialization probe exited with status {result.returncode}"
+            )
+        status = (
+            "pass"
+            if result.returncode == 0
+            and bool(payload.get("ok"))
+            and evidence["profile_churn"]
+            and evidence["worker_bootstrap"]
+            and not diagnostics
+            else "failed"
+        )
+    return {
+        "status": status,
+        "diagnostics": diagnostics,
+        "evidence": evidence,
+    }
+
+
+def _empty_materialization_check(identity: dict | None = None) -> dict:
+    return {
+        "status": "failed",
+        "diagnostics": [],
+        "evidence": {
+            "profile_churn": False,
+            "worker_bootstrap": False,
+            "runtime_identity": dict(identity or {}),
+        },
+    }
+
+
+
 def _pytest_available(python: str) -> bool:
     return subprocess.run(
         [python, "-c", "import pytest"], capture_output=True, check=False
@@ -314,7 +712,7 @@ def main(argv: list[str] | None = None) -> int:
     runtime_root = (args.runtime_root or REPO_ROOT).resolve()
     created = datetime.now(timezone.utc).isoformat()
     receipt = {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_at": created,
         "reference": {
             "layer": args.layer,
@@ -324,6 +722,10 @@ def main(argv: list[str] | None = None) -> int:
         },
         "result": {"status": "incomplete", "scenarios": [], "diagnostics": []},
     }
+    if args.layer != "active":
+        receipt["result"]["checks"] = {
+            "dispatcher_materialization": _empty_materialization_check(),
+        }
     receipt_path = args.receipt or args.receipt_dir / f"kanban-lifecycle-{args.layer}-{int(time.time())}.json"
     try:
         receipt["reference"]["policy_digest"] = _policy_digest(
@@ -362,6 +764,12 @@ def main(argv: list[str] | None = None) -> int:
                 "module_root": identity.get("module_root"),
             }
         )
+        receipt["result"]["checks"]["dispatcher_materialization"] = _dispatcher_materialization_check(
+            args.layer,
+            runtime_root,
+            sys.executable,
+            identity,
+        )
         return_code, output, runner, pythonpath = _run_suite(
             args.layer, runtime_root, sys.executable, args.junit
         )
@@ -378,9 +786,18 @@ def main(argv: list[str] | None = None) -> int:
         receipt["reference"]["runner"] = runner
         receipt["reference"]["pythonpath"] = pythonpath
         receipt["result"]["scenarios"] = scenarios
-        receipt["result"]["status"] = "pass" if return_code == 0 else "failed"
+        materialization = receipt["result"]["checks"]["dispatcher_materialization"]
+        receipt["result"]["status"] = (
+            "pass"
+            if return_code == 0 and materialization["status"] == "pass"
+            else "failed"
+        )
         if return_code != 0:
             receipt["result"]["diagnostics"].append(output[-4000:])
+        elif materialization["status"] != "pass":
+            receipt["result"]["diagnostics"].append(
+                "dispatcher materialization check failed"
+            )
         receipt["result"]["exit_code"] = return_code
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         receipt["result"]["diagnostics"].append(str(exc))
