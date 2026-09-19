@@ -165,13 +165,10 @@ def _dispatcher_probe_script() -> str:
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
-import contextlib
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect
@@ -204,6 +201,17 @@ from hermes_cli.profiles import resolve_profile_env
 if Path(resolve_profile_env("verify")).resolve() != worker_profile:
     raise RuntimeError("native worker profile selection did not resolve the child profile")
 board_home.mkdir(parents=True, exist_ok=True)
+gateway_profile.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+# Keep the native child on its constructor/grant fence with a local-only,
+# credential-free provider.  No network request can reach a paid endpoint.
+worker_profile.joinpath("config.yaml").write_text(
+    "model:\n"
+    "  provider: openai\n"
+    "  model: hermes-issue22-synthetic\n"
+    "  base_url: http://127.0.0.1:9/v1\n"
+    "  api_key: synthetic-issue22-key\n",
+    encoding="utf-8",
+)
 if "" not in sys.path:
     sys.path.insert(0, "")
 if str(gateway_profile) not in sys.path:
@@ -274,10 +282,9 @@ def _churn_profile():
 
 
 storage = profile.parent / "runtime-storage"
+proof = {"cancelled_before_grant": False}
 generations._runtime_storage_root = lambda: storage
 dispatcher._profile_exists_fn = lambda: (lambda _name: True)
-proof = {}
-generation = None
 churn_thread = threading.Thread(target=_churn_profile, daemon=True)
 churn_thread.start()
 try:
@@ -299,107 +306,30 @@ try:
         )
         kb.unblock_task(conn, task_id)
 
+        # The native launcher reaches worker_bootstrap_after_constructor before
+        # any model request.  Keep its normal argv and let the real grant fence
+        # block the child while this probe cancels the deferred launch.
         def spawn(task, workspace, *, board=None):
-            nonlocal_generation = None
-            worker = None
+            launch = None
             try:
                 if Path(os.environ["HERMES_HOME"]).resolve() != gateway_profile:
                     raise RuntimeError("dispatcher HERMES_HOME changed before generation")
-                nonlocal_generation = generations.prepare_runtime_generation(
-                    source_identity,
-                    workspace=workspace,
-                    profile_home=worker_profile,
-                    project_plugins_enabled=False,
+                launch = dispatcher._default_spawn(
+                    task, workspace, board=board, defer_grant=True,
                 )
-                worker_env = {**os.environ, **nonlocal_generation.env}
-                worker_env.update(
-                    {
-                        "HERMES_HOME": str(worker_profile),
-                        "HERMES_KANBAN_HOME": str(board_home),
-                        "HERMES_PROFILE": "verify",
-                    }
-                )
-                bootstrap_path = profile.parent / f"bootstrap-{uuid.uuid4().hex}.json"
-                preparation_id = f"verify-{uuid.uuid4().hex}"
-                worker_env.update(
-                    {
-                        "HERMES_KANBAN_BOOTSTRAP_PATH": str(bootstrap_path),
-                        "HERMES_KANBAN_PREPARATION_ID": preparation_id,
-                        "HERMES_KANBAN_EXPECTED_RUNTIME": json.dumps(
-                            nonlocal_generation.identity.as_dict(), sort_keys=True,
-                        ),
-                        "HERMES_KANBAN_BOOTSTRAP_WAIT": "1",
-                    }
-                )
-                worker_args = dispatcher._worker_argv(task, "verify", str(worker_profile))
-                if worker_args[:2] == ["-p", "verify"]:
-                    del worker_args[:2]
-                # Keep the real worker command, but let argparse's help path
-                # exit before model/provider startup.
-                worker_args.append("--help")
-                worker = subprocess.Popen(
-                    [*nonlocal_generation.command_prefix, *worker_args],
-                    cwd=workspace,
-                    env=worker_env,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-                deadline = time.monotonic() + 60
-                pre_import = None
-                while time.monotonic() < deadline:
-                    if bootstrap_path.is_file():
-                        try:
-                            candidate = json.loads(bootstrap_path.read_text(encoding="utf-8"))
-                        except (OSError, json.JSONDecodeError):
-                            candidate = None
-                        if isinstance(candidate, dict) and candidate.get("phase") == "pre_import":
-                            pre_import = candidate
-                            break
-                    if worker.poll() is not None:
-                        break
-                    time.sleep(0.05)
-                if not isinstance(pre_import, dict):
-                    raise RuntimeError("worker did not report pre-import bootstrap")
-                early = pre_import.get("runtime_identity")
-                if (
-                    pre_import.get("ready") is not True
-                    or str(pre_import.get("preparation_id")) != preparation_id
-                    or not isinstance(early, dict)
-                    or not runtime.same_code_identity(nonlocal_generation.identity, early)
-                ):
-                    raise RuntimeError("worker pre-import identity did not match the sealed runtime")
-                if worker.stdin is None:
-                    raise RuntimeError("worker bootstrap pipe unavailable")
-                worker.stdin.write(json.dumps(
-                    {
-                        "continue_imports": True,
-                        "preparation_id": preparation_id,
-                        "runtime_identity": early,
-                    },
-                    sort_keys=True,
-                ) + "\n")
-                worker.stdin.flush()
-                _worker_stdout, worker_stderr = worker.communicate(timeout=60)
-                bootstrap = (
-                    json.loads(bootstrap_path.read_text(encoding="utf-8"))
-                    if bootstrap_path.is_file()
-                    else {}
-                )
-                observed = bootstrap.get("runtime_identity")
-                same_generation = (
-                    worker.returncode == 0
-                    and isinstance(observed, dict)
-                    and runtime.same_code_identity(nonlocal_generation.identity, observed)
-                    and observed.get("module_root") == str(runtime_root)
-                )
-                manifest = generations.generation_manifest(nonlocal_generation.root)
+                if not isinstance(launch, dispatcher.WorkerLaunch):
+                    raise RuntimeError("native dispatcher did not return WorkerLaunch")
+                if launch.grant is None or launch.cancel is None:
+                    raise RuntimeError("native deferred launch omitted grant/cancel")
+                snapshot = dispatcher._worker_runtime_snapshots.get(launch.launcher_pid)
+                if snapshot is None:
+                    raise RuntimeError("native launch did not retain its runtime generation")
+                snapshot = Path(snapshot)
+                observed = dict(launch.runtime_identity)
+                manifest = generations.generation_manifest(snapshot)
                 payload_names = {
-                    path.relative_to(nonlocal_generation.root).as_posix()
-                    for path in nonlocal_generation.root.rglob("*")
+                    path.relative_to(snapshot).as_posix()
+                    for path in snapshot.rglob("*")
                 }
                 sentinels = (
                     "sessions/secret-sentinel.txt",
@@ -415,7 +345,7 @@ try:
                 )
                 payload_bytes = (
                     path.read_bytes()
-                    for path in nonlocal_generation.root.rglob("*")
+                    for path in snapshot.rglob("*")
                     if path.is_file()
                 )
                 profile_marker_values = tuple(
@@ -428,50 +358,67 @@ try:
                     for content in payload_bytes
                     for marker in profile_marker_values
                 )
-                worker_ready = (
-                    bootstrap.get("ready") is True
-                    and bootstrap.get("phase") == "post_import"
-                    and bootstrap.get("post_import") is True
-                    and str(bootstrap.get("preparation_id")) == preparation_id
-                    and str(bootstrap.get("runtime_generation"))
-                    == str(nonlocal_generation.root)
-                    and isinstance(bootstrap.get("runtime_identity"), dict)
+                preparation_path = (
+                    board_home / "kanban" / "runtime-preparations"
+                    / f"{task.id}-{launch.preparation_id}.json"
+                )
+                post_import = json.loads(preparation_path.read_text(encoding="utf-8"))
+                native_post_import = (
+                    post_import.get("ready") is True
+                    and post_import.get("phase") == "post_import"
+                    and post_import.get("post_import") is True
+                    and str(post_import.get("preparation_id")) == launch.preparation_id
+                    and str(post_import.get("runtime_generation")) == str(snapshot)
+                    and isinstance(post_import.get("runtime_identity"), dict)
                     and runtime.same_code_identity(
-                        nonlocal_generation.identity, bootstrap["runtime_identity"],
+                        observed, post_import["runtime_identity"],
                     )
+                )
+                same_generation = (
+                    runtime.same_code_identity(manifest["identity"], observed)
+                    and observed.get("module_root") == str(runtime_root)
+                    and observed.get("generation") == manifest["identity"].get("generation")
                 )
                 proof.update(
                     {
-                        "worker_bootstrap": bool(same_generation and worker_ready and no_profile_state),
-                        "runtime_identity": observed
-                        if isinstance(observed, dict)
-                        else nonlocal_generation.identity.as_dict(),
+                        "worker_bootstrap": bool(
+                            same_generation and native_post_import and no_profile_state
+                        ),
+                        "runtime_identity": observed,
                         "diagnostics": []
-                        if same_generation and worker_ready and no_profile_state
-                        else ["worker identity or sealed payload proof failed"],
+                        if same_generation and native_post_import and no_profile_state
+                        else ["native worker identity or sealed payload proof failed"],
                         "manifest_identity": manifest.get("identity", {}),
                     }
                 )
-                if worker.returncode != 0 and worker_stderr:
-                    proof["diagnostics"].append(worker_stderr[-500:])
-                with contextlib.suppress(OSError):
-                    bootstrap_path.unlink()
                 if not same_generation:
-                    proof["diagnostics"].append("worker did not report the frozen runtime identity")
-                if not worker_ready:
-                    proof["diagnostics"].append("worker post-import bootstrap did not report ready")
+                    proof["diagnostics"].append(
+                        "worker did not report the frozen runtime identity",
+                    )
+                if not native_post_import:
+                    proof["diagnostics"].append(
+                        "native worker post-import bootstrap did not report ready",
+                    )
                 if not no_profile_state:
-                    proof["diagnostics"].append("profile-state sentinel appeared in the sealed payload")
+                    proof["diagnostics"].append(
+                        "profile-state sentinel appeared in the sealed payload",
+                    )
+                # Do not invoke grant: cancel while the native constructor fence
+                # is waiting, before Kanban tools or a model request can start.
+                launch.cancel()
+                proof["cancelled_before_grant"] = True
+                cancelled = launch
+                launch = None
                 return dispatcher.WorkerLaunch(
-                    pid=int(observed["pid"]),
-                    runtime_identity=observed,
-                    preparation_id=preparation_id,
+                    pid=cancelled.pid,
+                    runtime_identity=cancelled.runtime_identity,
+                    preparation_id=cancelled.preparation_id,
                 )
             except Exception as exc:
                 proof["worker_bootstrap"] = False
                 proof["runtime_identity"] = (
-                    nonlocal_generation.identity.as_dict()
-                    if nonlocal_generation is not None
+                    launch.runtime_identity
+                    if isinstance(launch, dispatcher.WorkerLaunch)
                     else source_identity.as_dict()
                 )
                 proof["diagnostics"] = [
@@ -479,12 +426,8 @@ try:
                 ]
                 raise
             finally:
-                if worker is not None and worker.poll() is None:
-                    worker.terminate()
-                    with contextlib.suppress(Exception):
-                        worker.communicate(timeout=5)
-                if nonlocal_generation is not None:
-                    generations.cleanup_runtime_generation(nonlocal_generation.root, force=True)
+                if launch is not None and launch.cancel is not None:
+                    launch.cancel()
 
         result = dispatcher.dispatch_once(
             conn,
@@ -504,14 +447,18 @@ finally:
 evidence = {
     "profile_churn": all(churn_counts.values()),
     "worker_bootstrap": bool(proof.get("worker_bootstrap")),
+    "cancelled_before_grant": bool(proof.get("cancelled_before_grant")),
     "runtime_identity": proof.get("runtime_identity") or expected.as_dict(),
 }
 diagnostics = list(proof.get("diagnostics") or [])
 if not proof.get("dispatcher_spawned"):
     diagnostics.append("dispatcher did not materialize a worker launch")
+if not evidence["cancelled_before_grant"]:
+    diagnostics.append("native deferred launch was not cancelled before grant")
 ok = (
     evidence["profile_churn"]
     and evidence["worker_bootstrap"]
+    and evidence["cancelled_before_grant"]
     and bool(proof.get("dispatcher_spawned"))
 )
 _emit({"ok": ok, "diagnostics": diagnostics, "evidence": evidence})
@@ -531,6 +478,7 @@ def _dispatcher_materialization_check(
     evidence = {
         "profile_churn": False,
         "worker_bootstrap": False,
+        "cancelled_before_grant": False,
         "runtime_identity": dict(identity),
     }
     diagnostics: list[str] = []
@@ -562,6 +510,14 @@ def _dispatcher_materialization_check(
             "HERMES_KANBAN_BOOTSTRAP_WAIT",
         ):
             env.pop(name, None)
+        for key in tuple(env):
+            if key.endswith(("_API_KEY", "_ACCESS_TOKEN", "_SECRET_KEY")) or key in {
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SESSION_TOKEN",
+                "BWS_ACCESS_TOKEN",
+                "OP_SERVICE_ACCOUNT_TOKEN",
+            }:
+                env.pop(key, None)
         try:
             result = subprocess.run(
                 [python, "-c", _dispatcher_probe_script(), str(runtime_root)],
@@ -602,6 +558,9 @@ def _dispatcher_materialization_check(
         if isinstance(raw_evidence, dict):
             evidence["profile_churn"] = bool(raw_evidence.get("profile_churn"))
             evidence["worker_bootstrap"] = bool(raw_evidence.get("worker_bootstrap"))
+            evidence["cancelled_before_grant"] = bool(
+                raw_evidence.get("cancelled_before_grant")
+            )
             if isinstance(raw_evidence.get("runtime_identity"), dict):
                 evidence["runtime_identity"] = dict(raw_evidence["runtime_identity"])
         diagnostics.extend(
@@ -632,6 +591,7 @@ def _dispatcher_materialization_check(
             and bool(payload.get("ok"))
             and evidence["profile_churn"]
             and evidence["worker_bootstrap"]
+            and evidence["cancelled_before_grant"]
             and not diagnostics
             else "failed"
         )
@@ -649,6 +609,7 @@ def _empty_materialization_check(identity: dict | None = None) -> dict:
         "evidence": {
             "profile_churn": False,
             "worker_bootstrap": False,
+            "cancelled_before_grant": False,
             "runtime_identity": dict(identity or {}),
         },
     }

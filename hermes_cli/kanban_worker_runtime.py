@@ -33,6 +33,9 @@ def _dispatcher():
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024
 DEFAULT_LOG_BACKUP_COUNT = 1
 
+# Sealed-payload validation scales with installed dependency size in both phases.
+_BOOTSTRAP_PHASE_TIMEOUT_SECONDS = 60.0
+
 
 @dataclass(frozen=True)
 class WorkerLaunch:
@@ -647,7 +650,7 @@ def _default_spawn(
         _worker_processes[proc.pid] = proc
         _worker_runtime_snapshots[proc.pid] = generation.root
         log_f.close()
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + _BOOTSTRAP_PHASE_TIMEOUT_SECONDS
         payload = None
         while time.monotonic() < deadline:
             if preparation_path.is_file():
@@ -680,7 +683,7 @@ def _default_spawn(
         }, sort_keys=True).encode("utf-8") + b"\n")
         proc.stdin.flush()
 
-        post_deadline = time.monotonic() + 30.0
+        post_deadline = time.monotonic() + _BOOTSTRAP_PHASE_TIMEOUT_SECONDS
         post_payload = None
         while time.monotonic() < post_deadline:
             if preparation_path.is_file():
