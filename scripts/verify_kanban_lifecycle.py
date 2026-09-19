@@ -338,7 +338,7 @@ try:
 
         def _claim_matches(launch, run_id, claim_lock):
             row = _claim_row()
-            if row is None:
+            if row is None or not isinstance(claim_lock, str) or not claim_lock:
                 return False
             try:
                 metadata = json.loads(row["run_metadata"] or "{}")
