@@ -282,7 +282,12 @@ def _churn_profile():
 
 
 storage = profile.parent / "runtime-storage"
-proof = {"cancelled_before_grant": False}
+proof = {
+    "cancelled_before_grant": False,
+    "claim_persisted_identity": False,
+    "diagnostics": [],
+    "launched_before_claim": False,
+}
 generations._runtime_storage_root = lambda: storage
 dispatcher._profile_exists_fn = lambda: (lambda _name: True)
 churn_thread = threading.Thread(target=_churn_profile, daemon=True)
@@ -296,6 +301,9 @@ try:
     os.environ["HERMES_KANBAN_DB"] = str(db_path)
     os.environ["HERMES_KANBAN_WORKSPACES_ROOT"] = str(board_home / "workspaces")
     conn = connect(db_path)
+    deferred_cleanup = []
+    native_cleanup = generations.cleanup_runtime_generation
+    native_default_spawn = dispatcher._default_spawn
     try:
         task_id = kb.create_task(
             conn,
@@ -306,58 +314,130 @@ try:
         )
         kb.unblock_task(conn, task_id)
 
-        # The native launcher reaches worker_bootstrap_after_constructor before
-        # any model request.  Keep its normal argv and let the real grant fence
-        # block the child while this probe cancels the deferred launch.
-        def spawn(task, workspace, *, board=None):
-            launch = None
+        def _defer_generation_cleanup(root, *, force=False):
+            if root is not None:
+                deferred_cleanup.append((Path(root), bool(force)))
+
+        def _claim_row():
+            return conn.execute(
+                '''
+                SELECT t.id AS task_id, t.status AS task_status,
+                       t.claim_lock AS task_claim_lock,
+                       t.worker_pid AS task_worker_pid,
+                       t.current_run_id AS task_run_id,
+                       r.id AS run_id, r.status AS run_status,
+                       r.claim_lock AS run_claim_lock,
+                       r.worker_pid AS run_worker_pid,
+                       r.metadata AS run_metadata
+                  FROM tasks t
+             LEFT JOIN task_runs r ON r.id = t.current_run_id
+                 WHERE t.id = ?
+                ''',
+                (task_id,),
+            ).fetchone()
+
+        def _claim_matches(launch, run_id, claim_lock):
+            row = _claim_row()
+            if row is None:
+                return False
             try:
-                if Path(os.environ["HERMES_HOME"]).resolve() != gateway_profile:
-                    raise RuntimeError("dispatcher HERMES_HOME changed before generation")
-                launch = dispatcher._default_spawn(
-                    task, workspace, board=board, defer_grant=True,
+                metadata = json.loads(row["run_metadata"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                return False
+            persisted = metadata.get("runtime_identity")
+            return bool(
+                row["task_status"] == "running"
+                and row["run_status"] == "running"
+                and row["task_run_id"] == row["run_id"] == int(run_id)
+                and row["task_claim_lock"] == row["run_claim_lock"] == claim_lock
+                and row["task_worker_pid"] == row["run_worker_pid"] == int(launch.pid)
+                and metadata.get("worker_pid") == int(launch.pid)
+                and metadata.get("worker_start_time") == int(
+                    launch.runtime_identity["start_time"]
                 )
+                and str(metadata.get("preparation_id")) == launch.preparation_id
+                and runtime.same_runtime_identity(launch.runtime_identity, persisted)
+            )
+
+        sentinels = (
+            "sessions/secret-sentinel.txt",
+            "credentials.sentinel",
+            "state.db",
+            "kanban.db",
+            ".env.sentinel",
+        )
+        profile_marker_values = tuple(
+            marker
+            for markers in profile_markers.values()
+            for marker in markers.values()
+        )
+
+        def _payload_has_no_profile_state(snapshot):
+            payload_names = {
+                path.relative_to(snapshot).as_posix()
+                for path in snapshot.rglob("*")
+            }
+            no_profile_state = not any(
+                name == sentinel or name.endswith("/" + sentinel)
+                for sentinel in sentinels
+                for name in payload_names
+            )
+            payload_bytes = (
+                path.read_bytes()
+                for path in snapshot.rglob("*")
+                if path.is_file()
+            )
+            return no_profile_state and not any(
+                marker.encode("utf-8") in content
+                for content in payload_bytes
+                for marker in profile_marker_values
+            )
+
+        # The native launcher reaches worker_bootstrap_after_constructor before
+        # any model request.  Keep its normal argv and cancel from the grant
+        # fence after checking the durable claim, without granting the child.
+        def instrumented_default_spawn(task, workspace, *, board=None, defer_grant=False):
+            if not defer_grant:
+                raise RuntimeError("materialization probe requires the native deferred grant")
+            if Path(os.environ["HERMES_HOME"]).resolve() != gateway_profile:
+                raise RuntimeError("dispatcher HERMES_HOME changed before generation")
+            launch = None
+            cancelled = False
+
+            def _cancel_launch():
+                nonlocal cancelled
+                if not cancelled:
+                    launch.cancel()
+                    cancelled = True
+
+            previous_cleanup = generations.cleanup_runtime_generation
+            generations.cleanup_runtime_generation = _defer_generation_cleanup
+            try:
+                try:
+                    launch = native_default_spawn(
+                        task, workspace, board=board, defer_grant=True,
+                    )
+                except Exception as exc:
+                    proof["worker_bootstrap"] = False
+                    proof["diagnostics"].append(
+                        f"native worker handshake raised {type(exc).__name__}: {str(exc)[:500]}",
+                    )
+                    raise
+            finally:
+                generations.cleanup_runtime_generation = previous_cleanup
+            try:
                 if not isinstance(launch, dispatcher.WorkerLaunch):
                     raise RuntimeError("native dispatcher did not return WorkerLaunch")
-                if launch.grant is None or launch.cancel is None:
+                native_grant = launch.grant
+                if not callable(native_grant) or launch.cancel is None:
                     raise RuntimeError("native deferred launch omitted grant/cancel")
                 snapshot = dispatcher._worker_runtime_snapshots.get(launch.launcher_pid)
                 if snapshot is None:
                     raise RuntimeError("native launch did not retain its runtime generation")
                 snapshot = Path(snapshot)
                 observed = dict(launch.runtime_identity)
+                proof["runtime_identity"] = observed
                 manifest = generations.generation_manifest(snapshot)
-                payload_names = {
-                    path.relative_to(snapshot).as_posix()
-                    for path in snapshot.rglob("*")
-                }
-                sentinels = (
-                    "sessions/secret-sentinel.txt",
-                    "credentials.sentinel",
-                    "state.db",
-                    "kanban.db",
-                    ".env.sentinel",
-                )
-                no_profile_state = not any(
-                    name == sentinel or name.endswith("/" + sentinel)
-                    for sentinel in sentinels
-                    for name in payload_names
-                )
-                payload_bytes = (
-                    path.read_bytes()
-                    for path in snapshot.rglob("*")
-                    if path.is_file()
-                )
-                profile_marker_values = tuple(
-                    marker
-                    for markers in profile_markers.values()
-                    for marker in markers.values()
-                )
-                no_profile_state = no_profile_state and not any(
-                    marker.encode("utf-8") in content
-                    for content in payload_bytes
-                    for marker in profile_marker_values
-                )
                 preparation_path = (
                     board_home / "kanban" / "runtime-preparations"
                     / f"{task.id}-{launch.preparation_id}.json"
@@ -379,18 +459,21 @@ try:
                     and observed.get("module_root") == str(runtime_root)
                     and observed.get("generation") == manifest["identity"].get("generation")
                 )
-                proof.update(
-                    {
-                        "worker_bootstrap": bool(
-                            same_generation and native_post_import and no_profile_state
-                        ),
-                        "runtime_identity": observed,
-                        "diagnostics": []
-                        if same_generation and native_post_import and no_profile_state
-                        else ["native worker identity or sealed payload proof failed"],
-                        "manifest_identity": manifest.get("identity", {}),
-                    }
+                proof["launched_before_claim"] = bool(
+                    (row := conn.execute(
+                        "SELECT status, claim_lock, current_run_id, worker_pid "
+                        "FROM tasks WHERE id = ?",
+                        (task_id,),
+                    ).fetchone())
+                    and row["status"] == "ready"
+                    and row["claim_lock"] is None
+                    and row["current_run_id"] is None
+                    and row["worker_pid"] is None
                 )
+                if not proof["launched_before_claim"]:
+                    raise RuntimeError("native launch was not observed before the DB claim")
+                metadata_ok = bool(same_generation and native_post_import)
+                proof["manifest_identity"] = manifest.get("identity", {})
                 if not same_generation:
                     proof["diagnostics"].append(
                         "worker did not report the frozen runtime identity",
@@ -399,52 +482,76 @@ try:
                     proof["diagnostics"].append(
                         "native worker post-import bootstrap did not report ready",
                     )
-                if not no_profile_state:
-                    proof["diagnostics"].append(
-                        "profile-state sentinel appeared in the sealed payload",
-                    )
-                # Do not invoke grant: cancel while the native constructor fence
-                # is waiting, before Kanban tools or a model request can start.
-                launch.cancel()
-                proof["cancelled_before_grant"] = True
-                cancelled = launch
-                launch = None
-                return dispatcher.WorkerLaunch(
-                    pid=cancelled.pid,
-                    runtime_identity=cancelled.runtime_identity,
-                    preparation_id=cancelled.preparation_id,
-                )
+
+                def _grant(run_id, claim_lock):
+                    try:
+                        proof["claim_persisted_identity"] = _claim_matches(
+                            launch, run_id, claim_lock,
+                        )
+                        if not proof["claim_persisted_identity"]:
+                            raise RuntimeError(
+                                "claimed DB row did not retain launch identity/run ownership"
+                            )
+                        # Keep the validated native callback in native_grant;
+                        # cancellation is deliberate, so this probe never calls it.
+                        _cancel_launch()
+                        proof["cancelled_before_grant"] = True
+                        no_profile_state = _payload_has_no_profile_state(snapshot)
+                        if not no_profile_state:
+                            proof["diagnostics"].append(
+                                "profile-state sentinel appeared in the sealed payload",
+                            )
+                        proof["worker_bootstrap"] = bool(metadata_ok and no_profile_state)
+                    except Exception as exc:
+                        proof["worker_bootstrap"] = False
+                        proof["diagnostics"].append(
+                            f"grant fence proof raised {type(exc).__name__}: {str(exc)[:500]}",
+                        )
+                        if not cancelled and launch.cancel is not None:
+                            _cancel_launch()
+                        raise
+
+                # Preserve the native WorkerLaunch and only instrument its
+                # already-validated grant callback; no synthetic launch object.
+                object.__setattr__(launch, "grant", _grant)
+                return launch
             except Exception as exc:
                 proof["worker_bootstrap"] = False
-                proof["runtime_identity"] = (
-                    launch.runtime_identity
-                    if isinstance(launch, dispatcher.WorkerLaunch)
-                    else source_identity.as_dict()
-                )
-                proof["diagnostics"] = [
+                proof["diagnostics"].append(
                     f"materialization raised {type(exc).__name__}: {str(exc)[:500]}",
-                ]
+                )
+                if isinstance(launch, dispatcher.WorkerLaunch):
+                    proof["runtime_identity"] = launch.runtime_identity
+                    if not cancelled and launch.cancel is not None:
+                        _cancel_launch()
                 raise
-            finally:
-                if launch is not None and launch.cancel is not None:
-                    launch.cancel()
 
-        result = dispatcher.dispatch_once(
-            conn,
-            spawn_fn=spawn,
-            max_spawn=1,
-            reconcile_orphans=False,
-        )
+        dispatcher._default_spawn = instrumented_default_spawn
+        try:
+            result = dispatcher.dispatch_once(
+                conn,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+        finally:
+            dispatcher._default_spawn = native_default_spawn
         proof["dispatcher_spawned"] = any(
             entry[0] == task_id for entry in result.spawned
         )
     finally:
+        dispatcher._default_spawn = native_default_spawn
         conn.close()
+        for root, _force in deferred_cleanup:
+            native_cleanup(root, force=True)
+        for root in (storage / "workers").glob("hermes-kanban-runtime-*"):
+            native_cleanup(root, force=True)
 finally:
     churn_stop.set()
     churn_thread.join(timeout=5)
 
 evidence = {
+    "claim_persisted_identity": bool(proof.get("claim_persisted_identity")),
+    "launched_before_claim": bool(proof.get("launched_before_claim")),
     "profile_churn": all(churn_counts.values()),
     "worker_bootstrap": bool(proof.get("worker_bootstrap")),
     "cancelled_before_grant": bool(proof.get("cancelled_before_grant")),
@@ -453,11 +560,17 @@ evidence = {
 diagnostics = list(proof.get("diagnostics") or [])
 if not proof.get("dispatcher_spawned"):
     diagnostics.append("dispatcher did not materialize a worker launch")
+if not evidence["launched_before_claim"]:
+    diagnostics.append("native launch was not observed before the DB claim")
+if not evidence["claim_persisted_identity"]:
+    diagnostics.append("claim did not persist the native launch identity")
 if not evidence["cancelled_before_grant"]:
     diagnostics.append("native deferred launch was not cancelled before grant")
 ok = (
     evidence["profile_churn"]
     and evidence["worker_bootstrap"]
+    and evidence["launched_before_claim"]
+    and evidence["claim_persisted_identity"]
     and evidence["cancelled_before_grant"]
     and bool(proof.get("dispatcher_spawned"))
 )
@@ -476,6 +589,8 @@ def _dispatcher_materialization_check(
 ) -> dict:
     """Exercise dispatch_once, sealed generation publication, and a worker."""
     evidence = {
+        "claim_persisted_identity": False,
+        "launched_before_claim": False,
         "profile_churn": False,
         "worker_bootstrap": False,
         "cancelled_before_grant": False,
@@ -556,6 +671,12 @@ def _dispatcher_materialization_check(
             }
         raw_evidence = payload.get("evidence")
         if isinstance(raw_evidence, dict):
+            evidence["claim_persisted_identity"] = bool(
+                raw_evidence.get("claim_persisted_identity")
+            )
+            evidence["launched_before_claim"] = bool(
+                raw_evidence.get("launched_before_claim")
+            )
             evidence["profile_churn"] = bool(raw_evidence.get("profile_churn"))
             evidence["worker_bootstrap"] = bool(raw_evidence.get("worker_bootstrap"))
             evidence["cancelled_before_grant"] = bool(
@@ -591,6 +712,8 @@ def _dispatcher_materialization_check(
             and bool(payload.get("ok"))
             and evidence["profile_churn"]
             and evidence["worker_bootstrap"]
+            and evidence["launched_before_claim"]
+            and evidence["claim_persisted_identity"]
             and evidence["cancelled_before_grant"]
             and not diagnostics
             else "failed"
@@ -607,6 +730,8 @@ def _empty_materialization_check(identity: dict | None = None) -> dict:
         "status": "failed",
         "diagnostics": [],
         "evidence": {
+            "claim_persisted_identity": False,
+            "launched_before_claim": False,
             "profile_churn": False,
             "worker_bootstrap": False,
             "cancelled_before_grant": False,
