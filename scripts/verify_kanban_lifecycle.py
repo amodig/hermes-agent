@@ -13,11 +13,11 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
-import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -39,44 +39,25 @@ SCENARIO_HEADER_RE = re.compile(
     r"^(?P<name>test_[^\s(]+)(?: \((?P<class>[^)]+)\))?"
 )
 
-def _policy_files(policy_root: Path) -> list[Path]:
-    policy_files = (
-        "scripts/apply.sh",
-        "scripts/verify.sh",
-        "scripts/verify_lifecycle.py",
-        "scripts/remnic_plugin.py",
-        "scripts/remnic-project-context",
-        "scripts/hermes-github",
-        "omp/remnic-project-context.ts",
-        "admin/loota-dnf",
-        "admin/install-package-helper",
-        "plugins/consequence_guard/plugin.yaml",
-        "plugins/consequence_guard/__init__.py",
-    )
-    files = [policy_root / relative for relative in policy_files]
-    profiles_root = policy_root / "profiles"
-    for profile in sorted(path for path in profiles_root.iterdir() if path.is_dir()):
-        files.extend(path for path in (profile / "SOUL.md", profile / "config.yaml") if path.is_file())
-    architecture = policy_root / "docs" / "ARCHITECTURE.md"
-    if architecture.is_file():
-        files.append(architecture)
-    decisions = policy_root / "docs" / "decisions"
-    if decisions.is_dir():
-        files.extend(path for path in sorted(decisions.rglob("*")) if path.is_file())
-    missing = [path.relative_to(policy_root).as_posix() for path in files if not path.is_file()]
-    if missing:
-        raise RuntimeError(f"policy artifact is missing: {', '.join(missing)}")
-    return sorted(files, key=lambda path: path.relative_to(policy_root).as_posix())
-
-
 def _policy_digest(policy_root: Path | None) -> str | None:
     if policy_root is None:
         return None
-    digest = hashlib.sha256()
-    for path in _policy_files(policy_root):
-        digest.update(path.relative_to(policy_root).as_posix().encode() + b"\0")
-        digest.update(path.read_bytes() + b"\0")
-    return digest.hexdigest()
+    owner = policy_root / "scripts" / "verify_lifecycle.py"
+    try:
+        if not owner.is_file():
+            raise RuntimeError("owner file is missing or not a regular file")
+        policy_digest = runpy.run_path(str(owner)).get("policy_digest")
+        if not callable(policy_digest):
+            raise RuntimeError("policy_digest(root) is missing or not callable")
+        digest = policy_digest(policy_root)
+    except (Exception, SystemExit) as exc:
+        raise RuntimeError(f"cannot compute policy digest using {owner}: {exc}") from exc
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise RuntimeError(
+            f"policy digest owner {owner} returned an invalid digest; "
+            "expected a lowercase 64-character SHA256 string"
+        )
+    return digest
 
 
 def _pythonpath(layer: str, runtime_root: Path) -> str:

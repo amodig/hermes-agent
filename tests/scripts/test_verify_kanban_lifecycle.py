@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import runpy
 import sys
 from pathlib import Path
 
@@ -36,10 +37,7 @@ def test_installed_verifier_rejects_source_runtime_fallback(tmp_path: Path) -> N
     assert payload["result"]["scenarios"] == []
 
 
-@pytest.mark.parametrize("profiles_present", [False, True])
-def test_policy_failure_writes_incomplete_receipt(tmp_path: Path, profiles_present: bool) -> None:
-    if profiles_present:
-        (tmp_path / "profiles").mkdir()
+def test_policy_failure_writes_incomplete_receipt(tmp_path: Path) -> None:
     receipt_path = tmp_path / "receipt.json"
     code = verify_kanban_lifecycle.main([
         "--layer", "source", "--policy-root", str(tmp_path), "--receipt", str(receipt_path),
@@ -49,8 +47,9 @@ def test_policy_failure_writes_incomplete_receipt(tmp_path: Path, profiles_prese
     assert receipt["result"]["status"] == "incomplete"
     assert receipt["result"]["scenarios"] == []
     assert receipt["reference"]["policy_digest"] is None
-    failed_path = "scripts/apply.sh" if profiles_present else "profiles"
-    assert any(failed_path in message for message in receipt["result"]["diagnostics"])
+    assert any("scripts/verify_lifecycle.py" in message
+               for message in receipt["result"]["diagnostics"])
+    assert verify_kanban_lifecycle._policy_digest(None) is None
 
 
 def test_installed_suite_runs_both_modules_without_source_runtime_fallback(
@@ -117,33 +116,38 @@ def test_installed_suite_runs_both_modules_without_source_runtime_fallback(
     assert runner == "python -c <installed conformance runner>"
 
 
-def test_policy_digest_excludes_untracked_profile_state(tmp_path: Path) -> None:
-    for relative in (
-        "scripts/apply.sh",
-        "scripts/verify.sh",
-        "scripts/verify_lifecycle.py",
-        "scripts/remnic_plugin.py",
-        "scripts/remnic-project-context",
-        "scripts/hermes-github",
-        "omp/remnic-project-context.ts",
-        "admin/loota-dnf",
-        "admin/install-package-helper",
-        "plugins/consequence_guard/plugin.yaml",
-        "plugins/consequence_guard/__init__.py",
-        "profiles/cto/SOUL.md",
-        "profiles/cto/config.yaml",
-    ):
-        artifact = tmp_path / relative
-        artifact.parent.mkdir(parents=True, exist_ok=True)
-        artifact.write_text(relative, encoding="utf-8")
-    digest = verify_kanban_lifecycle._policy_digest(tmp_path)
-    for relative in (
-        ".env", "profiles/cto/.env", "profiles/cto/sessions.json",
-        "profiles/cto/sessions/session.json", "profiles/cto/untracked.txt",
-    ):
-        state = tmp_path / relative
-        state.parent.mkdir(parents=True, exist_ok=True)
-        state.write_text("untracked fixture state", encoding="utf-8")
-    assert verify_kanban_lifecycle._policy_digest(tmp_path) == digest
-    (tmp_path / "profiles/cto/config.yaml").write_text("changed policy", encoding="utf-8")
-    assert verify_kanban_lifecycle._policy_digest(tmp_path) != digest
+def test_policy_digest_uses_trusted_policy_owner_coverage(tmp_path: Path) -> None:
+    owner_path = tmp_path / "scripts" / "verify_lifecycle.py"
+    helper_path = tmp_path / "scripts" / "new_policy_helper.py"
+    owner_path.parent.mkdir(parents=True)
+    owner_path.write_text(
+        "from hashlib import sha256\n"
+        "from pathlib import Path\n"
+        "\n"
+        "def policy_digest(policy_root):\n"
+        "    helper = Path(policy_root) / 'scripts' / 'new_policy_helper.py'\n"
+        "    return sha256(helper.read_bytes()).hexdigest()\n",
+        encoding="utf-8",
+    )
+    helper_path.write_text("VALUE = 1\n", encoding="utf-8")
+    owner = runpy.run_path(str(owner_path))
+    owner_digest = owner["policy_digest"](tmp_path)
+    assert verify_kanban_lifecycle._policy_digest(tmp_path) == owner_digest
+
+    helper_path.write_text("VALUE = 2\n", encoding="utf-8")
+    changed_owner_digest = owner["policy_digest"](tmp_path)
+    assert changed_owner_digest != owner_digest
+    assert verify_kanban_lifecycle._policy_digest(tmp_path) == changed_owner_digest
+
+
+def test_policy_digest_rejects_malformed_owner_digest(tmp_path: Path) -> None:
+    owner_path = tmp_path / "scripts" / "verify_lifecycle.py"
+    owner_path.parent.mkdir(parents=True)
+    owner_path.write_text(
+        "def policy_digest(policy_root):\n"
+        "    return 'A' * 64\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="scripts/verify_lifecycle.py"):
+        verify_kanban_lifecycle._policy_digest(tmp_path)
