@@ -56,6 +56,9 @@ def test_dispatcher_materialization_ignores_churning_profile_state(tmp_path: Pat
     assert check["status"] == "pass", check
     assert check["evidence"]["profile_churn"] is True
     assert check["evidence"]["worker_bootstrap"] is True
+    assert check["evidence"]["cancelled_before_grant"] is True
+    assert check["evidence"]["launched_before_claim"] is True
+    assert check["evidence"]["claim_persisted_identity"] is True
     assert check["evidence"]["runtime_identity"]["module_root"] == str(REPOSITORY)
 
 
