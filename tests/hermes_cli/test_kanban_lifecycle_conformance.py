@@ -1499,6 +1499,100 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
                 },
             )
 
+    def test_duplicate_review_edge_reports_the_existing_child(self) -> None:
+        candidate = kb.create_task(
+            self.conn,
+            title="reviewed candidate",
+            assignee="implementer",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        )
+        review = kb.create_task(
+            self.conn,
+            title="existing review",
+            assignee="reviewer",
+            initial_status="blocked",
+            parents=[candidate],
+            lifecycle_contract={"kind": "review", "candidate_task_id": candidate},
+        )
+        kb.link_tasks(self.conn, candidate, review, requirement="phase_finished")
+        linked = self.conn.execute(
+            "SELECT requirement FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (candidate, review),
+        ).fetchone()
+        self.assertEqual(linked["requirement"], "phase_finished")
+
+        before = tuple(self.conn.iterdump())
+        with self.assertRaises(kb.LifecycleContractError) as raised:
+            kb.create_task(
+                self.conn,
+                title="duplicate review",
+                assignee="reviewer",
+                initial_status="blocked",
+                parents=[candidate],
+                lifecycle_contract={"kind": "review", "candidate_task_id": candidate},
+            )
+        self.assertIn("no legal lifecycle requirement", str(raised.exception))
+        self.assertIn("duplicate lifecycle review edge", str(raised.exception))
+        self.assertIn(candidate, str(raised.exception))
+        self.assertIn(review, str(raised.exception))
+        self.assertEqual(tuple(self.conn.iterdump()), before)
+
+        second = kb.create_task(
+            self.conn,
+            title="unlinked duplicate review",
+            assignee="reviewer",
+            initial_status="blocked",
+            lifecycle_contract={"kind": "review", "candidate_task_id": candidate},
+        )
+        before = tuple(self.conn.iterdump())
+        with self.assertRaises(kb.LifecycleContractError) as raised:
+            kb.link_tasks(self.conn, candidate, second)
+        self.assertIn("no legal lifecycle requirement", str(raised.exception))
+        self.assertIn("duplicate lifecycle review edge", str(raised.exception))
+        self.assertIn(candidate, str(raised.exception))
+        self.assertIn(review, str(raised.exception))
+        self.assertEqual(tuple(self.conn.iterdump()), before)
+
+    def test_illegal_topology_reports_every_rejection_not_ambiguity(self) -> None:
+        first = kb.create_task(
+            self.conn,
+            title="separate-card candidate",
+            assignee="implementer",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "separate_card",
+                "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        )
+        second = kb.create_task(
+            self.conn,
+            title="same-card candidate",
+            assignee="implementer",
+            initial_status="blocked",
+            lifecycle_contract={
+                "kind": "code",
+                "review_mode": "same_card",
+                "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        )
+        before = tuple(self.conn.iterdump())
+        with self.assertRaises(kb.LifecycleContractError) as raised:
+            kb.link_tasks(self.conn, first, second)
+        message = str(raised.exception)
+        self.assertIn("no legal lifecycle requirement", message)
+        self.assertIn("illegal lifecycle edge", message)
+        self.assertIn(f"{first} -> {second}", message)
+        self.assertEqual(tuple(self.conn.iterdump()), before)
+
     def test_default_dispatch_grants_worker_before_claimed_hook(self) -> None:
         task_id = kb.create_task(
             self.conn,
