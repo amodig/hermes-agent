@@ -2,6 +2,18 @@
 
 Browser-based dashboard for managing Hermes Agent configuration, API keys, and monitoring active sessions.
 
+## Shared provider credentials
+
+**System → Shared credential pool** manages the default profile's root
+`auth.json`, independent of both the selected profile and the dashboard's
+launch profile. Add/delete operations affect that shared pool. Named profiles
+without private credentials for a provider borrow its root entries; runtime
+status updates remain in the owning root store rather than creating local
+copies. An explicit profile-local credential still overrides root fallback.
+The **Keys** page remains profile-scoped. A saved environment-source reference
+without a live key cannot authenticate, even when its label appears in the pool.
+
+
 ## Stack
 
 - **Vite** + **React 19** + **TypeScript**

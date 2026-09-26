@@ -1145,8 +1145,12 @@ export default function SystemPage() {
       {/* ── Credential pool ───────────────────────────────────────── */}
       <section className="flex flex-col gap-3">
         <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
-          <KeyRound className="h-4 w-4" /> Credential pool
+          <KeyRound className="h-4 w-4" /> Shared credential pool
         </H2>
+        <p className="text-sm text-muted-foreground">
+          Stored in the default profile and available to all profiles. Adding or removing
+          credentials here affects the shared pool, regardless of the selected profile.
+        </p>
         <Card>
           <CardContent className="flex flex-col gap-4 py-4">
             <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 items-end">

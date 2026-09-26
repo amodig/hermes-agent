@@ -288,3 +288,37 @@ def test_write_pool_never_merges_cooldown_onto_reauthed_entry(classic_env):
     assert persisted["access_token"] == "sk-new"
     assert persisted.get("last_status") != "exhausted"
     assert persisted.get("last_error_code") is None
+
+
+def test_dashboard_pool_manages_shared_root_from_named_profile(tmp_path, monkeypatch):
+    """Adding/listing/removing shared keys must never target the launch profile."""
+    import asyncio
+    from hermes_cli.web_models import CredentialPoolAdd
+    from hermes_cli.web_routers import ops
+
+    shared_home = tmp_path / "hermes"
+    profile_home = shared_home / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    profile_auth = profile_home / "auth.json"
+    _write(profile_auth, _make_auth_store(pool={
+        "deepseek": [_pool_entry(label="private", access_token="private-key")],
+    }))
+    original = profile_auth.read_bytes()
+
+    async def exercise():
+        await ops.add_credential_pool_entry(CredentialPoolAdd(
+            provider="deepseek", api_key="shared-key", label="shared",
+        ))
+        result = await ops.list_credential_pool()
+        assert [(p["provider"], [e["label"] for e in p["entries"]])
+                for p in result["providers"]] == [("deepseek", ["shared"])]
+        shared_auth = shared_home / "auth.json"
+        stored = json.loads(shared_auth.read_text())["credential_pool"]["deepseek"]
+        assert [e["access_token"] for e in stored] == ["shared-key"]
+        await ops.remove_credential_pool_entry("deepseek", 1)
+        assert json.loads(shared_auth.read_text())["credential_pool"]["deepseek"] == []
+
+    asyncio.run(exercise())
+    assert profile_auth.read_bytes() == original

@@ -779,12 +779,8 @@ def _profile_owns_pool_provider(provider: str) -> bool:
     return isinstance(entries, list) and bool(entries)
 
 
-def _borrowed_single_use_pool_root() -> Optional[Path]:
-    """Global-root auth.json when persisting a BORROWED single-use pool, else None.
-
-    ``None`` means "persist to the active store as usual": classic mode
-    (profile == root), or the profile owns its own rows for this provider.
-    """
+def _borrowed_pool_root() -> Optional[Path]:
+    """Guarded global-root auth.json in profile mode, else None."""
     try:
         return _guarded_global_root(_global_auth_file_path())
     except Exception:
@@ -838,19 +834,21 @@ def persist_pool_entries(
     *,
     removed_ids: Optional[Iterable[str]] = None,
     status_cleared_ids: Optional[Iterable[str]] = None,
+    borrowed_root_ids: Optional[Set[str]] = None,
 ) -> None:
     """Persist a provider's pool rows to the store that OWNS them.
 
-    A named profile that sees a single-use-refresh provider (Anthropic,
-    Codex, xAI OAuth) only through the global-root fallback must not
-    materialize a local ``credential_pool.<provider>`` copy: that copy forks
-    the single-use refresh token, the first profile to rotate commits the new
-    pair only to its own file, and root plus every sibling die with
-    ``invalid_grant`` (#100339). Such rows are written back to the root store
-    (under the root lock); everything else goes to the active store.
+    Borrowed rows are update-only at root: copying them into a profile would
+    shadow later shared updates (and fork single-use OAuth refresh tokens).
+    Keep the load-time IDs even if root removes a row before this save.
+    Newly seeded profile rows still belong to the active store.
     """
-    if provider in SINGLE_USE_REFRESH_POOL_PROVIDERS and not _profile_owns_pool_provider(provider):
-        global_path = _borrowed_single_use_pool_root()
+    single_use_borrower = (
+        provider in SINGLE_USE_REFRESH_POOL_PROVIDERS
+        and not _profile_owns_pool_provider(provider)
+    )
+    if borrowed_root_ids or single_use_borrower:
+        global_path = _borrowed_pool_root()
         if global_path is not None:
             try:
                 _update_root_pool_rows(
@@ -862,11 +860,19 @@ def persist_pool_entries(
                 # writing a local copy (that IS the bug). The in-memory pool
                 # still holds the rotated pair for this process.
                 logger.warning(
-                    "%s pool: write-through of borrowed root grant failed (%s); "
+                    "%s pool: write-through of borrowed root rows failed (%s); "
                     "not materializing a profile-local copy",
                     provider, exc,
                 )
-            return
+            # Preserve the single-use singleton seeding safeguard: these may
+            # borrow root provider state even before any pool row exists.
+            if single_use_borrower:
+                return
+        if borrowed_root_ids:
+            payloads = [p for p in payloads if p.get("id") not in borrowed_root_ids]
+            removed_ids = [rid for rid in (removed_ids or ()) if rid not in borrowed_root_ids]
+            if not payloads and not removed_ids:
+                return
     write_credential_pool(
         provider, payloads, removed_ids=removed_ids, status_cleared_ids=status_cleared_ids,
     )
@@ -915,8 +921,7 @@ class CredentialPool:
         self.provider = provider
         self._entries = sorted(entries, key=lambda entry: entry.priority)
         self._current_id: Optional[str] = None
-        # Ids of rows read via the global-root fallback (single-use OAuth
-        # providers only); set by load_pool(), consumed by add_entry().
+        # Load-time root ownership survives later root deletions and local seeding.
         self._borrowed_root_ids: Set[str] = set()
         self._strategy = get_pool_strategy(provider)
         # RLock: _replace_entry/_persist self-acquire it so the DEFERRED
@@ -1044,6 +1049,7 @@ class CredentialPool:
                 [entry.to_dict() for entry in self._entries],
                 removed_ids=removed_ids,
                 status_cleared_ids=status_cleared_ids,
+                borrowed_root_ids=self._borrowed_root_ids,
             )
 
     def _adopt(self, entry: PooledCredential, *, persist: bool = True, **updates: Any) -> PooledCredential:
@@ -2189,11 +2195,7 @@ class CredentialPool:
                 return None
             removed = self._entries.pop(index - 1)
             self._entries = [replace(e, priority=p) for p, e in enumerate(self._entries)]
-            persist_pool_entries(
-                self.provider,
-                [entry.to_dict() for entry in self._entries],
-                removed_ids=[removed.id],
-            )
+            self._persist(removed_ids=[removed.id])
             if self._current_id == removed.id:
                 self._current_id = None
             return removed
@@ -2230,11 +2232,9 @@ class CredentialPool:
             self._entries.append(entry)
             borrowed_ids = getattr(self, "_borrowed_root_ids", None)
             if borrowed_ids:
-                # ``hermes -p <profile> auth add <single-use provider>``: the
-                # profile claims its OWN credential. Persist only profile-owned
-                # rows — copying the borrowed root grant alongside would fork
-                # its single-use refresh token (#100339). Once the profile owns
-                # rows, the root fallback for this provider is shadowed.
+                # Explicit auth add claims only profile-owned credentials;
+                # borrowed rows must keep following root, not become local copies.
+                # The new local rows shadow this provider's root fallback.
                 self._entries = [e for e in self._entries if e.id not in borrowed_ids]
                 write_credential_pool(self.provider, [e.to_dict() for e in self._entries])
                 self._borrowed_root_ids = set()
@@ -2699,6 +2699,14 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         base_url = env_url or pconfig.inference_base_url
         if resolve_base_url is not None:
             base_url = resolve_base_url(token, pconfig.inference_base_url, env_url)
+        # A shell copy of a shared manual key is not a private credential.
+        # Duplicating it would shadow root updates and bypass its cooldown.
+        if any(
+            _is_manual_source(entry.source) and entry.runtime_api_key == token
+            and _norm_url(entry.runtime_base_url or pconfig.inference_base_url) == _norm_url(base_url)
+            for entry in entries
+        ):
+            continue
         seed.upsert(f"env:{env_var}", _env_payload(env_var=env_var, token=token, base_url=base_url))
     return seed.result
 
@@ -2786,6 +2794,7 @@ def load_pool(provider: str) -> CredentialPool:
         auth_mod.heal_forked_single_use_oauth_grants(provider)
     raw_entries = read_credential_pool(provider)
     disk_ids = {e.get("id") for e in raw_entries if isinstance(e, dict) and e.get("id")}
+    borrowed_root_ids = disk_ids if disk_ids and not _profile_owns_pool_provider(provider) else set()
     changed = any(
         isinstance(payload, dict) and sanitize_borrowed_credential_payload(payload, provider) != payload
         for payload in raw_entries
@@ -2807,36 +2816,22 @@ def load_pool(provider: str) -> CredentialPool:
         changed |= bool(active_entries)
 
     if provider.startswith(CUSTOM_POOL_PREFIX):
-        custom_changed, custom_sources = _seed_custom_pool(provider, entries)
+        custom_changed, active_sources = _seed_custom_pool(provider, entries)
         changed |= custom_changed
-        changed |= _prune_stale_seeded_entries(entries, custom_sources)
     else:
         singleton_changed, singleton_sources = _seed_from_singletons(provider, entries)
         env_changed, env_sources = _seed_from_env(provider, entries)
+        active_sources = singleton_sources | env_sources
         changed |= singleton_changed or env_changed
-        # ``load_pool()`` is a non-destructive read for env-seeded entries
-        # (#9331); file-backed singletons still prune when their file is gone.
-        borrowing_root_grant = (
-            provider in SINGLE_USE_REFRESH_POOL_PROVIDERS
-            and bool(disk_ids)
-            and not _profile_owns_pool_provider(provider)
-        )
-        if borrowing_root_grant:
-            # Rows read through the global-root fallback are seeded from the
-            # ROOT's singleton files, which this profile cannot see; pruning
-            # them would hide (and, via write-through, delete) the shared
-            # grant. The root's own load_pool() prunes.
-            borrowed = [e for e in entries if e.id in disk_ids]
-            others = [e for e in entries if e.id not in disk_ids]
-            changed |= _prune_stale_seeded_entries(
-                others, singleton_sources | env_sources, prune_env_sources=False,
-            )
-            entries[:] = borrowed + others
-        else:
-            changed |= _prune_stale_seeded_entries(
-                entries, singleton_sources | env_sources, prune_env_sources=False,
-            )
-        changed |= _normalize_pool_priorities(provider, entries)
+
+    # Only the owner may prune rows whose backing sources are absent.
+    owned = [e for e in entries if e.id not in borrowed_root_ids] if borrowed_root_ids else entries
+    changed |= _prune_stale_seeded_entries(
+        owned, active_sources, prune_env_sources=provider.startswith(CUSTOM_POOL_PREFIX),
+    )
+    if borrowed_root_ids:
+        entries[:] = [e for e in entries if e.id in borrowed_root_ids] + owned
+    changed |= _normalize_pool_priorities(provider, entries)
 
     if changed:
         new_ids = {entry.id for entry in entries}
@@ -2844,10 +2839,10 @@ def load_pool(provider: str) -> CredentialPool:
             provider,
             [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
             removed_ids=disk_ids - new_ids,
+            borrowed_root_ids=borrowed_root_ids,
         )
     pool = CredentialPool(provider, entries)
     # Remember the root's borrowed rows so a later ``add_entry`` in this
     # profile leaves them out of the profile's own store (#100339).
-    if provider in SINGLE_USE_REFRESH_POOL_PROVIDERS and not _profile_owns_pool_provider(provider):
-        pool._borrowed_root_ids = set(disk_ids)
+    pool._borrowed_root_ids = borrowed_root_ids
     return pool

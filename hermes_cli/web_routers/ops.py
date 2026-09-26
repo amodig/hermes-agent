@@ -25,6 +25,7 @@ from hermes_cli.web_deps import late
 from hermes_cli.web_server_files import _path_is_under
 from hermes_cli.web_server_gateway import _restart_gateway_after
 from hermes_cli.web_server_memory import _normalize_memory_provider_name, _require_memory_provider_ready
+from hermes_cli.web_server_profiles import _config_profile_scope
 from hermes_cli.web_models import (
     BackupRequest, CredentialPoolAdd, HookCreate, HookDelete, ImportRequest, MemoryProviderSelect,
     MemoryReset, PairingApprove, PairingRevoke, WebhookCreate, WebhookEnabledToggle,
@@ -262,8 +263,8 @@ async def stop_gateway(profile: Optional[str] = None):
     return {"ok": True, "pid": proc.pid, "name": "gateway-stop"}
 
 
-# --- Credential pool (auth.json -> credential_pool.<provider>[]): secrets are
-# redacted on read; only the agent sees raw values at session start.
+# --- Shared credential pool (default profile's auth.json). Every profile may
+# borrow this pool; management must not depend on the dashboard launch profile.
 #
 # load_pool() may hit the network synchronously (Copilot token exchange over raw
 # urllib, whose timeout does NOT bound DNS resolution) — on a networkless host it
@@ -293,6 +294,7 @@ async def list_credential_pool():
     from agent.credential_pool import load_pool
     from hermes_cli.auth import read_credential_pool
 
+    @_config_profile_scope("default")
     def _run():
         providers = []
         # read_credential_pool(None) lists every provider with pooled entries;
@@ -330,6 +332,7 @@ async def add_credential_pool_entry(body: CredentialPoolAdd):
     if not provider or not api_key:
         raise HTTPException(status_code=400, detail="provider and api_key are required")
 
+    @_config_profile_scope("default")
     def _run():
         try:
             pool = load_pool(provider)
@@ -391,6 +394,7 @@ async def remove_credential_pool_entry(provider: str, index: int):
 
     provider = (provider or "").strip().lower()
 
+    @_config_profile_scope("default")
     def _run():
         try:
             pool = load_pool(provider)
