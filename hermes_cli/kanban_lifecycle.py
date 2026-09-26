@@ -554,7 +554,8 @@ def validate_edge(
                 and existing_contract.get("candidate_task_id") == c.get("candidate_task_id")
             ):
                 raise LifecycleContractError(
-                    f"duplicate lifecycle {ck} edge for candidate {c.get('candidate_task_id')}"
+                    f"duplicate lifecycle {ck} edge for candidate {c.get('candidate_task_id')} "
+                    f"(existing child {existing['id']})"
                 )
     return requirement
 
@@ -599,12 +600,19 @@ def is_required_lifecycle_edge(
 def infer_edge_requirement(conn: sqlite3.Connection, parent_id: str, child_id: str) -> str:
     """Choose the only legal requirement for a newly declared edge."""
     valid: list[str] = []
+    rejections: list[str] = []
     for requirement in sorted(VALID_REQUIREMENTS):
         try:
             validate_edge(conn, parent_id, child_id, requirement)
-        except LifecycleContractError:
+        except LifecycleContractError as exc:
+            rejections.append(f"{requirement}: {exc}")
             continue
         valid.append(requirement)
+    if not valid:
+        raise LifecycleContractError(
+            f"no legal lifecycle requirement for {parent_id} -> {child_id}: "
+            + "; ".join(rejections)
+        )
     if len(valid) != 1:
         raise LifecycleContractError(
             f"cannot infer a unique lifecycle requirement for {parent_id} -> {child_id}"
