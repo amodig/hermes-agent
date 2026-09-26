@@ -1069,7 +1069,7 @@ def check_respawn_guard(
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR). The review
+    (PR URL in a recent comment, unless explicitly promoted afterward). The review
     lane skips the last two: they are the *inputs* to a review handoff. Stale /
     dead claim locks are NOT a guard reason — the reclaim passes own those.
     """
@@ -1130,7 +1130,7 @@ def check_respawn_guard(
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "AND kind IN ('status', 'promoted', 'promoted_manual', 'unblocked', 'reclaimed') "
             "LIMIT 1",
             (task_id, completed_at),
         ).fetchone()
@@ -1139,6 +1139,15 @@ def check_respawn_guard(
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    # Only an operator promotion acknowledges existing PR work; automatic
+    # readiness must not turn a duplicate-work signal into another worker.
+    promoted_at = conn.execute(
+        "SELECT MAX(created_at) FROM task_events "
+        "WHERE task_id = ? AND kind = 'promoted_manual'", (task_id,),
+    ).fetchone()[0]
+    if promoted_at is not None:
+        pr_cutoff = max(pr_cutoff, int(promoted_at))
+    # Same-second comments remain guarded: their ordering is ambiguous.
     for c in conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
