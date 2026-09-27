@@ -1710,15 +1710,27 @@ KANBAN_GOAL_FINALIZE_TEMPLATE = (
     "[The work looks complete, but the task is still open]\n"
     "Reason: {reason}\n"
     "{phase_note}"
-    "Call the handoff tool for this phase: kanban_complete with a short summary "
-    "(typed review cards: verdict=APPROVE or REQUEST_CHANGES; typed validation "
-    "cards: verdict=PASS or FAIL), or kanban_request_review for a same-card "
-    "review handoff. For ``kind=code`` implementation work, put direct "
-    "``base_sha`` and ``head_sha`` commit fields in the handoff ``metadata``. "
-    "Finishing a phase is not final acceptance — acceptance is a computed "
-    "projection of fresh execution, review, and validation evidence. If "
-    "something still blocks completion, call kanban_block with the reason instead."
+    "{action}. For ``kind=code`` implementation work, put direct ``base_sha`` "
+    "and ``head_sha`` commit fields in the handoff ``metadata``. Finishing a "
+    "phase is not final acceptance — acceptance is a computed projection of fresh "
+    "execution, review, and validation evidence. If something still blocks "
+    "completion, call kanban_block with the reason instead."
 )
+
+# The terminal action a finalize nudge may recommend. ``kanban_request_review``
+# belongs to implementation only: a review run submits a verdict instead.
+_KANBAN_FINALIZE_ACTIONS = {
+    "implementation": (
+        "Call kanban_complete with a short summary, or kanban_request_review for a "
+        "same-card review handoff"
+    ),
+    "review": (
+        "Call kanban_complete with verdict=\"APPROVE\" or \"REQUEST_CHANGES\", or "
+        "kanban_request_changes for same-card rework"
+    ),
+    "validation": "Call kanban_complete with verdict=\"PASS\" or \"FAIL\"",
+}
+_KANBAN_FINALIZE_DEFAULT_ACTION = "Call kanban_complete with a short summary"
 
 # How each phase's handoff tools differ — the same-card vs separate-card split is
 # the part workers get wrong (#37). Empty string for an unknown/absent phase.
@@ -1859,7 +1871,10 @@ def run_kanban_goal_loop(
                 )
                 return _result("blocked_budget", "judged done, never finalized")
             prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(
-                reason=_truncate(reason, 400), phase_note=_KANBAN_PHASE_NOTES.get(phase, ""))
+                reason=_truncate(reason, 400),
+                phase_note=_KANBAN_PHASE_NOTES.get(phase, ""),
+                action=_KANBAN_FINALIZE_ACTIONS.get(phase, _KANBAN_FINALIZE_DEFAULT_ACTION),
+            )
             nudged_to_finalize = True
         else:
             prompt = KANBAN_GOAL_CONTINUATION_TEMPLATE.format(

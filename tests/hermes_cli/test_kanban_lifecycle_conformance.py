@@ -3478,6 +3478,25 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
         self.assertIn("kanban_request_review", prompts[0])
         self.assertIn("not final acceptance", prompts[0])
 
+        # A finalize nudge in the review phase must not send the reviewer to the
+        # implementation handoff, which the runtime now rejects for review runs.
+        review_judge = _PhaseJudge(("review", "done"))
+        review_statuses = iter(["running", "changes_requested"])
+        review_prompts: list[str] = []
+        with patch.multiple("hermes_cli.goals", _call_goal_judge_llm=review_judge):
+            reviewed = goals.run_kanban_goal_loop(
+                task_id="t_review",
+                goal_text=self.GOAL,
+                phase="review",
+                run_turn=lambda prompt: review_prompts.append(prompt) or "verdict submitted",
+                task_status_fn=lambda: next(review_statuses),
+                block_fn=lambda reason: self.fail(f"must not block: {reason}"),
+                first_response="Reviewed the candidate at its head; findings listed.",
+            )
+        self.assertEqual(reviewed["outcome"], "changes_requested_by_reviewer")
+        self.assertNotIn("kanban_request_review", review_prompts[0])
+        self.assertIn("REQUEST_CHANGES", review_prompts[0])
+
         with self.subTest(surface="phase_less_loop"):
             generic_judge = _PhaseJudge((None, "continue"))
             generic_prompts: list[str] = []
