@@ -112,7 +112,6 @@ def handoff_phase(conn: sqlite3.Connection, task_before: Any) -> Optional[str]:
         else None
     )
     claimed_source = _kb._json_dict(_kb._row_get(claimed_event, "payload")).get("source_status")
-    resumed_review = _kb._resume_status_from_events(conn, task_id) == "review"
     completed_review = (
         task_before.status == "done"
         and contract.get("review_mode") == "same_card"
@@ -122,8 +121,14 @@ def handoff_phase(conn: sqlite3.Connection, task_before: Any) -> Optional[str]:
         task_before.status == "review"
         or claimed_source == "review"
         or completed_review
-        or resumed_review
     ):
+        return "review"
+    if task_before.current_run_id:
+        # A live claim that is not a review claim is implementation work: an
+        # operator promotion or unblock supersedes older review-resume history,
+        # which is otherwise still the newest resumable event on the card.
+        return "implementation"
+    if _kb._resume_status_from_events(conn, task_id) == "review":
         return "review"
     return "implementation"
 

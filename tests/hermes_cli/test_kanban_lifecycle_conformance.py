@@ -3350,6 +3350,46 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
                 self.assertIn("- changed_files:", prompt)
                 self.assertIn("[truncated]", prompt)
 
+        with self.subTest(surface="manual_promotion"):
+            # A blocked review resumed by an operator promotion is implementation
+            # work again: the implementer's handoff must not be read as a review.
+            repo, base = self._repo()
+            tid, _, run = self._same_card_graph(repo, validation_required=False)
+            head = self._commit(repo, 1)
+            judge, patcher = self._judge(("implementation", "done"),
+                                         ("implementation", "done"))
+            with patcher, patch("agent.auxiliary_client.get_text_auxiliary_client",
+                                lambda *a, **k: (object(), "judge-double")):
+                self._handoff("tool_request_review", tid, run, base, head)
+                with kbc.connect_closing() as conn:
+                    review_run = kb.claim_review_task(conn, tid, claimer="reviewer:1")
+                    assert review_run is not None
+                    self.assertTrue(kb.block_task(
+                        conn, tid, reason="maintainer input required",
+                        kind="needs_input", expected_run_id=review_run.current_run_id,
+                    ))
+                    self.assertEqual(kb._resume_status_from_events(conn, tid), "review")
+                    self.assertEqual(
+                        kb.promote_task(conn, tid, actor="operator",
+                                        reason="manual promotion", force=True),
+                        (True, None),
+                    )
+                    self.assertEqual(kb.get_task(conn, tid).status, "ready")
+                    resumed = kb.claim_task(conn, tid, claimer="implementer:2")
+                assert resumed is not None
+                self.assertEqual(self._phase(tid), "implementation")
+                with patch.dict(os.environ, {
+                    "HERMES_KANBAN_TASK": tid,
+                    "HERMES_KANBAN_RUN_ID": str(resumed.current_run_id),
+                    "HERMES_PROFILE": "implementer",
+                }):
+                    out = self._handoff("tool_request_review", tid, resumed, base, head)
+
+            self.assertTrue(out.get("ok"), out)
+            self.assertEqual(self._state(tid)["task"].status, "review")
+            self.assertEqual([call[0] for call in judge.calls],
+                             ["implementation", "implementation"])
+
         with self.subTest(surface="secret_metadata"):
             # The auxiliary judge is a separate provider, so the evidence is
             # redacted at that boundary even when structured redaction upstream
