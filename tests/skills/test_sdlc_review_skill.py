@@ -1,4 +1,11 @@
-"""Contract tests for the bundled SDLC review skill."""
+"""Behavioural contracts for the bundled SDLC review skill.
+
+`skills/AGENTS.md` requires a per-skill suite at this path. This one checks the
+two contracts the skill itself cannot state: which runtime environment offers it,
+and that every Kanban transition it instructs a reviewer to call actually exists.
+Prose wording is deliberately not asserted here — the typed review transitions are
+covered by the lifecycle conformance suite.
+"""
 
 from __future__ import annotations
 
@@ -7,30 +14,15 @@ from pathlib import Path
 
 import pytest
 
-SKILL_MD = (
-    Path(__file__).resolve().parents[2]
-    / "skills"
-    / "devops"
-    / "sdlc-review"
-    / "SKILL.md"
-)
-REQUIRED_SECTIONS = [
-    "## When to Use",
-    "## Prerequisites",
-    "## How to Run",
-    "## Quick Reference",
-    "## Review Lenses",
-    "## Procedure",
-    "## Pitfalls",
-    "## Verification",
-]
-REVIEW_ACTIONS = {
-    "kanban_show",
-    "kanban_comment",
-    "kanban_complete",
+from agent.skill_utils import parse_frontmatter, skill_matches_environment
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SKILL_MD = REPO_ROOT / "skills" / "devops" / "sdlc-review" / "SKILL.md"
+# The reviewer's route for each card contract, cited as `tool(...)` in the skill.
+DOCUMENTED_TRANSITIONS = (
     "kanban_request_changes",
-    "kanban_block",
-}
+    "kanban_complete",
+)
 
 
 @pytest.fixture(scope="module")
@@ -38,48 +30,31 @@ def skill_text() -> str:
     return SKILL_MD.read_text(encoding="utf-8")
 
 
-def _frontmatter_value(text: str, key: str) -> str:
-    match = re.search(rf"^{re.escape(key)}:\s*(.+)$", text, re.MULTILINE)
-    assert match, f"missing frontmatter field: {key}"
-    return match.group(1).strip()
-
-
-def test_frontmatter_meets_hardline_standard(skill_text: str) -> None:
-    assert skill_text.startswith("---\n")
-    assert _frontmatter_value(skill_text, "name") == "sdlc-review"
-
-    description = _frontmatter_value(skill_text, "description")
-    assert len(description) <= 60
-    assert description.endswith(".")
-
-    for field in ("version", "author", "license", "platforms"):
-        assert _frontmatter_value(skill_text, field)
-    assert not _frontmatter_value(skill_text, "author").startswith("Hermes Agent")
-
-
-def test_body_uses_required_modern_section_order(skill_text: str) -> None:
-    assert "# SDLC Review Skill" in skill_text
-    positions = [skill_text.index(section) for section in REQUIRED_SECTIONS]
-    assert positions == sorted(positions)
-
-
-@pytest.mark.parametrize("tool_name", sorted(REVIEW_ACTIONS))
-def test_skill_documents_native_review_actions(
-    skill_text: str,
-    tool_name: str,
+def test_skill_is_offered_to_kanban_workers(
+    skill_text: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    assert f"`{tool_name}`" in skill_text
+    frontmatter, _body = parse_frontmatter(skill_text)
+    assert frontmatter["name"] == "sdlc-review"
+    assert frontmatter["version"]
+    assert frontmatter["environments"] == ["kanban"]
+
+    # A dispatcher-spawned worker owns HERMES_KANBAN_TASK: only then is the skill
+    # offered, so a reviewer is never handed review guidance outside the lane.
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_0123456789abcdef")
+    assert skill_matches_environment(frontmatter) is True
 
 
-def test_review_lenses_vary_per_round(skill_text: str) -> None:
-    lenses = skill_text.split("## Review Lenses", 1)[1].split("## Procedure", 1)[0]
-    # Round derivation must key off history the reviewer actually sees.
-    assert "`changes_requested`" in lenses
-    assert "Prior attempts on this task" in lenses
-    # One distinct lens per round.
-    for lens in ("Artifact", "Execution", "Contract"):
-        assert lens in lenses
-    # Execution lens must direct empirical verification via the terminal.
-    assert "`terminal`" in lenses
-    # Fan-out note: parallel reviewers get different briefs.
-    assert "`delegate_task`" in lenses
+def test_documented_transitions_are_registered_kanban_tools(skill_text: str) -> None:
+    from tools.registry import registry
+
+    import tools.kanban_tools  # noqa: F401 - registers the kanban tools
+
+    cited = set(re.findall(r"`(kanban_[a-z_]+)\(", skill_text))
+    assert set(DOCUMENTED_TRANSITIONS) <= cited
+
+    unregistered = sorted(
+        name
+        for name in cited
+        if (entry := registry.get_entry(name)) is None or entry.toolset != "kanban"
+    )
+    assert unregistered == [], f"skill documents unknown kanban tools: {unregistered}"

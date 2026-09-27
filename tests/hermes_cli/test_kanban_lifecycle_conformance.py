@@ -23,7 +23,9 @@ from unittest.mock import patch
 from types import SimpleNamespace
 
 from gateway import kanban_watchers_notifier as notifier
+from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_runtime as runtime
 from hermes_cli.kanban_lifecycle import evaluate_dependencies, get_lifecycle_state, lifecycle_metadata
@@ -3097,6 +3099,686 @@ recovery.recover_if_needed(project_root=root, argv=[])
         self.assertEqual(kb._retry_status_for_run(self.conn, task_id), "ready")
         self.assertTrue(kb.reclaim_task(self.conn, task_id, reason="conformance cleanup"))
         self.assertIn(kb.get_task(self.conn, task_id).status, {"ready", "todo"})
+
+
+def _handoff_phase_hint(user_prompt: str) -> str:
+    """The phase marker the runtime must put in the judge prompt."""
+    for phase in ("implementation", "review", "validation"):
+        if f"Lifecycle phase being judged now: {phase}" in user_prompt:
+            return phase
+    return "generic"
+
+
+class _PhaseJudge:
+    """Deterministic auxiliary-model double keyed on the judge's phase marker.
+
+    ``pairs`` lists the ``(phase, verdict)`` each successive judge call must
+    produce. A call whose prompt carries a different phase than expected returns
+    ``continue``, so a handoff that reaches the judge without its phase — the
+    reported regression — surfaces as a rejected transition instead of a pass.
+    """
+
+    def __init__(self, *pairs: tuple[Optional[str], str]):
+        self.pairs = list(pairs)
+        self.calls: list[tuple[str, str, str, str]] = []
+
+    def __call__(self, call_llm, system_prompt: str, user_prompt: str, timeout) -> str:
+        expected, verdict = self.pairs[min(len(self.calls), len(self.pairs) - 1)]
+        phase = _handoff_phase_hint(user_prompt)
+        self.calls.append((phase, system_prompt, user_prompt, verdict))
+        ok = phase == ("generic" if expected is None else expected)
+        return json.dumps({
+            "verdict": verdict if ok else "continue",
+            "reason": "scripted" if ok else f"judge saw phase {phase!r}, expected {expected!r}",
+        })
+
+
+class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
+    GUARD_REASON = "same-card review runs must submit a review verdict"
+    GOAL = (
+        "Land the phase-aware handoff fix.\n"
+        "Acceptance: implemented and locally verified, independently reviewed by the "
+        "reviewer profile, then validated by the tester profile."
+    )
+
+    def setUp(self) -> None:
+        super().setUp()
+        for name in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_DELEGATED_CHILD_CONTEXT"):
+            os.environ.pop(name, None)
+        kb._INITIALIZED_PATHS.clear()
+        kb.init_db()
+
+    # --- fixtures ---------------------------------------------------------
+    def _repo(self) -> tuple[Path, str]:
+        scratch = tempfile.TemporaryDirectory(prefix="kanban-phase-repo-")
+        self.addCleanup(scratch.cleanup)
+        repo = Path(scratch.name)
+        MODULE._git(repo, "init", "-q", "-b", "main")
+        MODULE._git(repo, "config", "user.email", "phase@example.invalid")
+        MODULE._git(repo, "config", "user.name", "Phase Conformance")
+        (repo / "README.md").write_text("base\n", encoding="utf-8")
+        MODULE._git(repo, "add", "README.md")
+        MODULE._git(repo, "commit", "-qm", "base")
+        base = MODULE._git(repo, "rev-parse", "HEAD")
+        MODULE._git(repo, "checkout", "-q", "-b", "task/phase-aware")
+        return repo, base
+
+    def _commit(self, repo: Path, n: int) -> str:
+        (repo / "phase.py").write_text(f"value = {n}\n", encoding="utf-8")
+        MODULE._git(repo, "add", "phase.py")
+        MODULE._git(repo, "commit", "-qm", f"implementation {n}")
+        return MODULE._git(repo, "rev-parse", "HEAD")
+
+    def _same_card_graph(self, repo: Path, *, goal_mode: bool = True,
+                         validation_required: bool = True):
+        """Implementation card + tester validation child gated on review_approved."""
+        with kbc.connect_closing() as conn:
+            implementation = kb.create_task(
+                conn,
+                title="Phase-aware handoff",
+                body=self.GOAL,
+                assignee="implementer",
+                workspace_kind="dir",
+                workspace_path=str(repo),
+                goal_mode=goal_mode,
+                lifecycle_contract={
+                    "kind": "code",
+                    "review_mode": "same_card",
+                    "reviewer": "reviewer",
+                    "validation_required": validation_required,
+                },
+            )
+            validation = None
+            if validation_required:
+                validation = kb.create_task(
+                    conn,
+                    title="Phase-aware validation",
+                    assignee="tester",
+                    initial_status="blocked",
+                    lifecycle_contract={"kind": "validation", "candidate_task_id": implementation},
+                )
+                kb.link_tasks(conn, implementation, validation, requirement="review_approved")
+            run = kb.claim_task(conn, implementation, claimer="implementer:1")
+            self.assertIsNotNone(run)
+        return implementation, validation, run
+
+    def _implementation_metadata(self, base: str, head: str) -> dict:
+        return {"base_sha": base, "head_sha": head, "changed_files": ["phase.py"]}
+
+    def _handoff(self, surface: str, tid: str, run, base: str, head: str, *, verdict=None,
+                 metadata: dict | None = None, summary: str | None = None):
+        """Drive one implementation handoff through a tool or CLI surface."""
+        summary = summary or (
+            "Implemented the phase-aware handoff and ran the focused suite: 12 passed. "
+            "Independent review and tester validation are still pending."
+        )
+        metadata = self._implementation_metadata(base, head) if metadata is None else metadata
+        env = {
+            "HERMES_KANBAN_TASK": tid,
+            "HERMES_KANBAN_RUN_ID": str(run.current_run_id),
+            "HERMES_PROFILE": "implementer",
+        }
+        with patch.dict(os.environ, env):
+            if surface == "tool_request_review":
+                from tools import kanban_tools as tools
+
+                return json.loads(tools._handle_request_review(
+                    {"summary": summary, "metadata": metadata}))
+            if surface == "tool_complete":
+                from tools import kanban_tools as tools
+
+                return json.loads(tools._handle_complete(
+                    {"summary": summary, "metadata": metadata, "verdict": verdict}))
+            if surface == "cli_request_review":
+                return kc.run_slash(
+                    f"request-review {tid} --summary {summary!r} "
+                    f"--metadata {json.dumps(metadata)!r}")
+            if surface == "cli_complete":
+                return kc.run_slash(
+                    f"complete {tid} --summary {summary!r} "
+                    f"--metadata {json.dumps(metadata)!r}")
+        raise AssertionError(f"unknown surface {surface!r}")
+
+    def _state(self, tid: str) -> dict:
+        with kbc.connect_closing() as conn:
+            task = kb.get_task(conn, tid)
+            state = get_lifecycle_state(conn, tid)
+            run = kb.latest_run(conn, tid)
+            events = kb.list_events(conn, tid)
+        return {
+            "task": task,
+            "lifecycle": state,
+            "run": run,
+            "events": events,
+            "phase": None if task is None else self._phase(tid),
+        }
+
+    def _phase(self, tid: str):
+        with kbc.connect_closing() as conn:
+            return kb.handoff_phase(conn, kb.get_task(conn, tid))
+
+    def _judge(self, *pairs: tuple[Optional[str], str]):
+        """Patch the auxiliary model reply, keeping the real prompt builder."""
+        judge = _PhaseJudge(*pairs)
+        return judge, patch.multiple(
+            "hermes_cli.goals",
+            _call_goal_judge_llm=judge,
+        )
+
+    def _claims(self, tid: str) -> bool:
+        with kbc.connect_closing() as conn:
+            return kb.claim_task(conn, tid, claimer="tester:conformance") is not None
+
+    # --- surface 1: phase-scoped judgement --------------------------------
+    def test_handoff_is_judged_in_its_own_lifecycle_phase(self) -> None:
+        # Invariant: a handoff is judged against the phase it belongs to, so a
+        # locally verified implementation candidate reaches review (never final
+        # acceptance) while a handoff judged without evidence, or from a review
+        # run, is rejected with the card untouched.
+        for surface in ("tool_request_review", "tool_complete",
+                        "cli_request_review", "cli_complete"):
+            with self.subTest(surface=surface):
+                repo, base = self._repo()
+                tid, validation, run = self._same_card_graph(repo)
+                head = self._commit(repo, 1)
+                judge, patcher = self._judge(("implementation", "done"))
+                with patcher, patch("agent.auxiliary_client.get_text_auxiliary_client",
+                                    lambda *a, **k: (object(), "judge-double")):
+                    out = self._handoff(surface, tid, run, base, head)
+
+                expected = ("Requested review" if "review" in surface else "Completed")
+                if isinstance(out, dict):
+                    self.assertTrue(out.get("ok"), out)
+                else:
+                    self.assertIn(expected, out)
+
+                state = self._state(tid)
+                self.assertEqual(state["task"].status, "review")
+                self.assertEqual(state["task"].assignee, "reviewer")
+                self.assertEqual(state["task"].candidate_run_id, run.current_run_id)
+                self.assertEqual(state["lifecycle"]["acceptance"], "pending")
+                self.assertEqual(state["lifecycle"]["head_sha"], head)
+                asked = [event for event in state["events"] if event.kind == "review_requested"]
+                self.assertEqual(asked[-1].payload["implementer"], "implementer")
+                # Downstream validation stays gated until the review approves.
+                with kbc.connect_closing() as conn:
+                    self.assertEqual(kb.get_task(conn, validation).status, "blocked")
+                self.assertFalse(self._claims(validation))
+
+                # Judged in the implementation phase, with the card's whole-goal
+                # text kept as context separate from the phase's own bar, and the
+                # machine-readable handoff (revisions, changed files) included.
+                self.assertEqual([call[0] for call in judge.calls], ["implementation"])
+                prompt = judge.calls[0][2]
+                self.assertIn("independently reviewed by the reviewer profile", prompt)
+                self.assertIn(f"- head_sha: {head}", prompt)
+                self.assertIn("- changed_files:", prompt)
+                self.assertLess(
+                    prompt.index("Goal (the card's whole objective"),
+                    prompt.index("Definition of done for THIS phase:"),
+                )
+
+        for surface in ("tool_request_review", "cli_complete"):
+            with self.subTest(surface=f"{surface}_refused"):
+                repo, base = self._repo()
+                tid, _, run = self._same_card_graph(repo)
+                head = self._commit(repo, 1)
+                judge, patcher = self._judge(("implementation", "continue"))
+                fat_metadata = {
+                    **self._implementation_metadata(base, head),
+                    "changed_files": [f"src/module_{i}.py" for i in range(90)],
+                    **{f"check_{i}": "passed" for i in range(30)},
+                }
+                with patcher, patch("agent.auxiliary_client.get_text_auxiliary_client",
+                                    lambda *a, **k: (object(), "judge-double")):
+                    # Long prose as well: the prose is clipped around the
+                    # evidence block, never the other way round.
+                    out = self._handoff(surface, tid, run, base, head,
+                                        metadata=fat_metadata, summary="detail " * 700)
+
+                text = json.dumps(out) if isinstance(out, dict) else out
+                self.assertIn("rejected by judge", text)
+                self.assertIn("implementation phase", text)
+                state = self._state(tid)
+                self.assertEqual(state["task"].status, "running")
+                self.assertIsNone(state["task"].candidate_run_id)
+                self.assertNotIn("review_requested", [e.kind for e in state["events"]])
+                # Neither a fat value nor long prose can push the revision or
+                # the executed checks out of the judged evidence.
+                prompt = judge.calls[0][2]
+                self.assertIn(f"- head_sha: {head}", prompt)
+                self.assertIn("- changed_files:", prompt)
+                self.assertIn("[truncated]", prompt)
+
+        with self.subTest(surface="manual_promotion"):
+            # A blocked review resumed by an operator promotion is implementation
+            # work again: the implementer's handoff must not be read as a review.
+            repo, base = self._repo()
+            tid, _, run = self._same_card_graph(repo, validation_required=False)
+            head = self._commit(repo, 1)
+            judge, patcher = self._judge(("implementation", "done"),
+                                         ("implementation", "done"))
+            with patcher, patch("agent.auxiliary_client.get_text_auxiliary_client",
+                                lambda *a, **k: (object(), "judge-double")):
+                self._handoff("tool_request_review", tid, run, base, head)
+                with kbc.connect_closing() as conn:
+                    review_run = kb.claim_review_task(conn, tid, claimer="reviewer:1")
+                    assert review_run is not None
+                    self.assertTrue(kb.block_task(
+                        conn, tid, reason="maintainer input required",
+                        kind="needs_input", expected_run_id=review_run.current_run_id,
+                    ))
+                    self.assertEqual(kb._resume_status_from_events(conn, tid), "review")
+                    self.assertEqual(
+                        kb.promote_task(conn, tid, actor="operator",
+                                        reason="manual promotion", force=True),
+                        (True, None),
+                    )
+                    self.assertEqual(kb.get_task(conn, tid).status, "ready")
+                    resumed = kb.claim_task(conn, tid, claimer="implementer:2")
+                assert resumed is not None
+                self.assertEqual(self._phase(tid), "implementation")
+                with patch.dict(os.environ, {
+                    "HERMES_KANBAN_TASK": tid,
+                    "HERMES_KANBAN_RUN_ID": str(resumed.current_run_id),
+                    "HERMES_PROFILE": "implementer",
+                }):
+                    out = self._handoff("tool_request_review", tid, resumed, base, head)
+
+            self.assertTrue(out.get("ok"), out)
+            self.assertEqual(self._state(tid)["task"].status, "review")
+            self.assertEqual([call[0] for call in judge.calls],
+                             ["implementation", "implementation"])
+
+        with self.subTest(surface="secret_metadata"):
+            # The auxiliary judge is a separate provider, so the evidence is
+            # redacted at that boundary even when structured redaction upstream
+            # had to keep the raw dict.
+            repo, base = self._repo()
+            tid, _, run = self._same_card_graph(repo)
+            head = self._commit(repo, 1)
+            secret = "ghp_" + "S" * 36
+            judge, patcher = self._judge(("implementation", "continue"))
+            with patcher, patch("agent.auxiliary_client.get_text_auxiliary_client",
+                                lambda *a, **k: (object(), "judge-double")):
+                # kanban_complete keeps the raw dict when structured redaction
+                # cannot re-parse; request_review refuses that metadata outright.
+                out = self._handoff(
+                    "tool_complete", tid, run, base, head,
+                    metadata={**self._implementation_metadata(base, head),
+                              "secret": f'abc\"{secret}'},
+                )
+            self.assertIn("rejected by judge", json.dumps(out))
+            self.assertNotIn(secret, judge.calls[0][2])
+
+        with self.subTest(surface="review_run"):
+            repo, base = self._repo()
+            tid, _, run = self._same_card_graph(repo)
+            head = self._commit(repo, 1)
+            judge, patcher = self._judge(("implementation", "done"),
+                                         ("review", "done"), ("review", "continue"))
+            with patcher, patch("agent.auxiliary_client.get_text_auxiliary_client",
+                                lambda *a, **k: (object(), "judge-double")):
+                self._handoff("tool_request_review", tid, run, base, head)
+                with kbc.connect_closing() as conn:
+                    review_run = kb.claim_review_task(conn, tid, claimer="reviewer:1")
+                self.assertIsNotNone(review_run)
+                assert review_run is not None
+                from tools import kanban_tools as tools
+
+                with patch.dict(os.environ, {
+                    "HERMES_KANBAN_TASK": tid,
+                    "HERMES_KANBAN_RUN_ID": str(review_run.current_run_id),
+                    "HERMES_PROFILE": "reviewer",
+                }):
+                    handoff = json.loads(tools._handle_request_review({
+                        "summary": "Handing the candidate back as implementation.",
+                        "metadata": self._implementation_metadata(base, head),
+                    }))
+                    approval = json.loads(tools._handle_complete({
+                        "summary": "APPROVE",
+                        "verdict": "APPROVE",
+                    }))
+
+            self.assertIn(self.GUARD_REASON, handoff["error"])
+            self.assertIn("rejected by judge", approval["error"])
+            state = self._state(tid)
+            self.assertEqual(state["task"].status, "running")
+            self.assertEqual(state["task"].assignee, "reviewer")
+            self.assertEqual(state["task"].candidate_run_id, run.current_run_id)
+            self.assertIsNone(state["lifecycle"]["review_verdict"])
+            self.assertIsNone(state["run"].metadata)  # no implementation evidence stamped
+            self.assertEqual([e.kind for e in state["events"]].count("review_requested"), 1)
+            self.assertEqual([call[0] for call in judge.calls],
+                             ["implementation", "review", "review"])
+            # The review rubric needs the revision under review, so the reviewer's
+            # metadata reaches the judge too.
+            self.assertIn(f"- head_sha: {head}", judge.calls[1][2])
+
+        # The goal loop judges its own phase only, and a caller without a phase
+        # keeps whole-goal judging and the effective-revision refresh.
+        from hermes_cli import goals
+
+        loop_judge = _PhaseJudge(("implementation", "done"))
+        statuses = iter(["running", "review"])
+        prompts: list[str] = []
+        with patch.multiple("hermes_cli.goals", _call_goal_judge_llm=loop_judge):
+            looped = goals.run_kanban_goal_loop(
+                task_id="t_phase",
+                goal_text=self.GOAL,
+                phase="implementation",
+                run_turn=lambda prompt: prompts.append(prompt) or "handed off",
+                task_status_fn=lambda: next(statuses),
+                block_fn=lambda reason: self.fail(f"must not block: {reason}"),
+                first_response="Implemented the candidate; 12 passed locally.",
+            )
+        self.assertEqual(looped["outcome"], "review_requested_by_worker")
+        self.assertEqual(len(loop_judge.calls), 1)  # the next phase is never judged
+        self.assertIn("implementation phase", prompts[0])
+        self.assertIn("kanban_request_review", prompts[0])
+        self.assertIn("not final acceptance", prompts[0])
+
+        # A finalize nudge in the review phase must not send the reviewer to the
+        # implementation handoff, which the runtime now rejects for review runs.
+        review_judge = _PhaseJudge(("review", "done"))
+        review_statuses = iter(["running", "changes_requested"])
+        review_prompts: list[str] = []
+        with patch.multiple("hermes_cli.goals", _call_goal_judge_llm=review_judge):
+            reviewed = goals.run_kanban_goal_loop(
+                task_id="t_review",
+                goal_text=self.GOAL,
+                phase="review",
+                run_turn=lambda prompt: review_prompts.append(prompt) or "verdict submitted",
+                task_status_fn=lambda: next(review_statuses),
+                block_fn=lambda reason: self.fail(f"must not block: {reason}"),
+                first_response="Reviewed the candidate at its head; findings listed.",
+            )
+        self.assertEqual(reviewed["outcome"], "changes_requested_by_reviewer")
+        self.assertNotIn("kanban_request_review", review_prompts[0])
+        self.assertIn("REQUEST_CHANGES", review_prompts[0])
+
+        with self.subTest(surface="phase_less_loop"):
+            generic_judge = _PhaseJudge((None, "continue"))
+            generic_prompts: list[str] = []
+            with patch.multiple("hermes_cli.goals", _call_goal_judge_llm=generic_judge):
+                stopped = goals.run_kanban_goal_loop(
+                    task_id="t_generic",
+                    goal_text="original goal",
+                    goal_text_fn=lambda: "revised goal",
+                    run_turn=lambda prompt: generic_prompts.append(prompt) or "still working",
+                    task_status_fn=lambda: "running",
+                    block_fn=lambda reason: None,
+                    max_turns=2,
+                    first_response="first response",
+                )
+            self.assertEqual(stopped["outcome"], "blocked_budget")
+            self.assertEqual(generic_judge.calls[0][0], "generic")
+            self.assertIn("revised goal", generic_judge.calls[0][2])
+            self.assertIn("not done yet", generic_prompts[0])
+            self.assertNotIn("implementation phase", generic_prompts[0])
+
+    # --- surface 2: typed rework and validation ---------------------------
+    def _review_ready(self, route: str):
+        """Implementation handed off and claimed for review on a fresh graph."""
+        repo, base = self._repo()
+        tid, validation, run = self._same_card_graph(repo)
+        head = self._commit(repo, 1)
+        judge, patcher = self._judge(("implementation", "done"), ("review", "done"))
+        with patcher, patch("agent.auxiliary_client.get_text_auxiliary_client",
+                            lambda *a, **k: (object(), "judge-double")):
+            self._handoff("tool_request_review", tid, run, base, head)
+            with kbc.connect_closing() as conn:
+                review_run = kb.claim_review_task(conn, tid, claimer="reviewer:1")
+            self.assertIsNotNone(review_run)
+            assert review_run is not None
+            from tools import kanban_tools as tools
+
+            with patch.dict(os.environ, {
+                "HERMES_KANBAN_TASK": tid,
+                "HERMES_KANBAN_RUN_ID": str(review_run.current_run_id),
+                "HERMES_PROFILE": "reviewer",
+            }):
+                if route == "request_changes":
+                    out = json.loads(tools._handle_request_changes({
+                        "reason": "Fix the boundary assertion in phase.py",
+                        "metadata": {"reviewed_head_sha": head},
+                    }))
+                else:
+                    out = json.loads(tools._handle_complete({
+                        "summary": "Reviewed phase.py at this head: the boundary "
+                                   "assertion is wrong. Requires rework.",
+                        "verdict": "REQUEST_CHANGES",
+                    }))
+        return tid, validation, run.current_run_id, base, head, out
+
+    def test_typed_rework_and_validation_decide_acceptance(self) -> None:
+        # Invariant: a review rejection is rework returned to the implementer —
+        # never a repair by the reviewer and never acceptance — and only a fresh
+        # tester verdict at the approved head decides the card.
+        for route in ("request_changes", "complete_request_changes"):
+            with self.subTest(route=route):
+                tid, validation, candidate_run_id, _base, head, out = self._review_ready(route)
+                self.assertTrue(out.get("ok"), out)
+                state = self._state(tid)
+                self.assertIn(state["task"].status, {"ready", "todo"})
+                self.assertEqual(state["task"].assignee, "implementer")
+                self.assertIsNone(state["task"].candidate_run_id)
+                self.assertEqual(state["lifecycle"]["review_verdict"], "REQUEST_CHANGES")
+                self.assertIsNone(state["lifecycle"]["head_sha"])
+                self.assertNotEqual(state["lifecycle"]["acceptance"], "accepted")
+                self.assertEqual(state["run"].outcome, "changes_requested")
+                # The negative verdict survives against the reviewed candidate/head.
+                elapsed = state["run"].metadata["lifecycle"]
+                self.assertEqual(elapsed["verdict"], "REQUEST_CHANGES")
+                self.assertEqual(elapsed["head_sha"], head)
+                self.assertEqual(elapsed["candidate_run_id"], candidate_run_id)
+                with kbc.connect_closing() as conn:
+                    self.assertEqual(kb.get_task(conn, validation).status, "blocked")
+                self.assertFalse(self._claims(validation))
+
+        for verdict, expected in (("PASS", "accepted"), ("FAIL", "rejected")):
+            with self.subTest(validation=verdict):
+                repo, base = self._repo()
+                tid, validation, run = self._same_card_graph(repo)
+                head1 = self._commit(repo, 1)
+                judge, patcher = self._judge(("implementation", "done"),
+                                             ("implementation", "done"), ("review", "done"))
+                with patcher, patch("agent.auxiliary_client.get_text_auxiliary_client",
+                                    lambda *a, **k: (object(), "judge-double")):
+                    from tools import kanban_tools as tools
+
+                    self._handoff("tool_request_review", tid, run, base, head1)
+                    with kbc.connect_closing() as conn:
+                        first_review = kb.claim_review_task(conn, tid, claimer="reviewer:1")
+                    assert first_review is not None
+                    with patch.dict(os.environ, {
+                        "HERMES_KANBAN_TASK": tid,
+                        "HERMES_KANBAN_RUN_ID": str(first_review.current_run_id),
+                        "HERMES_PROFILE": "reviewer",
+                    }):
+                        rejected = json.loads(tools._handle_request_changes({
+                            "reason": "Boundary assertion is wrong; fix it.",
+                            "metadata": {"reviewed_head_sha": head1},
+                        }))
+                    self.assertTrue(rejected["ok"], rejected)
+
+                    # The rejected candidate's verdict cannot release the tester.
+                    self.assertEqual(self._phase(validation), "validation")
+                    self.assertFalse(self._claims(validation))
+
+                    head2 = self._commit(repo, 2)
+                    self.assertNotEqual(head1, head2)
+                    with kbc.connect_closing() as conn:
+                        repair = kb.claim_task(conn, tid, claimer="implementer:2")
+                    assert repair is not None
+                    with patch.dict(os.environ, {
+                        "HERMES_KANBAN_TASK": tid,
+                        "HERMES_KANBAN_RUN_ID": str(repair.current_run_id),
+                        "HERMES_PROFILE": "implementer",
+                    }):
+                        repaired = json.loads(tools._handle_complete({
+                            "summary": "Fixed the boundary assertion; 13 passed.",
+                            "metadata": self._implementation_metadata(base, head2),
+                        }))
+                    self.assertTrue(repaired["ok"], repaired)
+                    repaired_state = self._state(tid)
+                    self.assertEqual(repaired_state["task"].status, "review")
+                    self.assertEqual(repaired_state["task"].candidate_run_id,
+                                     repair.current_run_id)
+                    self.assertEqual(repaired_state["lifecycle"]["head_sha"], head2)
+                    self.assertNotEqual(repaired_state["lifecycle"]["acceptance"], "accepted")
+
+                    with kbc.connect_closing() as conn:
+                        second_review = kb.claim_review_task(conn, tid, claimer="reviewer:2")
+                    assert second_review is not None
+                    with patch.dict(os.environ, {
+                        "HERMES_KANBAN_TASK": tid,
+                        "HERMES_KANBAN_RUN_ID": str(second_review.current_run_id),
+                        "HERMES_PROFILE": "reviewer",
+                    }):
+                        approved = json.loads(tools._handle_complete({
+                            "summary": "Re-reviewed phase.py at the repaired head: "
+                                       "13 passed, findings addressed.",
+                            "verdict": "APPROVE",
+                        }))
+                    self.assertTrue(approved["ok"], approved)
+
+                    # Approval releases the gated tester without accepting the card.
+                    approved_state = self._state(tid)
+                    self.assertEqual(approved_state["lifecycle"]["review_verdict"], "APPROVE")
+                    self.assertEqual(approved_state["lifecycle"]["acceptance"], "pending")
+                    self.assertEqual(approved_state["lifecycle"]["head_sha"], head2)
+                    with kbc.connect_closing() as conn:
+                        self.assertEqual(kb.get_task(conn, validation).status, "ready")
+                        tester_run = kb.claim_task(conn, validation, claimer="tester:1")
+                    assert tester_run is not None
+                    with patch.dict(os.environ, {
+                        "HERMES_KANBAN_TASK": validation,
+                        "HERMES_KANBAN_RUN_ID": str(tester_run.current_run_id),
+                        "HERMES_PROFILE": "tester",
+                    }):
+                        executed = ("13 passed" if verdict == "PASS" else "boundary case failed")
+                        validated = json.loads(tools._handle_complete({
+                            "summary": f"Executed the acceptance suite at the approved "
+                                       f"head: {executed}.",
+                            "verdict": verdict,
+                        }))
+                self.assertTrue(validated["ok"], validated)
+                final = self._state(tid)
+                self.assertEqual(final["lifecycle"]["validation_verdict"], verdict)
+                self.assertEqual(final["lifecycle"]["acceptance"], expected)
+                # An approval that carries no revision in its own metadata is
+                # still judged against the persisted candidate head.
+                self.assertIn(f"- reviewed_head_sha: {head2}", judge.calls[2][2])
+
+        with self.subTest(route="approval_retry"):
+            # A retried approval (validation not required) is judged against the
+            # pinned candidate revision even though the finished review run is now
+            # the newest handoff on the card.
+            repo, base = self._repo()
+            tid, _, run = self._same_card_graph(repo, validation_required=False)
+            head = self._commit(repo, 1)
+            judge, patcher = self._judge(("implementation", "done"),
+                                         ("review", "done"), ("review", "done"))
+            with patcher, patch("agent.auxiliary_client.get_text_auxiliary_client",
+                                lambda *a, **k: (object(), "judge-double")):
+                from tools import kanban_tools as tools
+
+                self._handoff("tool_request_review", tid, run, base, head)
+                with kbc.connect_closing() as conn:
+                    review_run = kb.claim_review_task(conn, tid, claimer="reviewer:1")
+                assert review_run is not None
+                with patch.dict(os.environ, {
+                    "HERMES_KANBAN_TASK": tid,
+                    "HERMES_KANBAN_RUN_ID": str(review_run.current_run_id),
+                    "HERMES_PROFILE": "reviewer",
+                }):
+                    approved = json.loads(tools._handle_complete({
+                        "summary": "Re-reviewed the candidate; checks passed.",
+                        "verdict": "APPROVE",
+                    }))
+                    self.assertTrue(approved["ok"], approved)
+                    self.assertEqual(self._state(tid)["task"].status, "done")
+                    # Same approval again, as a client that lost the first response.
+                    retried = json.loads(tools._handle_complete({
+                        "summary": "Re-reviewed the candidate; checks passed.",
+                        "verdict": "APPROVE",
+                    }))
+
+            self.assertTrue(retried.get("ok"), retried)
+            self.assertEqual(self._state(tid)["task"].status, "done")
+            self.assertEqual([call[0] for call in judge.calls],
+                             ["implementation", "review", "review"])
+            self.assertIn(f"- reviewed_head_sha: {head}", judge.calls[2][2])
+
+        with self.subTest(route="separate_review_card"):
+            repo, base = self._repo()
+            with kbc.connect_closing() as conn:
+                implementation = kb.create_task(
+                    conn,
+                    title="Separate-card implementation",
+                    body=self.GOAL,
+                    assignee="implementer",
+                    workspace_kind="dir",
+                    workspace_path=str(repo),
+                    goal_mode=True,
+                    lifecycle_contract={
+                        "kind": "code",
+                        "review_mode": "separate_card",
+                        "reviewer": "reviewer",
+                        "validation_required": True,
+                    },
+                )
+                review = kb.create_task(
+                    conn,
+                    title="Separate review",
+                    assignee="reviewer",
+                    goal_mode=True,
+                    lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
+                )
+                kb.link_tasks(conn, implementation, review)
+                run = kb.claim_task(conn, implementation, claimer="implementer:1")
+                assert run is not None
+            head = self._commit(repo, 1)
+            judge, patcher = self._judge(("implementation", "done"), ("review", "done"))
+            with patcher, patch("agent.auxiliary_client.get_text_auxiliary_client",
+                                lambda *a, **k: (object(), "judge-double")):
+                from tools import kanban_tools as tools
+
+                with patch.dict(os.environ, {
+                    "HERMES_KANBAN_TASK": implementation,
+                    "HERMES_KANBAN_RUN_ID": str(run.current_run_id),
+                    "HERMES_PROFILE": "implementer",
+                }):
+                    handed_off = json.loads(tools._handle_complete({
+                        "summary": "Implemented and verified locally: 12 passed.",
+                        "metadata": self._implementation_metadata(base, head),
+                    }))
+                self.assertTrue(handed_off["ok"], handed_off)
+                with kbc.connect_closing() as conn:
+                    # The completed candidate promotes its separate review child.
+                    self.assertEqual(kb.get_task(conn, review).status, "review")
+                    self.assertEqual(self._phase(review), "review")
+                    review_run = kb.claim_review_task(conn, review, claimer="reviewer:1")
+                assert review_run is not None
+                with patch.dict(os.environ, {
+                    "HERMES_KANBAN_TASK": review,
+                    "HERMES_KANBAN_RUN_ID": str(review_run.current_run_id),
+                    "HERMES_PROFILE": "reviewer",
+                }):
+                    rejected = json.loads(tools._handle_complete({
+                        "summary": "Inspected the diff: the retry path drops the error. "
+                                   "Requires rework.",
+                        "verdict": "REQUEST_CHANGES",
+                    }))
+
+            self.assertTrue(rejected["ok"], rejected)
+            review_state = self._state(review)
+            self.assertEqual(review_state["task"].status, "done")
+            self.assertEqual(review_state["lifecycle"]["review_verdict"], "REQUEST_CHANGES")
+            self.assertNotEqual(
+                self._state(implementation)["lifecycle"]["acceptance"], "accepted")
+            self.assertEqual([call[0] for call in judge.calls], ["implementation", "review"])
 
 
 if __name__ == "__main__":

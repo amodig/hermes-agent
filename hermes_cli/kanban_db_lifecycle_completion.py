@@ -87,34 +87,94 @@ def _completion_mode_validation(
     return "validation"
 
 
-def _completion_mode_code(
-    conn: sqlite3.Connection,
-    task_before: Any,
-    task_id: str,
-    verdict: Optional[str],
-) -> str:
+def handoff_phase(conn: sqlite3.Connection, task_before: Any) -> Optional[str]:
+    """The lifecycle phase a card's next handoff belongs to, from persisted state.
+
+    ``None`` for general / untyped / unknown contracts — those keep the generic
+    goal judging and writer validation. Callers must never derive this from a
+    supplied verdict, summary, role name, or goal wording: the phase decides
+    which rubric the judge applies, so it is read from the card only.
+    """
+    contract = getattr(task_before, "lifecycle_contract", None)
+    task_id = getattr(task_before, "id", None)
+    if not task_id or not isinstance(contract, dict):
+        return None
+    kind = contract.get("kind")
+    if kind == "review":
+        return "review"
+    if kind == "validation":
+        return "validation"
+    if kind != "code":
+        return None
     claimed_event = (
         _kb._latest_event(conn, task_id, "claimed", task_before.current_run_id)
         if task_before.current_run_id
         else None
     )
     claimed_source = _kb._json_dict(_kb._row_get(claimed_event, "payload")).get("source_status")
-    resumed_review = _kb._resume_status_from_events(conn, task_id) == "review"
     completed_review = (
         task_before.status == "done"
-        and task_before.lifecycle_contract.get("review_mode") == "same_card"
+        and contract.get("review_mode") == "same_card"
         and get_lifecycle_state(conn, task_id).get("review_verdict") is not None
     )
-    typed_phase = (
-        "review"
-        if (
-            task_before.status == "review"
-            or claimed_source == "review"
-            or completed_review
-            or resumed_review
-        )
-        else "implementation"
+    if (
+        task_before.status == "review"
+        or claimed_source == "review"
+        or completed_review
+    ):
+        return "review"
+    if task_before.current_run_id:
+        # A live claim that is not a review claim is implementation work: an
+        # operator promotion or unblock supersedes older review-resume history,
+        # which is otherwise still the newest resumable event on the card.
+        return "implementation"
+    if _kb._resume_status_from_events(conn, task_id) == "review":
+        return "review"
+    return "implementation"
+
+
+def handoff_evidence(conn: sqlite3.Connection, task_before: Any) -> Optional[dict]:
+    """Persisted candidate revision for a review/validation-phase handoff.
+
+    The completion writer derives the reviewed revision itself, inside
+    ``_stamp_lifecycle_metadata``, after the goal gate has already run — and the
+    bundled review flow records findings rather than a head in its handoff
+    metadata. Hand the judge the revision that is already durable on the card so
+    an approval cannot look evidence-free. ``None`` when the card is not in a
+    review/validation phase or has no candidate head yet.
+    """
+    contract = getattr(task_before, "lifecycle_contract", None)
+    if not isinstance(contract, dict) or handoff_phase(conn, task_before) not in {
+        "review", "validation"
+    }:
+        return None
+    candidate_task_id = (
+        getattr(task_before, "id", None)
+        if contract.get("kind") == "code"
+        else contract.get("candidate_task_id")
     )
+    if not candidate_task_id:
+        return None
+    candidate_task_id = str(candidate_task_id)
+    # The card's own projection is authoritative: it resolves the pinned
+    # candidate run, whereas latest_handoff can be shadowed by a newer review run
+    # whose handoff fields live in its lifecycle envelope.
+    head_sha = get_lifecycle_state(conn, candidate_task_id).get("head_sha")
+    if not isinstance(head_sha, str) or not head_sha.strip():
+        head_sha = _kb.latest_handoff(conn, candidate_task_id).get("head_sha")
+    evidence: dict = {"candidate_task_id": candidate_task_id}
+    if isinstance(head_sha, str) and head_sha.strip():
+        evidence["reviewed_head_sha"] = head_sha
+    return evidence
+
+
+def _completion_mode_code(
+    conn: sqlite3.Connection,
+    task_before: Any,
+    task_id: str,
+    verdict: Optional[str],
+) -> str:
+    typed_phase = handoff_phase(conn, task_before)
     if typed_phase == "review":
         if verdict is None:
             raise LifecycleEvidenceError("same-card review completion requires a verdict")
@@ -964,6 +1024,15 @@ def request_review(
             return _ret(False, "reviewer does not match the declared lifecycle reviewer")
     if typed_code:
         reviewer = typed_code.get("reviewer")
+    # A typed review run may not hand off as implementation: the phase rubric
+    # (and the implementation evidence stamp below) only fit the implementation
+    # phase, so a reviewer must submit a review verdict instead.
+    if (
+        typed_code
+        and typed_code.get("review_mode") == "same_card"
+        and handoff_phase(conn, task_before) == "review"
+    ):
+        return _ret(False, "same-card review runs must submit a review verdict")
 
     summary = _kb.redact_review_value(summary)
     metadata = _kb.redact_review_value(metadata)
@@ -1015,6 +1084,11 @@ def request_review(
     contract_err: Optional[_kb.CompletionContractError] = None
     synthetic_run_id: Optional[int] = None
     with _kb.write_txn(conn):
+        # Re-read the card inside the txn: a review claim can land between the
+        # preflight check above and the mutation below.
+        if typed_code and typed_code.get("review_mode") == "same_card":
+            if handoff_phase(conn, _kb.get_task(conn, task_id)) == "review":
+                return _ret(False, "same-card review runs must submit a review verdict")
         if _completion_contract_snapshot(conn, task_id) != preflight_contract:
             contract_err = _kb.CompletionContractError(
                 task_id,

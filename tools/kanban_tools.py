@@ -16,7 +16,12 @@ from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
 from agent.redact import redact_sensitive_text
-from hermes_cli.goals import judge_goal, render_effective_goal
+from hermes_cli.goals import (
+    JUDGE_PHASE_GATE_HINTS,
+    judge_goal,
+    render_effective_goal,
+    render_judge_evidence,
+)
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
@@ -378,9 +383,8 @@ _GOAL_GATE_MESSAGES = {
             "will NOT complete silently. Either re-scope the task with kanban_edit, or record "
             "the block with kanban_block and hand the decision to a human / reviewer."),
         "continue": (
-            "Goal completion rejected by judge: {reason}. To proceed, either: (1) provide "
-            "explicit acceptance evidence in your summary matching the task's criteria, or (2) "
-            "create continuation tasks with parents=[{tid}] and keep this task alive.")},
+            "Goal completion rejected by judge: {reason}. Provide explicit acceptance evidence "
+            "in your summary matching the task's criteria.")},
     "kanban_request_review": {
         "blocked": (
             "Goal review handoff rejected: judge ruled the goal unachievable — {reason}. "
@@ -390,6 +394,12 @@ _GOAL_GATE_MESSAGES = {
             "matching the card before requesting review.")}}
 
 
+def _phase_gate_hint(phase: Optional[str]) -> str:
+    """Phase-specific evidence guidance appended to a judge rejection (#37)."""
+    hint = JUDGE_PHASE_GATE_HINTS.get(phase) if phase else None
+    return f" {hint}" if hint else ""
+
+
 def _goal_gate(
     tool_name: str,
     task,
@@ -397,10 +407,19 @@ def _goal_gate(
     evidence: str,
     *,
     effective_goal: Optional[dict] = None,
+    phase: Optional[str] = None,
 ) -> None:
-    """Goal-mode pre-handoff judge gate using the current effective goal."""
+    """Goal-mode pre-handoff judge gate using the current effective goal.
+
+    ``phase`` (the card's lifecycle phase) makes the judge apply that phase's
+    definition of done instead of the whole card objective. The evidence is
+    redacted here as well: the judge is a separately configured provider, and the
+    structured redaction upstream keeps the raw dict when its JSON round-trip
+    fails.
+    """
     if not task or not task.goal_mode or not _goal_judge_available():
         return
+    evidence = _redact(evidence)
     try:
         verdict, reason, _, _, _ = judge_goal(
             goal=render_effective_goal(
@@ -409,6 +428,7 @@ def _goal_gate(
                 fallback_body=task.body,
             ),
             last_response=evidence.strip(),
+            phase=phase,
         )
     except Exception as judge_exc:
         logger.warning(
@@ -420,7 +440,10 @@ def _goal_gate(
     if verdict == "done":
         return
     key = "blocked" if verdict == "blocked" else "continue"
-    raise _Reject(_GOAL_GATE_MESSAGES[tool_name][key].format(reason=reason, tid=tid))
+    message = _GOAL_GATE_MESSAGES[tool_name][key].format(reason=reason, tid=tid)
+    if key == "continue":
+        message += _phase_gate_hint(phase)
+    raise _Reject(message)
 
 
 # --- Runtime-activity → board bridges (auto-heartbeat, live comment injection) ---
@@ -599,8 +622,17 @@ def _handle_complete(args: dict, **kw) -> str:
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
         task = kb.get_task(conn, tid)
         effective_goal = kb.get_effective_goal(conn, tid)
-        _goal_gate("kanban_complete", task, tid, (summary or result or str(verdict) or "").strip(),
-                   effective_goal=effective_goal)
+        # The card's phase decides the judge's rubric; a submitted verdict is
+        # evidence for that phase, never the phase selector.
+        phase = kb.handoff_phase(conn, task)
+        # The writer derives the reviewed revision after this gate, so the judge
+        # gets the candidate revision that is already persisted on the card.
+        evidence_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        evidence_metadata.update(kb.handoff_evidence(conn, task) or {})
+        _goal_gate("kanban_complete", task, tid,
+                   render_judge_evidence(summary or result, verdict=verdict,
+                                         metadata=evidence_metadata),
+                   effective_goal=effective_goal, phase=phase)
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
@@ -691,8 +723,9 @@ def _handle_request_review(args: dict, **kw) -> str:
     with _board(args.get("board")) as (kb, conn):
         task = kb.get_task(conn, tid)
         effective_goal = kb.get_effective_goal(conn, tid)
-        _goal_gate("kanban_request_review", task, tid, summary,
-                   effective_goal=effective_goal)
+        _goal_gate("kanban_request_review", task, tid,
+                   render_judge_evidence(summary, metadata=metadata),
+                   effective_goal=effective_goal, phase=kb.handoff_phase(conn, task))
         try:
             ok, fail_reason = kb.request_review(
                 conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
