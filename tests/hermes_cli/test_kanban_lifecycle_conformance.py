@@ -3169,7 +3169,8 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
         MODULE._git(repo, "commit", "-qm", f"implementation {n}")
         return MODULE._git(repo, "rev-parse", "HEAD")
 
-    def _same_card_graph(self, repo: Path, *, goal_mode: bool = True):
+    def _same_card_graph(self, repo: Path, *, goal_mode: bool = True,
+                         validation_required: bool = True):
         """Implementation card + tester validation child gated on review_approved."""
         with kbc.connect_closing() as conn:
             implementation = kb.create_task(
@@ -3184,17 +3185,19 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
                     "kind": "code",
                     "review_mode": "same_card",
                     "reviewer": "reviewer",
-                    "validation_required": True,
+                    "validation_required": validation_required,
                 },
             )
-            validation = kb.create_task(
-                conn,
-                title="Phase-aware validation",
-                assignee="tester",
-                initial_status="blocked",
-                lifecycle_contract={"kind": "validation", "candidate_task_id": implementation},
-            )
-            kb.link_tasks(conn, implementation, validation, requirement="review_approved")
+            validation = None
+            if validation_required:
+                validation = kb.create_task(
+                    conn,
+                    title="Phase-aware validation",
+                    assignee="tester",
+                    initial_status="blocked",
+                    lifecycle_contract={"kind": "validation", "candidate_task_id": implementation},
+                )
+                kb.link_tasks(conn, implementation, validation, requirement="review_approved")
             run = kb.claim_task(conn, implementation, claimer="implementer:1")
             self.assertIsNotNone(run)
         return implementation, validation, run
@@ -3587,6 +3590,46 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
                 # An approval that carries no revision in its own metadata is
                 # still judged against the persisted candidate head.
                 self.assertIn(f"- reviewed_head_sha: {head2}", judge.calls[2][2])
+
+        with self.subTest(route="approval_retry"):
+            # A retried approval (validation not required) is judged against the
+            # pinned candidate revision even though the finished review run is now
+            # the newest handoff on the card.
+            repo, base = self._repo()
+            tid, _, run = self._same_card_graph(repo, validation_required=False)
+            head = self._commit(repo, 1)
+            judge, patcher = self._judge(("implementation", "done"),
+                                         ("review", "done"), ("review", "done"))
+            with patcher, patch("agent.auxiliary_client.get_text_auxiliary_client",
+                                lambda *a, **k: (object(), "judge-double")):
+                from tools import kanban_tools as tools
+
+                self._handoff("tool_request_review", tid, run, base, head)
+                with kbc.connect_closing() as conn:
+                    review_run = kb.claim_review_task(conn, tid, claimer="reviewer:1")
+                assert review_run is not None
+                with patch.dict(os.environ, {
+                    "HERMES_KANBAN_TASK": tid,
+                    "HERMES_KANBAN_RUN_ID": str(review_run.current_run_id),
+                    "HERMES_PROFILE": "reviewer",
+                }):
+                    approved = json.loads(tools._handle_complete({
+                        "summary": "Re-reviewed the candidate; checks passed.",
+                        "verdict": "APPROVE",
+                    }))
+                    self.assertTrue(approved["ok"], approved)
+                    self.assertEqual(self._state(tid)["task"].status, "done")
+                    # Same approval again, as a client that lost the first response.
+                    retried = json.loads(tools._handle_complete({
+                        "summary": "Re-reviewed the candidate; checks passed.",
+                        "verdict": "APPROVE",
+                    }))
+
+            self.assertTrue(retried.get("ok"), retried)
+            self.assertEqual(self._state(tid)["task"].status, "done")
+            self.assertEqual([call[0] for call in judge.calls],
+                             ["implementation", "review", "review"])
+            self.assertIn(f"- reviewed_head_sha: {head}", judge.calls[2][2])
 
         with self.subTest(route="separate_review_card"):
             repo, base = self._repo()

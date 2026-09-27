@@ -150,8 +150,14 @@ def handoff_evidence(conn: sqlite3.Connection, task_before: Any) -> Optional[dic
     )
     if not candidate_task_id:
         return None
-    head_sha = _kb.latest_handoff(conn, str(candidate_task_id)).get("head_sha")
-    evidence: dict = {"candidate_task_id": str(candidate_task_id)}
+    candidate_task_id = str(candidate_task_id)
+    # The card's own projection is authoritative: it resolves the pinned
+    # candidate run, whereas latest_handoff can be shadowed by a newer review run
+    # whose handoff fields live in its lifecycle envelope.
+    head_sha = get_lifecycle_state(conn, candidate_task_id).get("head_sha")
+    if not isinstance(head_sha, str) or not head_sha.strip():
+        head_sha = _kb.latest_handoff(conn, candidate_task_id).get("head_sha")
+    evidence: dict = {"candidate_task_id": candidate_task_id}
     if isinstance(head_sha, str) and head_sha.strip():
         evidence["reviewed_head_sha"] = head_sha
     return evidence
