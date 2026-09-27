@@ -4481,6 +4481,7 @@ from hermes_cli.kanban_db_lifecycle import (  # noqa: E402
     delete_archived_task,
     delete_task,
     edit_completed_task_result,
+    handoff_phase,
     invalidate_descendants_for_parent_reopen,
     link_tasks,
     promote_task,

@@ -1,7 +1,7 @@
 ---
 name: sdlc-review
 description: Review Kanban handoffs and route verified outcomes.
-version: 1.1.0
+version: 1.2.0
 author: Jakub Wolniewicz (@frizikk) + Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -49,15 +49,34 @@ This skill is loaded automatically by the review dispatcher. Start with `kanban_
 
 | Verdict | When | Final action |
 |---|---|---|
-| Approve | Acceptance criteria and verification pass | Typed review: `kanban_complete(verdict="APPROVE", ...)`; typed validation: `kanban_complete(verdict="PASS", ...)`; legacy card: `kanban_complete(...)` |
-| Request changes | Correctable implementation defects remain | Typed review: `kanban_complete(verdict="REQUEST_CHANGES", ...)`; typed validation: `kanban_complete(verdict="FAIL", ...)`; legacy card: `kanban_request_changes` |
+| Approve | Acceptance criteria and verification pass | Typed review (same-card code or separate review card): `kanban_complete(verdict="APPROVE", ...)`; typed validation: `kanban_complete(verdict="PASS", ...)`; legacy card: `kanban_complete(...)` |
+| Request changes | Correctable implementation defects remain | Same-card code: `kanban_request_changes(reason=..., metadata=...)`; separate review card: `kanban_complete(verdict="REQUEST_CHANGES", ...)`; typed validation: `kanban_complete(verdict="FAIL", ...)`; legacy card: `kanban_request_changes` |
 | Escalate | A human decision or external prerequisite is required | `kanban_block` |
+
+Which transition you use follows the card's contract, not your preference or
+your summary wording:
+
+- A `kind=code, review_mode=same_card` task you claimed from the `review` lane
+  is one card carrying both roles. Record the verdict with the typed
+  `kanban_complete` (`APPROVE` / `REQUEST_CHANGES`) when the review is the
+  card's move; when the outcome is rework, `kanban_request_changes(reason=...,
+  metadata=...)` names the exact reviewed head and returns the card to its
+  original implementer. The native runtime validates the candidate-run
+  provenance and restores that implementer — never reassign the card yourself.
+- A separate `kind=review` card completes with `kanban_complete(verdict=...)`
+  alone. The CTO reworks the typed graph from that recorded negative verdict.
+- `kind=validation` cards record `PASS` or `FAIL` — never
+  `kanban_request_changes`.
 
 A requested-changes transition returns the task to its original implementer.
 For a typed separate-card graph, the orchestrator reworks the lifecycle graph
 after the review card records `REQUEST_CHANGES`. When that implementer requests
 review again without naming a reviewer, persisted reviewer provenance routes
 the re-review back to the same reviewer profile.
+
+An approval is the review phase's own completion: it may release the gated
+tester validation, and it does not claim that validation has already run or
+passed.
 
 ## Review Lenses
 
@@ -139,7 +158,22 @@ kanban_comment(
 )
 ```
 
-For a typed review card, finish with the explicit lifecycle verdict:
+For a same-card `kind=code, review_mode=same_card` task you claimed for review,
+return it to its implementer with the exact reviewed head and the actionable
+findings:
+
+```text
+kanban_request_changes(
+    reason="<concise summary of the required corrections>",
+    metadata={"review_outcome": "changes_requested", "reviewed_head_sha": "<head>"},
+)
+```
+
+The native runtime supplies and validates the candidate-run provenance for this
+transition and restores the original implementer; you do not reassign the card.
+
+For a separate `kind=review` card, finish with the explicit lifecycle verdict —
+the CTO reworks the typed graph from it:
 
 ```text
 kanban_complete(
@@ -166,9 +200,9 @@ kanban_request_changes(
 )
 ```
 
-Do not call `kanban_request_changes` for a typed review or validation card.
-Same-card typed code uses the typed `kanban_complete` action; a separate-card
-graph is reworked by the orchestrator after the review card is completed.
+Do not call `kanban_request_changes` for a separate review card or for a typed
+validation card, and do not call `kanban_complete(verdict=...)` to reject work on
+a same-card code task.
 State where the defect is, how it reproduces, why it violates the task, and the minimum outcome that would resolve it. The transition does not use blocker recurrence accounting.
 
 #### Escalate
@@ -194,8 +228,9 @@ Do not edit the implementation while acting as reviewer. Request changes and let
 - **Vague findings:** “Needs work” does not give the implementer a reproducible correction target.
 - **Style-only blocking:** Do not request changes for preference-level nits when behavior and repository standards are satisfied.
 - **Skipping prior rounds:** Re-review must confirm both the requested corrections and preservation of previously passing behavior.
-- **Using blockers for ordinary rework:** In legacy/untyped review flows, correctable defects belong in `kanban_request_changes`; typed review cards record `REQUEST_CHANGES`, and typed validation cards record `FAIL`, through `kanban_complete(verdict=...)`. Reserve `kanban_block` for genuine external blockers or human decisions.
+- **Using blockers for ordinary rework:** Correctable defects belong in the transition the card's contract names — `kanban_request_changes` for a same-card code task and for legacy/untyped review runs, `kanban_complete(verdict="REQUEST_CHANGES")` for a separate review card, `kanban_complete(verdict="FAIL")` for a typed validation card. Reserve `kanban_block` for genuine external blockers or human decisions.
 - **Completing without evidence:** Every approval summary must name the checks or artifacts actually inspected.
+- **Fighting the judge:** A completion judge that keeps a phase open is asking for that phase's evidence. Supply it. Never disable the judge, invent evidence, reassign the card directly, or build a replacement graph to escape a rejection — a review phase completes with a verdict and its findings, not with repairs.
 
 ## Verification
 
@@ -207,6 +242,7 @@ Before submitting the verdict, confirm:
 - [ ] Relevant focused checks were run or an explicit reason was recorded when execution was impossible.
 - [ ] Prior requested changes were re-tested on re-review.
 - [ ] Unrelated regressions and scope changes were considered.
-- [ ] The verdict uses exactly one terminal action.
+- [ ] The verdict uses exactly one terminal action, chosen by the card's contract: `kanban_request_changes(reason=..., metadata=...)` for same-card code rework, `kanban_complete(verdict="REQUEST_CHANGES")` for a separate review card, `kanban_complete(verdict="PASS"/"FAIL")` for typed validation.
 - [ ] The summary contains concrete, non-secret evidence.
 - [ ] No implementation files were edited by the reviewer.
+- [ ] No judge was disabled, no card reassigned directly, and no replacement graph created to make the transition land.

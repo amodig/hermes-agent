@@ -214,6 +214,106 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "Is the goal satisfied per its completion contract — done, blocked, continue, or wait?"
 )
 
+# ── Kanban phase-aware judging (#37) ──
+# A typed Kanban card's goal text states the whole card objective, which for a
+# ``kind=code`` card includes independent review, tester validation, and final
+# acceptance. Judging every handoff against that whole objective made a correct
+# implementation-to-review handoff look incomplete: the judge demanded review
+# and validation evidence that only later phases produce, so no candidate could
+# ever enter review. When the caller knows the phase a handoff belongs to, judge
+# that phase alone — its completion authorizes only the phase transition, while
+# the board still computes acceptance from fresh typed evidence.
+JUDGE_PHASE_INSTRUCTIONS = {
+    "implementation": (
+        "DONE = the implementation candidate is ready for independent review: the "
+        "deliverable exists and is described with concrete local verification "
+        "(what changed, plus the commands/checks that were run and their result). "
+        "Independent reviewer approval and downstream tester validation are "
+        "REQUIRED for the card's final acceptance, but they are the PENDING work of "
+        "later phases: never demand them here, and never treat their absence as "
+        "unfinished implementation. Missing implementation work, violated "
+        "constraints, or missing implementation evidence are CONTINUE or BLOCKED."
+    ),
+    "review": (
+        "DONE = the independent review of the candidate revision is complete and "
+        "its verdict is supported by the response: REQUEST_CHANGES with concrete, "
+        "actionable findings completes a review without any implementation repair, "
+        "and APPROVE requires evidence of a real review (what was inspected, at "
+        "which revision). A bare verdict, an approval with no review evidence, or a "
+        "tooling/startup failure is NOT a completed review. The reviewer must not "
+        "implement the findings and must not run the downstream tester validation."
+    ),
+    "validation": (
+        "DONE = the tester's validation of the reviewed candidate was executed and "
+        "its verdict is backed by the run's evidence: an evidence-backed FAIL "
+        "completes validation and does NOT ask the tester to repair anything, and "
+        "PASS requires the executed check plus its result. A claimed pass with no "
+        "execution evidence is CONTINUE."
+    ),
+}
+
+JUDGE_PHASE_SYSTEM_PROMPT = (
+    "You are a strict judge of ONE lifecycle phase of a Kanban card in an "
+    "autonomous multi-agent pipeline (implementation -> independent review -> "
+    "tester validation -> final acceptance). You receive the card's goal text, "
+    "the phase being judged with that phase's definition of done, and the "
+    "agent's most recent response. Decide one of four verdicts.\n\n"
+    "DONE — the phase being judged is complete as defined below. Phase "
+    "completion is NOT final acceptance of the card: the board computes "
+    "acceptance later from fresh execution, review, and validation evidence, so "
+    "never demand evidence that a later phase produces.\n\n"
+    "BLOCKED — the phase cannot be completed as stated: the work is genuinely "
+    "unachievable, or the agent needs user input to proceed. Return BLOCKED with "
+    "the reason describing what is blocking. BLOCKED is a refusal, not a "
+    "completion — never return BLOCKED for a phase that was completed.\n\n"
+    "WAIT — the phase is NOT done, but the agent is genuinely gated on something "
+    "running on its own (a CI poller, build, test run, rate limit). Only when "
+    "re-poking now would be pure busy-work.\n\n"
+    "CONTINUE — the phase is not done and there is a concrete next step the "
+    "agent can take right now. This is the default when in doubt.\n\n"
+    "Reply ONLY with a single JSON object on one line. Shapes:\n"
+    '{"verdict": "done", "reason": "<one sentence>"}\n'
+    '{"verdict": "blocked", "reason": "<one sentence>"}\n'
+    '{"verdict": "continue", "reason": "<one sentence>"}\n'
+    '{"verdict": "wait", "wait_on_session": "<id>", "reason": "<one sentence>"}\n'
+    '{"verdict": "wait", "wait_on_pid": <int>, "reason": "<one sentence>"}\n'
+    '{"verdict": "wait", "wait_for_seconds": <int>, "reason": "<one sentence>"}\n'
+    "The legacy shape {\"done\": <true|false>, \"reason\": \"...\"} is still "
+    "accepted (true=done, false=continue)."
+)
+
+JUDGE_USER_PROMPT_WITH_PHASE_TEMPLATE = (
+    "Goal (the card's whole objective, including the work owned by later "
+    "phases — context only, not this phase's bar):\n{goal}\n\n"
+    "Lifecycle phase being judged now: {phase}\n"
+    "Definition of done for THIS phase:\n{phase_rules}\n\n"
+    "{criteria_block}"
+    "Agent's most recent response:\n{response}\n\n"
+    "{background_block}"
+    "Current time: {current_time}\n\n"
+    "Judge ONLY the {phase} phase against its definition above — is that phase "
+    "done, blocked, continue, or wait?"
+)
+
+# Worker-facing guidance appended to a judge rejection, per phase. Kept next to
+# the rubrics so both handoff surfaces say the same thing.
+JUDGE_PHASE_GATE_HINTS = {
+    "implementation": (
+        "This card is judged on the implementation phase: supply the candidate's "
+        "base/head revisions and the local checks you ran. Independent review and "
+        "tester validation are still pending requirements of final acceptance — not "
+        "prerequisites for entering review."),
+    "review": (
+        "This card is judged on the completed independent review: record the review "
+        "verdict with its concrete findings at the reviewed revision "
+        "(kanban_request_changes for same-card rework, or kanban_complete with "
+        "verdict=APPROVE / REQUEST_CHANGES on a separate review card). Do not "
+        "implement the findings and do not run the tester's validation."),
+    "validation": (
+        "This card is judged on the executed validation: record verdict=PASS or "
+        "FAIL with the evidence you actually ran at the reviewed revision."),
+}
+
 # /goal draft: turn a plain objective into a reviewable contract (after Codex's "draft the goal").
 DRAFT_CONTRACT_SYSTEM_PROMPT = (
     "You turn a user's plain-language objective into a structured completion "
@@ -909,13 +1009,21 @@ def judge_goal(
     subgoals: Optional[List[str]] = None,
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
+    phase: Optional[str] = None,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
     Returns ``(verdict, reason, parse_failed, wait_directive, transport_failed)``; verdict is done /
     blocked / continue / wait / skipped. ``parse_failed`` means unusable output; transport errors
     set ``transport_failed`` instead and fail-open to ``continue``.
+
+    ``phase`` judges one Kanban lifecycle phase instead of the whole goal (see
+    ``JUDGE_PHASE_INSTRUCTIONS``): ``None`` keeps the generic rubric, and any
+    other value must be a known phase — an unsupported one raises rather than
+    silently falling back to a weaker rubric.
     """
+    if phase is not None and phase not in JUDGE_PHASE_INSTRUCTIONS:
+        raise ValueError(f"unsupported judge phase: {phase!r}")
     if not goal.strip():
         return "skipped", "empty goal", False, None, False
     if not last_response.strip():
@@ -929,8 +1037,8 @@ def judge_goal(
         logger.debug("goal judge: auxiliary client import failed: %s", exc)
         return "continue", "auxiliary client unavailable", False, None, False
 
-    # Prompt priority: contract > subgoals > plain. With both, subgoals fold into the contract
-    # block as extra criteria so the judge sees a single source of truth.
+    # Prompt priority: phase > contract > subgoals > plain. With both, subgoals fold into the
+    # contract block as extra criteria so the judge sees a single source of truth.
     clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
     common = dict(
         goal=_truncate(goal, 2000),
@@ -938,7 +1046,33 @@ def judge_goal(
         background_block=_render_background_block(background_processes),
         current_time=datetime.now(tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
     )
-    if contract is not None and not contract.is_empty():
+    system_prompt = JUDGE_SYSTEM_PROMPT
+    if phase is not None:
+        # Phase instructions stay outside the (truncated) goal text; the card's
+        # goal and contract stay visible as context for the phase.
+        criteria: List[str] = []
+        if contract is not None and not contract.is_empty():
+            contract_block = contract.render_block()
+            if clean_subgoals:
+                contract_block = f"{contract_block}\n{_render_extra_criteria(clean_subgoals)}"
+            criteria.append(
+                "Card completion contract (final acceptance, satisfied by all phases "
+                f"together — not this phase's bar):\n{_truncate(contract_block, 2500)}"
+            )
+        elif clean_subgoals:
+            criteria.append(
+                "Additional criteria the user added mid-loop:\n"
+                + _truncate("\n".join(
+                    f"- {i}. {text}" for i, text in enumerate(clean_subgoals, start=1)), 2000)
+            )
+        prompt = JUDGE_USER_PROMPT_WITH_PHASE_TEMPLATE.format(
+            phase=phase,
+            phase_rules=JUDGE_PHASE_INSTRUCTIONS[phase],
+            criteria_block=("\n\n".join(criteria) + "\n\n") if criteria else "",
+            **common,
+        )
+        system_prompt = JUDGE_PHASE_SYSTEM_PROMPT
+    elif contract is not None and not contract.is_empty():
         contract_block = contract.render_block()
         if clean_subgoals:
             contract_block = f"{contract_block}\n{_render_extra_criteria(clean_subgoals)}"
@@ -950,7 +1084,7 @@ def judge_goal(
         prompt = JUDGE_USER_PROMPT_TEMPLATE.format(**common)
 
     try:
-        raw = _call_goal_judge_llm(call_llm, JUDGE_SYSTEM_PROMPT, prompt, timeout)
+        raw = _call_goal_judge_llm(call_llm, system_prompt, prompt, timeout)
     except Exception as exc:
         logger.info("goal judge: API call failed (%s) — falling through to continue", exc)
         return "continue", f"judge error: {type(exc).__name__}", False, None, True
@@ -1492,31 +1626,57 @@ class GoalManager:
 # back at the lifecycle contract (it already has the full task body).
 KANBAN_GOAL_CONTINUATION_TEMPLATE = (
     "[Continuing toward this kanban task — judge says it is not done yet]\n"
-    "Judge feedback: {reason}\n\n"
-    "Take the next concrete step toward completing the task. When the work "
-    "is genuinely finished, call kanban_complete with a summary. For a typed "
-    "review card, include verdict=APPROVE or REQUEST_CHANGES; for a typed "
-    "validation card, include verdict=PASS or FAIL. A review handoff is not "
-    "acceptance: the board computes acceptance from fresh execution, review, "
-    "and validation evidence. If this is a ``kind=code`` implementation "
-    "task, put direct ``base_sha`` and ``head_sha`` commit fields in "
-    "kanban_complete's ``metadata``. If you are blocked and need human input, "
-    "call kanban_block with a reason. Do not stop without calling one of them."
+    "Judge feedback: {reason}\n"
+    "{phase_note}"
+    "Take the next concrete step toward finishing this phase, then record the "
+    "handoff: kanban_complete with a summary (typed review cards use "
+    "verdict=APPROVE or REQUEST_CHANGES; typed validation cards use verdict=PASS "
+    "or FAIL), or kanban_block with a reason if you need human input. For "
+    "``kind=code`` implementation work, put direct ``base_sha`` and ``head_sha`` "
+    "commit fields in the handoff ``metadata``. Completing a phase is not final "
+    "acceptance: the board computes acceptance from fresh execution, review, and "
+    "validation evidence. Do not stop without calling one of them."
 )
 
 # Judge says done but the worker never called kanban_complete/kanban_block: one explicit nudge.
 KANBAN_GOAL_FINALIZE_TEMPLATE = (
     "[The work looks complete, but the task is still open]\n"
-    "Reason: {reason}\n\n"
-    "If this is implementation work, call kanban_complete with a short "
-    "summary (or kanban_request_review for a same-card review handoff). "
-    "For ``kind=code`` implementation work, put direct ``base_sha`` and "
-    "``head_sha`` commit fields in the handoff ``metadata``. For typed review "
-    "cards use verdict=APPROVE or REQUEST_CHANGES; for "
-    "typed validation cards use verdict=PASS or FAIL. Acceptance is a "
-    "computed projection, not a status toggle. If something still blocks "
-    "completion, call kanban_block with the reason instead."
+    "Reason: {reason}\n"
+    "{phase_note}"
+    "Call the handoff tool for this phase: kanban_complete with a short summary "
+    "(typed review cards: verdict=APPROVE or REQUEST_CHANGES; typed validation "
+    "cards: verdict=PASS or FAIL), or kanban_request_review for a same-card "
+    "review handoff. For ``kind=code`` implementation work, put direct "
+    "``base_sha`` and ``head_sha`` commit fields in the handoff ``metadata``. "
+    "Finishing a phase is not final acceptance — acceptance is a computed "
+    "projection of fresh execution, review, and validation evidence. If "
+    "something still blocks completion, call kanban_block with the reason instead."
 )
+
+# How each phase's handoff tools differ — the same-card vs separate-card split is
+# the part workers get wrong (#37). Empty string for an unknown/absent phase.
+_KANBAN_PHASE_NOTES = {
+    "implementation": (
+        "You are in the implementation phase: hand the candidate off with "
+        "kanban_request_review (same-card review) or, for a separate review card, "
+        "kanban_complete — carrying the immutable base/head revisions and your local "
+        "verification. Do not claim independent review or tester validation; those "
+        "belong to later phases.\n"
+    ),
+    "review": (
+        "You are in the review phase: on a same-card code task return rework with "
+        "kanban_request_changes(reason=..., metadata=...) naming the exact reviewed "
+        "head and the actionable findings; on a separate review card call "
+        "kanban_complete with verdict=\"REQUEST_CHANGES\", or verdict=\"APPROVE\" when "
+        "the review passes. Never edit the candidate yourself and never run the "
+        "tester's validation.\n"
+    ),
+    "validation": (
+        "You are in the validation phase: record the executed validation with "
+        "kanban_complete and verdict=\"PASS\" or \"FAIL\". An evidence-backed FAIL is a "
+        "completed validation — it does not ask you to repair the candidate.\n"
+    ),
+}
 
 
 # Worker-driven terminal task statuses → loop outcome. The card's own acceptance criteria are the
@@ -1542,6 +1702,7 @@ def run_kanban_goal_loop(
     first_response: str = "",
     log=None,
     goal_text_fn=None,
+    phase: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Drive a kanban worker through a Ralph-style goal loop.
 
@@ -1549,6 +1710,10 @@ def run_kanban_goal_loop(
     while the worker is running. Each judge call then reads the current
     effective revision; the original ``goal_text`` remains the fallback for
     older callers and transient board-read failures.
+
+    ``phase`` (a Kanban lifecycle phase) judges only that phase, so a
+    finished implementation handoff is not rejected for missing review or
+    validation evidence it cannot produce yet. Non-Kanban callers leave it None.
 
     Each iteration: stop if the worker already terminated the task (``kanban_complete`` /
     ``kanban_block`` / review hand-off); otherwise judge the latest response against the effective
@@ -1603,7 +1768,7 @@ def run_kanban_goal_loop(
         # verdict is treated as CONTINUE here.
         current_goal = _goal_text_for_loop(goal_text, goal_text_fn)
         verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(
-            current_goal, last_response
+            current_goal, last_response, phase=phase
         )
         if verdict == "wait":
             verdict = "continue"
@@ -1626,10 +1791,12 @@ def run_kanban_goal_loop(
                     f"called kanban_complete after a finalize nudge ({reason})."
                 )
                 return _result("blocked_budget", "judged done, never finalized")
-            prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason=_truncate(reason, 400))
+            prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(
+                reason=_truncate(reason, 400), phase_note=_KANBAN_PHASE_NOTES.get(phase, ""))
             nudged_to_finalize = True
         else:
-            prompt = KANBAN_GOAL_CONTINUATION_TEMPLATE.format(reason=_truncate(reason, 400))
+            prompt = KANBAN_GOAL_CONTINUATION_TEMPLATE.format(
+                reason=_truncate(reason, 400), phase_note=_KANBAN_PHASE_NOTES.get(phase, ""))
 
         # Budget check BEFORE spending another turn.
         if turns_used >= max_turns:
@@ -1654,6 +1821,8 @@ __all__ = [
     "workspace_fingerprint", "CONTINUATION_PROMPT_TEMPLATE", "CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE",
     "CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE", "JUDGE_USER_PROMPT_TEMPLATE",
     "JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE", "JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE",
+    "JUDGE_USER_PROMPT_WITH_PHASE_TEMPLATE", "JUDGE_PHASE_INSTRUCTIONS", "JUDGE_PHASE_SYSTEM_PROMPT",
+    "JUDGE_PHASE_GATE_HINTS",
     "DRAFT_CONTRACT_SYSTEM_PROMPT", "KANBAN_GOAL_CONTINUATION_TEMPLATE", "KANBAN_GOAL_FINALIZE_TEMPLATE",
     "DEFAULT_MAX_TURNS", "load_goal", "save_goal", "clear_goal", "migrate_goal_to_session", "judge_goal",
     "run_kanban_goal_loop",

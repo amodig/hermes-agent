@@ -4062,6 +4062,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     with _kbc.connect_closing() as conn:
         task = _kb.get_task(conn, task_id)
         effective_goal = _kb.get_effective_goal(conn, task_id)
+        phase = _kb.handoff_phase(conn, task)
     if task is None:
         return
 
@@ -4103,7 +4104,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     _run_loop(
         task_id=task_id, goal_text=goal_text, goal_text_fn=_goal_text, run_turn=_run_turn, task_status_fn=_task_status, block_fn=_block,
         max_turns=task.goal_max_turns or _DEF_TURNS, first_response=first_response or "",
-        log=lambda m: logger.info("%s", m),
+        log=lambda m: logger.info("%s", m), phase=phase,
     )
 
 

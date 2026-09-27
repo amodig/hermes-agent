@@ -905,12 +905,16 @@ def _goal_mode_handoff_rejection(
     evidence: str,
     *,
     effective_goal: Optional[dict] = None,
+    phase: Optional[str] = None,
 ):
     """Goal judge for every terminal worker handoff (including review).
 
     Returns ``(verdict, reason_or_None)``: ``"done"`` allows; ``"blocked"`` = judge ruled the goal
     unachievable; ``"continue"``/``"wait"`` reject with the judge's reason. Judge failures allow
     the handoff (logged).
+
+    ``phase`` (the card's lifecycle phase) makes the judge apply that phase's definition of done
+    instead of the whole card objective.
 
     See #100954.
     ``{"done", None}`` means the judge allows the handoff; anything else is a rejection whose verdict
@@ -939,6 +943,7 @@ def _goal_mode_handoff_rejection(
                 fallback_body=task.body,
             ),
             last_response=evidence.strip(),
+            phase=phase,
         )
     except Exception as judge_exc:
         import logging as _logging
@@ -948,20 +953,25 @@ def _goal_mode_handoff_rejection(
     return (verdict, None if verdict == "done" else reason)
 
 def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint: str,
-                     continue_hint: str) -> Optional[str]:
+                     continue_hint: str, *, phase: Optional[str] = None) -> Optional[str]:
     """Goal-mode judge gate shared by ``complete`` / ``request-review`` (mirrors tools/kanban_tools.py);
     applied to every terminal handoff so request-review can't bypass it. Returns the error line, or
     None to allow."""
     task = kb.get_task(conn, tid)
     effective_goal = kb.get_effective_goal(conn, tid)
     verdict, rejection = _goal_mode_handoff_rejection(
-        task, evidence, effective_goal=effective_goal
+        task, evidence, effective_goal=effective_goal, phase=phase
     )
     if verdict == "blocked":
         return (f"kanban: goal {handoff} of {tid} rejected: judge ruled "
                 f"the goal unachievable — {rejection}. {blocked_hint}")
     if rejection is not None:
-        return f"kanban: goal {handoff} of {tid} rejected by judge: {rejection}. {continue_hint}"
+        from hermes_cli.goals import JUDGE_PHASE_GATE_HINTS
+
+        hint = JUDGE_PHASE_GATE_HINTS.get(phase) if phase else None
+        suffix = f" {hint}" if hint else ""
+        return (f"kanban: goal {handoff} of {tid} rejected by judge: {rejection}. "
+                f"{continue_hint}{suffix}")
     return None
 
 def _cmd_complete(args: argparse.Namespace) -> int:
@@ -981,11 +991,15 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     fail_msg: dict[str, str] = {}
     with kbc.connect_closing() as conn:
         def op(tid):
-            evidence = (summary or args.result or str(verdict or "")).strip()
+            phase = kb.handoff_phase(conn, kb.get_task(conn, tid))
+            evidence = (summary or args.result or "").strip()
+            if verdict:
+                evidence = f"{evidence}\nSubmitted verdict: {verdict}".strip()
             gate_err = _goal_gate_error(
                 conn, tid, evidence, "completion",
                 "Re-scope with kanban edit, or record the block with kanban block instead of completing.",
-                "Provide evidence matching the task's acceptance criteria.")
+                "Provide evidence matching the task's acceptance criteria.",
+                phase=phase)
             if gate_err:
                 fail_msg[tid] = gate_err
                 return False
@@ -1088,7 +1102,8 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
         gate_err = _goal_gate_error(
             conn, tid, summary or "", "review handoff",
             "Record the block with kanban block instead of requesting review.",
-            "Provide acceptance evidence matching the task.")
+            "Provide acceptance evidence matching the task.",
+            phase=kb.handoff_phase(conn, kb.get_task(conn, tid)))
         if gate_err:
             return _err(gate_err)
         try:

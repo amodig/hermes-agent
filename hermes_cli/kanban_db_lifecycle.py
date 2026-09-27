@@ -1266,6 +1266,7 @@ from hermes_cli.kanban_db_lifecycle_completion import (
     _unique_attachment_path,
     complete_task,
     edit_completed_task_result,
+    handoff_phase,
     request_review,
 )
 
