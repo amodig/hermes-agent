@@ -3203,9 +3203,9 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
         return {"base_sha": base, "head_sha": head, "changed_files": ["phase.py"]}
 
     def _handoff(self, surface: str, tid: str, run, base: str, head: str, *, verdict=None,
-                 metadata: dict | None = None):
+                 metadata: dict | None = None, summary: str | None = None):
         """Drive one implementation handoff through a tool or CLI surface."""
-        summary = (
+        summary = summary or (
             "Implemented the phase-aware handoff and ran the focused suite: 12 passed. "
             "Independent review and tester validation are still pending."
         )
@@ -3328,7 +3328,10 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
                 }
                 with patcher, patch("agent.auxiliary_client.get_text_auxiliary_client",
                                     lambda *a, **k: (object(), "judge-double")):
-                    out = self._handoff(surface, tid, run, base, head, metadata=fat_metadata)
+                    # Long prose as well: the prose is clipped around the
+                    # evidence block, never the other way round.
+                    out = self._handoff(surface, tid, run, base, head,
+                                        metadata=fat_metadata, summary="detail " * 700)
 
                 text = json.dumps(out) if isinstance(out, dict) else out
                 self.assertIn("rejected by judge", text)
@@ -3337,10 +3340,12 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
                 self.assertEqual(state["task"].status, "running")
                 self.assertIsNone(state["task"].candidate_run_id)
                 self.assertNotIn("review_requested", [e.kind for e in state["events"]])
-                # A fat value cannot push the revision out of the judged evidence.
+                # Neither a fat value nor long prose can push the revision or
+                # the executed checks out of the judged evidence.
                 prompt = judge.calls[0][2]
                 self.assertIn(f"- head_sha: {head}", prompt)
-                self.assertIn("further metadata keys omitted", prompt)
+                self.assertIn("- changed_files:", prompt)
+                self.assertIn("[truncated]", prompt)
 
         with self.subTest(surface="review_run"):
             repo, base = self._repo()

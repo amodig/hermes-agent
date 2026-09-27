@@ -217,15 +217,15 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
 
 # ── Judge evidence (#37) ──
 # Everything the judge is shown for one handoff, including the machine-readable
-# fields a phase rubric asks about. Each value is clipped on its own and the key
-# budget is explicit, so one fat list value cannot push the revision or executed
-# checks out of the prompt.
+# fields a phase rubric asks about. Values are clipped individually, the
+# metadata block has its own budget, and the prose is sized to what remains, so
+# neither a fat value nor a long summary can push the revision or the executed
+# checks out of the judge's prompt.
 
 _JUDGE_EVIDENCE_VALUE_CHARS = 200
-_JUDGE_EVIDENCE_KEYS = 24
-# Fields a phase rubric asks about directly, listed in the order they are
-# rendered; they are kept ahead of arbitrary worker metadata so the key budget
-# can never drop the revision or the executed checks.
+_JUDGE_EVIDENCE_BLOCK_CHARS = 1600
+# Fields a phase rubric asks about directly, in render order; they stay ahead of
+# arbitrary worker metadata so the budget cannot drop the revision or the checks.
 _JUDGE_EVIDENCE_KEY_PRIORITY = (
     "base_sha", "head_sha", "reviewed_head_sha", "branch_name", "changed_files",
     "tests_run", "reviewer_checks", "review_outcome", "summary", "result",
@@ -249,27 +249,36 @@ def render_judge_evidence(
     workers put exactly that in ``metadata`` (``base_sha``, ``head_sha``,
     ``changed_files``, ``reviewer_checks``, ``tests_run``). Sending only the prose
     makes a documented summary-plus-metadata handoff look evidence-free, so the
-    machine-readable fields travel with it, one bounded line per sorted key.
-    Callers pass already-redacted values.
+    machine-readable fields travel with it as bounded lines, ahead of prose that
+    is clipped to what ``judge_goal``'s own response budget leaves. Callers pass
+    already-redacted values.
     """
-    parts: List[str] = []
-    text = str(prose or "").strip()
-    if text:
-        parts.append(text)
+    block_lines: List[str] = []
     if verdict:
-        parts.append(f"Submitted verdict: {verdict}")
+        block_lines.append(f"Submitted verdict: {verdict}")
     if isinstance(metadata, dict) and metadata:
-        remaining = [key for key in sorted(metadata, key=str)
+        priority = [key for key in _JUDGE_EVIDENCE_KEY_PRIORITY if key in metadata]
+        remainder = [key for key in sorted(metadata, key=str)
                      if key not in _JUDGE_EVIDENCE_KEY_PRIORITY]
-        keys = [key for key in _JUDGE_EVIDENCE_KEY_PRIORITY if key in metadata] + remaining
-        lines = [
-            f"- {key}: {_bounded_evidence_value(metadata[key])}"
-            for key in keys[:_JUDGE_EVIDENCE_KEYS]
-        ]
-        if len(keys) > _JUDGE_EVIDENCE_KEYS:
-            lines.append(f"- … {len(keys) - _JUDGE_EVIDENCE_KEYS} further metadata keys omitted")
-        parts.append("Handoff metadata:\n" + "\n".join(lines))
-    return "\n".join(parts)
+        keys = [*priority, *remainder]
+        budget = _JUDGE_EVIDENCE_BLOCK_CHARS - sum(len(line) + 1 for line in block_lines)
+        lines: List[str] = []
+        used = len("Handoff metadata:")
+        for key in keys:
+            line = f"- {key}: {_bounded_evidence_value(metadata[key])}"
+            if lines and used + len(line) + 1 > budget:
+                break
+            lines.append(line)
+            used += len(line) + 1
+        if len(lines) < len(keys):
+            lines.append(f"- … {len(keys) - len(lines)} further metadata keys omitted")
+        block_lines.append("Handoff metadata:\n" + "\n".join(lines))
+    block = "\n".join(block_lines)
+    text = str(prose or "").strip()
+    if not block:
+        return text
+    prose_budget = max(200, _JUDGE_RESPONSE_SNIPPET_CHARS - len(block) - 32)
+    return "\n".join(part for part in (_truncate(text, prose_budget), block) if part)
 
 
 # ── Kanban phase-aware judging (#37) ──
