@@ -3302,10 +3302,13 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
                 self.assertFalse(self._claims(validation))
 
                 # Judged in the implementation phase, with the card's whole-goal
-                # text kept as context separate from the phase's own bar.
+                # text kept as context separate from the phase's own bar, and the
+                # machine-readable handoff (revisions, changed files) included.
                 self.assertEqual([call[0] for call in judge.calls], ["implementation"])
                 prompt = judge.calls[0][2]
                 self.assertIn("independently reviewed by the reviewer profile", prompt)
+                self.assertIn(f'"head_sha": "{head}"', prompt)
+                self.assertIn('"changed_files"', prompt)
                 self.assertLess(
                     prompt.index("Goal (the card's whole objective"),
                     prompt.index("Definition of done for THIS phase:"),
@@ -3369,6 +3372,9 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
             self.assertEqual([e.kind for e in state["events"]].count("review_requested"), 1)
             self.assertEqual([call[0] for call in judge.calls],
                              ["implementation", "review", "review"])
+            # The review rubric needs the revision under review, so the reviewer's
+            # metadata reaches the judge too.
+            self.assertIn(f'"head_sha": "{head}"', judge.calls[1][2])
 
         # The goal loop judges its own phase only, and a caller without a phase
         # keeps whole-goal judging and the effective-revision refresh.

@@ -16,7 +16,12 @@ from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
 from agent.redact import redact_sensitive_text
-from hermes_cli.goals import JUDGE_PHASE_GATE_HINTS, judge_goal, render_effective_goal
+from hermes_cli.goals import (
+    JUDGE_PHASE_GATE_HINTS,
+    judge_goal,
+    render_effective_goal,
+    render_judge_evidence,
+)
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
@@ -616,10 +621,8 @@ def _handle_complete(args: dict, **kw) -> str:
         # The card's phase decides the judge's rubric; a submitted verdict is
         # evidence for that phase, never the phase selector.
         phase = kb.handoff_phase(conn, task)
-        evidence = (summary or result or "").strip()
-        if verdict:
-            evidence = f"{evidence}\nSubmitted verdict: {verdict}".strip()
-        _goal_gate("kanban_complete", task, tid, evidence,
+        _goal_gate("kanban_complete", task, tid,
+                   render_judge_evidence(summary or result, verdict=verdict, metadata=metadata),
                    effective_goal=effective_goal, phase=phase)
         try:
             ok = kb.complete_task(
@@ -711,7 +714,8 @@ def _handle_request_review(args: dict, **kw) -> str:
     with _board(args.get("board")) as (kb, conn):
         task = kb.get_task(conn, tid)
         effective_goal = kb.get_effective_goal(conn, tid)
-        _goal_gate("kanban_request_review", task, tid, summary,
+        _goal_gate("kanban_request_review", task, tid,
+                   render_judge_evidence(summary, metadata=metadata),
                    effective_goal=effective_goal, phase=kb.handoff_phase(conn, task))
         try:
             ok, fail_reason = kb.request_review(

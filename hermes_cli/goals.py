@@ -212,7 +212,45 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "return BLOCKED with the reason describing the block.\n"
     "- Otherwise the goal is NOT done — CONTINUE.\n\n"
     "Is the goal satisfied per its completion contract — done, blocked, continue, or wait?"
-)
+ )
+
+
+# ── Judge evidence (#37) ──
+# Everything the judge is shown for one handoff, including the machine-readable
+# fields a phase rubric asks about; bounded so a fat metadata blob cannot crowd
+# out the response.
+
+_JUDGE_EVIDENCE_METADATA_CHARS = 1500
+
+
+def render_judge_evidence(
+    prose: Optional[str] = None,
+    *,
+    verdict: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> str:
+    """Render one handoff's evidence for the goal judge.
+
+    Phase rubrics ask *which* revision was inspected and *what* actually ran, and
+    workers put exactly that in ``metadata`` (``base_sha``, ``head_sha``,
+    ``changed_files``, ``reviewer_checks``, ``tests_run``). Sending only the prose
+    makes a documented summary-plus-metadata handoff look evidence-free, so the
+    machine-readable fields travel with it. Callers pass already-redacted values;
+    keys stay sorted so the revision fields survive prompt truncation.
+    """
+    parts: List[str] = []
+    text = str(prose or "").strip()
+    if text:
+        parts.append(text)
+    if verdict:
+        parts.append(f"Submitted verdict: {verdict}")
+    if isinstance(metadata, dict) and metadata:
+        parts.append(
+            "Handoff metadata: "
+            + json.dumps(metadata, sort_keys=True, default=str)[:_JUDGE_EVIDENCE_METADATA_CHARS]
+        )
+    return "\n".join(parts)
+
 
 # ── Kanban phase-aware judging (#37) ──
 # A typed Kanban card's goal text states the whole card objective, which for a
@@ -1822,7 +1860,7 @@ __all__ = [
     "CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE", "JUDGE_USER_PROMPT_TEMPLATE",
     "JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE", "JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE",
     "JUDGE_USER_PROMPT_WITH_PHASE_TEMPLATE", "JUDGE_PHASE_INSTRUCTIONS", "JUDGE_PHASE_SYSTEM_PROMPT",
-    "JUDGE_PHASE_GATE_HINTS",
+    "JUDGE_PHASE_GATE_HINTS", "render_judge_evidence",
     "DRAFT_CONTRACT_SYSTEM_PROMPT", "KANBAN_GOAL_CONTINUATION_TEMPLATE", "KANBAN_GOAL_FINALIZE_TEMPLATE",
     "DEFAULT_MAX_TURNS", "load_goal", "save_goal", "clear_goal", "migrate_goal_to_session", "judge_goal",
     "run_kanban_goal_loop",

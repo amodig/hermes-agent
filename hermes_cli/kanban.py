@@ -991,12 +991,17 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     fail_msg: dict[str, str] = {}
     with kbc.connect_closing() as conn:
         def op(tid):
+            from hermes_cli.goals import render_judge_evidence
+
             phase = kb.handoff_phase(conn, kb.get_task(conn, tid))
-            evidence = (summary or args.result or "").strip()
-            if verdict:
-                evidence = f"{evidence}\nSubmitted verdict: {verdict}".strip()
             gate_err = _goal_gate_error(
-                conn, tid, evidence, "completion",
+                conn, tid,
+                render_judge_evidence(
+                    kb.redact_review_value(summary or args.result),
+                    verdict=verdict,
+                    metadata=kb.redact_review_value(metadata),
+                ),
+                "completion",
                 "Re-scope with kanban edit, or record the block with kanban block instead of completing.",
                 "Provide evidence matching the task's acceptance criteria.",
                 phase=phase)
@@ -1099,8 +1104,15 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
     if rc:
         return rc
     with kbc.connect_closing() as conn:
+        from hermes_cli.goals import render_judge_evidence
+
         gate_err = _goal_gate_error(
-            conn, tid, summary or "", "review handoff",
+            conn, tid,
+            render_judge_evidence(
+                kb.redact_review_value(summary),
+                metadata=kb.redact_review_value(metadata),
+            ),
+            "review handoff",
             "Record the block with kanban block instead of requesting review.",
             "Provide acceptance evidence matching the task.",
             phase=kb.handoff_phase(conn, kb.get_task(conn, tid)))
