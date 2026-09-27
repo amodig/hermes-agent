@@ -3202,13 +3202,14 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
     def _implementation_metadata(self, base: str, head: str) -> dict:
         return {"base_sha": base, "head_sha": head, "changed_files": ["phase.py"]}
 
-    def _handoff(self, surface: str, tid: str, run, base: str, head: str, *, verdict=None):
+    def _handoff(self, surface: str, tid: str, run, base: str, head: str, *, verdict=None,
+                 metadata: dict | None = None):
         """Drive one implementation handoff through a tool or CLI surface."""
         summary = (
             "Implemented the phase-aware handoff and ran the focused suite: 12 passed. "
             "Independent review and tester validation are still pending."
         )
-        metadata = self._implementation_metadata(base, head)
+        metadata = self._implementation_metadata(base, head) if metadata is None else metadata
         env = {
             "HERMES_KANBAN_TASK": tid,
             "HERMES_KANBAN_RUN_ID": str(run.current_run_id),
@@ -3307,8 +3308,8 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
                 self.assertEqual([call[0] for call in judge.calls], ["implementation"])
                 prompt = judge.calls[0][2]
                 self.assertIn("independently reviewed by the reviewer profile", prompt)
-                self.assertIn(f'"head_sha": "{head}"', prompt)
-                self.assertIn('"changed_files"', prompt)
+                self.assertIn(f"- head_sha: {head}", prompt)
+                self.assertIn("- changed_files:", prompt)
                 self.assertLess(
                     prompt.index("Goal (the card's whole objective"),
                     prompt.index("Definition of done for THIS phase:"),
@@ -3320,9 +3321,14 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
                 tid, _, run = self._same_card_graph(repo)
                 head = self._commit(repo, 1)
                 judge, patcher = self._judge(("implementation", "continue"))
+                fat_metadata = {
+                    **self._implementation_metadata(base, head),
+                    "changed_files": [f"src/module_{i}.py" for i in range(90)],
+                    **{f"check_{i}": "passed" for i in range(30)},
+                }
                 with patcher, patch("agent.auxiliary_client.get_text_auxiliary_client",
                                     lambda *a, **k: (object(), "judge-double")):
-                    out = self._handoff(surface, tid, run, base, head)
+                    out = self._handoff(surface, tid, run, base, head, metadata=fat_metadata)
 
                 text = json.dumps(out) if isinstance(out, dict) else out
                 self.assertIn("rejected by judge", text)
@@ -3331,6 +3337,10 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
                 self.assertEqual(state["task"].status, "running")
                 self.assertIsNone(state["task"].candidate_run_id)
                 self.assertNotIn("review_requested", [e.kind for e in state["events"]])
+                # A fat value cannot push the revision out of the judged evidence.
+                prompt = judge.calls[0][2]
+                self.assertIn(f"- head_sha: {head}", prompt)
+                self.assertIn("further metadata keys omitted", prompt)
 
         with self.subTest(surface="review_run"):
             repo, base = self._repo()
@@ -3374,7 +3384,7 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
                              ["implementation", "review", "review"])
             # The review rubric needs the revision under review, so the reviewer's
             # metadata reaches the judge too.
-            self.assertIn(f'"head_sha": "{head}"', judge.calls[1][2])
+            self.assertIn(f"- head_sha: {head}", judge.calls[1][2])
 
         # The goal loop judges its own phase only, and a caller without a phase
         # keeps whole-goal judging and the effective-revision refresh.

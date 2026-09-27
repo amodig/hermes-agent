@@ -217,10 +217,24 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
 
 # ── Judge evidence (#37) ──
 # Everything the judge is shown for one handoff, including the machine-readable
-# fields a phase rubric asks about; bounded so a fat metadata blob cannot crowd
-# out the response.
+# fields a phase rubric asks about. Each value is clipped on its own and the key
+# budget is explicit, so one fat list value cannot push the revision or executed
+# checks out of the prompt.
 
-_JUDGE_EVIDENCE_METADATA_CHARS = 1500
+_JUDGE_EVIDENCE_VALUE_CHARS = 200
+_JUDGE_EVIDENCE_KEYS = 24
+# Fields a phase rubric asks about directly, listed in the order they are
+# rendered; they are kept ahead of arbitrary worker metadata so the key budget
+# can never drop the revision or the executed checks.
+_JUDGE_EVIDENCE_KEY_PRIORITY = (
+    "base_sha", "head_sha", "reviewed_head_sha", "branch_name", "changed_files",
+    "tests_run", "reviewer_checks", "review_outcome", "summary", "result",
+)
+
+
+def _bounded_evidence_value(value: Any) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, sort_keys=True, default=str)
+    return text if len(text) <= _JUDGE_EVIDENCE_VALUE_CHARS else text[:_JUDGE_EVIDENCE_VALUE_CHARS] + "…"
 
 
 def render_judge_evidence(
@@ -235,8 +249,8 @@ def render_judge_evidence(
     workers put exactly that in ``metadata`` (``base_sha``, ``head_sha``,
     ``changed_files``, ``reviewer_checks``, ``tests_run``). Sending only the prose
     makes a documented summary-plus-metadata handoff look evidence-free, so the
-    machine-readable fields travel with it. Callers pass already-redacted values;
-    keys stay sorted so the revision fields survive prompt truncation.
+    machine-readable fields travel with it, one bounded line per sorted key.
+    Callers pass already-redacted values.
     """
     parts: List[str] = []
     text = str(prose or "").strip()
@@ -245,10 +259,16 @@ def render_judge_evidence(
     if verdict:
         parts.append(f"Submitted verdict: {verdict}")
     if isinstance(metadata, dict) and metadata:
-        parts.append(
-            "Handoff metadata: "
-            + json.dumps(metadata, sort_keys=True, default=str)[:_JUDGE_EVIDENCE_METADATA_CHARS]
-        )
+        remaining = [key for key in sorted(metadata, key=str)
+                     if key not in _JUDGE_EVIDENCE_KEY_PRIORITY]
+        keys = [key for key in _JUDGE_EVIDENCE_KEY_PRIORITY if key in metadata] + remaining
+        lines = [
+            f"- {key}: {_bounded_evidence_value(metadata[key])}"
+            for key in keys[:_JUDGE_EVIDENCE_KEYS]
+        ]
+        if len(keys) > _JUDGE_EVIDENCE_KEYS:
+            lines.append(f"- … {len(keys) - _JUDGE_EVIDENCE_KEYS} further metadata keys omitted")
+        parts.append("Handoff metadata:\n" + "\n".join(lines))
     return "\n".join(parts)
 
 
