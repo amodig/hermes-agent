@@ -3584,6 +3584,9 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
                 final = self._state(tid)
                 self.assertEqual(final["lifecycle"]["validation_verdict"], verdict)
                 self.assertEqual(final["lifecycle"]["acceptance"], expected)
+                # An approval that carries no revision in its own metadata is
+                # still judged against the persisted candidate head.
+                self.assertIn(f"- reviewed_head_sha: {head2}", judge.calls[2][2])
 
         with self.subTest(route="separate_review_card"):
             repo, base = self._repo()

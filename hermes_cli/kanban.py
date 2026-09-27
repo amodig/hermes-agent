@@ -993,18 +993,20 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         def op(tid):
             from hermes_cli.goals import render_judge_evidence
 
-            phase = kb.handoff_phase(conn, kb.get_task(conn, tid))
+            task = kb.get_task(conn, tid)
+            evidence_metadata = dict(kb.redact_review_value(metadata) or {})
+            evidence_metadata.update(kb.handoff_evidence(conn, task) or {})
             gate_err = _goal_gate_error(
                 conn, tid,
                 render_judge_evidence(
                     kb.redact_review_value(summary or args.result),
                     verdict=verdict,
-                    metadata=kb.redact_review_value(metadata),
+                    metadata=evidence_metadata,
                 ),
                 "completion",
                 "Re-scope with kanban edit, or record the block with kanban block instead of completing.",
                 "Provide evidence matching the task's acceptance criteria.",
-                phase=phase)
+                phase=kb.handoff_phase(conn, task))
             if gate_err:
                 fail_msg[tid] = gate_err
                 return False

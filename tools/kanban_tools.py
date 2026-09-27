@@ -621,8 +621,13 @@ def _handle_complete(args: dict, **kw) -> str:
         # The card's phase decides the judge's rubric; a submitted verdict is
         # evidence for that phase, never the phase selector.
         phase = kb.handoff_phase(conn, task)
+        # The writer derives the reviewed revision after this gate, so the judge
+        # gets the candidate revision that is already persisted on the card.
+        evidence_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        evidence_metadata.update(kb.handoff_evidence(conn, task) or {})
         _goal_gate("kanban_complete", task, tid,
-                   render_judge_evidence(summary or result, verdict=verdict, metadata=metadata),
+                   render_judge_evidence(summary or result, verdict=verdict,
+                                         metadata=evidence_metadata),
                    effective_goal=effective_goal, phase=phase)
         try:
             ok = kb.complete_task(

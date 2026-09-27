@@ -128,6 +128,35 @@ def handoff_phase(conn: sqlite3.Connection, task_before: Any) -> Optional[str]:
     return "implementation"
 
 
+def handoff_evidence(conn: sqlite3.Connection, task_before: Any) -> Optional[dict]:
+    """Persisted candidate revision for a review/validation-phase handoff.
+
+    The completion writer derives the reviewed revision itself, inside
+    ``_stamp_lifecycle_metadata``, after the goal gate has already run — and the
+    bundled review flow records findings rather than a head in its handoff
+    metadata. Hand the judge the revision that is already durable on the card so
+    an approval cannot look evidence-free. ``None`` when the card is not in a
+    review/validation phase or has no candidate head yet.
+    """
+    contract = getattr(task_before, "lifecycle_contract", None)
+    if not isinstance(contract, dict) or handoff_phase(conn, task_before) not in {
+        "review", "validation"
+    }:
+        return None
+    candidate_task_id = (
+        getattr(task_before, "id", None)
+        if contract.get("kind") == "code"
+        else contract.get("candidate_task_id")
+    )
+    if not candidate_task_id:
+        return None
+    head_sha = _kb.latest_handoff(conn, str(candidate_task_id)).get("head_sha")
+    evidence: dict = {"candidate_task_id": str(candidate_task_id)}
+    if isinstance(head_sha, str) and head_sha.strip():
+        evidence["reviewed_head_sha"] = head_sha
+    return evidence
+
+
 def _completion_mode_code(
     conn: sqlite3.Connection,
     task_before: Any,
