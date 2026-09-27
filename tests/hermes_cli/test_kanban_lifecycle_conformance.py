@@ -3350,6 +3350,27 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
                 self.assertIn("- changed_files:", prompt)
                 self.assertIn("[truncated]", prompt)
 
+        with self.subTest(surface="secret_metadata"):
+            # The auxiliary judge is a separate provider, so the evidence is
+            # redacted at that boundary even when structured redaction upstream
+            # had to keep the raw dict.
+            repo, base = self._repo()
+            tid, _, run = self._same_card_graph(repo)
+            head = self._commit(repo, 1)
+            secret = "ghp_" + "S" * 36
+            judge, patcher = self._judge(("implementation", "continue"))
+            with patcher, patch("agent.auxiliary_client.get_text_auxiliary_client",
+                                lambda *a, **k: (object(), "judge-double")):
+                # kanban_complete keeps the raw dict when structured redaction
+                # cannot re-parse; request_review refuses that metadata outright.
+                out = self._handoff(
+                    "tool_complete", tid, run, base, head,
+                    metadata={**self._implementation_metadata(base, head),
+                              "secret": f'abc\"{secret}'},
+                )
+            self.assertIn("rejected by judge", json.dumps(out))
+            self.assertNotIn(secret, judge.calls[0][2])
+
         with self.subTest(surface="review_run"):
             repo, base = self._repo()
             tid, _, run = self._same_card_graph(repo)

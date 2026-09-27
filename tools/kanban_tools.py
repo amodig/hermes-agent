@@ -412,10 +412,14 @@ def _goal_gate(
     """Goal-mode pre-handoff judge gate using the current effective goal.
 
     ``phase`` (the card's lifecycle phase) makes the judge apply that phase's
-    definition of done instead of the whole card objective.
+    definition of done instead of the whole card objective. The evidence is
+    redacted here as well: the judge is a separately configured provider, and the
+    structured redaction upstream keeps the raw dict when its JSON round-trip
+    fails.
     """
     if not task or not task.goal_mode or not _goal_judge_available():
         return
+    evidence = _redact(evidence)
     try:
         verdict, reason, _, _, _ = judge_goal(
             goal=render_effective_goal(

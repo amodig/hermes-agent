@@ -956,7 +956,9 @@ def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint: 
                      continue_hint: str, *, phase: Optional[str] = None) -> Optional[str]:
     """Goal-mode judge gate shared by ``complete`` / ``request-review`` (mirrors tools/kanban_tools.py);
     applied to every terminal handoff so request-review can't bypass it. Returns the error line, or
-    None to allow."""
+    None to allow. The evidence is redacted again here, because the judge is a separately configured
+    provider and structured redaction upstream can fall back to the raw value."""
+    evidence = str(kb.redact_review_value(evidence))
     task = kb.get_task(conn, tid)
     effective_goal = kb.get_effective_goal(conn, tid)
     verdict, rejection = _goal_mode_handoff_rejection(
