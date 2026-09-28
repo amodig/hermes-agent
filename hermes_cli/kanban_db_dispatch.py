@@ -1668,14 +1668,13 @@ def _note_claim_hold(
 
     The pre-claim guard can pass and a fresh unauthorized PR URL can then arrive
     while a deferred worker is being prepared. ``claim_task`` re-checks inside its
-    own transaction, so that hold is observable only from the ``claim_rejected``
-    event it wrote. Ordinary CAS losers stay ordinary losers.
+    own transaction, so that hold is observable from the ``claim_rejected`` event
+    it writes — which is also its durable record, so this only reports the hold
+    for the tick and appends nothing of its own. Ordinary CAS losers stay
+    ordinary losers.
     """
-    if _last_claim_rejected_reason(conn, task_id) != "active_pr":
-        return
-    result.respawn_guarded.append((task_id, "active_pr"))
-    with _kb.write_txn(conn):
-        _record_respawn_guard(conn, task_id, "active_pr")
+    if _last_claim_rejected_reason(conn, task_id) == "active_pr":
+        result.respawn_guarded.append((task_id, "active_pr"))
 
 
 def _dispatch_lane_task(
