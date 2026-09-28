@@ -307,7 +307,7 @@ def test_live_guard_clears_after_authorization_despite_recorded_events(kanban_ho
 
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="PR card", assignee="demo")
+        tid = kb.create_task(conn, title="PR card", assignee="default")
         kb.add_comment(conn, tid, author="worker", body="https://github.com/o/r/pull/7")
         with kb.write_txn(conn):
             kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
@@ -329,5 +329,22 @@ def test_live_guard_clears_after_authorization_despite_recorded_events(kanban_ho
             reason="explicitly authorized", transition="continue_existing_pr",
         )
         assert "respawn_guarded" not in _kinds()
+
+        # A held card whose assignee is not a real profile is nonspawnable
+        # BEFORE the guard is consulted, so the guard is not its blocker: the
+        # precise hold would otherwise hide the assignee failure.
+        unheard = kb.create_task(conn, title="typo assignee", assignee="no-such-profile")
+        kb.add_comment(conn, unheard, author="worker", body="https://github.com/o/r/pull/8")
+        assert kb.get_dispatch_guard(conn, unheard, board="default") is None
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (unheard,)).fetchone()
+        events = list(conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (unheard,),
+        ).fetchall())
+        kinds = sorted(d.kind for d in kd.compute_task_diagnostics(
+            row, events, [], now=int(time.time()) + 3600,
+            config={"stranded_threshold_seconds": 1},
+            dispatch_guard=kb.get_dispatch_guard(conn, unheard),
+        ))
+        assert kinds == ["stranded_in_ready"], kinds
     finally:
         conn.close()

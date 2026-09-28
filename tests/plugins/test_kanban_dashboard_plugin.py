@@ -1828,7 +1828,7 @@ _PR_URL = "https://github.com/example/repo/pull/11"
 def _pr_task(client, **extra):
     t = client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "finish PR", "assignee": "cto", **extra},
+        json={"title": "finish PR", "assignee": "default", **extra},
     ).json()["task"]
     r = client.post(
         f"/api/plugins/kanban/tasks/{t['id']}/comments",

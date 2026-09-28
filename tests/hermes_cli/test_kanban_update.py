@@ -402,7 +402,7 @@ _PR_URL = "https://github.com/example/repo/pull/21"
 
 
 def _pr_task(conn, **kwargs):
-    tid = kb.create_task(conn, title="published work", assignee="cto", **kwargs)
+    tid = kb.create_task(conn, title="published work", assignee="default", **kwargs)
     kb.add_comment(conn, tid, author="worker", body=f"Published {_PR_URL}; continue, do not recreate.")
     return tid
 
@@ -515,7 +515,7 @@ def test_tool_update_and_show_expose_continuation_parity(kanban_home, monkeypatc
     cleared = json.loads(kanban_tools._handle_show({"task_id": tid}))
     assert cleared["dispatch_guard"] is None
 
-    listed = json.loads(kanban_tools._handle_list({"assignee": "cto"}))
+    listed = json.loads(kanban_tools._handle_list({"assignee": "default"}))
     assert listed["tasks"][0]["dispatch_guard"] is None
 
     with kbc.connect_closing() as conn:
@@ -533,7 +533,7 @@ def test_cli_diagnostics_recovery_command_names_the_selected_board(kanban_home, 
 
     kb.create_board("other")
     with kbc.connect(board="other") as conn:
-        tid = kb.create_task(conn, title="held elsewhere", assignee="cto")
+        tid = kb.create_task(conn, title="held elsewhere", assignee="default")
         kb.add_comment(conn, tid, author="worker", body=_PR_URL)
         assert kbd.check_respawn_guard(conn, tid) == "active_pr"
 

@@ -292,7 +292,7 @@ def test_recovery_hint_is_a_runnable_cli_command(clock, tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
     kb.init_db()
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="hint", assignee="cto")
+        tid = kb.create_task(conn, title="hint", assignee="default")
         kb.add_comment(conn, tid, author="worker", body=PR1)
         guard = kb.get_dispatch_guard(conn, tid, board="default")
         assert guard is not None and guard["reason"] == "active_pr"
