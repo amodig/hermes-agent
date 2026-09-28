@@ -296,10 +296,13 @@ def test_recovery_hint_is_a_runnable_cli_command(clock, tmp_path, monkeypatch):
         kb.add_comment(conn, tid, author="worker", body=PR1)
         guard = kb.get_dispatch_guard(conn, tid, board="default")
         assert guard is not None and guard["reason"] == "active_pr"
-        recovery = guard["recovery"]
+        command = guard["command"]
         version = kb.get_task(conn, tid).version
+        assert guard["recovery"] and "hermes kanban" not in guard["recovery"]
 
-    command = recovery[recovery.index("hermes kanban"):]
+    # The copyable field is the command alone - never prose with a command
+    # buried inside it, which is what the dashboard pastes to the clipboard.
+    assert command.startswith("hermes kanban ")
     argv = shlex.split(command)
     assert argv[0] == "hermes" and argv[1] == "kanban"
     root = argparse.ArgumentParser()

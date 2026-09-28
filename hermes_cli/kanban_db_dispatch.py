@@ -1296,38 +1296,43 @@ def check_respawn_guard(
 
 
 _GUARD_RECOVERY: dict[str, str] = {
+    "active_pr": (
+        "A recent comment records an existing GitHub PR that no live continuation "
+        "authorization covers, so the dispatcher will not start a worker for this "
+        "card. Acknowledge the existing PR with the explicit 'continue_existing_pr' "
+        "transition (only with the user's authorization) instead of opening a "
+        "replacement PR."
+    ),
     "rate_limit_cooldown": (
-        "Provider rate-limit cooldown after a quota wall; no action needed — dispatch "
-        "resumes by itself once the cooldown elapses."
+        "The last run hit a provider rate limit. The dispatcher retries by itself "
+        "once the cooldown elapses; no action is required."
     ),
     "blocker_auth": (
-        "The last run failed with a quota/auth error, so immediate retries cannot help. "
-        "Fix the profile's credentials or quota, then re-queue; the circuit breaker "
-        "auto-blocks the task after the failure limit."
+        "The last run failed with a quota/auth error; immediate retries cannot help, "
+        "and the circuit breaker will auto-block the card after the failure limit."
     ),
     "recent_success": (
-        "A run completed successfully within the guard window. Re-queue the card "
-        "deliberately, or authorize continuation of its recorded PR, before it will "
-        "dispatch again."
+        "A run already completed successfully inside the respawn guard window, so "
+        "the dispatcher treats a new spawn as duplicate work. Re-queue the card "
+        "deliberately, or authorize continuation of its recorded PR, to run it again."
     ),
 }
 
 
-def _guard_recovery(
+def _guard_command(
     reason: str, task_id: str, version: int, *, board: Optional[str],
 ) -> str:
-    """Operator guidance for one guard reason (the copyable recovery action)."""
+    """The runnable recovery command for one guard reason, or ``""``.
+
+    Only a reason with a single safe command gets one; the rest are guidance
+    only. Surfaces offering a copy action paste this field verbatim, so it must
+    never carry explanation prose.
+    """
     if reason != "active_pr":
-        return _GUARD_RECOVERY.get(
-            reason, f"The dispatcher respawn guard is holding this task ({reason}).",
-        )
+        return ""
     board_flag = f"--board {board} " if board else ""
     return (
-        "A recent comment records an existing GitHub PR with no live continuation "
-        "authorization. When the user has explicitly authorized repairing/reviewing "
-        "that PR (not opening another), acknowledge it: hermes kanban "
-        f"{board_flag}update {task_id} "
-        f"--expected-version {version} "
+        f"hermes kanban {board_flag}update {task_id} --expected-version {version} "
         "--transition continue_existing_pr --reason 'Explicitly authorized: continue "
         "the existing PR; do not open another PR'"
     )
@@ -1357,8 +1362,9 @@ def get_dispatch_guard(
 
     A projection of the guard as it stands *now* — never inferred from
     historical ``respawn_guarded`` events, which a later authorization leaves
-    stale. Returns ``{"reason", "recovery"}`` or None for missing, claimed, or
-    non-dispatchable tasks.
+    stale. Returns ``{"reason", "recovery", "command"}`` — operator guidance plus
+    the runnable command (``""`` when the reason has none) — or None for missing,
+    claimed, or non-dispatchable tasks.
     """
     row = conn.execute(
         "SELECT status, claim_lock, version FROM tasks WHERE id = ?", (task_id,),
@@ -1375,7 +1381,10 @@ def get_dispatch_guard(
         return None
     return {
         "reason": reason,
-        "recovery": _guard_recovery(
+        "recovery": _GUARD_RECOVERY.get(
+            reason, f"The dispatcher respawn guard is holding this task ({reason}).",
+        ),
+        "command": _guard_command(
             reason, task_id, int(row["version"] or 1), board=board,
         ),
     }

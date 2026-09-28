@@ -521,3 +521,34 @@ def test_tool_update_and_show_expose_continuation_parity(kanban_home, monkeypatc
     with kbc.connect_closing() as conn:
         assert kb.get_task(conn, tid).status == "ready"
         assert kb._pr_continuation(conn, tid)["event_id"] > 0
+
+
+def test_cli_diagnostics_recovery_command_names_the_selected_board(kanban_home, capsys):
+    """`--board other diagnostics` must suggest a command for that board.
+
+    The board override is scoped to the invocation, so a hint that omits
+    ``--board`` would send the operator at whichever board is current later.
+    """
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    kb.create_board("other")
+    with kbc.connect(board="other") as conn:
+        tid = kb.create_task(conn, title="held elsewhere", assignee="cto")
+        kb.add_comment(conn, tid, author="worker", body=_PR_URL)
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+    assert _run_cli(
+        "--board", "other", "diagnostics", "--task", tid, "--json",
+    ) == 0
+    rows = json.loads(capsys.readouterr().out)
+    hints = [
+        action["payload"]["command"]
+        for row in rows
+        for diag in row["diagnostics"]
+        for action in diag["actions"]
+        if action["kind"] == "cli_hint"
+    ]
+    recovery = [cmd for cmd in hints if "continue_existing_pr" in cmd]
+    assert recovery, hints
+    assert recovery[0].startswith("hermes kanban --board other update ")
+    assert "--transition continue_existing_pr" in recovery[0]

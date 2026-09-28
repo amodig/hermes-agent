@@ -242,7 +242,8 @@ def test_respawn_guarded_rule_reports_the_live_hold():
     task = _task(status="ready", assignee="demo", claim_lock=None)
     guard = {
         "reason": "active_pr",
-        "recovery": "hermes kanban update t_demo00 --expected-version 3 --transition continue_existing_pr",
+        "recovery": "A recent comment records an existing GitHub PR ...",
+        "command": "hermes kanban update t_demo00 --expected-version 3 --transition continue_existing_pr",
     }
     diags = kd.compute_task_diagnostics(
         task, [_event("respawn_guarded", ts=now - 60, reason="active_pr")], [],
@@ -253,8 +254,23 @@ def test_respawn_guarded_rule_reports_the_live_hold():
     assert held[0].severity == "warning"
     assert held[0].title == "Dispatch held: active_pr"
     assert held[0].data["reason"] == "active_pr"
+    # The drawer copies the command field verbatim, so it carries no prose.
+    assert held[0].detail == guard["recovery"]
     hints = [a for a in held[0].actions if a.kind == "cli_hint"]
-    assert any(a.payload["command"] == guard["recovery"] for a in hints)
+    assert any(a.payload["command"] == guard["command"] for a in hints)
+
+
+def test_respawn_guarded_rule_offers_no_copy_action_without_a_command():
+    """Guidance-only holds must not offer a clipboard action at all."""
+    task = _task(status="ready", assignee="demo", claim_lock=None)
+    diags = kd.compute_task_diagnostics(
+        task, [], [], now=100_000,
+        dispatch_guard={"reason": "recent_success", "recovery": "Re-queue it", "command": ""},
+    )
+    held = [d for d in diags if d.kind == "respawn_guarded"][0]
+    assert [a.label for a in held.actions if a.kind == "cli_hint"] == [
+        "Check dispatch state: hermes kanban show t_demo00",
+    ]
 
 
 def test_respawn_guarded_absent_without_a_live_projection():

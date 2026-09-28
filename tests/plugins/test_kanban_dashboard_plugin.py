@@ -1860,6 +1860,9 @@ def test_board_surfaces_live_active_pr_hold_with_recovery_hint(client):
     hint = [a for a in held[0]["actions"] if a["kind"] == "cli_hint"]
     recovery = [a for a in hint if "continue_existing_pr" in a["payload"]["command"]]
     assert recovery, hint
+    # The drawer copies ``payload.command`` verbatim, so it must be a runnable
+    # command and not the explanation with a command embedded in it.
+    assert recovery[0]["payload"]["command"].startswith("hermes kanban ")
     assert f"--expected-version {task['version']}" in recovery[0]["payload"]["command"]
 
 

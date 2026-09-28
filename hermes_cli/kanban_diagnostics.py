@@ -621,32 +621,6 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
     )]
 
 
-_DISPATCH_GUARD_DETAIL = {
-    "active_pr": (
-        "A recent comment records a GitHub PR that no live continuation "
-        "authorization covers, so the dispatcher will not start a worker for "
-        "this card. Acknowledge the existing PR with the explicit "
-        "'continue_existing_pr' transition (only with the user's authorization) "
-        "instead of opening a replacement PR."
-    ),
-    "recent_success": (
-        "A run already completed successfully inside the respawn guard window, "
-        "so the dispatcher treats a new spawn as duplicate work. Re-queue the "
-        "card deliberately, or authorize continuation of its recorded PR, to "
-        "run it again."
-    ),
-    "blocker_auth": (
-        "The last run failed with a quota/auth error; immediate retries cannot "
-        "help, and the circuit breaker will auto-block the card after the "
-        "failure limit."
-    ),
-    "rate_limit_cooldown": (
-        "The last run hit a provider rate limit. The dispatcher retries by "
-        "itself once the cooldown elapses; no action is required."
-    ),
-}
-
-
 def _rule_respawn_guarded(task, events, runs, now, cfg) -> list[Diagnostic]:
     """The dispatcher's respawn guard is holding this card *right now*.
 
@@ -661,19 +635,23 @@ def _rule_respawn_guarded(task, events, runs, now, cfg) -> list[Diagnostic]:
     reason = str(guard.get("reason") or "").strip()
     if not reason:
         return []
-    recovery = str(guard.get("recovery") or "").strip()
+    # Only a reason with an actual command offers the copy-to-clipboard action;
+    # the hint's payload is pasted verbatim, so prose must stay in the detail.
+    command = str(guard.get("command") or "").strip()
     task_id = str(_task_field(task, "id") or "")
     seen_at = _latest_event_ts(events, {"respawn_guarded"}) or now
-    actions = [
-        *([_cli_hint(f"Recover from {reason}", recovery, suggested=True)] if recovery else []),
-        # Ready is queue admission, not execution: point at the live state.
+    actions = []
+    if command:
+        actions.append(_cli_hint(f"Recover from {reason}", command, suggested=True))
+    # Ready is queue admission, not execution: point at the live state.
+    actions.append(
         _cli_hint(f"Check dispatch state: hermes kanban show {task_id}", f"hermes kanban show {task_id}"),
-    ]
+    )
     return [Diagnostic(
         kind="respawn_guarded", severity="warning",
         title=f"Dispatch held: {reason}",
-        detail=_DISPATCH_GUARD_DETAIL.get(
-            reason, "The dispatcher respawn guard is refusing to start a worker for this card.",
+        detail=str(guard.get("recovery") or "").strip() or (
+            "The dispatcher respawn guard is refusing to start a worker for this card."
         ),
         actions=actions,
         first_seen_at=seen_at, last_seen_at=seen_at, count=1,
