@@ -11,6 +11,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -1382,20 +1383,29 @@ _GUARD_RECOVERY: dict[str, str] = {
 
 def _guard_command(
     reason: str, task_id: str, version: int, *, board: Optional[str],
+    pr_urls: Optional[list[str]] = None,
 ) -> str:
     """The runnable recovery command for one guard reason, or ``""``.
 
     Only a reason with a single safe command gets one; the rest are guidance
     only. Surfaces offering a copy action paste this field verbatim, so it must
     never carry explanation prose.
+
+    The acknowledgment names the PR URLs it authorizes. A comment does not bump
+    the card's version, so a URL that lands after this command was printed would
+    otherwise be authorized without the operator ever seeing it; the transition
+    requires the set to match exactly.
     """
     if reason != "active_pr":
         return ""
     board_flag = f"--board {board} " if board else ""
+    authorized = " ".join(
+        f"--authorized-pr {shlex.quote(url)}" for url in (pr_urls or [])
+    )
     return (
         f"hermes kanban {board_flag}update {task_id} --expected-version {version} "
-        "--transition continue_existing_pr --reason 'Explicitly authorized: continue "
-        "the existing PR; do not open another PR'"
+        f"--transition continue_existing_pr {authorized} "
+        "--reason 'Explicitly authorized: continue the existing PR; do not open another PR'"
     )
 
 
@@ -1417,7 +1427,8 @@ def respawn_guard_alert(holds: list[tuple[str, str]], ticks: int) -> str:
 
 
 def _guard_projection(
-    entry: Optional[dict[str, Any]], *, now: int, board: Optional[str],
+    conn: sqlite3.Connection, entry: Optional[dict[str, Any]], *,
+    now: int, board: Optional[str],
 ) -> Optional[dict[str, str]]:
     """Live hold projection for one guard-state entry, or None when spawnable."""
     if (
@@ -1446,7 +1457,10 @@ def _guard_projection(
         "recovery": _GUARD_RECOVERY.get(
             reason, f"The dispatcher respawn guard is holding this task ({reason}).",
         ),
-        "command": _guard_command(reason, entry["task_id"], entry["version"], board=board),
+        "command": _guard_command(
+            reason, entry["task_id"], entry["version"], board=board,
+            pr_urls=_kb._task_pr_urls(conn, entry["task_id"]),
+        ),
     }
 
 
@@ -1464,7 +1478,7 @@ def get_dispatch_guard(
     """
     now = int(time.time())
     return _guard_projection(
-        _guard_state(conn, [task_id], now=now).get(task_id), now=now, board=board,
+        conn, _guard_state(conn, [task_id], now=now).get(task_id), now=now, board=board,
     )
 
 
@@ -1480,7 +1494,7 @@ def get_dispatch_guards(
     now = int(time.time())
     guards: dict[str, dict[str, str]] = {}
     for task_id, entry in _guard_state(conn, list(task_ids), now=now).items():
-        projection = _guard_projection(entry, now=now, board=board)
+        projection = _guard_projection(conn, entry, now=now, board=board)
         if projection is not None:
             guards[task_id] = projection
     return guards
@@ -1497,19 +1511,39 @@ def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
     return profile_exists
 
 
-def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
+def _spawnable_ids(conn: sqlite3.Connection, status: str) -> list[str]:
+    """Ids of ``status``+assigned+unclaimed tasks the dispatcher would spawn for.
+
+    Lets health telemetry tell "stuck" (``0 spawned`` with spawnable work) from
+    "correctly idle" (only control-plane lanes waiting on ``claim_task``), and
+    lets a caller subtract the cards it already explains. Falls back to "any
+    assigned" when ``profile_exists`` is unimportable.
+    """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
+        "SELECT id, assignee FROM tasks "
+        "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL "
+        "ORDER BY priority DESC, created_at ASC",
         (status,),
     ).fetchall()
     if not rows:
-        return False
+        return []
     profile_exists = _profile_exists_fn()
     if profile_exists is None:
         # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
-    return any(profile_exists(row["assignee"]) for row in rows)
+        return [row["id"] for row in rows]
+    return [row["id"] for row in rows if profile_exists(row["assignee"])]
+
+
+def spawnable_lane_ids(conn: sqlite3.Connection) -> list[str]:
+    """Spawnable ready ids plus review ids when review dispatch is on.
+
+    Same gate as :func:`ready_nonempty` in the gateway dispatcher: the review
+    column counts only while this process would claim from it.
+    """
+    ids = _spawnable_ids(conn, "ready")
+    if review_dispatch_enabled():
+        ids += _spawnable_ids(conn, "review")
+    return ids
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -1519,12 +1553,12 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     "correctly idle" (only control-plane lanes waiting on ``claim_task``). Falls
     back to "any assigned" when ``profile_exists`` is unimportable.
     """
-    return _has_spawnable(conn, "ready")
+    return bool(_spawnable_ids(conn, "ready"))
 
 
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     """:func:`has_spawnable_ready` for the review column."""
-    return _has_spawnable(conn, "review")
+    return bool(_spawnable_ids(conn, "review"))
 
 
 def review_dispatch_enabled() -> bool:

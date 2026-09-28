@@ -29,13 +29,14 @@ def clock(monkeypatch):
     return _set
 
 
-def _continue(conn, tid, reason="Explicitly authorized: continue the existing PR"):
+def _continue(conn, tid, reason="Explicitly authorized: continue the existing PR", urls=None):
     return kb.update_task(
         conn,
         tid,
         expected_version=kb.get_task(conn, tid).version,
         reason=reason,
         transition="continue_existing_pr",
+        authorized_pr_urls=urls if urls is not None else kb._task_pr_urls(conn, tid),
     )
 
 
@@ -198,7 +199,9 @@ def test_rejected_updates_leave_no_authorization_or_partial_goal_edit(clock, tmp
         bare = kb.create_task(conn, title="nothing recorded", assignee="cto")
         before = kb.get_task(conn, bare).version
         with pytest.raises(ValueError, match="requires an existing GitHub PR URL"):
-            _continue(conn, bare, reason="authorize")
+            _continue(conn, bare, reason="authorize", urls=[PR1])
+        with pytest.raises(ValueError, match="requires the authorized PR URL list"):
+            _continue(conn, bare, reason="authorize", urls=[])
         assert kb.get_task(conn, bare).version == before
         assert _events(conn, bare, "pr_continuation_authorized") == []
         assert kb._pr_continuation(conn, bare) is None
@@ -220,10 +223,25 @@ def test_rejected_updates_leave_no_authorization_or_partial_goal_edit(clock, tmp
             kb.update_task(
                 conn, stale, expected_version=99, reason="authorize",
                 transition="continue_existing_pr", title="never applied",
+                authorized_pr_urls=[PR1],
             )
         assert kb.get_task(conn, stale).title == "stale cas"
         assert _events(conn, stale, "pr_continuation_authorized") == []
         assert dispatch.check_respawn_guard(conn, stale) == "active_pr"
+
+        # A PR URL that lands after the operator read the card must not be
+        # authorized by the stale command: the named set has to match, because a
+        # comment does not bump the card's version.
+        drifted = kb.create_task(conn, title="drifted", assignee="cto")
+        kb.add_comment(conn, drifted, author="worker", body=PR1)
+        kb.add_comment(conn, drifted, author="worker", body=PR2)
+        with pytest.raises(ValueError, match="changed since the authorization"):
+            _continue(conn, drifted, urls=[PR1])
+        assert _events(conn, drifted, "pr_continuation_authorized") == []
+        assert kb._pr_continuation(conn, drifted) is None
+        assert dispatch.check_respawn_guard(conn, drifted) == "active_pr"
+        assert _continue(conn, drifted, urls=[PR1, PR2])
+        assert kb._pr_continuation(conn, drifted)["pr_urls"] == [PR1, PR2]
 
         # A claimed card refuses the update entirely.
         claimed_task = kb.create_task(conn, title="claimed", assignee="cto")

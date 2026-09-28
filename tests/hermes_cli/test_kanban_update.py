@@ -432,7 +432,7 @@ def test_continue_existing_pr_is_the_only_acknowledgment(kanban_home, capsys, mo
     assert _run_cli(
         "update", tid, "--expected-version", str(version),
         "--reason", "Explicitly authorized: continue the existing PR",
-        "--transition", "continue_existing_pr",
+        "--transition", "continue_existing_pr", "--authorized-pr", _PR_URL,
     ) == 0
     with kbc.connect_closing() as conn:
         assert kbd.check_respawn_guard(conn, tid) is None
@@ -460,7 +460,7 @@ def test_continue_existing_pr_goal_and_authorization_are_atomic(kanban_home, cap
     assert _run_cli(
         "update", tid, "--expected-version", str(version),
         "--reason", "authorized repair", "--title", "authorized scoped goal",
-        "--transition", "continue_existing_pr",
+        "--transition", "continue_existing_pr", "--authorized-pr", _PR_URL,
     ) == 0
     with kbc.connect_closing() as conn:
         task = kb.get_task(conn, tid)
@@ -483,6 +483,7 @@ def test_continue_existing_pr_respects_unmet_typed_dependencies(kanban_home):
             conn, tid, expected_version=kb.get_task(conn, tid).version,
             reason="authorized but upstream unfinished",
             transition="continue_existing_pr",
+            authorized_pr_urls=[_PR_URL],
         )
         # Authorization is recorded, but the dependency gate still decides the
         # landing column — never 'ready' past an unfinished parent.
@@ -507,6 +508,7 @@ def test_tool_update_and_show_expose_continuation_parity(kanban_home, monkeypatc
         "expected_version": version,
         "reason": "Explicitly authorized: continue the existing PR",
         "transition": "continue_existing_pr",
+        "authorized_pr_urls": [_PR_URL],
     }))
     assert payload["ok"] is True
     assert payload["version"] == version + 1

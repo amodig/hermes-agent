@@ -3010,6 +3010,7 @@ recovery.recover_if_needed(project_root=root, argv=[])
             self.conn, coordinator, expected_version=self._task(coordinator).version,
             reason="Explicitly authorized: continue the existing PR",
             transition="continue_existing_pr",
+            authorized_pr_urls=[pr_url],
         ))
         self.assertIsNone(kbd.check_respawn_guard(self.conn, coordinator))
         authorization = kb._pr_continuation(self.conn, coordinator)
@@ -3109,6 +3110,7 @@ recovery.recover_if_needed(project_root=root, argv=[])
             self.conn, task_id, expected_version=self._task(task_id).version,
             reason="Explicitly authorized: continue the existing PR",
             transition="continue_existing_pr",
+            authorized_pr_urls=[pr_url],
         ))
         identity = runtime_identity(MODULE.RUNTIME_ROOT)
         cancelled: list[bool] = []
@@ -3152,6 +3154,7 @@ recovery.recover_if_needed(project_root=root, argv=[])
             self.conn, task_id, expected_version=self._task(task_id).version,
             reason="Explicitly authorized: continue both recorded PRs",
             transition="continue_existing_pr",
+            authorized_pr_urls=[pr_url, pr_url.replace("/7", "/8")],
         ))
         self.assertEqual(
             kb._pr_continuation(self.conn, task_id)["pr_urls"], [pr_url, pr_url.replace("/7", "/8")],

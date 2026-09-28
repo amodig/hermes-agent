@@ -40,6 +40,7 @@ class _UpdateRequest:
     lifecycle_contract: Any
     lifecycle_json: Any
     normalized_lifecycle: Any
+    authorized_pr_urls: Optional[list[str]]
 
 
 @dataclass
@@ -107,6 +108,7 @@ def _validate_update_request(
     goal_mode: Any,
     lifecycle_contract: Any,
     transition: Optional[str],
+    authorized_pr_urls: Optional[list[str]],
 ) -> _UpdateRequest:
     if isinstance(expected_version, bool) or not isinstance(expected_version, int):
         raise ValueError("expected_version must be an integer")
@@ -120,6 +122,28 @@ def _validate_update_request(
         raise ValueError(
             f"unsupported transition {transition_text!r}; "
             "only 'triage_to_ready' and 'continue_existing_pr' are supported"
+        )
+    authorized: Optional[list[str]] = None
+    if transition_text == "continue_existing_pr":
+        # The acknowledgment names the PR URLs the operator saw, so a comment
+        # that lands after the recovery command was printed cannot be
+        # authorized without being shown.
+        if isinstance(authorized_pr_urls, (str, bytes)) or not isinstance(
+            authorized_pr_urls, (list, tuple)
+        ):
+            raise ValueError(
+                "continue_existing_pr requires the authorized PR URL list "
+                "(authorized_pr_urls)"
+            )
+        authorized = sorted(dict.fromkeys(str(url).strip() for url in authorized_pr_urls))
+        if not authorized or not all(authorized):
+            raise ValueError(
+                "continue_existing_pr requires the authorized PR URL list "
+                "(authorized_pr_urls)"
+            )
+    elif authorized_pr_urls is not None:
+        raise ValueError(
+            "authorized_pr_urls is only valid with the 'continue_existing_pr' transition"
         )
     if goal_mode is not _kb._UPDATE_UNSET and not isinstance(goal_mode, bool):
         raise ValueError("goal_mode must be a boolean")
@@ -157,6 +181,7 @@ def _validate_update_request(
         lifecycle_contract=lifecycle_contract,
         lifecycle_json=lifecycle_json,
         normalized_lifecycle=normalized_lifecycle,
+        authorized_pr_urls=authorized,
     )
 
 
@@ -485,10 +510,17 @@ def _persist_update(
     # rolls the whole transaction back either way.
     continuation_urls: Optional[list[str]] = None
     if request.transition_text == "continue_existing_pr":
-        continuation_urls = _kb._task_pr_urls(conn, task_id)
-        if not continuation_urls:
+        recorded_urls = _kb._task_pr_urls(conn, task_id)
+        if not recorded_urls:
             raise ValueError(
                 "continue_existing_pr requires an existing GitHub PR URL comment"
+            )
+        continuation_urls = list(request.authorized_pr_urls or [])
+        if continuation_urls != recorded_urls:
+            raise ValueError(
+                "the PR URLs recorded on this task changed since the "
+                "authorization was prepared; re-run kanban show and acknowledge "
+                "the current set"
             )
     if plan.goal_changed:
         prior_goal_version = int(goal_row["version"])
@@ -626,6 +658,7 @@ def update_task(
     goal_mode: Any = _UPDATE_UNSET,
     lifecycle_contract: Any = _UPDATE_UNSET,
     transition: Optional[str] = None,
+    authorized_pr_urls: Optional[list[str]] = None,
     author: Optional[str] = None,
 ) -> bool:
     """Atomically revise and optionally requeue one existing task."""
@@ -641,6 +674,7 @@ def update_task(
         goal_mode=goal_mode,
         lifecycle_contract=lifecycle_contract,
         transition=transition,
+        authorized_pr_urls=authorized_pr_urls,
     )
     actor = _kb._update_actor(author)
     with _kb.write_txn(conn):

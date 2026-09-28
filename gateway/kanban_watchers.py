@@ -293,8 +293,7 @@ class GatewayKanbanWatchersMixin:
                         await _to_thread_process_service(dispatcher.auto_decompose_tick, _ad_per_tick)
                     results = await _to_thread_process_service(dispatcher.tick_once)
                     any_spawned = _log_spawn_results(results)
-                    ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
-                    bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
+                    pending_ids = await _to_thread_process_service(dispatcher.spawnable_ids)
                     # Guard holds stay visible even when another card spawned:
                     # the operator question is "why is THIS card queued?", not
                     # "is the board idle?".
@@ -302,6 +301,12 @@ class GatewayKanbanWatchersMixin:
                     guarded_ticks = guarded_ticks + 1 if holds else 0
                     if holds:
                         guard_holds = holds
+                    # The stuck signal counts only pending work the guard does
+                    # not already explain, so a guard hold cannot masquerade as
+                    # a profile/PATH failure.
+                    held_ids = {label for label, _reason in holds}
+                    unexplained = [task_id for task_id in pending_ids if task_id not in held_ids]
+                    bad_ticks = bad_ticks + 1 if unexplained and not any_spawned else 0
                 now = int(time.time())
                 if guarded_ticks >= _HEALTH_WINDOW and now - last_guard_warn_at >= 300:
                     logger.warning(

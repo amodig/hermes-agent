@@ -327,6 +327,7 @@ def test_live_guard_clears_after_authorization_despite_recorded_events(kanban_ho
             conn, tid,
             expected_version=kb.get_task(conn, tid).version,
             reason="explicitly authorized", transition="continue_existing_pr",
+            authorized_pr_urls=["https://github.com/o/r/pull/7"],
         )
         assert "respawn_guarded" not in _kinds()
 

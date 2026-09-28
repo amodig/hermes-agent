@@ -605,6 +605,17 @@ KANBAN_UPDATE_SCHEMA = _schema(
             "integer", "Current task version required for the CAS update."
         ),
         "reason": _prop("string", "Human-readable reason for the correction."),
+        "authorized_pr_urls": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "The GitHub PR URLs this update authorizes, exactly as recorded "
+                "on the task. Required with transition 'continue_existing_pr' so "
+                "a URL added after the operator read the card cannot be "
+                "authorized silently; the transition refuses a set that no "
+                "longer matches the task's recorded URLs."
+            ),
+        },
         "transition": {
             "type": "string",
             "enum": ["triage_to_ready", "continue_existing_pr"],

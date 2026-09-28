@@ -193,22 +193,26 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         "last_guard_warn_at": 0, "last_stuck_warn_at": 0,
     }
 
-    def _ready_queue_nonempty() -> bool:
-        """Is there a ready+assigned+unclaimed task the dispatcher would spawn for?
+    def _spawnable_ids() -> list[str]:
+        """Ids of ready/review tasks the dispatcher would spawn for.
         Control-plane lanes pulled via ``claim_task`` are correctly idle, not stuck."""
         try:
             with kbc.connect_closing() as conn:
-                return kbd.has_spawnable_ready(conn)
+                return kbd.spawnable_lane_ids(conn)
         except Exception:
-            return False
+            return []
 
     def _on_tick(res):
-        ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
-        if ready_pending and not res.spawned:
+        pending = _spawnable_ids()
+        holds = list(getattr(res, "respawn_guarded", None) or [])
+        # Count only pending work the guard does not already explain, so a guard
+        # hold cannot masquerade as a profile/PATH failure.
+        held_ids = {task_id for task_id, _reason in holds}
+        unexplained = [task_id for task_id in pending if task_id not in held_ids]
+        if (bool(res.skipped_unassigned) or unexplained) and not res.spawned:
             health_state["bad_ticks"] += 1
         else:
             health_state["bad_ticks"] = 0
-        holds = list(getattr(res, "respawn_guarded", None) or [])
         if holds:
             health_state["guarded_ticks"] += 1
             health_state["guard_holds"] = holds

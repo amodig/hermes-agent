@@ -1873,6 +1873,7 @@ def test_patch_continue_existing_pr_acknowledges_and_clears_the_hold(client):
         json={
             "expected_version": task["version"],
             "transition": "continue_existing_pr",
+            "authorized_pr_urls": [_PR_URL],
             "reason": "User authorized repairing/reviewing the existing PR",
         },
     )

@@ -645,6 +645,7 @@ def _cmd_update(args: argparse.Namespace) -> int:
             provider=optional(getattr(args, "provider", None)),
             goal_mode=kb._UPDATE_UNSET if goal_mode is None else goal_mode,
             transition=getattr(args, "transition", None),
+            authorized_pr_urls=getattr(args, "authorized_pr", None),
             lifecycle_contract=lifecycle_contract,
             author=getattr(args, "author", None) or _profile_author(),
         )

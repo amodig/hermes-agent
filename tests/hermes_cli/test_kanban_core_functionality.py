@@ -1438,6 +1438,7 @@ class _FakeClock:
 
 def _drive_gateway_ticks(
     monkeypatch, tmp_path, results, *, ticks: int, caplog, clock=None, after_tick=None,
+    pending=None,
 ):
     """Run ``ticks`` synthetic dispatcher ticks through the real watcher loop.
 
@@ -1462,6 +1463,10 @@ def _drive_gateway_ticks(
     clock = clock or _FakeClock(1_000_000)
     monkeypatch.setattr(_kw, "time", clock)
 
+    # Pending spawnable work defaults to exactly the cards the guard holds, so a
+    # guard-only stall carries no unexplained work.
+    default_pending = [f"default/{tid}" for tid, _reason in (results[0].respawn_guarded or [])]
+
     class _FakeDispatcher:
         def __init__(self, kb, settings):  # noqa: D107 - test double
             pass
@@ -1471,8 +1476,8 @@ def _drive_gateway_ticks(
             state["i"] += 1
             return [("default", res)]
 
-        def ready_nonempty(self):
-            return True
+        def spawnable_ids(self):
+            return list(default_pending if pending is None else pending)
 
         def auto_decompose_tick(self, _n):
             return 0
@@ -1516,10 +1521,27 @@ def test_gateway_alerts_on_six_consecutive_guarded_ticks(monkeypatch, tmp_path, 
     # Board-qualified, so the operator knows which board's dispatcher reported it.
     assert "default/t_aaaa1111" in alerts[0]
     assert "`hermes kanban diagnostics`" in alerts[0]
-    # The two classes are limited independently: a guard hold must not consume
-    # the slot that reports the same ready queue failing to spawn for other
-    # reasons (profile, PATH, credentials).
-    assert len(_warnings(caplog, "dispatcher stuck")) == 1, caplog.text
+    # The held card is the only pending work, so the stall is fully explained by
+    # the guard: the generic profile/PATH alert must not fire for it.
+    assert _warnings(caplog, "dispatcher stuck") == []
+
+
+def test_gateway_reports_a_guard_hold_and_an_unexplained_stall_together(
+    monkeypatch, tmp_path, caplog,
+):
+    """The two classes share no limiter, and held work does not mask a stall."""
+    held = kbd.DispatchResult(respawn_guarded=[("t_aaaa1111", "active_pr")])
+    _drive_gateway_ticks(
+        monkeypatch, tmp_path, [held], ticks=6, caplog=caplog,
+        pending=["default/t_aaaa1111", "default/t_dddd4444"],
+    )
+
+    alerts = _warnings(caplog, "respawn guard held ready work")
+    assert len(alerts) == 1, caplog.text
+    assert "default/t_aaaa1111" in alerts[0]
+    stuck = _warnings(caplog, "dispatcher stuck")
+    assert len(stuck) == 1, caplog.text
+    assert "0 workers spawned" in stuck[0]
 
 
 def test_gateway_guard_alert_stays_visible_when_other_cards_spawn(monkeypatch, tmp_path, caplog):
@@ -1562,7 +1584,10 @@ def test_gateway_keeps_the_generic_stuck_alert_for_other_causes(
     monkeypatch, tmp_path, caplog,
 ):
     no_hold = kbd.DispatchResult(skipped_unassigned=["t_cccc3333"])
-    _drive_gateway_ticks(monkeypatch, tmp_path, [no_hold], ticks=6, caplog=caplog)
+    _drive_gateway_ticks(
+        monkeypatch, tmp_path, [no_hold], ticks=6, caplog=caplog,
+        pending=["default/t_cccc3333"],
+    )
 
     assert _warnings(caplog, "respawn guard held ready work") == []
     stuck = _warnings(caplog, "dispatcher stuck")

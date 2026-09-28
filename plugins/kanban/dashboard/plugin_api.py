@@ -591,6 +591,9 @@ class UpdateTaskBody(BaseModel):
     # "the user explicitly acknowledged this", so it never rides along with the
     # dashboard's default expected_version/reason.
     transition: Optional[str] = None
+    # The PR URLs the operator is authorizing; required with a
+    # ``continue_existing_pr`` transition and matched against the task.
+    authorized_pr_urls: Optional[list[str]] = None
     # In a PATCH ``None`` means "field not sent", so ``clear_*=True`` is the explicit clear signal.
     # ``reasoning_effort="none"`` is a VALUE (thinking off); it is cleared separately so
     # dropping a model override doesn't silently reset the depth.
@@ -797,6 +800,7 @@ def _patch_title_body(
                 payload.lifecycle_contract if wants_lifecycle else kanban_db._UPDATE_UNSET
             ),
             transition=transition,
+            authorized_pr_urls=payload.authorized_pr_urls,
             author="dashboard",
         )
     _require_ok(ok)
@@ -840,6 +844,10 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             if not (payload.reason or "").strip():
                 raise HTTPException(
                     status_code=400, detail="transition requires a reason")
+        if transition == "continue_existing_pr" and not payload.authorized_pr_urls:
+            raise HTTPException(
+                status_code=400,
+                detail="continue_existing_pr requires authorized_pr_urls")
         cas_fields = {"title", "body", "lifecycle_contract"}
         if transition is not None:
             cas_fields.add("transition")

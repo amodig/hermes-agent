@@ -387,6 +387,7 @@ def test_board_guard_projection_agrees_with_single_task_projection(kanban_home):
         assert kb.update_task(
             conn, authorized, expected_version=kb.get_task(conn, authorized).version,
             reason="authorized", transition="continue_existing_pr",
+            authorized_pr_urls=["https://github.com/o/r/pull/2"],
         )
         plain = kb.create_task(conn, title="plain", assignee="default")
         running = kb.create_task(conn, title="running", assignee="default")

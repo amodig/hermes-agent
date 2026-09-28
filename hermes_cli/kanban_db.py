@@ -4441,6 +4441,7 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _worker_terminal_timeout_env,
     get_dispatch_guard,
     get_dispatch_guards,
+    spawnable_lane_ids,
 )
 from hermes_cli.kanban_db_lifecycle import (  # noqa: E402
     ArtifactPreservationError,

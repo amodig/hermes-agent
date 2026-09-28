@@ -1079,7 +1079,8 @@ def _handle_update(args: dict, **kw) -> str:
         "reason": reason,
         "author": os.environ.get("HERMES_PROFILE") or "orchestrator",
     }
-    for name in ("title", "body", "assignee", "model", "provider", "transition"):
+    for name in ("title", "body", "assignee", "model", "provider", "transition",
+                 "authorized_pr_urls"):
         if name in args:
             kwargs[name] = args[name]
     if "goal_mode" in args:

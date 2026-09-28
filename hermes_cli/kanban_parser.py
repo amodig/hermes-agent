@@ -254,6 +254,11 @@ _SPECS = [
                   "URLs already recorded on the task as operator-authorized work to "
                   "continue (needs the user's explicit authorization; never opens a "
                   "replacement PR)"),
+        _arg("--authorized-pr", action="append", dest="authorized_pr",
+             metavar="URL",
+             help="GitHub PR URL this operation authorizes; repeat for each URL. "
+                  "Required with --transition continue_existing_pr and must match "
+                  "the URLs recorded on the task."),
         _arg("--author", help=argparse.SUPPRESS),
         _json_flag(help="Emit JSON output"),
         _arg("--lifecycle-contract",
