@@ -353,3 +353,35 @@ def test_guard_window_lapses_but_the_grant_survives(clock, tmp_path, monkeypatch
         assert dispatch.check_respawn_guard(conn, stale) is None
         kb.add_comment(conn, stale, author="worker", body=f"still open: {PR2}")
         assert dispatch.check_respawn_guard(conn, stale) == "active_pr"
+
+
+def test_review_claim_keeps_the_live_continuation(clock, tmp_path, monkeypatch):
+    """A same-card reviewer still gets the published-PR context.
+
+    The review lane is exempt from the guard fence, but losing the claim-bound
+    authorization there would let the review phase act as if no PR existed.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    kb.init_db()
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="published PR review", assignee="cto")
+        kb.add_comment(conn, tid, author="worker", body=f"Published {PR1}")
+        assert _continue(conn, tid)
+        implementation = kb.claim_task(conn, tid)
+        assert implementation is not None
+        assert kb.request_review(
+            conn, tid, summary="published PR ready for review",
+            expected_run_id=implementation.current_run_id,
+        )
+        reviewer = kb.claim_review_task(conn, tid)
+        assert reviewer is not None
+        run = kb.get_run(conn, reviewer.current_run_id)
+        assert run.metadata["pr_continuation"]["pr_urls"] == [PR1]
+        claimed_event = [
+            e for e in kb.list_events(conn, tid) if e.kind == "claimed"
+        ][-1]
+        assert claimed_event.payload["pr_continuation_event_id"] == (
+            kb._pr_continuation(conn, tid)["event_id"]
+        )
+        assert "Existing PR — continue, do not replace" in kb.build_worker_context(conn, tid)

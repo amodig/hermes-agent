@@ -314,6 +314,11 @@ def claim_review_task(
             conn, task_id, "review", lock, expires, now,
             event_extra={"source_status": "review"},
             runtime_claim=runtime_claim, expected_task=expected_task,
+            # The review lane stays exempt from the PR *fence* (a PR is the input
+            # to a review), but a live continuation still binds: on a same-card
+            # review the reviewer is reviewing the already-published PR, and must
+            # be told to keep reviewing it rather than open a replacement.
+            pr_continuation=_kb._pr_continuation(conn, task_id),
         )
         if run_id is None:
             return None
