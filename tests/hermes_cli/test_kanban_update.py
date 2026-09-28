@@ -545,10 +545,13 @@ def test_cli_diagnostics_recovery_command_names_the_selected_board(kanban_home, 
         action["payload"]["command"]
         for row in rows
         for diag in row["diagnostics"]
+        if diag["kind"] == "respawn_guarded"
         for action in diag["actions"]
         if action["kind"] == "cli_hint"
     ]
+    assert hints, rows
+    # Every offered command must target the board that was inspected.
+    assert all(cmd.startswith("hermes kanban --board other ") for cmd in hints), hints
     recovery = [cmd for cmd in hints if "continue_existing_pr" in cmd]
     assert recovery, hints
-    assert recovery[0].startswith("hermes kanban --board other update ")
     assert "--transition continue_existing_pr" in recovery[0]

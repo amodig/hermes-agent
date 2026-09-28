@@ -261,16 +261,20 @@ def test_respawn_guarded_rule_reports_the_live_hold():
 
 
 def test_respawn_guarded_rule_offers_no_copy_action_without_a_command():
-    """Guidance-only holds must not offer a clipboard action at all."""
+    """Guidance-only holds must not offer a clipboard action at all.
+
+    A hint built here rather than taken from the dispatcher's projection cannot
+    know which board the caller selected, so it would suggest a command for the
+    wrong board.
+    """
     task = _task(status="ready", assignee="demo", claim_lock=None)
     diags = kd.compute_task_diagnostics(
         task, [], [], now=100_000,
         dispatch_guard={"reason": "recent_success", "recovery": "Re-queue it", "command": ""},
     )
     held = [d for d in diags if d.kind == "respawn_guarded"][0]
-    assert [a.label for a in held.actions if a.kind == "cli_hint"] == [
-        "Check dispatch state: hermes kanban show t_demo00",
-    ]
+    assert held.detail == "Re-queue it"
+    assert [a for a in held.actions if a.kind == "cli_hint"] == []
 
 
 def test_respawn_guarded_absent_without_a_live_projection():

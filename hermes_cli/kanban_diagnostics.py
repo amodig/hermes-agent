@@ -637,15 +637,13 @@ def _rule_respawn_guarded(task, events, runs, now, cfg) -> list[Diagnostic]:
         return []
     # Only a reason with an actual command offers the copy-to-clipboard action;
     # the hint's payload is pasted verbatim, so prose must stay in the detail.
+    # Every hint therefore comes from the dispatcher's own projection, which
+    # knows the board it was taken for — a locally built command would drop a
+    # `--board` the operator passed to `diagnostics`.
     command = str(guard.get("command") or "").strip()
-    task_id = str(_task_field(task, "id") or "")
     seen_at = _latest_event_ts(events, {"respawn_guarded"}) or now
-    actions = []
-    if command:
-        actions.append(_cli_hint(f"Recover from {reason}", command, suggested=True))
-    # Ready is queue admission, not execution: point at the live state.
-    actions.append(
-        _cli_hint(f"Check dispatch state: hermes kanban show {task_id}", f"hermes kanban show {task_id}"),
+    actions = (
+        [_cli_hint(f"Recover from {reason}", command, suggested=True)] if command else []
     )
     return [Diagnostic(
         kind="respawn_guarded", severity="warning",
