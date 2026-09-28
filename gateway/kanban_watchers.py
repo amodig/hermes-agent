@@ -261,7 +261,10 @@ class GatewayKanbanWatchersMixin:
         bad_ticks = 0
         guarded_ticks = 0
         guard_holds: list[tuple[str, str]] = []
-        last_warn_at = 0
+        # One limiter per alert class: a persistent guard hold must not consume
+        # the slot that reports a profile/PATH failure, and vice versa.
+        last_guard_warn_at = 0
+        last_stuck_warn_at = 0
 
         logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
         while self._running:
@@ -300,22 +303,21 @@ class GatewayKanbanWatchersMixin:
                     if holds:
                         guard_holds = holds
                 now = int(time.time())
-                if now - last_warn_at >= 300:
-                    if guarded_ticks >= _HEALTH_WINDOW:
-                        logger.warning(
-                            "kanban dispatcher: %s",
-                            guarded_alert(guard_holds, guarded_ticks),
-                        )
-                        last_warn_at = now
-                    elif bad_ticks >= _HEALTH_WINDOW:
-                        logger.warning(
-                            "kanban dispatcher stuck: ready queue non-empty for "
-                            "%d consecutive ticks but 0 workers spawned. Check "
-                            "profile health (venv, PATH, credentials) and "
-                            "`hermes kanban list --status ready`.",
-                            bad_ticks,
-                        )
-                        last_warn_at = now
+                if guarded_ticks >= _HEALTH_WINDOW and now - last_guard_warn_at >= 300:
+                    logger.warning(
+                        "kanban dispatcher: %s",
+                        guarded_alert(guard_holds, guarded_ticks),
+                    )
+                    last_guard_warn_at = now
+                if bad_ticks >= _HEALTH_WINDOW and now - last_stuck_warn_at >= 300:
+                    logger.warning(
+                        "kanban dispatcher stuck: ready queue non-empty for "
+                        "%d consecutive ticks but 0 workers spawned. Check "
+                        "profile health (venv, PATH, credentials) and "
+                        "`hermes kanban list --status ready`.",
+                        bad_ticks,
+                    )
+                    last_stuck_warn_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
                 self._release_kanban_dispatcher_lock()

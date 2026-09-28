@@ -1516,8 +1516,10 @@ def test_gateway_alerts_on_six_consecutive_guarded_ticks(monkeypatch, tmp_path, 
     # Board-qualified, so the operator knows which board's dispatcher reported it.
     assert "default/t_aaaa1111" in alerts[0]
     assert "`hermes kanban diagnostics`" in alerts[0]
-    # The guard-specific alert replaces the generic one for the same stall.
-    assert _warnings(caplog, "dispatcher stuck") == []
+    # The two classes are limited independently: a guard hold must not consume
+    # the slot that reports the same ready queue failing to spawn for other
+    # reasons (profile, PATH, credentials).
+    assert len(_warnings(caplog, "dispatcher stuck")) == 1, caplog.text
 
 
 def test_gateway_guard_alert_stays_visible_when_other_cards_spawn(monkeypatch, tmp_path, caplog):
