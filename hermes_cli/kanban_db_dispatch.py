@@ -1093,13 +1093,14 @@ def _guard_state(
     marks = ",".join("?" * len(ids))
     state: dict[str, dict[str, Any]] = {}
     for row in conn.execute(
-        f"SELECT id, status, claim_lock, version, goal_revision_id, last_failure_error "
-        f"FROM tasks WHERE id IN ({marks})",
+        f"SELECT id, status, claim_lock, version, goal_revision_id, last_failure_error, "
+        f"assignee FROM tasks WHERE id IN ({marks})",
         tuple(ids),
     ).fetchall():
         state[row["id"]] = {
             "task_id": row["id"],
             "status": row["status"],
+            "assignee": row["assignee"],
             "claim_lock": row["claim_lock"],
             "version": int(row["version"] or 1),
             "goal_revision_id": _kb._opt_int(row["goal_revision_id"]),
@@ -1425,6 +1426,16 @@ def _guard_projection(
         or entry["status"] not in ("ready", "review")
     ):
         return None
+    assignee = (entry["assignee"] or "").strip()
+    profile_exists = _profile_exists_fn()
+    if not assignee or (profile_exists is not None and not profile_exists(assignee)):
+        # `_dispatch_lane_task` classifies an unassigned card (`skipped_unassigned`)
+        # or one with no real profile (`skipped_nonspawnable`) BEFORE it consults
+        # the guard, so the guard is not what stops it and its recovery command
+        # would not make it spawn. `profile_exists` also rejects an empty name,
+        # so the unassigned case must not reach it. The stranded-in-ready
+        # diagnostic already names the assignee cause for the typo case.
+        return None
     reason = _guard_reason(
         entry, lane="review" if entry["status"] == "review" else "ready", now=now,
     )
@@ -1448,7 +1459,8 @@ def get_dispatch_guard(
     historical ``respawn_guarded`` events, which a later authorization leaves
     stale. Returns ``{"reason", "recovery", "command"}`` — operator guidance plus
     the runnable command (``""`` when the reason has none) — or None for missing,
-    claimed, or non-dispatchable tasks.
+    claimed, or non-dispatchable tasks, including a card whose assignee is not a
+    real profile (the dispatcher classifies those as nonspawnable first).
     """
     now = int(time.time())
     return _guard_projection(
