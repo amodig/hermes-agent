@@ -1077,10 +1077,95 @@ def _task_pr_urls(conn: sqlite3.Connection, task_id: str) -> list[str]:
     return sorted(urls)
 
 
-def _pr_continuation(
-    conn: sqlite3.Connection, task_id: str,
-) -> Optional[dict[str, Any]]:
-    """Newest usable ``pr_continuation_authorized`` for ``task_id``, else None.
+def _guard_state(
+    conn: sqlite3.Connection, task_ids: list[str], *, now: Optional[int] = None,
+) -> dict[str, dict[str, Any]]:
+    """Every input the respawn guard reads, for many tasks, in a fixed number of queries.
+
+    The guard's semantics live in :func:`_guard_reason`; this exists so a
+    board-wide projection does not run a query per card. A missing task simply
+    has no entry, which the evaluator treats as "no guard".
+    """
+    ids = list(dict.fromkeys(task_ids))
+    if not ids:
+        return {}
+    now = int(time.time()) if now is None else int(now)
+    marks = ",".join("?" * len(ids))
+    state: dict[str, dict[str, Any]] = {}
+    for row in conn.execute(
+        f"SELECT id, status, claim_lock, version, goal_revision_id, last_failure_error "
+        f"FROM tasks WHERE id IN ({marks})",
+        tuple(ids),
+    ).fetchall():
+        state[row["id"]] = {
+            "task_id": row["id"],
+            "status": row["status"],
+            "claim_lock": row["claim_lock"],
+            "version": int(row["version"] or 1),
+            "goal_revision_id": _kb._opt_int(row["goal_revision_id"]),
+            "last_failure_error": row["last_failure_error"],
+            "latest_outcome": None,
+            "latest_ended_at": None,
+            "last_completed_at": None,
+            "last_requeue_at": None,
+            "newest_authorization": None,
+            "max_completed_run_id": None,
+            "recent_pr_urls": [],
+        }
+    if not state:
+        return state
+    for row in conn.execute(
+        "SELECT task_id, outcome, ended_at FROM ("
+        "  SELECT task_id, outcome, ended_at, ROW_NUMBER() OVER ("
+        "    PARTITION BY task_id ORDER BY ended_at DESC, id DESC) AS position"
+        f"  FROM task_runs WHERE task_id IN ({marks}) AND ended_at IS NOT NULL"
+        ") WHERE position = 1",
+        tuple(ids),
+    ).fetchall():
+        entry = state[row["task_id"]]
+        entry["latest_outcome"] = row["outcome"]
+        entry["latest_ended_at"] = _kb._opt_int(row["ended_at"])
+    for row in conn.execute(
+        f"SELECT task_id, MAX(ended_at) AS last_at FROM task_runs "
+        f"WHERE task_id IN ({marks}) AND outcome = 'completed' AND ended_at >= ? "
+        f"GROUP BY task_id",
+        (*ids, now - _RESPAWN_GUARD_SUCCESS_WINDOW),
+    ).fetchall():
+        state[row["task_id"]]["last_completed_at"] = _kb._opt_int(row["last_at"])
+    for row in conn.execute(
+        f"SELECT task_id, MAX(id) AS last_id FROM task_runs "
+        f"WHERE task_id IN ({marks}) AND outcome = 'completed' GROUP BY task_id",
+        tuple(ids),
+    ).fetchall():
+        state[row["task_id"]]["max_completed_run_id"] = _kb._opt_int(row["last_id"])
+    requeue_kinds = ("status", "promoted", "promoted_manual", "unblocked", "reclaimed")
+    for row in conn.execute(
+        f"SELECT task_id, MAX(created_at) AS last_at FROM task_events "
+        f"WHERE task_id IN ({marks}) "
+        f"AND kind IN ({','.join('?' * len(requeue_kinds))}) GROUP BY task_id",
+        (*ids, *requeue_kinds),
+    ).fetchall():
+        state[row["task_id"]]["last_requeue_at"] = _kb._opt_int(row["last_at"])
+    for row in conn.execute(
+        "SELECT task_id, id, payload FROM ("
+        "  SELECT task_id, id, payload, ROW_NUMBER() OVER ("
+        "    PARTITION BY task_id ORDER BY id DESC) AS position"
+        f"  FROM task_events WHERE task_id IN ({marks}) AND kind = ?"
+        ") WHERE position = 1",
+        (*ids, PR_CONTINUATION_EVENT),
+    ).fetchall():
+        state[row["task_id"]]["newest_authorization"] = row
+    for row in conn.execute(
+        f"SELECT task_id, body FROM task_comments "
+        f"WHERE task_id IN ({marks}) AND created_at >= ?",
+        (*ids, now - _RESPAWN_GUARD_PR_WINDOW),
+    ).fetchall():
+        state[row["task_id"]]["recent_pr_urls"].extend(_pr_urls_in(row["body"]))
+    return state
+
+
+def _continuation_from_state(entry: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Usable ``pr_continuation_authorized`` for one guard-state entry, else None.
 
     The authorization covers the PR URL set recorded when it was written, and
     survives unsuccessful retries. It stops being usable once the effective
@@ -1088,13 +1173,9 @@ def _pr_continuation(
     success must not enable a later duplicate worker. A missing or malformed
     payload fails closed (no authorization).
     """
-    row = conn.execute(
-        "SELECT id, payload FROM task_events "
-        "WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
-        (task_id, PR_CONTINUATION_EVENT),
-    ).fetchone()
-    if row is None:
+    if entry is None or entry["newest_authorization"] is None:
         return None
+    row = entry["newest_authorization"]
     payload = _kb._json_dict(_kb._row_get(row, "payload"))
     urls = payload.get("pr_urls")
 
@@ -1116,15 +1197,10 @@ def _pr_continuation(
         or not all(isinstance(url, str) and url for url in urls)
     ):
         return None
-    task = conn.execute(
-        "SELECT goal_revision_id FROM tasks WHERE id = ?", (task_id,),
-    ).fetchone()
-    if task is None or _kb._opt_int(task["goal_revision_id"]) != goal_revision_id:
+    if entry["goal_revision_id"] != goal_revision_id:
         return None
-    if conn.execute(
-        "SELECT 1 FROM task_runs WHERE task_id = ? AND id > ? AND outcome = 'completed' LIMIT 1",
-        (task_id, after_run_id),
-    ).fetchone():
+    newest_completed = entry["max_completed_run_id"]
+    if newest_completed is not None and newest_completed > after_run_id:
         return None
     return {
         "event_id": int(row["id"]),
@@ -1137,6 +1213,20 @@ def _pr_continuation(
     }
 
 
+def _pr_continuation(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict[str, Any]]:
+    """Newest usable ``pr_continuation_authorized`` for ``task_id``, else None."""
+    return _continuation_from_state(_guard_state(conn, [task_id]).get(task_id))
+
+
+def _uncovered_recent_pr(entry: dict[str, Any]) -> bool:
+    """True while a recent PR comment URL is outside the live authorized set."""
+    continuation = _continuation_from_state(entry)
+    authorized = set(continuation["pr_urls"]) if continuation else set()
+    return any(url not in authorized for url in entry["recent_pr_urls"])
+
+
 def _active_pr_guard_reason(
     conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None,
 ) -> Optional[str]:
@@ -1147,16 +1237,10 @@ def _active_pr_guard_reason(
     repeating an already-authorized URL stays permitted, a new URL guards even
     in the same second as the authorization.
     """
-    continuation = _pr_continuation(conn, task_id)
-    authorized = set(continuation["pr_urls"]) if continuation else set()
-    cutoff = (int(time.time()) if now is None else int(now)) - _RESPAWN_GUARD_PR_WINDOW
-    for row in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, cutoff),
-    ).fetchall():
-        if any(url not in authorized for url in _pr_urls_in(row["body"])):
-            return "active_pr"
-    return None
+    entry = _guard_state(conn, [task_id], now=now).get(task_id)
+    if entry is None or not _uncovered_recent_pr(entry):
+        return None
+    return "active_pr"
 
 
 def _record_respawn_guard(
@@ -1194,105 +1278,81 @@ def _last_claim_rejected_reason(
     return _kb._json_dict(_kb._row_get(row, "payload")).get("reason")
 
 
-def check_respawn_guard(
-    conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
+def _guard_reason(
+    entry: Optional[dict[str, Any]], *, lane: str, now: int,
 ) -> Optional[str]:
-    """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
+    """Guard reason for one guard-state entry, or None when it may be spawned.
 
-    Called per ready/review row before any claim attempt. Priority order:
-    ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
-    checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
-    ``last_failure_error`` that would otherwise park the task forever — that
-    path never increments ``consecutive_failures``), ``"blocker_auth"``
-    (quota/auth pattern; the breaker still trips eventually), then for the
-    ready lane only ``"recent_success"`` (completed run within the window, unless
-    a re-queue event arrived after it — a deliberate re-run — or a live
-    ``continue_existing_pr`` authorization covers it) and ``"active_pr"`` (a
+    Priority: ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the
+    cooldown; checked BEFORE ``blocker_auth`` because the requeue stamps a
+    quota-flavored ``last_failure_error`` that would otherwise park the task
+    forever — that path never increments ``consecutive_failures``),
+    ``"blocker_auth"`` (quota/auth pattern; the breaker still trips eventually),
+    then for the ready lane only ``"recent_success"`` (completed run within the
+    window, unless a re-queue event arrived after it — a deliberate re-run — or a
+    live ``continue_existing_pr`` authorization covers it) and ``"active_pr"`` (a
     recent comment URL outside the task's live authorized PR set). The review
     lane skips the last two: they are the *inputs* to a review handoff. Stale /
     dead claim locks are NOT a guard reason — the reclaim passes own those.
 
     The two rate-limit early-return branches still skip ``blocker_auth`` and
-    ``recent_success`` as documented, but do apply the PR fence, so live
-    diagnostics never report a task dispatchable that :func:`claim_task` would
-    refuse. Authorization never bypasses an active cooldown.
+    ``recent_success``, but do apply the PR fence, so live diagnostics never
+    report a task dispatchable that :func:`claim_task` would refuse.
+    Authorization never bypasses an active cooldown.
     """
-    row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if row is None:
+    if entry is None:
         return None
 
-    now = int(time.time())
-
-    def _pr_hold() -> Optional[str]:
+    def pr_hold() -> Optional[str]:
         """PR fence for the ready lane; the review lane treats PRs as inputs."""
-        return None if lane == "review" else _active_pr_guard_reason(conn, task_id, now=now)
+        if lane == "review" or not _uncovered_recent_pr(entry):
+            return None
+        return "active_pr"
 
-    # 1. Rate-limit cooldown — see docstring for why this precedes blocker_auth.
-    #    LATEST run only: a newer crash/completion supersedes the rate-limit run.
-    rl_cooldown = _kb._resolve_rate_limit_cooldown_seconds()
-    latest_run = conn.execute(
-        "SELECT outcome, ended_at FROM task_runs "
-        "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    if latest_run is not None and latest_run["outcome"] == "rate_limited":
-        if rl_cooldown <= 0:
+    if entry["latest_outcome"] == "rate_limited":
+        cooldown = _kb._resolve_rate_limit_cooldown_seconds()
+        if cooldown <= 0:
             # Cooldown disabled — respawn immediately, skipping blocker_auth so
             # the stamped rate-limit text doesn't re-trap the task.
-            return _pr_hold()
-        ended_at = latest_run["ended_at"]
-        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
+            return pr_hold()
+        ended_at = entry["latest_ended_at"]
+        if ended_at is not None and (now - ended_at) < cooldown:
             return "rate_limit_cooldown"
         # Cooldown elapsed — return early so blocker_auth doesn't catch the
         # stamped rate-limit text; this path intentionally retries forever
         # (spaced by the cooldown) until quota returns or a real run supersedes it.
-        return _pr_hold()
+        return pr_hold()
 
-    # 2. Quota / auth blocker: retrying immediately will not help.
-    err = row["last_failure_error"]
+    err = entry["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
-    # Review-lane spawns stop here: a recent completed run and a fresh PR URL
-    # are the canonical *inputs* to a review handoff, not duplicate-work signals.
     if lane == "review":
         return None
 
-    # 3. Completed run within guard window. Exception: an explicit re-queue
-    #    AFTER that success (done→ready drag, re-promotion, unblock, reclaim) is
-    #    a deliberate "run it again" — otherwise a manual done→ready would sit
-    #    silently held until the window elapses.
-    cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
-    recent_completed = conn.execute(
-        "SELECT ended_at FROM task_runs "
-        "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ? "
-        "ORDER BY ended_at DESC LIMIT 1",
-        (task_id, cutoff),
-    ).fetchone()
-    if recent_completed:
-        completed_at = int(recent_completed["ended_at"] or 0)
-        requeued_after = conn.execute(
-            "SELECT 1 FROM task_events "
-            "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'promoted_manual', 'unblocked', 'reclaimed') "
-            "LIMIT 1",
-            (task_id, completed_at),
-        ).fetchone()
-        # A live continuation authorizes continuing the same PR work, so it
-        # acknowledges this hold too; it cannot cover a *newer* success, which
-        # _pr_continuation already refuses in that case.
-        if not requeued_after and _pr_continuation(conn, task_id) is None:
+    completed_at = entry["last_completed_at"]
+    if completed_at:
+        requeued_after = entry["last_requeue_at"]
+        if (requeued_after is None or requeued_after < completed_at) and (
+            _continuation_from_state(entry) is None
+        ):
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment outside the authorized URL set — a
-    #    prior worker already opened a PR and nobody acknowledged it for
-    #    continuation. Only the explicit ``continue_existing_pr`` CAS transition
-    #    grants that acknowledgment.
-    return _active_pr_guard_reason(conn, task_id, now=now)
+    return pr_hold()
+
+
+def check_respawn_guard(
+    conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
+) -> Optional[str]:
+    """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
+
+    Called per ready/review row before any claim attempt; see
+    :func:`_guard_reason` for the priority order.
+    """
+    now = int(time.time())
+    return _guard_reason(
+        _guard_state(conn, [task_id], now=now).get(task_id), lane=lane, now=now,
+    )
 
 
 _GUARD_RECOVERY: dict[str, str] = {
@@ -1355,6 +1415,30 @@ def respawn_guard_alert(holds: list[tuple[str, str]], ticks: int) -> str:
     )
 
 
+def _guard_projection(
+    entry: Optional[dict[str, Any]], *, now: int, board: Optional[str],
+) -> Optional[dict[str, str]]:
+    """Live hold projection for one guard-state entry, or None when spawnable."""
+    if (
+        entry is None
+        or entry["claim_lock"] is not None
+        or entry["status"] not in ("ready", "review")
+    ):
+        return None
+    reason = _guard_reason(
+        entry, lane="review" if entry["status"] == "review" else "ready", now=now,
+    )
+    if reason is None:
+        return None
+    return {
+        "reason": reason,
+        "recovery": _GUARD_RECOVERY.get(
+            reason, f"The dispatcher respawn guard is holding this task ({reason}).",
+        ),
+        "command": _guard_command(reason, entry["task_id"], entry["version"], board=board),
+    }
+
+
 def get_dispatch_guard(
     conn: sqlite3.Connection, task_id: str, *, board: Optional[str] = None,
 ) -> Optional[dict[str, str]]:
@@ -1366,28 +1450,28 @@ def get_dispatch_guard(
     the runnable command (``""`` when the reason has none) — or None for missing,
     claimed, or non-dispatchable tasks.
     """
-    row = conn.execute(
-        "SELECT status, claim_lock, version FROM tasks WHERE id = ?", (task_id,),
-    ).fetchone()
-    if row is None or row["claim_lock"] is not None:
-        return None
-    status = row["status"]
-    if status not in ("ready", "review"):
-        return None
-    reason = check_respawn_guard(
-        conn, task_id, lane="review" if status == "review" else "ready",
+    now = int(time.time())
+    return _guard_projection(
+        _guard_state(conn, [task_id], now=now).get(task_id), now=now, board=board,
     )
-    if reason is None:
-        return None
-    return {
-        "reason": reason,
-        "recovery": _GUARD_RECOVERY.get(
-            reason, f"The dispatcher respawn guard is holding this task ({reason}).",
-        ),
-        "command": _guard_command(
-            reason, task_id, int(row["version"] or 1), board=board,
-        ),
-    }
+
+
+def get_dispatch_guards(
+    conn: sqlite3.Connection, task_ids: list[str], *, board: Optional[str] = None,
+) -> dict[str, dict[str, str]]:
+    """:func:`get_dispatch_guard` for many tasks in a fixed number of queries.
+
+    Board and fleet views project every card they render, so the per-task form
+    would put one query set per card back into each request. Evaluation is
+    shared with the single-task form; only the state fetch is batched.
+    """
+    now = int(time.time())
+    guards: dict[str, dict[str, str]] = {}
+    for task_id, entry in _guard_state(conn, list(task_ids), now=now).items():
+        projection = _guard_projection(entry, now=now, board=board)
+        if projection is not None:
+            guards[task_id] = projection
+    return guards
 
 
 def _profile_exists_fn() -> Optional[Callable[[str], bool]]:

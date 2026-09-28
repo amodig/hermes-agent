@@ -753,12 +753,13 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 ev_by = _rows_by_task(conn, "task_events", ids)
                 run_by = _rows_by_task(conn, "task_runs", ids)
                 graph_by = kb.task_graph_contexts(conn, ids)
+                guards_by = kb.get_dispatch_guards(
+                    conn, ids, board=getattr(args, "board", None))
                 for r in rows:
                     tid = r["id"]
                     dl = kd.compute_task_diagnostics(r, ev_by.get(tid, []), run_by.get(tid, []),
                                                      graph=graph_by.get(tid), config=diag_config,
-                                                     dispatch_guard=kb.get_dispatch_guard(
-                                                         conn, tid, board=getattr(args, "board", None)))
+                                                     dispatch_guard=guards_by.get(tid))
                     if dl:
                         diags_by_task[tid] = dl
 

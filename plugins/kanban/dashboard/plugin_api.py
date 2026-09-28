@@ -292,12 +292,15 @@ def _compute_task_diagnostics(
     events_by_task = _rows_by_task("task_events")
     runs_by_task = _rows_by_task("task_runs")
     graph_by_task = kanban_db.task_graph_contexts(conn, row_ids)
+    # One batched projection for the whole board: a per-task call would add a
+    # query set per card to every /board and /diagnostics request.
+    guards_by_task = kanban_db.get_dispatch_guards(conn, row_ids, board=board)
     out: dict[str, list[dict]] = {}
     for r in rows:
         tid = r["id"]
         diags = kd.compute_task_diagnostics(
             r, events_by_task[tid], runs_by_task[tid], config=diag_config, graph=graph_by_task.get(tid),
-            dispatch_guard=kanban_db.get_dispatch_guard(conn, tid, board=board))
+            dispatch_guard=guards_by_task.get(tid))
         if diags:
             out[tid] = [d.to_dict() for d in diags]
     return out
