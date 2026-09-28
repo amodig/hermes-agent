@@ -314,3 +314,42 @@ def test_recovery_hint_is_a_runnable_cli_command(clock, tmp_path, monkeypatch):
     assert parsed.expected_version == version
     assert parsed.transition == "continue_existing_pr"
     assert parsed.reason
+
+
+def test_guard_window_lapses_but_the_grant_survives(clock, tmp_path, monkeypatch):
+    """The documented boundary: the hold only inspects recent comments, while an
+    authorization stays usable and still reaches the next run."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    kb.init_db()
+    window = dispatch._RESPAWN_GUARD_PR_WINDOW
+    with kbc.connect() as conn:
+        authorized = kb.create_task(conn, title="authorized", assignee="cto")
+        kb.add_comment(conn, authorized, author="worker", body=PR1)
+        assert _continue(conn, authorized)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_comments SET created_at = ? WHERE task_id = ?",
+                (2000000000 - window - 60, authorized),
+            )
+        assert dispatch.check_respawn_guard(conn, authorized) is None
+        assert kb._pr_continuation(conn, authorized) is not None
+        claimed = kb.claim_task(conn, authorized)
+        assert claimed is not None
+        run_row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?", (claimed.current_run_id,),
+        ).fetchone()
+        assert PR1 in run_row["metadata"]
+
+        # An unauthorized card is equally unheld once its only comment ages out,
+        # and a fresh comment re-arms the hold.
+        stale = kb.create_task(conn, title="stale", assignee="cto")
+        kb.add_comment(conn, stale, author="worker", body=PR2)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_comments SET created_at = ? WHERE task_id = ?",
+                (2000000000 - window - 60, stale),
+            )
+        assert dispatch.check_respawn_guard(conn, stale) is None
+        kb.add_comment(conn, stale, author="worker", body=f"still open: {PR2}")
+        assert dispatch.check_respawn_guard(conn, stale) == "active_pr"
