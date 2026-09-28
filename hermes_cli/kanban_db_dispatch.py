@@ -1068,14 +1068,30 @@ def _pr_urls_in(text: Optional[str]) -> list[str]:
     return list(dict.fromkeys(_RESPAWN_GUARD_PR_URL_RE.findall(text)))
 
 
+def _recorded_pr_urls(
+    conn: sqlite3.Connection, task_ids: list[str],
+) -> dict[str, list[str]]:
+    """Sorted distinct GitHub PR URLs per task, from all of their comments.
+
+    One query for many tasks: a held card's recovery command names its recorded
+    set, so a board view must not pay a query per held card.
+    """
+    ids = list(dict.fromkeys(task_ids))
+    if not ids:
+        return {}
+    marks = ",".join("?" * len(ids))
+    found: dict[str, set[str]] = {task_id: set() for task_id in ids}
+    for row in conn.execute(
+        f"SELECT task_id, body FROM task_comments WHERE task_id IN ({marks})",
+        tuple(ids),
+    ).fetchall():
+        found.setdefault(row["task_id"], set()).update(_pr_urls_in(row["body"]))
+    return {task_id: sorted(urls) for task_id, urls in found.items()}
+
+
 def _task_pr_urls(conn: sqlite3.Connection, task_id: str) -> list[str]:
     """Sorted distinct GitHub PR URLs recorded anywhere in the task's comments."""
-    urls: set[str] = set()
-    for row in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ?", (task_id,),
-    ).fetchall():
-        urls.update(_pr_urls_in(row["body"]))
-    return sorted(urls)
+    return _recorded_pr_urls(conn, [task_id]).get(task_id, [])
 
 
 def _guard_state(
@@ -1426,11 +1442,18 @@ def respawn_guard_alert(holds: list[tuple[str, str]], ticks: int) -> str:
     )
 
 
-def _guard_projection(
-    conn: sqlite3.Connection, entry: Optional[dict[str, Any]], *,
-    now: int, board: Optional[str],
-) -> Optional[dict[str, str]]:
-    """Live hold projection for one guard-state entry, or None when spawnable."""
+def _guard_hold(
+    entry: Optional[dict[str, Any]], *, now: int,
+) -> Optional[tuple[dict[str, Any], str]]:
+    """``(entry, reason)`` when the guard holds this card, else None.
+
+    Mirrors the dispatch order: `_dispatch_lane_task` classifies an unassigned
+    card (`skipped_unassigned`) or one with no real profile
+    (`skipped_nonspawnable`) BEFORE it consults the guard, so the guard is not
+    what stops those cards and its recovery command would not make them spawn.
+    `profile_exists` also rejects an empty name, so the unassigned case must not
+    reach it; the stranded-in-ready diagnostic names the assignee cause instead.
+    """
     if (
         entry is None
         or entry["claim_lock"] is not None
@@ -1440,26 +1463,26 @@ def _guard_projection(
     assignee = (entry["assignee"] or "").strip()
     profile_exists = _profile_exists_fn()
     if not assignee or (profile_exists is not None and not profile_exists(assignee)):
-        # `_dispatch_lane_task` classifies an unassigned card (`skipped_unassigned`)
-        # or one with no real profile (`skipped_nonspawnable`) BEFORE it consults
-        # the guard, so the guard is not what stops it and its recovery command
-        # would not make it spawn. `profile_exists` also rejects an empty name,
-        # so the unassigned case must not reach it. The stranded-in-ready
-        # diagnostic already names the assignee cause for the typo case.
         return None
     reason = _guard_reason(
         entry, lane="review" if entry["status"] == "review" else "ready", now=now,
     )
     if reason is None:
         return None
+    return entry, reason
+
+
+def _guard_payload(
+    entry: dict[str, Any], reason: str, *, board: str, pr_urls: list[str],
+) -> dict[str, str]:
+    """The projection payload for one held card. ``board`` is the resolved slug."""
     return {
         "reason": reason,
         "recovery": _GUARD_RECOVERY.get(
             reason, f"The dispatcher respawn guard is holding this task ({reason}).",
         ),
         "command": _guard_command(
-            reason, entry["task_id"], entry["version"], board=board,
-            pr_urls=_kb._task_pr_urls(conn, entry["task_id"]),
+            reason, entry["task_id"], entry["version"], board=board, pr_urls=pr_urls,
         ),
     }
 
@@ -1477,8 +1500,17 @@ def get_dispatch_guard(
     real profile (the dispatcher classifies those as nonspawnable first).
     """
     now = int(time.time())
-    return _guard_projection(
-        conn, _guard_state(conn, [task_id], now=now).get(task_id), now=now, board=board,
+    hold = _guard_hold(_guard_state(conn, [task_id], now=now).get(task_id), now=now)
+    if hold is None:
+        return None
+    entry, reason = hold
+    pr_urls = (
+        _task_pr_urls(conn, entry["task_id"]) if reason == "active_pr" else []
+    )
+    # Pin the command to the board this card actually lives on, so a copied
+    # command cannot land on whichever board is current later.
+    return _guard_payload(
+        entry, reason, board=board or _kb.get_current_board(), pr_urls=pr_urls,
     )
 
 
@@ -1492,12 +1524,22 @@ def get_dispatch_guards(
     shared with the single-task form; only the state fetch is batched.
     """
     now = int(time.time())
-    guards: dict[str, dict[str, str]] = {}
+    holds: dict[str, tuple[dict[str, Any], str]] = {}
     for task_id, entry in _guard_state(conn, list(task_ids), now=now).items():
-        projection = _guard_projection(conn, entry, now=now, board=board)
-        if projection is not None:
-            guards[task_id] = projection
-    return guards
+        hold = _guard_hold(entry, now=now)
+        if hold is not None:
+            holds[task_id] = hold
+    if not holds:
+        return {}
+    pr_holds = [task_id for task_id, (_, reason) in holds.items() if reason == "active_pr"]
+    recorded = _recorded_pr_urls(conn, pr_holds)
+    resolved_board = board or _kb.get_current_board()
+    return {
+        task_id: _guard_payload(
+            entry, reason, board=resolved_board, pr_urls=recorded.get(task_id, []),
+        )
+        for task_id, (entry, reason) in holds.items()
+    }
 
 
 def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
