@@ -292,6 +292,24 @@ class _KanbanDispatcher:
         return 1
 
 
+def guarded_holds(results: Optional[list]) -> list[tuple[str, str]]:
+    """``(board/task, reason)`` for every guard hold in one gateway tick.
+
+    Board-qualified so an operator can act on the reported task without
+    guessing which board's dispatcher produced it.
+    """
+    holds: list[tuple[str, str]] = []
+    for slug, res in (results or []):
+        for task_id, reason in (getattr(res, "respawn_guarded", None) or []):
+            holds.append((f"{slug}/{task_id}", reason))
+    return holds
+
+
+def guarded_alert(holds: list[tuple[str, str]], ticks: int) -> str:
+    """Bounded alert text for a run of guard-held ticks (dispatcher-owned wording)."""
+    return _kbd().respawn_guard_alert(holds, ticks)
+
+
 def _log_spawn_results(results: Optional[list]) -> bool:
     """Log per-board spawn summaries; returns whether any board spawned."""
     any_spawned = False

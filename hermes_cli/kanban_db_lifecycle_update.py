@@ -116,10 +116,10 @@ def _validate_update_request(
     if not reason_text:
         raise ValueError("reason is required")
     transition_text = str(transition or "").strip() or None
-    if transition_text not in (None, "triage_to_ready"):
+    if transition_text not in (None, "triage_to_ready", "continue_existing_pr"):
         raise ValueError(
             f"unsupported transition {transition_text!r}; "
-            "only 'triage_to_ready' is supported"
+            "only 'triage_to_ready' and 'continue_existing_pr' are supported"
         )
     if goal_mode is not _kb._UPDATE_UNSET and not isinstance(goal_mode, bool):
         raise ValueError("goal_mode must be a boolean")
@@ -309,7 +309,22 @@ def _build_update_plan(
         rebound_edges = []
 
     new_status = row["status"]
-    if request.transition_text:
+    if request.transition_text == "continue_existing_pr":
+        # Explicit, audited acknowledgment of already-published PR work. It only
+        # re-queues an unclaimed, not-yet-started card; every other status keeps
+        # its own recovery path (unblock / reopen / reclaim) so this transition
+        # can never bypass a gate.
+        if row["status"] not in {"triage", "todo", "ready"}:
+            raise ValueError(
+                "transition 'continue_existing_pr' requires an unclaimed task in "
+                "status 'triage', 'todo' or 'ready' "
+                f"(current status {row['status']!r})"
+            )
+        new_status = (
+            _kb._lifecycle_ready_status(conn, row["id"])
+            if _parents_satisfied(conn, row["id"]) else "todo"
+        )
+    elif request.transition_text:
         if row["status"] != "triage":
             raise ValueError(
                 "transition 'triage_to_ready' requires a task in "
@@ -466,6 +481,15 @@ def _persist_update(
     goal_terminations: list[tuple[Optional[int], Optional[str]]] = []
     goal_revision = None
     goal_revision_id = plan.goal_revision_id
+    # Fail before any mutation when there is nothing to acknowledge: the caller
+    # rolls the whole transaction back either way.
+    continuation_urls: Optional[list[str]] = None
+    if request.transition_text == "continue_existing_pr":
+        continuation_urls = _kb._task_pr_urls(conn, task_id)
+        if not continuation_urls:
+            raise ValueError(
+                "continue_existing_pr requires an existing GitHub PR URL comment"
+            )
     if plan.goal_changed:
         prior_goal_version = int(goal_row["version"])
         goal_cur = conn.execute(
@@ -561,6 +585,30 @@ def _persist_update(
         "lifecycle_bound" if plan.lifecycle_changed else "goal_revised" if plan.goal_changed else "updated",
         payload,
     )
+    if continuation_urls is not None:
+        # Explicit, auditable replacement for the old timestamp-based
+        # ``promoted_manual`` PR exception: the acknowledgment is bound to the
+        # goal revision and to the exact PR set recorded at this moment, and it
+        # is the only thing that lifts the ``active_pr`` guard.
+        through_comment_id = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?", (task_id,),
+        ).fetchone()[0]
+        after_run_id = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_runs WHERE task_id = ?", (task_id,),
+        ).fetchone()[0]
+        _kb._append_event(
+            conn,
+            task_id,
+            _kb.PR_CONTINUATION_EVENT,
+            {
+                "actor": actor,
+                "reason": request.reason_text,
+                "goal_revision_id": goal_revision_id,
+                "through_comment_id": int(through_comment_id),
+                "after_run_id": int(after_run_id),
+                "pr_urls": continuation_urls,
+            },
+        )
     return changed_fields, goal_invalidated, goal_terminations
 
 

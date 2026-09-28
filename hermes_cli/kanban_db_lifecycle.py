@@ -1206,11 +1206,31 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         "dependencies": dependency,
         "routing": _implementation_routing(conn, str(routing_task_id)),
     }
+    # Claim-bound provenance, never freshly inferred authority: a running card
+    # renders the authorization its current run consumed, so context matches the
+    # identity the claim was accepted under.
+    continuation = None
+    if task.current_run_id:
+        run = _kb.get_run(conn, int(task.current_run_id))
+        metadata = run.metadata if run is not None else None
+        if isinstance(metadata, dict) and isinstance(metadata.get("pr_continuation"), dict):
+            continuation = metadata["pr_continuation"]
+    if continuation:
+        snapshot["pr_continuation"] = continuation
     lines.append("## Lifecycle snapshot (read before prose)")
     lines.append("```json")
     lines.append(json.dumps(snapshot, ensure_ascii=False, sort_keys=True))
     lines.append("```")
     lines.append("")
+    if continuation:
+        urls = ", ".join(continuation.get("pr_urls") or []) or "(see recorded comment)"
+        lines.append(
+            "## Existing PR — continue, do not replace\n"
+            f"PRs already authorized by the operator for this task: {urls}. Continue work on "
+            "them; do NOT open a replacement PR. Publication/merge approvals and exact-head "
+            "acceptance gates are unchanged."
+        )
+        lines.append("")
     _kb._ctx_attachments(lines, _kb.list_attachments(conn, task_id))
     _kb._ctx_prior_attempts(lines, conn, task_id, now)
     _kb._ctx_header(lines, task, effective_goal=effective_goal)

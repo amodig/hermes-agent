@@ -115,10 +115,14 @@ def _forced_promotion_active(conn: sqlite3.Connection, task_id: str) -> bool:
 def _claim_and_open_run(
     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
     *, event_extra: Optional[dict] = None, runtime_claim: Optional[dict[str, Any]] = None,
-    expected_task: Any = None,
+    expected_task: Any = None, pr_continuation: Optional[dict[str, Any]] = None,
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
-    when the CAS lost. Caller holds the txn."""
+    when the CAS lost. Caller holds the txn. ``pr_continuation`` is the accepted
+    ``continue_existing_pr`` authorization this claim consumes: it is bound to
+    the run (``metadata.pr_continuation``) and its event id recorded on
+    ``claimed`` so downstream surfaces render the claim-time provenance rather
+    than re-inferring authority later."""
     if expected_task is not None and not _claim_snapshot_matches(conn, task_id, expected_task):
         _claim_rejected_for_snapshot(conn, task_id)
         return None
@@ -149,6 +153,8 @@ def _claim_and_open_run(
         "branch_name, lifecycle_contract FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     run_metadata = dict(runtime_claim or {})
+    if pr_continuation:
+        run_metadata["pr_continuation"] = dict(pr_continuation)
     contract = safe_decode_contract(_kb._row_get(trow, "lifecycle_contract"))
     if source_status == "ready" and contract and contract.get("kind") == "code":
         run_metadata["lifecycle_routing"] = {
@@ -182,7 +188,15 @@ def _claim_and_open_run(
     conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, task_id))
     _kb._append_event(
         conn, task_id, "claimed",
-        {"lock": lock, "expires": expires, "run_id": run_id, **(event_extra or {})}, run_id=run_id,
+        {
+            "lock": lock, "expires": expires, "run_id": run_id,
+            **(event_extra or {}),
+            **(
+                {"pr_continuation_event_id": pr_continuation["event_id"]}
+                if pr_continuation else {}
+            ),
+        },
+        run_id=run_id,
     )
     return run_id
 
@@ -228,6 +242,15 @@ def claim_task(
                 {"reason": "dependencies_unsatisfied", "blockers": dependencies["blockers"]},
             )
             return None
+        # PR fence (#39): the pre-claim guard can pass and an unauthorized PR URL
+        # can still arrive while a deferred worker is being prepared, so the
+        # acknowledgment is re-checked here, in the same transaction that would
+        # open the run. A hold is not a worker failure — no run, no grant, no
+        # failure counter.
+        continuation = _kb._pr_continuation(conn, task_id)
+        if _kb._active_pr_guard_reason(conn, task_id) is not None:
+            _kb._append_event(conn, task_id, "claim_rejected", {"reason": "active_pr"})
+            return None
         # Close a leaked prior run so the CAS below doesn't strand it.
         _kb._reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
@@ -235,6 +258,7 @@ def claim_task(
         run_id = _claim_and_open_run(
             conn, task_id, "ready", lock, expires, now,
             runtime_claim=runtime_claim, expected_task=expected_task,
+            pr_continuation=continuation,
         )
         if run_id is None:
             return None

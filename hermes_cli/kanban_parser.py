@@ -248,8 +248,12 @@ _SPECS = [
              help="Current task version required for this atomic update"),
         _arg("--reason", required=True,
              help="Why this correction or requeue is being made"),
-        _arg("--transition", choices=("triage_to_ready",),
-             help="Promote a triage task to todo/ready after updating it"),
+        _arg("--transition", choices=("triage_to_ready", "continue_existing_pr"),
+             help="Requeue after updating: 'triage_to_ready' promotes a triage task "
+                  "to todo/ready; 'continue_existing_pr' acknowledges the GitHub PR "
+                  "URLs already recorded on the task as operator-authorized work to "
+                  "continue (needs the user's explicit authorization; never opens a "
+                  "replacement PR)"),
         _arg("--author", help=argparse.SUPPRESS),
         _json_flag(help="Emit JSON output"),
         _arg("--lifecycle-contract",

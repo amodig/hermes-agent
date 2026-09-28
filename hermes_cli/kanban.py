@@ -506,6 +506,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
             if isinstance(effective_goal, dict)
             else task.body
         )
+        # Live projection; must be read while this connection is still open.
+        dispatch_guard = kb.get_dispatch_guard(
+            conn, args.task_id, board=getattr(args, "board", None),
+        )
     if want_json:
         task_payload = _task_to_dict(task)
         task_payload.update({
@@ -518,6 +522,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "task": task_payload,
             "effective_goal": effective_goal,
             "lifecycle": lifecycle,
+            "dispatch_guard": dispatch_guard,
             "latest_summary": latest_summary,
             "parents": parents,
             "children": children,
@@ -566,7 +571,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     # Diagnostics up top so CLI users see distress signals before scrolling.
     from hermes_cli import kanban_diagnostics as kd
-    diags = kd.compute_task_diagnostics(task, events, runs, graph=graph)
+    diags = kd.compute_task_diagnostics(
+        task, events, runs, graph=graph, dispatch_guard=dispatch_guard,
+    )
     if diags:
         print(f"\n  Diagnostics ({len(diags)}):")
         _print_diagnostics(diags, "    ", with_kind=False)
@@ -734,7 +741,8 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 return _err(f"no such task: {args.task}")
             diags_by_task = {args.task: kd.compute_task_diagnostics(
                 task, kb.list_events(conn, args.task), kb.list_runs(conn, args.task),
-                graph=kb.task_graph_context(conn, args.task), config=diag_config)}
+                graph=kb.task_graph_context(conn, args.task), config=diag_config,
+                dispatch_guard=kb.get_dispatch_guard(conn, args.task))}
         else:
             # Fleet mode: pull all non-archived tasks + their events/runs.
             rows = list(conn.execute("SELECT * FROM tasks WHERE status != 'archived'").fetchall())
@@ -747,7 +755,8 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 for r in rows:
                     tid = r["id"]
                     dl = kd.compute_task_diagnostics(r, ev_by.get(tid, []), run_by.get(tid, []),
-                                                     graph=graph_by.get(tid), config=diag_config)
+                                                     graph=graph_by.get(tid), config=diag_config,
+                                                     dispatch_guard=kb.get_dispatch_guard(conn, tid))
                     if dl:
                         diags_by_task[tid] = dl
 

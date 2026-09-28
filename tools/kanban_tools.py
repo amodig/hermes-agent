@@ -344,7 +344,7 @@ def _fields(obj: Any, names: tuple[str, ...]) -> dict[str, Any]:
     return {n: getattr(obj, n) if obj is not None else None for n in names}
 
 
-def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
+def _task_summary_dict(kb, conn, task, *, board: Optional[str] = None) -> dict[str, Any]:
     parents = kb.parent_ids(conn, task.id)
     children = kb.child_ids(conn, task.id)
     return {
@@ -355,6 +355,9 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "child_count": len(children),
         "lifecycle": kb.get_lifecycle_state(conn, task.id),
         "dependencies": kb.evaluate_dependencies(conn, task.id),
+        # Live dispatcher hold with its recovery action; a ready card is queue
+        # admission, not proof a worker will start.
+        "dispatch_guard": kb.get_dispatch_guard(conn, task.id, board=board),
     }
 
 
@@ -556,6 +559,8 @@ def _handle_show(args: dict, **kw) -> str:
             "task": _fields(task, _TASK_FIELDS),
             "effective_goal": effective_goal,
             "lifecycle": kb.get_lifecycle_state(conn, tid),
+            # Live dispatcher guard; ready/review cards can be held while queued.
+            "dispatch_guard": kb.get_dispatch_guard(conn, tid, board=args.get("board")),
             "parents": kb.parent_ids(conn, tid),
             "children": kb.child_ids(conn, tid),
             "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
@@ -590,7 +595,7 @@ def _handle_list(args: dict, **kw) -> str:
         truncated = len(rows) > limit
         tasks = rows[:limit]
         return json.dumps({
-            "tasks": [_task_summary_dict(kb, conn, t) for t in tasks],
+            "tasks": [_task_summary_dict(kb, conn, t, board=args.get("board")) for t in tasks],
             "count": len(tasks), "limit": limit, "truncated": truncated,
             "next_limit": (min(limit * 2, KANBAN_LIST_MAX_LIMIT)
                            if truncated and limit < KANBAN_LIST_MAX_LIMIT else None),

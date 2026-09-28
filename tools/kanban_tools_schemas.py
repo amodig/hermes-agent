@@ -577,10 +577,13 @@ KANBAN_UPDATE_SCHEMA = _schema(
         "Atomically revise an existing task with optimistic concurrency. "
         "Requires the current expected_version and a reason; stale versions "
         "are rejected without mutation. Title, body, or goal_mode changes "
-        "create an immutable effective-goal revision. The only supported "
-        "transition is 'triage_to_ready', which lands in 'todo' while "
-        "parents remain open and 'ready' once parent gating is satisfied. "
-        "Orchestrator-only; a claimed worker is never silently cancelled."
+        "create an immutable effective-goal revision. Supported transitions: "
+        "'triage_to_ready' lands in 'todo' while parents remain open and "
+        "'ready' once parent gating is satisfied; 'continue_existing_pr' is the "
+        "explicit operator authorization to keep repairing/reviewing the GitHub "
+        "PR URLs already recorded on the card instead of opening a replacement, "
+        "and accepts only an unclaimed triage/todo/ready card. Orchestrator-only; "
+        "a claimed worker is never silently cancelled."
     ),
     {
         "task_id": _prop("string", "Task to revise."),
@@ -604,8 +607,15 @@ KANBAN_UPDATE_SCHEMA = _schema(
         "reason": _prop("string", "Human-readable reason for the correction."),
         "transition": {
             "type": "string",
-            "enum": ["triage_to_ready"],
-            "description": "Optional triage requeue transition.",
+            "enum": ["triage_to_ready", "continue_existing_pr"],
+            "description": (
+                "Optional requeue transition. 'triage_to_ready' promotes a "
+                "triage card. 'continue_existing_pr' acknowledges the PR URLs "
+                "already recorded on the card as operator-authorized work to "
+                "continue, granting dispatch past the active_pr respawn guard; "
+                "it requires the user's explicit authorization and never opens "
+                "a replacement PR."
+            ),
         },
     },
     ["task_id", "expected_version", "reason"],

@@ -4429,12 +4429,17 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     DEFAULT_FAILURE_LIMIT,
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     DispatchResult,
+    PR_CONTINUATION_EVENT,
+    _active_pr_guard_reason,
     _clear_failure_counter,
     _defer_reclaim_for_live_worker,
     _pid_alive,
+    _pr_continuation,
+    _task_pr_urls,
     _terminate_reclaimed_worker,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
+    get_dispatch_guard,
 )
 from hermes_cli.kanban_db_lifecycle import (  # noqa: E402
     ArtifactPreservationError,

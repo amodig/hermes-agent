@@ -183,8 +183,12 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     # Health telemetry: warn when every tick finds ready work but spawns
     # nothing (broken profile, PATH drift, missing venv, credential loss) —
     # the per-task breaker auto-blocks quietly, so the operator needs a signal.
+    # Guard-held ready work is tracked separately: it names a specific card and
+    # its recovery even while the rest of the queue still spawns.
     HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
-    health_state = {"bad_ticks": 0, "last_warn_at": 0}
+    health_state = {
+        "bad_ticks": 0, "guarded_ticks": 0, "guard_holds": [], "last_warn_at": 0,
+    }
 
     def _ready_queue_nonempty() -> bool:
         """Is there a ready+assigned+unclaimed task the dispatcher would spawn for?
@@ -201,10 +205,23 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             health_state["bad_ticks"] += 1
         else:
             health_state["bad_ticks"] = 0
+        holds = list(getattr(res, "respawn_guarded", None) or [])
+        if holds:
+            health_state["guarded_ticks"] += 1
+            health_state["guard_holds"] = holds
+        else:
+            health_state["guarded_ticks"] = 0
         # Warn once per HEALTH_WINDOW bad ticks, at most every 5 minutes.
-        if health_state["bad_ticks"] >= HEALTH_WINDOW:
-            now = int(time.time())
-            if now - health_state["last_warn_at"] >= 300:
+        now = int(time.time())
+        if now - health_state["last_warn_at"] >= 300:
+            if health_state["guarded_ticks"] >= HEALTH_WINDOW:
+                print(
+                    f"[{_fmt_ts(now)}] WARN dispatcher: "
+                    f"{kbd.respawn_guard_alert(health_state['guard_holds'], health_state['guarded_ticks'])}",
+                    file=sys.stderr, flush=True,
+                )
+                health_state["last_warn_at"] = now
+            elif health_state["bad_ticks"] >= HEALTH_WINDOW:
                 print(
                     f"[{_fmt_ts(now)}] WARN dispatcher stuck: ready queue non-empty for "
                     f"{health_state['bad_ticks']} consecutive ticks but 0 workers spawned "

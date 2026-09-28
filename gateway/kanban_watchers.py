@@ -29,6 +29,8 @@ from gateway.kanban_watchers_dispatcher import (
     _KanbanDispatcher,
     _log_spawn_results,
     _resolve_dispatcher_settings,
+    guarded_alert,
+    guarded_holds,
 )
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -252,8 +254,13 @@ class GatewayKanbanWatchersMixin:
 
         # Health telemetry (mirrors `_cmd_daemon`): warn when the ready queue
         # is non-empty but spawns are 0 for N consecutive ticks — usually a
-        # broken PATH, missing venv, or credential loss.
+        # broken PATH, missing venv, or credential loss. Guard-held ready work
+        # (e.g. an unacknowledged existing PR) is tracked alongside it: it holds
+        # specific cards even while the rest of the board still spawns, so it
+        # needs its own consecutive-tick counter and its own actionable alert.
         bad_ticks = 0
+        guarded_ticks = 0
+        guard_holds: list[tuple[str, str]] = []
         last_warn_at = 0
 
         logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
@@ -273,6 +280,7 @@ class GatewayKanbanWatchersMixin:
                 # dispatch while paused; running workers finish naturally.
                 if not _kanban_dispatch_allowed():
                     bad_ticks = 0
+                    guarded_ticks = 0
                 else:
                     # Re-read the auto-decompose toggle live so disabling it
                     # takes effect on the next tick, not on restart.
@@ -284,16 +292,30 @@ class GatewayKanbanWatchersMixin:
                     any_spawned = _log_spawn_results(results)
                     ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
                     bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
+                    # Guard holds stay visible even when another card spawned:
+                    # the operator question is "why is THIS card queued?", not
+                    # "is the board idle?".
+                    holds = guarded_holds(results)
+                    guarded_ticks = guarded_ticks + 1 if holds else 0
+                    if holds:
+                        guard_holds = holds
                 now = int(time.time())
-                if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
-                    logger.warning(
-                        "kanban dispatcher stuck: ready queue non-empty for "
-                        "%d consecutive ticks but 0 workers spawned. Check "
-                        "profile health (venv, PATH, credentials) and "
-                        "`hermes kanban list --status ready`.",
-                        bad_ticks,
-                    )
-                    last_warn_at = now
+                if now - last_warn_at >= 300:
+                    if guarded_ticks >= _HEALTH_WINDOW:
+                        logger.warning(
+                            "kanban dispatcher: %s",
+                            guarded_alert(guard_holds, guarded_ticks),
+                        )
+                        last_warn_at = now
+                    elif bad_ticks >= _HEALTH_WINDOW:
+                        logger.warning(
+                            "kanban dispatcher stuck: ready queue non-empty for "
+                            "%d consecutive ticks but 0 workers spawned. Check "
+                            "profile health (venv, PATH, credentials) and "
+                            "`hermes kanban list --status ready`.",
+                            bad_ticks,
+                        )
+                        last_warn_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
                 self._release_kanban_dispatcher_lock()
