@@ -1416,3 +1416,183 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         conn.close()
 
 
+
+
+# ---------------------------------------------------------------------------
+# Bounded guard-hold alerts (#39)
+#
+# A card held by the respawn guard is queue-admitted but never spawned. The
+# operator needs one actionable, rate-limited alert naming the reason and the
+# affected cards — not a per-tick storm, and not a generic "queue non-empty"
+# message that hides which card is stuck.
+# ---------------------------------------------------------------------------
+
+
+class _FakeClock:
+    def __init__(self, now: int) -> None:
+        self.now = now
+
+    def time(self) -> int:
+        return self.now
+
+
+def _drive_gateway_ticks(
+    monkeypatch, tmp_path, results, *, ticks: int, caplog, clock=None, after_tick=None,
+):
+    """Run ``ticks`` synthetic dispatcher ticks through the real watcher loop.
+
+    ``after_tick`` is called with the number of completed ticks after each
+    iteration, so a test can advance the clock inside one watcher run (the
+    alert rate limiter lives in loop state, so it cannot be exercised across
+    separate runs).
+    """
+    import asyncio
+    import logging
+
+    from gateway.run import GatewayRunner
+    import hermes_cli.kanban_db as _kb
+    import gateway.kanban_watchers as _kw
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    state = {"i": 0}
+    clock = clock or _FakeClock(1_000_000)
+    monkeypatch.setattr(_kw, "time", clock)
+
+    class _FakeDispatcher:
+        def __init__(self, kb, settings):  # noqa: D107 - test double
+            pass
+
+        def tick_once(self):
+            res = results[min(state["i"], len(results) - 1)]
+            state["i"] += 1
+            return [("default", res)]
+
+        def ready_nonempty(self):
+            return True
+
+        def auto_decompose_tick(self, _n):
+            return 0
+
+    async def _inline(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    async def _sleep(_interval):
+        if after_tick is not None:
+            after_tick(state["i"])
+        if state["i"] >= ticks:
+            runner._running = False
+
+    monkeypatch.setattr(_kw, "_KanbanDispatcher", _FakeDispatcher)
+    monkeypatch.setattr(
+        _kw, "_resolve_dispatcher_settings", lambda cfg, kb: SimpleNamespace(interval=1.0),
+    )
+    monkeypatch.setattr(
+        runner, "_kanban_dispatcher_boot", lambda: (lambda: {"kanban": {}}, _kb, {}),
+    )
+    monkeypatch.setattr(_kw, "_to_thread_process_service", _inline)
+    monkeypatch.setattr(runner, "_sleep_between_ticks", _sleep)
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        asyncio.run(asyncio.wait_for(runner._kanban_dispatcher_watcher(), timeout=10.0))
+    return clock
+
+
+def _warnings(caplog, needle: str) -> list[str]:
+    return [r.getMessage() for r in caplog.records if needle in r.getMessage()]
+
+
+def test_gateway_alerts_on_six_consecutive_guarded_ticks(monkeypatch, tmp_path, caplog):
+    held = kbd.DispatchResult(respawn_guarded=[("t_aaaa1111", "active_pr")])
+    _drive_gateway_ticks(monkeypatch, tmp_path, [held], ticks=6, caplog=caplog)
+
+    alerts = _warnings(caplog, "respawn guard held ready work")
+    assert len(alerts) == 1, caplog.text
+    assert "for 6 consecutive ticks" in alerts[0]
+    assert "active_pr=1" in alerts[0]
+    # Board-qualified, so the operator knows which board's dispatcher reported it.
+    assert "default/t_aaaa1111" in alerts[0]
+    assert "`hermes kanban diagnostics`" in alerts[0]
+    # The guard-specific alert replaces the generic one for the same stall.
+    assert _warnings(caplog, "dispatcher stuck") == []
+
+
+def test_gateway_guard_alert_stays_visible_when_other_cards_spawn(monkeypatch, tmp_path, caplog):
+    mixed = kbd.DispatchResult(
+        spawned=[("t_bbbb2222", "worker", "/tmp/ws")],
+        respawn_guarded=[("t_aaaa1111", "active_pr")],
+    )
+    _drive_gateway_ticks(monkeypatch, tmp_path, [mixed], ticks=6, caplog=caplog)
+
+    alerts = _warnings(caplog, "respawn guard held ready work")
+    assert len(alerts) == 1, caplog.text
+    assert "default/t_aaaa1111" in alerts[0]
+    # ...and the generic no-spawn alert stays silent, since cards ARE spawning.
+    assert _warnings(caplog, "dispatcher stuck") == []
+
+
+def test_gateway_guard_alert_is_rate_limited_to_one_per_300_seconds(
+    monkeypatch, tmp_path, caplog,
+):
+    """18 guarded ticks in ONE watcher run: the alert fires at tick 6, is
+    suppressed inside the 300s window, and fires again once it elapses."""
+    held = kbd.DispatchResult(respawn_guarded=[("t_aaaa1111", "active_pr")])
+    clock = _FakeClock(1_000_000)
+
+    def _advance(completed: int) -> None:
+        if completed == 6:
+            clock.now += 299  # inside the suppression window
+        elif completed == 12:
+            clock.now += 301  # window elapsed
+
+    _drive_gateway_ticks(
+        monkeypatch, tmp_path, [held], ticks=18, caplog=caplog,
+        clock=clock, after_tick=_advance,
+    )
+    alerts = _warnings(caplog, "respawn guard held ready work")
+    assert len(alerts) == 2, caplog.text
+
+
+def test_gateway_keeps_the_generic_stuck_alert_for_other_causes(
+    monkeypatch, tmp_path, caplog,
+):
+    no_hold = kbd.DispatchResult(skipped_unassigned=["t_cccc3333"])
+    _drive_gateway_ticks(monkeypatch, tmp_path, [no_hold], ticks=6, caplog=caplog)
+
+    assert _warnings(caplog, "respawn guard held ready work") == []
+    stuck = _warnings(caplog, "dispatcher stuck")
+    assert len(stuck) == 1, caplog.text
+    assert "0 workers spawned" in stuck[0]
+
+
+def test_daemon_reports_guard_holds_with_reason_counts(kanban_home, monkeypatch, capsys):
+    """The standalone ``--force`` daemon shares the same bounded alert."""
+    from hermes_cli import kanban_ops
+
+    results = [
+        kbd.DispatchResult(respawn_guarded=[
+            ("t_aaaa1111", "active_pr"), ("t_bbbb2222", "recent_success"),
+        ])
+        for _ in range(6)
+    ]
+
+    def _driver(*, interval, max_spawn, failure_limit, on_tick=None, stop_event=None):
+        for res in results:
+            on_tick(res)
+
+    monkeypatch.setattr(kbd, "run_daemon", _driver)
+    args = SimpleNamespace(
+        force=True, interval=1.0, max=None, failure_limit=2, pidfile=None, verbose=False,
+    )
+    assert kanban_ops._cmd_daemon(args) == 0
+
+    err = capsys.readouterr().err
+    alerts = [line for line in err.splitlines() if "respawn guard held ready work" in line]
+    assert len(alerts) == 1, err
+    assert "for 6 consecutive ticks" in alerts[0]
+    assert "active_pr=1" in alerts[0] and "recent_success=1" in alerts[0]
+    assert "t_aaaa1111" in alerts[0]
+    assert "dispatcher stuck" not in err

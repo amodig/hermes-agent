@@ -2965,6 +2965,204 @@ recovery.recover_if_needed(project_root=root, argv=[])
         ]
         self.assertEqual(rejected[-1].payload["reason"], "dispatch_snapshot_changed")
 
+    # #39: an authorized existing-PR continuation dispatches the SAME
+    # coordinator — one claimed run, a real post-grant child, no duplicate
+    # worker, and no loss of graph/upstream evidence. (No docstring: unittest's
+    # verbose runner interleaves it with the "... ok" trailer, which the
+    # lifecycle verification receipt parses by line.)
+    def test_existing_pr_continuation_starts_worker(self) -> None:
+        upstream = kb.create_task(
+            self.conn, title="upstream review", assignee="reviewer",
+            initial_status="blocked",
+        )
+        self.assertTrue(kb.unblock_task(self.conn, upstream))
+        upstream_run = kb.claim_task(self.conn, upstream, claimer="reviewer:upstream")
+        self.assertIsNotNone(upstream_run)
+        self.assertTrue(kb.complete_task(
+            self.conn, upstream, expected_run_id=upstream_run.current_run_id,
+            summary="upstream acceptance evidence",
+        ))
+        coordinator = kb.create_task(
+            self.conn, title="repair the existing PR", assignee="implementer",
+            parents=[upstream], triage=True,
+        )
+        self.assertEqual(self._task(coordinator).status, "triage")
+        # Native triage requeue onto a satisfied typed dependency.
+        self.assertTrue(kb.update_task(
+            self.conn, coordinator, expected_version=self._task(coordinator).version,
+            reason="ready for publication work", transition="triage_to_ready",
+        ))
+        self.assertEqual(self._task(coordinator).status, "ready")
+        pr_url = "https://github.com/example/repo/pull/4242"
+        kb.add_comment(
+            self.conn, coordinator, author="worker",
+            body=f"Published {pr_url}; continue published-head checks.",
+        )
+        self.assertEqual(kbd.check_respawn_guard(self.conn, coordinator), "active_pr")
+        # An ordinary goal revision still does not acknowledge the PR.
+        self.assertTrue(kb.update_task(
+            self.conn, coordinator, expected_version=self._task(coordinator).version,
+            reason="Polish the PR with review loops",
+            body="Polish the PR with review loops.",
+        ))
+        self.assertEqual(kbd.check_respawn_guard(self.conn, coordinator), "active_pr")
+        self.assertTrue(kb.update_task(
+            self.conn, coordinator, expected_version=self._task(coordinator).version,
+            reason="Explicitly authorized: continue the existing PR",
+            transition="continue_existing_pr",
+        ))
+        self.assertIsNone(kbd.check_respawn_guard(self.conn, coordinator))
+        authorization = kb._pr_continuation(self.conn, coordinator)
+        self.assertEqual(authorization["pr_urls"], [pr_url])
+        graph_before = (
+            kb.parent_ids(self.conn, coordinator), kb.child_ids(self.conn, coordinator),
+        )
+        upstream_result_before = self._task(upstream).result
+
+        with tempfile.TemporaryDirectory(prefix="kanban-pr-continuation-") as raw:
+            source = Path(raw) / "install"
+            MODULE._make_runtime_fixture(source)
+            receipt = Path(raw) / "grant.json"
+            release = Path(raw) / "release"
+            with patch.object(kbd, "_profile_exists_fn", return_value=None), patch.object(
+                kbd, "_restart_safe_worker_argv",
+                side_effect=lambda task, command, preparation_id=None: command,
+            ), patch.object(
+                generations, "prepare_runtime_generation",
+                side_effect=lambda expected, workspace=None, profile_home=None, project_plugins_enabled=None: MODULE._prepare_fixture_generation(
+                    source, workspace=workspace, profile_home=profile_home,
+                    project_plugins_enabled=project_plugins_enabled,
+                ),
+            ), patch.dict(os.environ, {
+                "HERMES_TEST_RUNTIME_RECEIPT": str(receipt),
+                "HERMES_TEST_RUNTIME_RELEASE": str(release),
+                "HERMES_BIN": "",
+            }):
+                result = kbd.dispatch_once(self.conn, max_spawn=1, reconcile_orphans=False)
+                self.assertEqual([entry[0] for entry in result.spawned], [coordinator])
+                claimed = self._task(coordinator)
+                self.assertEqual(claimed.status, "running")
+                process = kbd._worker_processes[claimed.worker_pid]
+                try:
+                    # The live claim owns the card: a second tick must not
+                    # launch a duplicate worker for the same PR continuation.
+                    second = kbd.dispatch_once(
+                        self.conn, max_spawn=1, reconcile_orphans=False,
+                    )
+                    self.assertEqual(second.spawned, [])
+                    self.assertEqual(
+                        self._task(coordinator).current_run_id, claimed.current_run_id,
+                    )
+                    release.write_text("go\n", encoding="utf-8")
+                    granted = MODULE._wait_for_receipt(receipt)
+                    self.assertEqual(granted["granted"], "1")
+                    self.assertEqual(granted["task"], coordinator)
+                    self.assertEqual(granted["run"], str(claimed.current_run_id))
+                    self.assertEqual(granted["claim"], claimed.claim_lock)
+                    metadata = json.loads(self.conn.execute(
+                        "SELECT metadata FROM task_runs WHERE id = ?",
+                        (claimed.current_run_id,),
+                    ).fetchone()["metadata"])
+                    self.assertEqual(metadata["runtime_identity"], granted["identity"])
+                    self.assertEqual(metadata["pr_continuation"]["pr_urls"], [pr_url])
+                    self.assertEqual(
+                        metadata["pr_continuation"]["event_id"],
+                        authorization["event_id"],
+                    )
+                    claimed_event = [
+                        event for event in kb.list_events(self.conn, coordinator)
+                        if event.kind == "claimed"
+                    ][-1]
+                    self.assertEqual(
+                        claimed_event.payload["pr_continuation_event_id"],
+                        authorization["event_id"],
+                    )
+                    process.wait(timeout=10)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=10)
+                    kbd._record_worker_exit(process.pid, process.returncode << 8)
+
+        # Exactly one run/owner, and the original graph plus upstream immutable
+        # evidence are untouched.
+        self.assertEqual(len(kb.list_runs(self.conn, coordinator)), 1)
+        self.assertEqual(
+            (kb.parent_ids(self.conn, coordinator), kb.child_ids(self.conn, coordinator)),
+            graph_before,
+        )
+        self.assertEqual(self._task(upstream).result, upstream_result_before)
+        self.assertEqual(self._task(upstream).status, "done")
+
+    def test_existing_pr_continuation_fences_a_new_unauthorized_url_at_claim(self) -> None:
+        # A PR URL that arrives while the deferred worker is being prepared
+        # cancels the launch: no grant, no run, and the hold is reported as
+        # ``active_pr`` rather than as a spawn failure.
+        task_id = kb.create_task(
+            self.conn, title="PR continuation race", assignee="implementer",
+            initial_status="blocked",
+        )
+        self.assertTrue(kb.unblock_task(self.conn, task_id))
+        pr_url = "https://github.com/example/repo/pull/7"
+        kb.add_comment(self.conn, task_id, author="worker", body=f"Published {pr_url}")
+        self.assertTrue(kb.update_task(
+            self.conn, task_id, expected_version=self._task(task_id).version,
+            reason="Explicitly authorized: continue the existing PR",
+            transition="continue_existing_pr",
+        ))
+        identity = runtime_identity(MODULE.RUNTIME_ROOT)
+        cancelled: list[bool] = []
+
+        def fake_default_spawn(task, workspace, *, board=None, defer_grant=False):
+            self.assertTrue(defer_grant)
+            # A brand-new, unauthorized PR appears after the pre-claim guard
+            # passed and before the claim transaction opens.
+            kb.add_comment(
+                self.conn, task.id, author="worker",
+                body="Also opened https://github.com/example/repo/pull/8",
+            )
+            return kbd.WorkerLaunch(
+                identity.pid,
+                identity.as_dict(),
+                "pr-race-preparation",
+                cancel=lambda: cancelled.append(True),
+            )
+
+        with patch.object(kbd, "_profile_exists_fn", return_value=None), patch.object(
+            kbd, "_default_spawn", side_effect=fake_default_spawn,
+        ):
+            result = kbd.dispatch_once(self.conn, max_spawn=1, reconcile_orphans=False)
+
+        current = self._task(task_id)
+        self.assertEqual(result.spawned, [])
+        self.assertEqual(result.respawn_guarded, [(task_id, "active_pr")])
+        self.assertEqual(cancelled, [True])
+        self.assertEqual(current.status, "ready")
+        self.assertIsNone(current.current_run_id)
+        self.assertIsNone(current.worker_pid)
+        self.assertEqual(kb.list_runs(self.conn, task_id), [])
+        rejected = [
+            event for event in kb.list_events(self.conn, task_id)
+            if event.kind == "claim_rejected"
+        ]
+        self.assertEqual(rejected[-1].payload["reason"], "active_pr")
+        # Re-authorizing now covers BOTH recorded URLs; two competing claims
+        # then produce exactly one run and one owner.
+        self.assertTrue(kb.update_task(
+            self.conn, task_id, expected_version=self._task(task_id).version,
+            reason="Explicitly authorized: continue both recorded PRs",
+            transition="continue_existing_pr",
+        ))
+        self.assertEqual(
+            kb._pr_continuation(self.conn, task_id)["pr_urls"], [pr_url, pr_url.replace("/7", "/8")],
+        )
+        winner = kb.claim_task(self.conn, task_id, claimer="claimer:a")
+        self.assertIsNotNone(winner)
+        self.assertIsNone(kb.claim_task(self.conn, task_id, claimer="claimer:b"))
+        runs = kb.list_runs(self.conn, task_id)
+        self.assertEqual([run.claim_lock for run in runs], [winner.claim_lock])
+        self.assertEqual(self._task(task_id).current_run_id, winner.current_run_id)
+
     def test_default_dispatch_rejects_child_identity_mismatch(self) -> None:
         task_id = kb.create_task(
             self.conn,

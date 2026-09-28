@@ -1811,3 +1811,115 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+
+
+# ---------------------------------------------------------------------------
+# Existing-PR continuation (#39)
+#
+# An unacknowledged PR URL in a comment holds the card. The dashboard surfaces
+# the hold as a live diagnostic and the recovery command; the explicit CAS
+# transition is the only thing that acknowledges it. Ordinary drags and edits
+# must NOT acknowledge — otherwise a stray UI action authorizes duplicate work.
+# ---------------------------------------------------------------------------
+
+_PR_URL = "https://github.com/example/repo/pull/11"
+
+
+def _pr_task(client, **extra):
+    t = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "finish PR", "assignee": "cto", **extra},
+    ).json()["task"]
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/comments",
+        json={"body": f"Published {_PR_URL}; continue it.", "author": "worker"},
+    )
+    assert r.status_code == 200
+    return t
+
+
+def _held(client, task_id):
+    """The live dispatch hold as the board projection renders it."""
+    board = client.get("/api/plugins/kanban/board").json()
+    for column in board["columns"]:
+        for card in column["tasks"]:
+            if card["id"] == task_id:
+                return card.get("warnings"), card.get("diagnostics")
+    return None, None
+
+
+def test_board_surfaces_live_active_pr_hold_with_recovery_hint(client):
+    task = _pr_task(client)
+    warnings, diagnostics = _held(client, task["id"])
+    assert warnings is not None
+    held = [d for d in diagnostics if d["kind"] == "respawn_guarded"]
+    assert len(held) == 1
+    assert held[0]["severity"] == "warning"
+    assert held[0]["title"] == "Dispatch held: active_pr"
+    assert held[0]["data"]["reason"] == "active_pr"
+    hint = [a for a in held[0]["actions"] if a["kind"] == "cli_hint"]
+    recovery = [a for a in hint if "continue_existing_pr" in a["payload"]["command"]]
+    assert recovery, hint
+    assert f"--expected-version {task['version']}" in recovery[0]["payload"]["command"]
+
+
+def test_patch_continue_existing_pr_acknowledges_and_clears_the_hold(client):
+    task = _pr_task(client)
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "expected_version": task["version"],
+            "transition": "continue_existing_pr",
+            "reason": "User authorized repairing/reviewing the existing PR",
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["version"] == task["version"] + 1
+    warnings, _diagnostics = _held(client, task["id"])
+    assert warnings is None
+
+    conn = kbc.connect()
+    try:
+        authorization = kb._pr_continuation(conn, task["id"])
+    finally:
+        conn.close()
+    assert authorization is not None
+    assert authorization["pr_urls"] == [_PR_URL]
+
+
+def test_patch_transition_requires_explicit_cas_and_reason(client):
+    task = _pr_task(client)
+    url = f"/api/plugins/kanban/tasks/{task['id']}"
+    body = {"transition": "continue_existing_pr", "reason": "authorized"}
+    r = client.patch(url, json=body)
+    assert r.status_code == 400, r.text
+    r = client.patch(url, json={**body, "expected_version": task["version"], "reason": "  "})
+    assert r.status_code == 400, r.text
+    r = client.patch(url, json={**body, "expected_version": task["version"], "status": "ready"})
+    assert r.status_code == 400, r.text
+    r = client.patch(url, json={**body, "expected_version": task["version"], "transition": "no_such"})
+    assert r.status_code == 400, r.text
+
+    current = client.get(url).json()["task"]
+    assert current["version"] == task["version"]
+    warnings, _ = _held(client, task["id"])
+    assert warnings is not None
+
+
+def test_ordinary_dashboard_edits_do_not_acknowledge_pr_work(client):
+    task = _pr_task(client)
+    url = f"/api/plugins/kanban/tasks/{task['id']}"
+    assert client.patch(url, json={"title": "renamed"}).status_code == 200
+    assert client.patch(url, json={"body": "revised goal"}).status_code == 200
+    # A drag is a plain status change: leaving ready drops the card out of the
+    # dispatchable lane, and coming back does not acknowledge the PR.
+    assert client.patch(url, json={"status": "todo"}).status_code == 200
+    assert client.patch(url, json={"status": "ready"}).status_code == 200
+
+    conn = kbc.connect()
+    try:
+        assert kb._pr_continuation(conn, task["id"]) is None
+    finally:
+        conn.close()
+    warnings, _ = _held(client, task["id"])
+    assert warnings is not None
