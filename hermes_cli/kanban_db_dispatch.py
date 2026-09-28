@@ -1475,7 +1475,12 @@ def _guard_hold(
 def _guard_payload(
     entry: dict[str, Any], reason: str, *, board: str, pr_urls: list[str],
 ) -> dict[str, str]:
-    """The projection payload for one held card. ``board`` is the resolved slug."""
+    """The projection payload for one held card.
+
+    ``board`` is the slug the caller resolved before opening its connection; an
+    empty value means the caller did not resolve one and the command carries no
+    ``--board``.
+    """
     return {
         "reason": reason,
         "recovery": _GUARD_RECOVERY.get(
@@ -1507,11 +1512,10 @@ def get_dispatch_guard(
     pr_urls = (
         _task_pr_urls(conn, entry["task_id"]) if reason == "active_pr" else []
     )
-    # Pin the command to the board this card actually lives on, so a copied
-    # command cannot land on whichever board is current later.
-    return _guard_payload(
-        entry, reason, board=board or _kb.get_current_board(), pr_urls=pr_urls,
-    )
+    # The caller resolves the board before opening the connection and passes it
+    # here, so the command names the board the card actually lives on rather
+    # than re-reading a pointer another process may have moved.
+    return _guard_payload(entry, reason, board=board or "", pr_urls=pr_urls)
 
 
 def get_dispatch_guards(
@@ -1533,10 +1537,9 @@ def get_dispatch_guards(
         return {}
     pr_holds = [task_id for task_id, (_, reason) in holds.items() if reason == "active_pr"]
     recorded = _recorded_pr_urls(conn, pr_holds)
-    resolved_board = board or _kb.get_current_board()
     return {
         task_id: _guard_payload(
-            entry, reason, board=resolved_board, pr_urls=recorded.get(task_id, []),
+            entry, reason, board=board or "", pr_urls=recorded.get(task_id, []),
         )
         for task_id, (entry, reason) in holds.items()
     }

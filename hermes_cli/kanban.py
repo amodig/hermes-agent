@@ -481,7 +481,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
         return rc
     graph = None
     want_json = getattr(args, "json", False)
-    with kbc.connect_closing() as conn:
+    # Resolve once and use the same slug for the connection and the projection:
+    # re-reading the current-board pointer later could name another board.
+    board = getattr(args, "board", None) or kb.get_current_board()
+    with kbc.connect_closing(board=board) as conn:
         task = kb.get_task(conn, args.task_id)
         if not task:
             return _err(f"no such task: {args.task_id}")
@@ -507,9 +510,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             else task.body
         )
         # Live projection; must be read while this connection is still open.
-        dispatch_guard = kb.get_dispatch_guard(
-            conn, args.task_id, board=getattr(args, "board", None),
-        )
+        dispatch_guard = kb.get_dispatch_guard(conn, args.task_id, board=board)
     if want_json:
         task_payload = _task_to_dict(task)
         task_payload.update({
@@ -733,8 +734,12 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     from hermes_cli.config import load_config
 
     diag_config = kd.config_from_runtime_config(load_config())
+    # Resolve once and use the same slug for the connection and every
+    # projection: re-reading the current-board pointer later could name another
+    # board, and the recovery command would target it.
+    board = getattr(args, "board", None) or kb.get_current_board()
 
-    with kbc.connect_closing() as conn:
+    with kbc.connect_closing(board=board) as conn:
         # Either one-task mode or fleet mode.
         if getattr(args, "task", None):
             task = kb.get_task(conn, args.task)
@@ -743,8 +748,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
             diags_by_task = {args.task: kd.compute_task_diagnostics(
                 task, kb.list_events(conn, args.task), kb.list_runs(conn, args.task),
                 graph=kb.task_graph_context(conn, args.task), config=diag_config,
-                dispatch_guard=kb.get_dispatch_guard(
-                    conn, args.task, board=getattr(args, "board", None)))}
+                dispatch_guard=kb.get_dispatch_guard(conn, args.task, board=board))}
         else:
             # Fleet mode: pull all non-archived tasks + their events/runs.
             rows = list(conn.execute("SELECT * FROM tasks WHERE status != 'archived'").fetchall())
@@ -754,8 +758,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 ev_by = _rows_by_task(conn, "task_events", ids)
                 run_by = _rows_by_task(conn, "task_runs", ids)
                 graph_by = kb.task_graph_contexts(conn, ids)
-                guards_by = kb.get_dispatch_guards(
-                    conn, ids, board=getattr(args, "board", None))
+                guards_by = kb.get_dispatch_guards(conn, ids, board=board)
                 for r in rows:
                     tid = r["id"]
                     dl = kd.compute_task_diagnostics(r, ev_by.get(tid, []), run_by.get(tid, []),

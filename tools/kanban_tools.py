@@ -212,6 +212,17 @@ def _require_orchestrator_tool(tool_name: str) -> None:
             "assigned task.")
 
 
+def _resolved_board(board: Optional[str]) -> str:
+    """The slug a handler should use for both its connection and its report.
+
+    Resolved once per call: re-reading the current-board pointer after the
+    connection was opened could name a different board.
+    """
+    from hermes_cli import kanban_db as kb
+
+    return board or kb.get_current_board()
+
+
 @contextmanager
 def _board(board: Optional[str], *, quiet_close: bool = False):
     """``with _board(slug) as (kb, conn)``; lazy import so the module loads in non-kanban
@@ -555,7 +566,10 @@ def inject_new_comments_from_env(agent: Any) -> bool:
 def _handle_show(args: dict, **kw) -> str:
     """Full task state: row, parents, children, comments, runs, last 50 events."""
     tid = _require_task_id(args)
-    with _board(args.get("board")) as (kb, conn):
+    # Resolve the slug before connecting so the connection and the recovery
+    # command cannot name different boards.
+    board = _resolved_board(args.get("board"))
+    with _board(board) as (kb, conn):
         task = _existing_task(kb, conn, tid)
         effective_goal = kb.get_effective_goal(conn, tid)
         return json.dumps({
@@ -563,7 +577,7 @@ def _handle_show(args: dict, **kw) -> str:
             "effective_goal": effective_goal,
             "lifecycle": kb.get_lifecycle_state(conn, tid),
             # Live dispatcher guard; ready/review cards can be held while queued.
-            "dispatch_guard": kb.get_dispatch_guard(conn, tid, board=args.get("board")),
+            "dispatch_guard": kb.get_dispatch_guard(conn, tid, board=board),
             "parents": kb.parent_ids(conn, tid),
             "children": kb.child_ids(conn, tid),
             "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
@@ -587,7 +601,8 @@ def _handle_list(args: dict, **kw) -> str:
         return tool_error("limit must be an integer")
     _check(limit >= 1, "limit must be >= 1")
     _check(limit <= KANBAN_LIST_MAX_LIMIT, f"limit must be <= {KANBAN_LIST_MAX_LIMIT}")
-    with _board(args.get("board")) as (kb, conn):
+    board = _resolved_board(args.get("board"))
+    with _board(board) as (kb, conn):
         # Match CLI list: dependencies cleared since the last dispatcher tick
         # should be visible to orchestrators immediately.
         promoted = kb.recompute_ready(conn)
@@ -598,7 +613,7 @@ def _handle_list(args: dict, **kw) -> str:
         truncated = len(rows) > limit
         tasks = rows[:limit]
         guards_by_task = kb.get_dispatch_guards(
-            conn, [t.id for t in tasks], board=args.get("board"))
+            conn, [t.id for t in tasks], board=board)
         return json.dumps({
             "tasks": [
                 _task_summary_dict(kb, conn, t, dispatch_guard=guards_by_task.get(t.id))
