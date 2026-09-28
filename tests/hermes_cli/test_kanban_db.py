@@ -372,6 +372,42 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kbd.check_respawn_guard(conn, tid) is None
 
 
+def test_board_guard_projection_agrees_with_single_task_projection(kanban_home):
+    """The batched and per-task guard projections are one contract.
+
+    Board and fleet views project every rendered card at once; if the batched
+    fetch drifted from the per-task fetch, a card could show as dispatchable in
+    the dashboard while the dispatcher still holds it.
+    """
+    with kbc.connect() as conn:
+        held = kb.create_task(conn, title="held", assignee="a")
+        kb.add_comment(conn, held, author="w", body="https://github.com/o/r/pull/1")
+        authorized = kb.create_task(conn, title="authorized", assignee="a")
+        kb.add_comment(conn, authorized, author="w", body="https://github.com/o/r/pull/2")
+        assert kb.update_task(
+            conn, authorized, expected_version=kb.get_task(conn, authorized).version,
+            reason="authorized", transition="continue_existing_pr",
+        )
+        plain = kb.create_task(conn, title="plain", assignee="a")
+        running = kb.create_task(conn, title="running", assignee="a")
+        assert kb.claim_task(conn, running) is not None
+        done = kb.create_task(conn, title="done", assignee="a")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (done,))
+
+        ids = [held, authorized, plain, running, done]
+        bulk = kb.get_dispatch_guards(conn, ids, board="default")
+        per_task = {
+            tid: guard
+            for tid in ids
+            if (guard := kb.get_dispatch_guard(conn, tid, board="default")) is not None
+        }
+        assert bulk == per_task
+        assert set(bulk) == {held}
+        assert bulk[held]["reason"] == "active_pr"
+        assert bulk[held]["command"].startswith("hermes kanban --board default update ")
+
+
 
 
 
