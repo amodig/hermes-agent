@@ -621,6 +621,42 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
     )]
 
 
+def _rule_respawn_guarded(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """The dispatcher's respawn guard is holding this card *right now*.
+
+    ``cfg["_dispatch_guard"]`` is a live projection supplied by the caller
+    (dispatcher guard evaluated against current state) — never inferred from
+    historical ``respawn_guarded`` events, which a later authorization leaves
+    stale. Without that projection the rule stays silent: ready-but-idle is
+    ``stranded_in_ready``'s job, and a task is not "held" merely because it was
+    held once.
+    """
+    guard = cfg.get("_dispatch_guard") or {}
+    reason = str(guard.get("reason") or "").strip()
+    if not reason:
+        return []
+    # Only a reason with an actual command offers the copy-to-clipboard action;
+    # the hint's payload is pasted verbatim, so prose must stay in the detail.
+    # Every hint therefore comes from the dispatcher's own projection, which
+    # knows the board it was taken for — a locally built command would drop a
+    # `--board` the operator passed to `diagnostics`.
+    command = str(guard.get("command") or "").strip()
+    seen_at = _latest_event_ts(events, {"respawn_guarded"}) or now
+    actions = (
+        [_cli_hint(f"Recover from {reason}", command, suggested=True)] if command else []
+    )
+    return [Diagnostic(
+        kind="respawn_guarded", severity="warning",
+        title=f"Dispatch held: {reason}",
+        detail=str(guard.get("recovery") or "").strip() or (
+            "The dispatcher respawn guard is refusing to start a worker for this card."
+        ),
+        actions=actions,
+        first_seen_at=seen_at, last_seen_at=seen_at, count=1,
+        data={"reason": reason},
+    )]
+
+
 def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Assigned, unclaimed, ``ready`` for >= cfg["stranded_threshold_seconds"]
     (default 30 min). Deliberately age-based and identity-agnostic so it
@@ -629,6 +665,10 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     the dispatcher's ``skipped_unassigned`` already covers them."""
     threshold_seconds = float(cfg.get("stranded_threshold_seconds", 30 * 60))
     if _task_field(task, "status") != "ready":
+        return []
+    # A live dispatch hold already names the precise cause and its recovery;
+    # do not bury it under generic stranded-in-ready advice.
+    if (cfg.get("_dispatch_guard") or {}).get("reason"):
         return []
     # A live claim means it's being worked on even without progress yet.
     if _task_field(task, "claim_lock"):
@@ -688,6 +728,7 @@ _RULES: list[RuleFn] = [
     _rule_review_dependency_deadlock,
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
+    _rule_respawn_guarded,
     _rule_stranded_in_ready,
 ]
 
@@ -751,14 +792,19 @@ def compute_task_diagnostics(
     now: Optional[int] = None,
     config: Optional[dict] = None,
     graph: Optional[dict] = None,
+    dispatch_guard: Optional[dict[str, str]] = None,
 ) -> list[Diagnostic]:
     """Run every rule for one task; critical first, then error, warning; ties
-    broken by most-recent ``last_seen_at``."""
+    broken by most-recent ``last_seen_at``. ``dispatch_guard`` is the caller's
+    live dispatcher-guard projection (``{"reason", "recovery"}``) surfaced by
+    :func:`hermes_cli.kanban_db_dispatch.get_dispatch_guard`."""
     now_ts = int(now if now is not None else time.time())
     config = config or {}
     cfg = {**DEFAULT_CONFIG, **config}
     if graph is not None:
         cfg["_graph"] = graph
+    if dispatch_guard:
+        cfg["_dispatch_guard"] = dispatch_guard
     if not _has_explicit_threshold(config) and "failure_limit" in config:
         cfg["failure_threshold"] = _positive_int(
             config.get("failure_limit"), DEFAULT_CONFIG["failure_threshold"],

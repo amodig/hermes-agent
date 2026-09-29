@@ -225,3 +225,127 @@ def test_severity_at_or_above_uses_threshold_semantics():
     assert kd.severity_at_or_above("error", "critical") is False
     assert kd.severity_at_or_above("mystery", "warning") is False
     assert kd.severity_at_or_above("warning", None) is True
+
+
+# ---------------------------------------------------------------------------
+# respawn_guarded — the dispatcher's LIVE guard projection
+#
+# Ready is queue admission, not execution: a card can be queued forever while
+# the respawn guard refuses to spawn it. The signal must come from the current
+# guard state, never from old respawn_guarded events (an authorization makes
+# those stale without deleting them).
+# ---------------------------------------------------------------------------
+
+
+def test_respawn_guarded_rule_reports_the_live_hold():
+    now = 100_000
+    task = _task(status="ready", assignee="demo", claim_lock=None)
+    guard = {
+        "reason": "active_pr",
+        "recovery": "A recent comment records an existing GitHub PR ...",
+        "command": "hermes kanban update t_demo00 --expected-version 3 --transition continue_existing_pr",
+    }
+    diags = kd.compute_task_diagnostics(
+        task, [_event("respawn_guarded", ts=now - 60, reason="active_pr")], [],
+        now=now, dispatch_guard=guard,
+    )
+    held = [d for d in diags if d.kind == "respawn_guarded"]
+    assert len(held) == 1
+    assert held[0].severity == "warning"
+    assert held[0].title == "Dispatch held: active_pr"
+    assert held[0].data["reason"] == "active_pr"
+    # The drawer copies the command field verbatim, so it carries no prose.
+    assert held[0].detail == guard["recovery"]
+    hints = [a for a in held[0].actions if a.kind == "cli_hint"]
+    assert any(a.payload["command"] == guard["command"] for a in hints)
+
+
+def test_respawn_guarded_rule_offers_no_copy_action_without_a_command():
+    """Guidance-only holds must not offer a clipboard action at all.
+
+    A hint built here rather than taken from the dispatcher's projection cannot
+    know which board the caller selected, so it would suggest a command for the
+    wrong board.
+    """
+    task = _task(status="ready", assignee="demo", claim_lock=None)
+    diags = kd.compute_task_diagnostics(
+        task, [], [], now=100_000,
+        dispatch_guard={"reason": "recent_success", "recovery": "Re-queue it", "command": ""},
+    )
+    held = [d for d in diags if d.kind == "respawn_guarded"][0]
+    assert held.detail == "Re-queue it"
+    assert [a for a in held.actions if a.kind == "cli_hint"] == []
+
+
+def test_respawn_guarded_absent_without_a_live_projection():
+    """A historical guard event is not a current hold."""
+    now = 100_000
+    task = _task(status="ready", assignee="demo", claim_lock=None)
+    diags = kd.compute_task_diagnostics(
+        task, [_event("respawn_guarded", ts=now - 60, reason="active_pr")], [], now=now,
+    )
+    assert [d for d in diags if d.kind == "respawn_guarded"] == []
+
+
+def test_live_hold_suppresses_generic_stranded_ready_advice():
+    now = 100_000
+    task = _task(status="ready", assignee="demo", claim_lock=None)
+    events = [_event("created", ts=now - 45 * 60)]
+    without = kd.compute_task_diagnostics(task, events, [], now=now)
+    assert [d.kind for d in without] == ["stranded_in_ready"]
+    with_hold = kd.compute_task_diagnostics(
+        task, events, [], now=now,
+        dispatch_guard={"reason": "active_pr", "recovery": "fix it"},
+    )
+    assert [d.kind for d in with_hold] == ["respawn_guarded"]
+
+
+def test_live_guard_clears_after_authorization_despite_recorded_events(kanban_home):
+    """The projection is re-evaluated, so authorization clears the warning
+    immediately even though the old respawn_guarded event stays in the log."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="PR card", assignee="default")
+        kb.add_comment(conn, tid, author="worker", body="https://github.com/o/r/pull/7")
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
+        events = list(conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (tid,),
+        ).fetchall())
+
+        def _kinds():
+            return sorted(d.kind for d in kd.compute_task_diagnostics(
+                row, events, [], config={"stranded_threshold_seconds": 1},
+                dispatch_guard=kb.get_dispatch_guard(conn, tid),
+            ))
+
+        assert "respawn_guarded" in _kinds()
+        assert kb.update_task(
+            conn, tid,
+            expected_version=kb.get_task(conn, tid).version,
+            reason="explicitly authorized", transition="continue_existing_pr",
+            authorized_pr_urls=["https://github.com/o/r/pull/7"],
+        )
+        assert "respawn_guarded" not in _kinds()
+
+        # A held card whose assignee is not a real profile is nonspawnable
+        # BEFORE the guard is consulted, so the guard is not its blocker: the
+        # precise hold would otherwise hide the assignee failure.
+        unheard = kb.create_task(conn, title="typo assignee", assignee="no-such-profile")
+        kb.add_comment(conn, unheard, author="worker", body="https://github.com/o/r/pull/8")
+        assert kb.get_dispatch_guard(conn, unheard, board="default") is None
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (unheard,)).fetchone()
+        events = list(conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (unheard,),
+        ).fetchall())
+        kinds = sorted(d.kind for d in kd.compute_task_diagnostics(
+            row, events, [], now=int(time.time()) + 3600,
+            config={"stranded_threshold_seconds": 1},
+            dispatch_guard=kb.get_dispatch_guard(conn, unheard),
+        ))
+        assert kinds == ["stranded_in_ready"], kinds
+    finally:
+        conn.close()

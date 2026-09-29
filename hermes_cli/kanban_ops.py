@@ -183,37 +183,61 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     # Health telemetry: warn when every tick finds ready work but spawns
     # nothing (broken profile, PATH drift, missing venv, credential loss) —
     # the per-task breaker auto-blocks quietly, so the operator needs a signal.
+    # Guard-held ready work is tracked separately: it names a specific card and
+    # its recovery even while the rest of the queue still spawns.
     HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
-    health_state = {"bad_ticks": 0, "last_warn_at": 0}
+    # One limiter per alert class: a persistent guard hold must not consume the
+    # slot that reports a profile/PATH failure, and vice versa.
+    health_state = {
+        "bad_ticks": 0, "guarded_ticks": 0, "guard_holds": [],
+        "last_guard_warn_at": 0, "last_stuck_warn_at": 0,
+    }
 
-    def _ready_queue_nonempty() -> bool:
-        """Is there a ready+assigned+unclaimed task the dispatcher would spawn for?
+    def _spawnable_ids() -> list[str]:
+        """Ids of ready/review tasks the dispatcher would spawn for.
         Control-plane lanes pulled via ``claim_task`` are correctly idle, not stuck."""
         try:
             with kbc.connect_closing() as conn:
-                return kbd.has_spawnable_ready(conn)
+                return kbd.spawnable_lane_ids(conn)
         except Exception:
-            return False
+            return []
 
     def _on_tick(res):
-        ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
-        if ready_pending and not res.spawned:
+        pending = _spawnable_ids()
+        holds = list(getattr(res, "respawn_guarded", None) or [])
+        # Count only pending work the guard does not already explain, so a guard
+        # hold cannot masquerade as a profile/PATH failure.
+        held_ids = {task_id for task_id, _reason in holds}
+        unexplained = [task_id for task_id in pending if task_id not in held_ids]
+        if (bool(res.skipped_unassigned) or unexplained) and not res.spawned:
             health_state["bad_ticks"] += 1
         else:
             health_state["bad_ticks"] = 0
-        # Warn once per HEALTH_WINDOW bad ticks, at most every 5 minutes.
-        if health_state["bad_ticks"] >= HEALTH_WINDOW:
-            now = int(time.time())
-            if now - health_state["last_warn_at"] >= 300:
-                print(
-                    f"[{_fmt_ts(now)}] WARN dispatcher stuck: ready queue non-empty for "
-                    f"{health_state['bad_ticks']} consecutive ticks but 0 workers spawned "
-                    f"successfully. Check profile health (venv, PATH, credentials) and `hermes "
-                    f"kanban list --status ready` / `hermes kanban list --status blocked` for "
-                    f"recent spawn_failed tasks.",
-                    file=sys.stderr, flush=True,
-                )
-                health_state["last_warn_at"] = now
+        if holds:
+            health_state["guarded_ticks"] += 1
+            health_state["guard_holds"] = holds
+        else:
+            health_state["guarded_ticks"] = 0
+        # Warn once per HEALTH_WINDOW bad ticks in each class, at most every 5
+        # minutes per class.
+        now = int(time.time())
+        if health_state["guarded_ticks"] >= HEALTH_WINDOW and now - health_state["last_guard_warn_at"] >= 300:
+            print(
+                f"[{_fmt_ts(now)}] WARN dispatcher: "
+                f"{kbd.respawn_guard_alert(health_state['guard_holds'], health_state['guarded_ticks'])}",
+                file=sys.stderr, flush=True,
+            )
+            health_state["last_guard_warn_at"] = now
+        if health_state["bad_ticks"] >= HEALTH_WINDOW and now - health_state["last_stuck_warn_at"] >= 300:
+            print(
+                f"[{_fmt_ts(now)}] WARN dispatcher stuck: ready queue non-empty for "
+                f"{health_state['bad_ticks']} consecutive ticks but 0 workers spawned "
+                f"successfully. Check profile health (venv, PATH, credentials) and `hermes "
+                f"kanban list --status ready` / `hermes kanban list --status blocked` for "
+                f"recent spawn_failed tasks.",
+                file=sys.stderr, flush=True,
+            )
+            health_state["last_stuck_warn_at"] = now
         if not verbose:
             return
         did_work = (

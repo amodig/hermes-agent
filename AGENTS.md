@@ -307,6 +307,12 @@ changing `pyproject.toml`. Reference: #2810 (bounds), #9801 (SHA pinning + audit
 - Tests per fix: 1–2 INVARIANT tests (behaviour contract, proven red on base), never
   change-detectors; ≤ 2 tests is the salvage bar too. Reject/rewrite in salvaged diffs:
   appendages to facades, new god helpers, compat aliases, wrappers.
+  A fix that introduces a new user-visible operation across independent surfaces
+  (dispatcher state machine, claim path, CLI/parser, agent tool, dashboard API,
+  diagnostics/alerts) may pin one invariant per surface: those contracts break
+  independently, so one test cannot fail red for more than one of them. Two tests
+  asserting the same invariant still count as one and get rejected, and the default
+  1–2 stands wherever the fix does not cross surfaces.
 
 ## Testing (applies everywhere)
 

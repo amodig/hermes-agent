@@ -29,6 +29,8 @@ from gateway.kanban_watchers_dispatcher import (
     _KanbanDispatcher,
     _log_spawn_results,
     _resolve_dispatcher_settings,
+    guarded_alert,
+    guarded_holds,
 )
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -252,9 +254,17 @@ class GatewayKanbanWatchersMixin:
 
         # Health telemetry (mirrors `_cmd_daemon`): warn when the ready queue
         # is non-empty but spawns are 0 for N consecutive ticks — usually a
-        # broken PATH, missing venv, or credential loss.
+        # broken PATH, missing venv, or credential loss. Guard-held ready work
+        # (e.g. an unacknowledged existing PR) is tracked alongside it: it holds
+        # specific cards even while the rest of the board still spawns, so it
+        # needs its own consecutive-tick counter and its own actionable alert.
         bad_ticks = 0
-        last_warn_at = 0
+        guarded_ticks = 0
+        guard_holds: list[tuple[str, str]] = []
+        # One limiter per alert class: a persistent guard hold must not consume
+        # the slot that reports a profile/PATH failure, and vice versa.
+        last_guard_warn_at = 0
+        last_stuck_warn_at = 0
 
         logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
         while self._running:
@@ -273,6 +283,7 @@ class GatewayKanbanWatchersMixin:
                 # dispatch while paused; running workers finish naturally.
                 if not _kanban_dispatch_allowed():
                     bad_ticks = 0
+                    guarded_ticks = 0
                 else:
                     # Re-read the auto-decompose toggle live so disabling it
                     # takes effect on the next tick, not on restart.
@@ -282,10 +293,28 @@ class GatewayKanbanWatchersMixin:
                         await _to_thread_process_service(dispatcher.auto_decompose_tick, _ad_per_tick)
                     results = await _to_thread_process_service(dispatcher.tick_once)
                     any_spawned = _log_spawn_results(results)
-                    ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
-                    bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
+                    pending_ids = await _to_thread_process_service(dispatcher.spawnable_ids)
+                    # Guard holds stay visible even when another card spawned:
+                    # the operator question is "why is THIS card queued?", not
+                    # "is the board idle?".
+                    holds = guarded_holds(results)
+                    guarded_ticks = guarded_ticks + 1 if holds else 0
+                    if holds:
+                        guard_holds = holds
+                    # The stuck signal counts only pending work the guard does
+                    # not already explain, so a guard hold cannot masquerade as
+                    # a profile/PATH failure.
+                    held_ids = {label for label, _reason in holds}
+                    unexplained = [task_id for task_id in pending_ids if task_id not in held_ids]
+                    bad_ticks = bad_ticks + 1 if unexplained and not any_spawned else 0
                 now = int(time.time())
-                if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
+                if guarded_ticks >= _HEALTH_WINDOW and now - last_guard_warn_at >= 300:
+                    logger.warning(
+                        "kanban dispatcher: %s",
+                        guarded_alert(guard_holds, guarded_ticks),
+                    )
+                    last_guard_warn_at = now
+                if bad_ticks >= _HEALTH_WINDOW and now - last_stuck_warn_at >= 300:
                     logger.warning(
                         "kanban dispatcher stuck: ready queue non-empty for "
                         "%d consecutive ticks but 0 workers spawned. Check "
@@ -293,7 +322,7 @@ class GatewayKanbanWatchersMixin:
                         "`hermes kanban list --status ready`.",
                         bad_ticks,
                     )
-                    last_warn_at = now
+                    last_stuck_warn_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
                 self._release_kanban_dispatcher_lock()

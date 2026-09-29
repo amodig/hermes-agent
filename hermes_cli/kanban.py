@@ -481,7 +481,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
         return rc
     graph = None
     want_json = getattr(args, "json", False)
-    with kbc.connect_closing() as conn:
+    # Resolve once and use the same slug for the connection and the projection:
+    # re-reading the current-board pointer later could name another board.
+    board = getattr(args, "board", None) or kb.get_current_board()
+    with kbc.connect_closing(board=board) as conn:
         task = kb.get_task(conn, args.task_id)
         if not task:
             return _err(f"no such task: {args.task_id}")
@@ -506,6 +509,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
             if isinstance(effective_goal, dict)
             else task.body
         )
+        # Live projection; must be read while this connection is still open.
+        dispatch_guard = kb.get_dispatch_guard(conn, args.task_id, board=board)
     if want_json:
         task_payload = _task_to_dict(task)
         task_payload.update({
@@ -518,6 +523,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "task": task_payload,
             "effective_goal": effective_goal,
             "lifecycle": lifecycle,
+            "dispatch_guard": dispatch_guard,
             "latest_summary": latest_summary,
             "parents": parents,
             "children": children,
@@ -566,7 +572,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     # Diagnostics up top so CLI users see distress signals before scrolling.
     from hermes_cli import kanban_diagnostics as kd
-    diags = kd.compute_task_diagnostics(task, events, runs, graph=graph)
+    diags = kd.compute_task_diagnostics(
+        task, events, runs, graph=graph, dispatch_guard=dispatch_guard,
+    )
     if diags:
         print(f"\n  Diagnostics ({len(diags)}):")
         _print_diagnostics(diags, "    ", with_kind=False)
@@ -638,6 +646,7 @@ def _cmd_update(args: argparse.Namespace) -> int:
             provider=optional(getattr(args, "provider", None)),
             goal_mode=kb._UPDATE_UNSET if goal_mode is None else goal_mode,
             transition=getattr(args, "transition", None),
+            authorized_pr_urls=getattr(args, "authorized_pr", None),
             lifecycle_contract=lifecycle_contract,
             author=getattr(args, "author", None) or _profile_author(),
         )
@@ -725,8 +734,12 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     from hermes_cli.config import load_config
 
     diag_config = kd.config_from_runtime_config(load_config())
+    # Resolve once and use the same slug for the connection and every
+    # projection: re-reading the current-board pointer later could name another
+    # board, and the recovery command would target it.
+    board = getattr(args, "board", None) or kb.get_current_board()
 
-    with kbc.connect_closing() as conn:
+    with kbc.connect_closing(board=board) as conn:
         # Either one-task mode or fleet mode.
         if getattr(args, "task", None):
             task = kb.get_task(conn, args.task)
@@ -734,7 +747,8 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 return _err(f"no such task: {args.task}")
             diags_by_task = {args.task: kd.compute_task_diagnostics(
                 task, kb.list_events(conn, args.task), kb.list_runs(conn, args.task),
-                graph=kb.task_graph_context(conn, args.task), config=diag_config)}
+                graph=kb.task_graph_context(conn, args.task), config=diag_config,
+                dispatch_guard=kb.get_dispatch_guard(conn, args.task, board=board))}
         else:
             # Fleet mode: pull all non-archived tasks + their events/runs.
             rows = list(conn.execute("SELECT * FROM tasks WHERE status != 'archived'").fetchall())
@@ -744,10 +758,12 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 ev_by = _rows_by_task(conn, "task_events", ids)
                 run_by = _rows_by_task(conn, "task_runs", ids)
                 graph_by = kb.task_graph_contexts(conn, ids)
+                guards_by = kb.get_dispatch_guards(conn, ids, board=board)
                 for r in rows:
                     tid = r["id"]
                     dl = kd.compute_task_diagnostics(r, ev_by.get(tid, []), run_by.get(tid, []),
-                                                     graph=graph_by.get(tid), config=diag_config)
+                                                     graph=graph_by.get(tid), config=diag_config,
+                                                     dispatch_guard=guards_by.get(tid))
                     if dl:
                         diags_by_task[tid] = dl
 

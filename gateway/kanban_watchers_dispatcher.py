@@ -210,8 +210,8 @@ class _KanbanDispatcher:
         """Run one dispatch_once per board. Returns (slug, result) pairs."""
         return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
 
-    def ready_nonempty(self) -> bool:
-        """Is there a ready+assigned+unclaimed task on ANY board the dispatcher would spawn for?
+    def spawnable_ids(self) -> list[str]:
+        """Board-qualified ids of tasks on ANY board the dispatcher would spawn for.
 
         Control-plane lanes (e.g. ``orion-cc``) are pulled by terminals via
         ``claim_task`` and never spawnable — a queue full of those is
@@ -220,20 +220,23 @@ class _KanbanDispatcher:
         for a human reviewer is idle, not stuck.
         """
         kbd = _kbd()
-        _review_probe = kbd.review_dispatch_enabled()
+        found: list[str] = []
         for slug in self._board_slugs():
             conn = None
             try:
                 conn = _kbc().connect(board=slug)
-                if kbd.has_spawnable_ready(conn) or (_review_probe and kbd.has_spawnable_review(conn)):
-                    return True
+                found += [f"{slug}/{task_id}" for task_id in kbd.spawnable_lane_ids(conn)]
             except Exception:
                 continue
             finally:
                 if conn is not None:
                     with contextlib.suppress(Exception):
                         conn.close()
-        return False
+        return found
+
+    def ready_nonempty(self) -> bool:
+        """:meth:`spawnable_ids` as a bool."""
+        return bool(self.spawnable_ids())
 
     def auto_decompose_tick(self, auto_decompose_per_tick: int) -> int:
         """Auto-decompose up to N triage tasks across all boards into ready workgraphs.
@@ -290,6 +293,24 @@ class _KanbanDispatcher:
         else:
             logger.info("kanban auto-decompose [%s]: %s → single task (no fanout)", slug, tid)
         return 1
+
+
+def guarded_holds(results: Optional[list]) -> list[tuple[str, str]]:
+    """``(board/task, reason)`` for every guard hold in one gateway tick.
+
+    Board-qualified so an operator can act on the reported task without
+    guessing which board's dispatcher produced it.
+    """
+    holds: list[tuple[str, str]] = []
+    for slug, res in (results or []):
+        for task_id, reason in (getattr(res, "respawn_guarded", None) or []):
+            holds.append((f"{slug}/{task_id}", reason))
+    return holds
+
+
+def guarded_alert(holds: list[tuple[str, str]], ticks: int) -> str:
+    """Bounded alert text for a run of guard-held ticks (dispatcher-owned wording)."""
+    return _kbd().respawn_guard_alert(holds, ticks)
 
 
 def _log_spawn_results(results: Optional[list]) -> bool:

@@ -263,7 +263,10 @@ def _placeholders(ids: list) -> str:
     return ",".join(["?"] * len(ids))
 
 
-def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[str]] = None) -> dict[str, list[dict]]:
+def _compute_task_diagnostics(
+    conn: sqlite3.Connection, task_ids: Optional[list[str]] = None,
+    *, board: Optional[str] = None,
+) -> dict[str, list[dict]]:
     """``{task_id: [diagnostic_dict, ...]}`` (tasks with none omitted) via three aggregate
     queries (tasks, events, runs) — slurps the board; paginate if profiling shows a hotspot."""
     from hermes_cli.config import load_config
@@ -289,11 +292,15 @@ def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[
     events_by_task = _rows_by_task("task_events")
     runs_by_task = _rows_by_task("task_runs")
     graph_by_task = kanban_db.task_graph_contexts(conn, row_ids)
+    # One batched projection for the whole board: a per-task call would add a
+    # query set per card to every /board and /diagnostics request.
+    guards_by_task = kanban_db.get_dispatch_guards(conn, row_ids, board=board)
     out: dict[str, list[dict]] = {}
     for r in rows:
         tid = r["id"]
         diags = kd.compute_task_diagnostics(
-            r, events_by_task[tid], runs_by_task[tid], config=diag_config, graph=graph_by_task.get(tid))
+            r, events_by_task[tid], runs_by_task[tid], config=diag_config, graph=graph_by_task.get(tid),
+            dispatch_guard=guards_by_task.get(tid))
         if diags:
             out[tid] = [d.to_dict() for d in diags]
     return out
@@ -374,7 +381,7 @@ def get_board(
             p["total"] += 1
             p["done"] += row["cstatus"] == "done"
         latest_event_id = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()["m"]
-        diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=[t.id for t in tasks])
+        diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=[t.id for t in tasks], board=board)
         columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
         if include_archived:
             columns["archived"] = []
@@ -432,7 +439,7 @@ def get_task(
         links = _links_for(conn, task_id)
         child_summaries = kanban_db.latest_summaries(conn, links["children"])
         children = filter(None, (kanban_db.get_task(conn, cid) for cid in links["children"]))
-        _attach_diagnostics(task_d, _compute_task_diagnostics(conn, task_ids=[task_id]).get(task_id) or [])
+        _attach_diagnostics(task_d, _compute_task_diagnostics(conn, task_ids=[task_id], board=board).get(task_id) or [])
         return {
             "task": task_d,
             "comments": [asdict(c) for c in kanban_db.list_comments(conn, task_id)],
@@ -580,6 +587,13 @@ class UpdateTaskBody(BaseModel):
     lifecycle_contract: Optional[dict] = None
     expected_version: Optional[int] = None
     reason: Optional[str] = None
+    # Same CAS requeue transitions as the CLI/tool. ``transition`` always means
+    # "the user explicitly acknowledged this", so it never rides along with the
+    # dashboard's default expected_version/reason.
+    transition: Optional[str] = None
+    # The PR URLs the operator is authorizing; required with a
+    # ``continue_existing_pr`` transition and matched against the task.
+    authorized_pr_urls: Optional[list[str]] = None
     # In a PATCH ``None`` means "field not sent", so ``clear_*=True`` is the explicit clear signal.
     # ``reasoning_effort="none"`` is a VALUE (thinking off); it is cleared separately so
     # dropping a model override doesn't silently reset the depth.
@@ -741,6 +755,11 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     raise _conflict(f"status transition to {s!r} not valid from current state")
 
 
+def _requested_transition(payload: UpdateTaskBody) -> Optional[str]:
+    """The CAS requeue transition explicitly asked for, or None."""
+    return (payload.transition or "").strip() or None
+
+
 def _patch_title_body(
     conn,
     task_id: str,
@@ -749,12 +768,14 @@ def _patch_title_body(
     *,
     expected_version: Optional[int] = None,
 ) -> None:
-    """Revise goal fields through the same optimistic-concurrency API as CLI/tools."""
+    """Revise goal fields (and/or run an explicit CAS transition) through the
+    same optimistic-concurrency API as CLI/tools."""
     sent = getattr(payload, "model_fields_set", getattr(payload, "__fields_set__", set()))
     wants_title = "title" in sent
     wants_body = "body" in sent
     wants_lifecycle = "lifecycle_contract" in sent
-    if not (wants_title or wants_body or wants_lifecycle):
+    transition = _requested_transition(payload)
+    if not (wants_title or wants_body or wants_lifecycle or transition):
         return
     if wants_title and (payload.title is None or not payload.title.strip()):
         raise HTTPException(status_code=400, detail="title cannot be empty")
@@ -778,6 +799,8 @@ def _patch_title_body(
             lifecycle_contract=(
                 payload.lifecycle_contract if wants_lifecycle else kanban_db._UPDATE_UNSET
             ),
+            transition=transition,
+            authorized_pr_urls=payload.authorized_pr_urls,
             author="dashboard",
         )
     _require_ok(ok)
@@ -803,6 +826,31 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         sent = getattr(payload, "model_fields_set", getattr(payload, "__fields_set__", set()))
         if "title" in sent and (payload.title is None or not payload.title.strip()):
             raise HTTPException(status_code=400, detail="title cannot be empty")
+        transition = _requested_transition(payload)
+        if transition is not None:
+            # A transition is an explicit, audited acknowledgment: it may not
+            # borrow the dashboard's implicit version/reason defaults, and it is
+            # not a drag-and-drop status change.
+            if transition not in ("triage_to_ready", "continue_existing_pr"):
+                raise HTTPException(
+                    status_code=400, detail=f"unsupported transition {transition!r}")
+            if payload.status is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="status and transition cannot be combined in one request")
+            if payload.expected_version is None:
+                raise HTTPException(
+                    status_code=400, detail="transition requires an explicit expected_version")
+            if not (payload.reason or "").strip():
+                raise HTTPException(
+                    status_code=400, detail="transition requires a reason")
+        if transition == "continue_existing_pr" and not payload.authorized_pr_urls:
+            raise HTTPException(
+                status_code=400,
+                detail="continue_existing_pr requires authorized_pr_urls")
+        cas_fields = {"title", "body", "lifecycle_contract"}
+        if transition is not None:
+            cas_fields.add("transition")
         if payload.status is not None:
             contract = current.lifecycle_contract or {}
             goal_changed = (
@@ -837,7 +885,8 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 _require_ok(ok)
         if payload.priority is not None:
             _set_priority(conn, task_id, payload.priority, board)
-        if {"title", "body", "lifecycle_contract"} & set(sent):
+        wants_cas_update = bool(cas_fields & set(sent))
+        if wants_cas_update:
             _patch_title_body(
                 conn,
                 task_id,
@@ -848,7 +897,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # Domain status/assignment/priority/override mutators record their own
         # events, but this route owns the optimistic-concurrency version.
         if (
-            not ({"title", "body", "lifecycle_contract"} & set(sent))
+            not wants_cas_update
             and (
                 payload.status is not None
                 or payload.assignee is not None
@@ -1079,7 +1128,7 @@ def list_diagnostics(
     """Tasks with an active diagnostic, highest severity first then most recent; also
     consumed by ``hermes kanban diagnostics`` when the dashboard runs."""
     with _board_conn(board) as (board, conn):
-        diags_by_task = _compute_task_diagnostics(conn, task_ids=None)
+        diags_by_task = _compute_task_diagnostics(conn, task_ids=None, board=board)
         if severity and diags_by_task:
             diags_by_task = {
                 tid: keep

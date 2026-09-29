@@ -392,3 +392,168 @@ def test_tool_update_matches_cli_and_tool_show_effective_goal(
     shown = json.loads(kanban_tools._handle_show({"task_id": tool_task}))
     assert shown["task"]["version"] == 2
     assert shown["effective_goal"] == tool_payload["effective_goal"]
+
+
+# ---------------------------------------------------------------------------
+# continue_existing_pr — explicit acknowledgment of already-published PR work
+# ---------------------------------------------------------------------------
+
+_PR_URL = "https://github.com/example/repo/pull/21"
+
+
+def _pr_task(conn, **kwargs):
+    tid = kb.create_task(conn, title="published work", assignee="default", **kwargs)
+    kb.add_comment(conn, tid, author="worker", body=f"Published {_PR_URL}; continue, do not recreate.")
+    return tid
+
+
+def test_continue_existing_pr_is_the_only_acknowledgment(kanban_home, capsys, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "cto")
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    with kbc.connect_closing() as conn:
+        tid = _pr_task(conn)
+        version = kb.get_task(conn, tid).version
+
+    # An ordinary CAS goal revision leaves the card held.
+    assert _run_cli(
+        "update", tid, "--expected-version", str(version),
+        "--reason", "Polish the PR with review loops", "--body", "Polish the PR with review loops.",
+    ) == 0
+    with kbc.connect_closing() as conn:
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+        version = kb.get_task(conn, tid).version
+
+    shown_before = _capture_show(tid, capsys)
+    assert shown_before["dispatch_guard"] is not None
+    assert shown_before["dispatch_guard"]["reason"] == "active_pr"
+    assert "continue_existing_pr" in shown_before["dispatch_guard"]["recovery"]
+
+    assert _run_cli(
+        "update", tid, "--expected-version", str(version),
+        "--reason", "Explicitly authorized: continue the existing PR",
+        "--transition", "continue_existing_pr", "--authorized-pr", _PR_URL,
+    ) == 0
+    with kbc.connect_closing() as conn:
+        assert kbd.check_respawn_guard(conn, tid) is None
+        assert kb._pr_continuation(conn, tid)["pr_urls"] == [_PR_URL]
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "pr_continuation_authorized"]
+        assert len(events) == 1
+
+    assert _capture_show(tid, capsys)["dispatch_guard"] is None
+
+
+def _capture_show(tid: str, capsys) -> dict:
+    """Run ``kanban show --json`` and parse its payload (clearing prior output)."""
+    capsys.readouterr()
+    assert _run_cli("show", tid, "--json") == 0
+    return json.loads(capsys.readouterr().out)
+
+
+def test_continue_existing_pr_goal_and_authorization_are_atomic(kanban_home, capsys):
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    with kbc.connect_closing() as conn:
+        tid = _pr_task(conn)
+        version = kb.get_task(conn, tid).version
+
+    assert _run_cli(
+        "update", tid, "--expected-version", str(version),
+        "--reason", "authorized repair", "--title", "authorized scoped goal",
+        "--transition", "continue_existing_pr", "--authorized-pr", _PR_URL,
+    ) == 0
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        goal = kb.get_effective_goal(conn, tid)
+        authorization = kb._pr_continuation(conn, tid)
+        assert task.title == "authorized scoped goal"
+        assert task.status == "ready"
+        assert authorization["goal_revision_id"] == task.goal_revision_id
+        assert goal["title"] == "authorized scoped goal"
+        assert kbd.check_respawn_guard(conn, tid) is None
+        assert len([e for e in kb.list_events(conn, tid) if e.kind == "pr_continuation_authorized"]) == 1
+
+
+def test_continue_existing_pr_respects_unmet_typed_dependencies(kanban_home):
+    with kbc.connect_closing() as conn:
+        parent = kb.create_task(conn, title="open parent", assignee="cto")
+        tid = _pr_task(conn, parents=[parent])
+        assert kb.get_task(conn, tid).status == "todo"
+        assert kb.update_task(
+            conn, tid, expected_version=kb.get_task(conn, tid).version,
+            reason="authorized but upstream unfinished",
+            transition="continue_existing_pr",
+            authorized_pr_urls=[_PR_URL],
+        )
+        # Authorization is recorded, but the dependency gate still decides the
+        # landing column — never 'ready' past an unfinished parent.
+        assert kb.get_task(conn, tid).status == "todo"
+        assert kb._pr_continuation(conn, tid) is not None
+        assert not kb.evaluate_dependencies(conn, tid)["satisfied"]
+
+
+def test_tool_update_and_show_expose_continuation_parity(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "cto")
+    from tools import kanban_tools
+
+    with kbc.connect_closing() as conn:
+        tid = _pr_task(conn)
+        version = kb.get_task(conn, tid).version
+
+    held = json.loads(kanban_tools._handle_show({"task_id": tid}))
+    assert held["dispatch_guard"]["reason"] == "active_pr"
+
+    payload = json.loads(kanban_tools._handle_update({
+        "task_id": tid,
+        "expected_version": version,
+        "reason": "Explicitly authorized: continue the existing PR",
+        "transition": "continue_existing_pr",
+        "authorized_pr_urls": [_PR_URL],
+    }))
+    assert payload["ok"] is True
+    assert payload["version"] == version + 1
+    assert payload["status"] == "ready"
+
+    cleared = json.loads(kanban_tools._handle_show({"task_id": tid}))
+    assert cleared["dispatch_guard"] is None
+
+    listed = json.loads(kanban_tools._handle_list({"assignee": "default"}))
+    assert listed["tasks"][0]["dispatch_guard"] is None
+
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+        assert kb._pr_continuation(conn, tid)["event_id"] > 0
+
+
+def test_cli_diagnostics_recovery_command_names_the_selected_board(kanban_home, capsys):
+    """`--board other diagnostics` must suggest a command for that board.
+
+    The board override is scoped to the invocation, so a hint that omits
+    ``--board`` would send the operator at whichever board is current later.
+    """
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    kb.create_board("other")
+    with kbc.connect(board="other") as conn:
+        tid = kb.create_task(conn, title="held elsewhere", assignee="default")
+        kb.add_comment(conn, tid, author="worker", body=_PR_URL)
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+    assert _run_cli(
+        "--board", "other", "diagnostics", "--task", tid, "--json",
+    ) == 0
+    rows = json.loads(capsys.readouterr().out)
+    hints = [
+        action["payload"]["command"]
+        for row in rows
+        for diag in row["diagnostics"]
+        if diag["kind"] == "respawn_guarded"
+        for action in diag["actions"]
+        if action["kind"] == "cli_hint"
+    ]
+    assert hints, rows
+    # Every offered command must target the board that was inspected.
+    assert all(cmd.startswith("hermes kanban --board other ") for cmd in hints), hints
+    recovery = [cmd for cmd in hints if "continue_existing_pr" in cmd]
+    assert recovery, hints
+    assert "--transition continue_existing_pr" in recovery[0]
