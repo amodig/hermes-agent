@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from typing import List, Dict, Any
 
@@ -930,3 +931,226 @@ class TestDeferredCallSchemaProbe:
         }, calls)
 
         assert validate_deferred_call_args(name, {"payload": {"anything": True}}) is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #41 — native CAS discovery in the FINAL model-facing catalog, without
+# widening authority.
+#
+# The defect: kanban_update was absent from toolsets._HERMES_CORE_TOOLS, so the
+# deferral classifier treated it as a plugin tool and dropped its direct schema
+# during final tool-search assembly. An unscoped CTO orchestrator therefore had
+# no native way to revise a card. The gate that hides it from dispatched
+# workers must survive the fix, so every case runs in a fresh process with its
+# own home/board (registry, check_fn TTL cache and env die with it).
+# ---------------------------------------------------------------------------
+
+_ISSUE41_SCRIPT = r'''
+import contextlib
+import json
+import os
+
+CASE = os.environ["ISSUE41_CASE"]
+
+from tools.registry import discover_builtin_tools, registry
+
+discover_builtin_tools()
+registry.register(
+    name="mcp_issue41_probe",
+    handler=lambda args, **kw: json.dumps({"ok": True}),
+    schema={
+        "name": "mcp_issue41_probe",
+        "description": "Unused local capability that forces active tool deferral",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    toolset="mcp-issue41-probe",
+)
+
+import model_tools
+from tools.tool_search_catalog import BRIDGE_TOOL_NAMES
+
+TOOLSETS = os.environ.get("ISSUE41_TOOLSETS")
+TOOLSETS = json.loads(TOOLSETS) if TOOLSETS else None
+RESULT = {}
+
+
+def names():
+    defs = model_tools.get_tool_definitions(enabled_toolsets=TOOLSETS, quiet_mode=True)
+    return sorted({td["function"]["name"] for td in defs})
+
+
+def run_scope():
+    RESULT["names"] = names()
+    if CASE == "delegated_child":
+        # A delegate_task child may read the catalog but must not mutate.
+        RESULT["direct"] = call(
+            board="default", task_id=seed, expected_version=seed_version,
+            reason="Issue 41 native CAS proof",
+            body="Revised effective goal from the parent CTO session.",
+        )
+    elif CASE == "catalog":
+        RESULT["first"] = call(
+            board="default", task_id=seed, expected_version=seed_version,
+            reason="Issue 41 native CAS proof",
+            body="Revised effective goal from the parent CTO session.",
+        )
+        RESULT["stale"] = call(
+            board="default", task_id=seed, expected_version=seed_version,
+            reason="stale repeat", body="stale version must not apply",
+        )
+        RESULT["missing_reason"] = call(
+            board="default", task_id=seed, expected_version=seed_version + 1,
+            body="reason is required",
+        )
+    elif CASE == "worker":
+        RESULT["direct"] = call(
+            board="default", task_id=seed, expected_version=seed_version,
+            reason="Issue 41 native CAS proof",
+            body="Revised effective goal from the parent CTO session.",
+        )
+    with kbc.connect_closing() as conn:
+        RESULT["version_after"] = kb.get_task(conn, seed).version
+        RESULT["body_after"] = kb.get_effective_goal(conn, seed)["body"]
+
+
+RESULT["bridge"] = sorted(BRIDGE_TOOL_NAMES)
+
+if CASE == "no_kanban":
+    RESULT["names"] = names()
+else:
+    from agent.delegation_context import delegated_child_context
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    # The board is seeded by a normal session; only the probed calls run inside
+    # the context under test.
+    kb.init_db()
+    with kbc.connect_closing() as conn:
+        seed = kb.create_task(
+            conn,
+            title="Issue 41 CAS seed",
+            body="Triage seed for the native CAS probe.",
+            triage=True,
+        )
+        seed_version = kb.get_task(conn, seed).version
+
+    def call(**args):
+        return json.loads(model_tools.handle_function_call("kanban_update", args))
+
+    if CASE == "delegated_child":
+        with delegated_child_context():
+            run_scope()
+    else:
+        run_scope()
+
+print(json.dumps(RESULT))
+'''
+
+
+class TestIssue41NativeCasCatalog:
+    """Final catalog + authority for the native Kanban CAS tool."""
+
+    PROBE_SCRIPT = _ISSUE41_SCRIPT
+
+    def _run(self, tmp_path, case, *, toolsets=("kanban", "mcp-issue41-probe"),
+             enabled=None, env_extra=None):
+        """Run one catalog/authority case in its own process, home and board."""
+        home = tmp_path / case / "home"
+        hermes_home = tmp_path / case / ".hermes"
+        home.mkdir(parents=True)
+        hermes_home.mkdir(parents=True)
+        listing = "".join(f"  - {name}\n" for name in toolsets)
+        (hermes_home / "config.yaml").write_text(
+            f"toolsets:\n{listing}tools:\n  tool_search:\n    enabled: \"on\"\n",
+            encoding="utf-8",
+        )
+        script = tmp_path / case / "probe.py"
+        script.write_text(self.PROBE_SCRIPT, encoding="utf-8")
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(home),
+            "PYTHONPATH": _REPO_ROOT,
+            "PYTHONUNBUFFERED": "1",
+            "HERMES_HOME": str(hermes_home),
+            "HERMES_PROFILE": "cto",
+            "ISSUE41_CASE": case,
+            "ISSUE41_TOOLSETS": json.dumps(list(enabled)) if enabled else "",
+            **(env_extra or {}),
+        }
+        completed = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=_REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        assert completed.returncode == 0, completed.stderr[-4000:]
+        return json.loads(completed.stdout.strip().splitlines()[-1])
+
+    def test_unscoped_orchestrator_keeps_direct_native_cas_tool(self, tmp_path):
+        from tools.tool_search_catalog import BRIDGE_TOOL_NAMES
+
+        result = self._run(
+            tmp_path, "catalog", enabled=["kanban", "mcp-issue41-probe"])
+
+        # The probe is a real deferrable capability, so assembly is active and
+        # the local MCP-style tool is behind the bridge...
+        assert "mcp_issue41_probe" not in result["names"]
+        assert set(BRIDGE_TOOL_NAMES) <= set(result["names"])
+        # ...while the native CAS tool stays direct in the FINAL catalog.
+        assert "kanban_update" in result["names"]
+
+        # A real audited CAS update through the dispatcher: version and goal
+        # revision advance once, on the same card.
+        first = result["first"]
+        assert first["ok"] is True, first
+        assert first["version"] == 2
+        assert first["effective_goal"]["body"] == (
+            "Revised effective goal from the parent CTO session.")
+        assert result["version_after"] == 2
+        assert result["body_after"] == "Revised effective goal from the parent CTO session."
+
+        # A stale repeat and a reason-less update both fail and change nothing.
+        for refused in ("stale", "missing_reason"):
+            assert result[refused].get("ok") is not True, result[refused]
+            assert "error" in result[refused]
+        assert result["version_after"] == 2
+        assert result["body_after"] == "Revised effective goal from the parent CTO session."
+
+    @pytest.mark.parametrize(
+        "case,env_extra",
+        [
+            ("worker", {"HERMES_KANBAN_TASK": "t_issue41_worker",
+                        "HERMES_KANBAN_RUN_ID": "1"}),
+            ("delegated_child", {}),
+        ],
+    )
+    def test_scoped_workers_do_not_receive_or_apply_native_cas(
+        self, tmp_path, case, env_extra
+    ):
+        result = self._run(tmp_path, case, enabled=["kanban", "mcp-issue41-probe"],
+                           env_extra=env_extra)
+
+        assert "kanban_update" not in result["names"]
+        refused = result["direct"]
+        assert refused.get("ok") is not True, refused
+        assert "error" in refused
+        # The board is untouched, and a dispatched CTO worker still gets the
+        # lifecycle handoff tools it legitimately owns.
+        assert result["version_after"] == 1
+        assert result["body_after"] == "Triage seed for the native CAS probe."
+        if case == "worker":
+            assert "kanban_complete" in result["names"]
+
+    def test_profile_without_kanban_toolset_stays_hidden(self, tmp_path):
+        from tools.tool_search_catalog import BRIDGE_TOOL_NAMES
+
+        result = self._run(
+            tmp_path, "no_kanban", toolsets=("mcp-issue41-probe",), enabled=None)
+
+        assert "kanban_update" not in result["names"]
+        assert "kanban_complete" not in result["names"]
+        # The catalog is genuinely assembled (not empty by accident).
+        assert "mcp_issue41_probe" not in result["names"]
+        assert set(BRIDGE_TOOL_NAMES) <= set(result["names"])

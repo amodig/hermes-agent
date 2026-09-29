@@ -292,10 +292,12 @@ def _prepare_completion_handoff(
     supplied = _kb._handoff_fields(updated)
     dependent_children = _handoff_children(conn, task_id)
     effective_goal = _kb.get_effective_goal(conn, task_id)
+    task_contract = task.lifecycle_contract or {}
     contract_reason = _kb._completion_contract_reason(
         effective_goal,
         supplied.get("changed_files"),
         dependent_children,
+        lifecycle_contract=task_contract,
     )
     if contract_reason:
         raise _kb.CompletionContractError(
@@ -303,7 +305,6 @@ def _prepare_completion_handoff(
             contract_reason,
             changed_files=supplied.get("changed_files"),
         )
-    task_contract = task.lifecycle_contract or {}
     if (
         task.workflow_template_id == "kanban_swarm_v1"
         and task_contract.get("kind") != "code"
@@ -370,6 +371,7 @@ def _prepare_completion_handoff(
                 effective_goal,
                 merged_handoff.get("changed_files"),
                 dependent_children,
+                lifecycle_contract=task_contract,
             )
             if contract_reason:
                 raise _kb.CompletionContractError(
@@ -424,6 +426,7 @@ def _prepare_completion_handoff(
         effective_goal,
         snapshot_files,
         dependent_children,
+        lifecycle_contract=task_contract,
     )
     if contract_reason:
         raise _kb.CompletionContractError(
@@ -487,6 +490,7 @@ def _prepare_completion_handoff(
         effective_goal,
         normalized_handoff.get("changed_files"),
         dependent_children,
+        lifecycle_contract=task_contract,
     )
     if contract_reason:
         raise _kb.CompletionContractError(

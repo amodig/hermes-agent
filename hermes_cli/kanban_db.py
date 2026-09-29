@@ -2751,7 +2751,21 @@ def _completion_contract_reason(
     goal: Optional[dict],
     changed_files: Optional[Iterable[str]],
     dependent_children: Iterable[tuple[str, str]],
+    *,
+    lifecycle_contract: Optional[dict],
 ) -> Optional[str]:
+    """Why a nonempty patch conflicts with the effective goal, or None.
+
+    An already-decoded ``kind="code"`` contract is authoritative: the card is an
+    implementation card, so goal prose that only scopes out other work (or quotes
+    this classifier) must not be read as a plan-only objective (#41). Prose still
+    constrains *which* work is authorized; it just cannot reclassify the card.
+    """
+    if (
+        isinstance(lifecycle_contract, Mapping)
+        and lifecycle_contract.get("kind") == "code"
+    ):
+        return None
     if isinstance(changed_files, str):
         files = [changed_files] if changed_files.strip() else []
     else:
@@ -2759,15 +2773,22 @@ def _completion_contract_reason(
     children = list(dependent_children)
     if not files or not children or not isinstance(goal, dict):
         return None
-    goal_text = "\n".join(str(goal.get(key) or "") for key in ("title", "body"))
-    if not _PLAN_ONLY_GOAL_RE.search(goal_text):
+    match = field = None
+    for candidate in ("title", "body"):
+        match = _PLAN_ONLY_GOAL_RE.search(str(goal.get(candidate) or ""))
+        if match:
+            field = candidate
+            break
+    if match is None or field is None:
         return None
     revision = goal.get("version", goal.get("goal_version", 1))
     roles = ", ".join(f"{task_id} ({role})" for task_id, role in children)
     return (
         f"effective goal revision v{revision} is plan-only/no implementation, "
         f"but the handoff contains a non-empty patch ({', '.join(files)}) "
-        f"for dependent review task(s): {roles}"
+        f"for dependent review task(s): {roles} "
+        f"(matched {match.group(0)!r} in effective_goal.{field} "
+        f"at characters {match.start()}:{match.end()})"
     )
 
 def _handoff_fields(metadata: Any) -> dict[str, Any]:

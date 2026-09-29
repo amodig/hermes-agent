@@ -32,6 +32,7 @@ _HERMES_CORE_TOOLS = [
     "kanban_heartbeat",
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
+    "kanban_update",  # orchestrator CAS revision: direct, not tool-search-only (#41)
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
     "computer_use",
 ]

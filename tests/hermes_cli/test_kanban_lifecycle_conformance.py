@@ -3981,6 +3981,64 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
                 self._state(implementation)["lifecycle"]["acceptance"], "accepted")
             self.assertEqual([call[0] for call in judge.calls], ["implementation", "review"])
 
+    # --- surface 3: typed code outranks plan-only prose --------------------
+    PLAN_ONLY_PHRASING_GOALS = (
+        # issue #41: the exclusion applies to sibling work (#486), not to this card.
+        "Implement the bounded repair and regression tests. "
+        "Review/comment scope only, no implementation of #486.",
+        # The goal names the classifier defect it is NOT making.
+        "IMPLEMENTATION task: implement the repair and regression tests. "
+        "If this goal still produces plan-only rejection, report the tooling defect.",
+    )
+
+    def test_code_typed_handoff_ignores_plan_only_phrasing(self) -> None:
+        # Invariant: the decoded kind=code contract decides that this handoff is
+        # an implementation handoff. Goal prose that scopes out other work or
+        # quotes the classifier defect must not turn a real patch into a
+        # plan-only violation, and the card, its goal revision, its graph and
+        # the reviewer/tester gates must survive the handoff unchanged.
+        for index, goal in enumerate(self.PLAN_ONLY_PHRASING_GOALS):
+            for surface in ("tool_request_review", "tool_complete"):
+                with self.subTest(goal=index, surface=surface):
+                    repo, base = self._repo()
+                    self.GOAL = goal
+                    tid, validation, run = self._same_card_graph(
+                        repo, goal_mode=False, validation_required=True)
+                    head = self._commit(repo, 1)
+                    with kbc.connect_closing() as conn:
+                        goal_before = kb.get_effective_goal(conn, tid)
+                        task_before = kb.get_task(conn, tid)
+                    metadata = {"base_sha": base, "head_sha": head}
+                    if index == 0:
+                        # One case relies on the verified Git diff for
+                        # changed_files, so both classifier entries are covered.
+                        metadata["changed_files"] = ["phase.py"]
+                    out = self._handoff(surface, tid, run, base, head, metadata=metadata)
+                    self.assertTrue(isinstance(out, dict) and out.get("ok"), out)
+
+                    state = self._state(tid)
+                    self.assertEqual(state["task"].id, tid)
+                    self.assertEqual(state["task"].status, "review")
+                    self.assertEqual(state["task"].assignee, "reviewer")
+                    self.assertEqual(state["task"].candidate_run_id, run.current_run_id)
+                    self.assertEqual(
+                        state["task"].goal_revision_id, task_before.goal_revision_id)
+                    self.assertEqual(state["lifecycle"]["acceptance"], "pending")
+                    self.assertIn("review_requested", [e.kind for e in state["events"]])
+                    with kbc.connect_closing() as conn:
+                        handoff = kb.latest_handoff(conn, tid)
+                        goal_after = kb.get_effective_goal(conn, tid)
+                        validation_after = kb.get_task(conn, validation)
+                    self.assertEqual(
+                        (goal_after["id"], goal_after["version"]),
+                        (goal_before["id"], goal_before["version"]),
+                    )
+                    self.assertEqual(handoff["head_sha"], head)
+                    self.assertIn("phase.py", handoff["changed_files"])
+                    self.assertEqual(validation_after.id, validation)
+                    self.assertEqual(validation_after.status, "blocked")
+                    self.assertFalse(self._claims(validation))
+
 
 if __name__ == "__main__":
     unittest.main()

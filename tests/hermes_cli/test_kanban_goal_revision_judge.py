@@ -318,6 +318,64 @@ def test_plan_only_nonempty_patch_is_rejected_before_reviewer_or_tester_release(
     assert "changed.py" in event["payload"]
 
 
+@pytest.mark.parametrize("field", ["title", "body"])
+def test_plan_only_refusal_names_the_matched_goal_span(kanban_home, tmp_path, field):
+    """A genuine plan-only refusal must say which goal field matched what, so the
+    operator can tell a real no-implementation objective from an incidental match."""
+    phrase = "Plan-only: no implementation is permitted."
+    repo, base, branch = _git_repo(tmp_path)
+    with kbc.connect_closing() as conn:
+        fields = {"title": "Implementation handoff", "body": "Implement the change."}
+        fields[field] = phrase
+        task_id = kb.create_task(
+            conn,
+            title=fields["title"],
+            body=fields["body"],
+            assignee="implementer",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name=branch,
+        )
+        reviewer = kb.create_task(
+            conn, title="Review implementation", assignee="reviewer", parents=[task_id]
+        )
+        tester = kb.create_task(
+            conn, title="Test implementation", assignee="tester", parents=[task_id]
+        )
+        head = _commit(repo)
+
+        with pytest.raises(kb.CompletionContractError) as refusal:
+            kb.request_review(
+                conn,
+                task_id,
+                summary="Implementation is ready.",
+                metadata={"base_sha": base, "head_sha": head},
+            )
+
+        reason = refusal.value.reason
+        event = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        task_after = kb.get_task(conn, task_id)
+        reviewer_after = kb.get_task(conn, reviewer)
+        tester_after = kb.get_task(conn, tester)
+
+    other = "body" if field == "title" else "title"
+    assert f"effective_goal.{field} at characters 0:9" in reason
+    assert "'Plan-only'" in reason
+    assert f"effective_goal.{other} at characters" not in reason
+    # The pre-existing explanation is retained, not replaced.
+    assert "v1" in reason and "changed.py" in reason
+    assert json.loads(event["payload"])["reason"] == reason
+    assert event["kind"] == "completion_blocked_contract"
+    assert task_after is not None and task_after.status == "ready"
+    assert task_after.version == 1
+    assert reviewer_after is not None and reviewer_after.status == "todo"
+    assert tester_after is not None and tester_after.status == "todo"
+
+
 def test_specifier_output_becomes_effective_goal_revision(kanban_home, monkeypatch):
     from hermes_cli import kanban_specify
 
