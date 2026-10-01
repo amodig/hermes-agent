@@ -1468,7 +1468,7 @@ def _drive_gateway_ticks(
     default_pending = [f"default/{tid}" for tid, _reason in (results[0].respawn_guarded or [])]
 
     class _FakeDispatcher:
-        def __init__(self, kb, settings, should_stop=None):  # noqa: D107 - test double
+        def __init__(self, kb, settings, should_stop=None, grant_guard=None):  # noqa: D107 - test double
             pass
 
         def tick_once(self):

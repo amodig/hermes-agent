@@ -142,7 +142,6 @@ def test_no_barrier_grants_work_once_a_stop_is_observed(
 
     assert stub.grants == [], "a stopping gateway must never grant"
     assert result.spawned == []
-    assert result.interrupted == [tid]
     row = _row(conn, tid)
     assert row["consecutive_failures"] == 0, "shutdown must not consume a retry"
     assert _spawn_refused_phase(conn, tid) is None
@@ -152,6 +151,9 @@ def test_no_barrier_grants_work_once_a_stop_is_observed(
         assert stub.spawn_calls == 1
         assert stub.cancels == 1, "the prepared worker must be cancelled"
     if barrier == "before_grant":
+        # The card WAS claimed, so its run is closed and it needs an operator unblock.
+        assert result.interrupted == [tid]
+        assert result.cancelled == []
         assert row["status"] == "blocked"
         runs = conn.execute(
             "SELECT status, outcome FROM task_runs WHERE task_id = ?", (tid,),
@@ -161,6 +163,9 @@ def test_no_barrier_grants_work_once_a_stop_is_observed(
             kbd.LAUNCH_STOPPED_BLOCK_REASON
         ]
     else:
+        # Nothing was claimed: still queued, no run, nothing for the operator to unblock.
+        assert result.cancelled == [tid]
+        assert result.interrupted == []
         assert row["status"] == "ready", "an unclaimed card stays queued"
         assert row["current_run_id"] is None, "nothing may be claimed"
 
@@ -236,8 +241,10 @@ def test_only_proven_shutdown_excuses_a_launch_failure(conn, switch, monkeypatch
         result = kbd.dispatch_once(conn, failure_limit=3, should_stop=switch)
 
         # Earlier cards in this test are ``ready`` again, so the stub raised for
-        # them too; every assertion below is scoped to this card.
-        assert tid in result.interrupted
+        # them too; every assertion below is scoped to this card. Nothing was
+        # claimed, so this is a cancellation, not an operator-recovery pause.
+        assert tid in result.cancelled
+        assert tid not in result.interrupted
         assert _spawn_refused_phase(conn, tid) is None
         assert _row(conn, tid)["consecutive_failures"] == 0
 

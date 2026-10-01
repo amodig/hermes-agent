@@ -118,9 +118,14 @@ class DispatchResult:
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     interrupted: list[str] = field(default_factory=list)
-    """Task ids paused because the host that owned their in-flight run was
-    re-instantiated (reboot / container restart). Not a crash and not a breaker
-    trip: no failure was charged and the card waits for ``unblock_task``."""
+    """Task ids whose in-flight run the dispatcher ended as ``interrupted``:
+    the card is sticky-blocked and waits for ``unblock_task``. Not a crash and not
+    a breaker trip — no failure was charged."""
+    cancelled: list[str] = field(default_factory=list)
+    """Task ids whose LAUNCH the dispatcher cancelled before any run existed, so
+    the card is still queued with no durable state change and nothing to unblock.
+    Kept apart from ``interrupted`` so operator-recovery telemetry does not report
+    a paused card for a launch that never started."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
     timed_out: list[str] = field(default_factory=list)
@@ -2084,10 +2089,11 @@ def _launch_failure_phase(exc: BaseException) -> str:
 def _note_launch_cancelled(task_id: str, error: str, result: "DispatchResult") -> None:
     """Record a launch the dispatcher cancelled on purpose.
 
-    The card was never claimed, so there is nothing to undo in the DB and
-    nothing to charge: no failure, no ``spawn_refused`` event, still queued.
+    The card was never claimed, so there is nothing to undo in the DB and nothing
+    to charge: it lands in ``cancelled``, not ``interrupted``, because it needs no
+    operator unblock and no run was closed.
     """
-    result.interrupted.append(task_id)
+    result.cancelled.append(task_id)
     _kb._log.info(
         "kanban dispatcher: launch of %s cancelled for shutdown/drain (%s)",
         task_id, error[:200],

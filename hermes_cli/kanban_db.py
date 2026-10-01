@@ -313,7 +313,7 @@ def notify_task_updated(
 # DispatchResult counters whose non-zero value means the tick did something.
 _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "crashed", "stale",
-    "timed_out", "auto_blocked", "rate_limited", "interrupted",
+    "timed_out", "auto_blocked", "rate_limited", "interrupted", "cancelled",
     "auto_assigned_default", "respawn_guarded", "skipped_per_profile_capped",
     "skipped_unassigned", "skipped_nonspawnable",
 )

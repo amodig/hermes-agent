@@ -347,18 +347,20 @@ def _log_spawn_results(results: Optional[list]) -> bool:
             continue
         spawned = getattr(res, "spawned", None)
         interrupted = len(getattr(res, "interrupted", ()) or ())
+        cancelled = len(getattr(res, "cancelled", ()) or ())
         if spawned:
             any_spawned = True
-        if not spawned and not interrupted:
+        if not spawned and not interrupted and not cancelled:
             # Quiet by default: an idle gateway stays silent.
             continue
         logger.info(
             "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
-            "crashed=%d timed_out=%d interrupted=%d promoted=%d auto_blocked=%d",
+            "crashed=%d timed_out=%d interrupted=%d cancelled=%d promoted=%d auto_blocked=%d",
             slug, len(spawned or ()), res.reclaimed,
             len(res.crashed) if hasattr(res.crashed, "__len__") else 0,
             len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
             interrupted,
+            cancelled,
             res.promoted,
             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
         )
