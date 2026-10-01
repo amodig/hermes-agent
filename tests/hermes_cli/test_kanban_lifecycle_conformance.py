@@ -2542,6 +2542,8 @@ import sys
 from pathlib import Path
 from hermes_cli import _early_recovery as recovery
 from hermes_cli import _install_repair as repair
+from hermes_cli import kanban_runtime_generation as generations
+generations._runtime_storage_root = lambda: Path(sys.argv[2])
 root = Path(sys.argv[1])
 def install(*args):
     (root / "installer-ran").touch()
@@ -2562,9 +2564,9 @@ recovery.recover_if_needed(project_root=root, argv=[])
                 )
                 (source / marker).write_text("pid=0\n", encoding="utf-8")
                 env = {**os.environ, "PYTHONPATH": str(MODULE.RUNTIME_ROOT), "TMPDIR": raw}
-                command = [sys.executable, "-c", script, raw]
+                command = [sys.executable, "-c", script, raw, str(source / "runtime-storage")]
                 # Other test files share the interpreter installation, not this fixture's locks.
-                with patch.object(tempfile, "tempdir", raw), generations.installation_mutation_lock(source):
+                with patch.object(generations, "_runtime_storage_root", lambda: source / "runtime-storage"), generations.installation_mutation_lock(source):
                     deferred = subprocess.run(
                         command, env=env, capture_output=True, text=True, timeout=10,
                     )

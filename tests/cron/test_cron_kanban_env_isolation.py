@@ -33,6 +33,8 @@ import threading
 
 import pytest
 
+from tests.hermes_cli.test_kanban_gateway_restart_handoff import worker_setup  # noqa: F401
+
 
 @pytest.fixture(autouse=True)
 def _clear_kanban_detect_cache():
@@ -59,10 +61,6 @@ def worker_env(monkeypatch):
 # ---------------------------------------------------------------------------
 
 class TestDispatcherOwnedPredicate:
-    def test_default_is_dispatcher_owned(self):
-        from agent.delegation_context import is_dispatcher_owned_worker_context
-
-        assert is_dispatcher_owned_worker_context() is True
 
     def test_false_inside_non_dispatcher_context(self):
         from agent.delegation_context import (
@@ -172,15 +170,6 @@ class TestKanbanGatesRespectContext:
         with non_dispatcher_owned_context():
             assert kanban_tools._default_task_id("t_explicit") == "t_explicit"
 
-    def test_skill_environment_gate(self, worker_env):
-        from agent.delegation_context import non_dispatcher_owned_context
-        import agent.skill_utils as su
-
-        su._ENV_DETECT_CACHE.pop("kanban", None)
-        assert su._detect_environment("kanban") is True
-        with non_dispatcher_owned_context():
-            su._ENV_DETECT_CACHE.pop("kanban", None)
-            assert su._detect_environment("kanban") is False
 
     def test_kanban_env_verdict_is_not_memoized(self, worker_env):
         """`kanban` must bypass _ENV_DETECT_CACHE: caching it process-wide would
@@ -274,7 +263,6 @@ class TestRunJobKanbanIsolation:
 
     def test_agent_runs_as_non_dispatcher(self, monkeypatch, worker_env):
         import cron.scheduler as sched
-        from cron import scheduler_delivery as sched_delivery
 
         observed: dict = {}
         self._install_stubs(monkeypatch, observed)
@@ -288,7 +276,6 @@ class TestRunJobKanbanIsolation:
         """The whole point of the ContextVar: os.environ must not be mutated, so
         the worker's claim heartbeat and the gateway watchers keep working."""
         import cron.scheduler as sched
-        from cron import scheduler_delivery as sched_delivery
 
         before = {
             k: v for k, v in os.environ.items() if k.startswith("HERMES_KANBAN_")
@@ -309,20 +296,9 @@ class TestRunJobKanbanIsolation:
         }
         assert after == before
 
-    def test_context_reset_after_job(self, monkeypatch, worker_env):
-        import cron.scheduler as sched
-        from cron import scheduler_delivery as sched_delivery
-        from agent.delegation_context import is_dispatcher_owned_worker_context
-
-        observed: dict = {}
-        self._install_stubs(monkeypatch, observed)
-
-        sched.run_job(self._job("kanban-iso-reset"))
-        assert is_dispatcher_owned_worker_context() is True
 
     def test_context_reset_even_when_job_raises(self, monkeypatch, worker_env):
         import cron.scheduler as sched
-        from cron import scheduler_delivery as sched_delivery
         from agent.delegation_context import is_dispatcher_owned_worker_context
 
         class ExplodingAgent:
@@ -352,7 +328,6 @@ class TestRunJobKanbanIsolation:
         restore this permanently destroyed the worker's identity; a ContextVar is
         per-thread and cannot."""
         import cron.scheduler as sched
-        from cron import scheduler_delivery as sched_delivery
 
         before = {
             k: v for k, v in os.environ.items() if k.startswith("HERMES_KANBAN_")
@@ -379,3 +354,34 @@ class TestRunJobKanbanIsolation:
         assert after == before, "worker identity must survive concurrent cron jobs"
 
 
+@pytest.mark.platforms("linux")
+def test_dispatcher_grants_only_the_assigned_worker_scope(worker_setup, monkeypatch):
+    from tests.hermes_cli.test_kanban_gateway_restart_handoff import _finish_launch
+    from tests.hermes_cli import kanban_conformance_fixture as fixture
+    from hermes_cli import kanban_db_dispatch as dispatch
+
+    workspace, task = worker_setup
+    # This assertion executes inside the real sealed worker, before its imports complete.
+    probe = workspace.parent / "install" / "fixture_early.py"
+    probe.write_text(
+        "import os\n"
+        "assert 'HERMES_DELEGATED_CHILD_CONTEXT' not in os.environ\n"
+        "assert os.environ['HERMES_KANBAN_TASK'] != 'prior-task'\n"
+        "value = 1\n", encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "prior-task")
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(workspace.parent))
+    launch = dispatch._default_spawn(task, str(workspace), board="default", defer_grant=True)
+    receipt = workspace.parent / "receipt.json"
+    try:
+        assert not receipt.exists()
+        launch.grant(task.current_run_id, task.claim_lock)
+        result = fixture._wait_for_receipt(receipt)
+        assert result["task"] == task.id
+        assert result["run"] == str(task.current_run_id)
+        assert result["claim"] == task.claim_lock
+        assert result["granted"] == "1"
+        assert os.environ["HERMES_KANBAN_TASK"] == "prior-task"
+        assert os.environ["HERMES_DELEGATED_CHILD_CONTEXT"] == str(workspace.parent)
+    finally:
+        _finish_launch(launch)

@@ -170,7 +170,7 @@ def _validate_lifecycle_role_identity(
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
-    workspace_kind: str = "scratch", workspace_path: Optional[str] = None,
+    workspace_kind: Optional[str] = None, workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 0,
     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
@@ -180,12 +180,18 @@ def create_task(
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
     lifecycle_contract: Optional[dict] = None,
+    creator_task_id: Optional[str] = None,
+    completion_contract: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
     New tasks always carry an explicit general contract when no contract is
     supplied.  Historical rows with NULL contracts are never backfilled.
     """
+    from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
+    from hermes_cli.kanban_pr_acceptance import validate_contract
+
+    completion_contract = validate_contract(completion_contract)
     _kb._ensure_goal_revision_schema(conn)
     lifecycle_json = encode_contract(lifecycle_contract, default_on_none=True)
     normalized_lifecycle = decode_contract(lifecycle_json)
@@ -210,6 +216,14 @@ def create_task(
         raise ValueError("title is required")
     if initial_status not in _kb.VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(_kb.VALID_INITIAL_STATUSES)}")
+    # Explicit scratch/project opt-outs must not inherit a board's repository.
+    if project_id is None and workspace_kind != "scratch":
+        try:
+            project_id = (_kb._board_meta_for(board).get("project_id") or "").strip() or None
+        except Exception:
+            pass
+    if workspace_kind is None:
+        workspace_kind = "scratch"
     if workspace_kind not in _kb.VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(_kb.VALID_WORKSPACE_KINDS)}, "
@@ -219,14 +233,6 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
-
-    # A project-scoped board anchors every new task to its project's repo
-    # (deterministic worktree + branch) without each surface repeating it.
-    if project_id is None:
-        try:
-            project_id = (_kb._board_meta_for(board).get("project_id") or "").strip() or None
-        except Exception:
-            pass
 
     project_id, project_obj, project_repo, workspace_kind = _kb._resolve_project_link(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
@@ -288,7 +294,7 @@ def create_task(
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
             with _kb.write_txn(conn, allow_nested=True):
-                task_status = _kb._initial_task_status(conn, parents, initial_status, triage)
+                task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
                 if task_status == "ready" and normalized_lifecycle and normalized_lifecycle.get("kind") == "review":
                     task_status = "review"
                 if (
@@ -314,8 +320,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id,
-                        lifecycle_contract, candidate_run_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        lifecycle_contract, candidate_run_id, completion_contract
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -325,7 +331,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _kb._opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _kb._opt_int(goal_max_turns), session_id,
-                        lifecycle_json, None,
+                        lifecycle_json, None, completion_contract,
                     ),
                 )
                 goal_author = str(created_by or os.environ.get("HERMES_PROFILE") or "system").strip() or "system"
@@ -378,6 +384,7 @@ def create_task(
                         "assignee": assignee,
                         "status": task_status,
                         "parents": list(parents),
+                        "creator_task_id": creator_task_id,
                         "tenant": tenant,
                         "workspace_kind": workspace_kind,
                         "workspace_path": workspace_path,
@@ -393,6 +400,19 @@ def create_task(
                 _validate_lifecycle_role_identity(
                     conn, normalized_lifecycle, assignee, task_id=task_id,
                 )
+                if task_status == "blocked":
+                    _kb._append_event(
+                        conn, task_id, "blocked",
+                        {"reason": "initial_status", "status": "blocked", "actor": created_by or "user"},
+                    )
+                elif task_status == "todo":
+                    blockers = evaluate_dependencies(conn, task_id)["blockers"]
+                    if blockers:
+                        _kb._append_event(
+                            conn, task_id, "dependency_wait",
+                            {"reason": "parent_not_done", "parent": blockers[0]["parent_id"]},
+                        )
+                inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 _kb._inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
@@ -454,7 +474,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             )
         else:
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
-        _kb._append_event(conn, task_id, "assigned", {"assignee": profile})
+        _kb._append_event(conn, task_id, "assigned", {"assignee": profile, "from": row["assignee"]})
     # Observer fires AFTER commit so subscribers see durable state.
     _kb.notify_task_updated(conn, task_id, ("assignee",))
     return True
@@ -469,14 +489,22 @@ def link_tasks(
     expected_child_version: Optional[int] = None,
     reason: Optional[str] = None,
     author: Optional[str] = None,
-) -> None:
+    expected_child_run_id: Optional[int] = None,
+) -> bool:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
-    terminations: list[tuple[Optional[int], Optional[str]]] = []
+    terminations: list[tuple[Optional[int], Optional[str], Any]] = []
     with _kb.write_txn(conn):
         missing = _kb._missing_task_ids(conn, [parent_id, child_id])
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
+        child = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (child_id,),
+        ).fetchone()
+        if child["status"] == "running" and (
+            expected_child_run_id is None or child["current_run_id"] != expected_child_run_id
+        ):
+            raise ValueError(f"cannot link {parent_id} -> {child_id}: child is already running")
         if _kb._would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
         requested = infer_edge_requirement(conn, parent_id, child_id) if requirement is None else validate_edge(
@@ -486,7 +514,7 @@ def link_tasks(
             (parent_id, child_id),
         ).fetchone()
         if existing is not None and existing["requirement"] == requested:
-            return
+            return False
         if conn.execute("SELECT status FROM tasks WHERE id = ?", (child_id,)).fetchone()["status"] == "archived":
             raise LifecycleContractError("cannot change dependencies of an archived task")
         acceptance_before = _capture_acceptance(conn, child_id, include_descendants=True)
@@ -543,19 +571,27 @@ def link_tasks(
             )
             _kb._inherit_notify_subs(conn, child_id, (parent_id,))
         dependencies = evaluate_dependencies(conn, child_id)
-        if any(blocker["parent_id"] == parent_id for blocker in dependencies["blockers"]):
+        owned_running = child["status"] == "running"
+        if not owned_running and any(blocker["parent_id"] == parent_id for blocker in dependencies["blockers"]):
             invalidation = invalidate_descendants_for_parent_reopen(
                 conn, parent_id, author=_kb._update_actor(author),
                 acceptance_before=acceptance_before, child_id=child_id,
             )
             terminations.extend(invalidation["terminations"])
-        elif not dependencies["satisfied"]:
+        elif not owned_running and not dependencies["satisfied"]:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'", (child_id,),
             )
         _emit_acceptance_changes(conn, acceptance_before, source_task_id=child_id)
-    for pid, claim_lock in terminations:
-        _kb._terminate_reclaimed_worker(pid, claim_lock)
+        gated = child["status"] == "ready" and _kb._task_status(conn, child_id) == "todo"
+        if gated:
+            _kb._append_event(
+                conn, child_id, "dependency_wait",
+                {"reason": "parent_not_done", "demoted": True, "parent": parent_id},
+            )
+    for pid, claim_lock, started_at in terminations:
+        _kb._terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
+    return gated
 
 def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     """Promote ``todo``/``blocked`` tasks whose parents are all done/archived;
@@ -731,7 +767,7 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             # consecutive_failures deliberately PRESERVED: review reopen is not
             # a success signal; only complete_task resets the breaker (#35072).
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
             + (", assignee = ?" if implementer else "")
             + " WHERE id = ? AND status = 'review'",
             params,
@@ -772,12 +808,12 @@ def invalidate_descendants_for_parent_reopen(
     emits their transitions in the same transaction.
 
     Returns ``{"invalidated": [{id, prior_status, new_status, resume_status}],
-    "terminations": [(worker_pid, claim_lock)]}``.
+    "terminations": [(worker_pid, claim_lock, worker_started_at)]}``.
     """
     caller_owns_txn = bool(conn.in_transaction)
     now = int(time.time())
     invalidated: list[dict[str, Any]] = []
-    terminations: list[tuple[Optional[int], Optional[str]]] = []
+    terminations: list[tuple[Optional[int], Optional[str], Any]] = []
     cause = (
         f"dependency {task_id} -> {child_id} changed"
         if child_id is not None else f"ancestor {task_id} reopened"
@@ -796,7 +832,7 @@ def invalidate_descendants_for_parent_reopen(
                 JOIN tasks parent ON parent.id = d.id
                 WHERE parent.status != 'archived'
             )
-            SELECT t.id, t.status, t.current_run_id, t.worker_pid, t.claim_lock,
+            SELECT t.id, t.status, t.current_run_id, t.worker_pid, t.claim_lock, t.worker_started_at,
                    t.assignee, t.lifecycle_contract
             FROM descendants d
             JOIN tasks t ON t.id = d.id
@@ -834,7 +870,7 @@ def invalidate_descendants_for_parent_reopen(
                 resume_status = _kb._resume_status_from_events(conn, row["id"])
             elif previous_status == "running":
                 resume_status = _kb._retry_status_for_run(conn, row["id"], row["current_run_id"])
-                terminations.append((row["worker_pid"], row["claim_lock"]))
+                terminations.append((row["worker_pid"], row["claim_lock"], row["worker_started_at"]))
                 run_id = _kb._end_run(
                     conn, row["id"], outcome="reclaimed", status="todo",
                     summary=cause,
@@ -845,7 +881,7 @@ def invalidate_descendants_for_parent_reopen(
             # docstring for why this diverges from reopen_review_task.
             conn.execute(
                 "UPDATE tasks SET status = ?, assignee = ?, completed_at = NULL, result = NULL, "
-                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                 "current_run_id = NULL, candidate_run_id = NULL, consecutive_failures = 0, "
                 "version = version + 1 WHERE id = ?", (new_status, assignee, row["id"]),
             )
@@ -879,8 +915,8 @@ def invalidate_descendants_for_parent_reopen(
     if not caller_owns_txn:
         # Standalone: committed above, audit trail durable, safe to kill now.
         # Composed calls leave this to the caller post-commit.
-        for pid, claim_lock in terminations:
-            _kb._terminate_reclaimed_worker(pid, claim_lock)
+        for pid, claim_lock, started_at in terminations:
+            _kb._terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
     return {"invalidated": invalidated, "terminations": terminations}
 
 def _lifecycle_graph_ids(

@@ -841,22 +841,28 @@ def test_generation_cleanup_is_confined_to_owned_worker_roots(runtime_storage, t
     assert live.is_dir()
 
 
-def test_generation_waits_for_source_and_dependency_transaction(installation):
+def test_generation_waits_for_source_and_dependency_transaction(installation, runtime_storage):
     source, _, _, _, _, _ = installation
     expected = runtime.runtime_identity(source)
+    writer_tmp = source.parent / "writer-scratch"
+    probe_tmp = source.parent / "probe-scratch"
+    writer_tmp.mkdir()
+    probe_tmp.mkdir()
     writer = subprocess.Popen(
         [sys.executable, "-c", """
 import sys
 from pathlib import Path
-from hermes_cli.kanban_runtime_generation import installation_mutation_lock
+from hermes_cli import kanban_runtime_generation as generation
+generation._runtime_storage_root = lambda: Path(sys.argv[2])
 root = Path(sys.argv[1])
-with installation_mutation_lock(root):
+with generation.installation_mutation_lock(root):
     (root / 'early.py').write_text("VALUE = 'new'\\n")
     print('half-written', flush=True)
     sys.stdin.readline()
     (root / 'late.py').write_text("VALUE = 'new'\\n")
-""", str(source)],
-        env={**os.environ, "PYTHONPATH": str(source), "HERMES_HOME": str(source / "other-profile")},
+""", str(source), str(runtime_storage)],
+        env={**os.environ, "PYTHONPATH": str(source), "HERMES_HOME": str(source / "other-profile"),
+             "TMPDIR": str(writer_tmp), "TEMP": str(writer_tmp), "TMP": str(writer_tmp)},
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     started = threading.Event()
@@ -868,14 +874,17 @@ with installation_mutation_lock(root):
         probe = subprocess.run(
             [sys.executable, "-c", """
 import sys
-from hermes_cli.kanban_runtime_generation import installation_mutation_lock
+from pathlib import Path
+from hermes_cli import kanban_runtime_generation as generation
+generation._runtime_storage_root = lambda: Path(sys.argv[2])
 try:
-    with installation_mutation_lock(sys.argv[1], blocking=False):
+    with generation.installation_mutation_lock(sys.argv[1], blocking=False):
         print('unexpected acquisition')
 except BlockingIOError:
     print('busy')
-""", str(source)],
-            env={**os.environ, "PYTHONPATH": str(source), "HERMES_HOME": str(source / "third-profile")},
+""", str(source), str(runtime_storage)],
+            env={**os.environ, "PYTHONPATH": str(source), "HERMES_HOME": str(source / "third-profile"),
+                 "TMPDIR": str(probe_tmp), "TEMP": str(probe_tmp), "TMP": str(probe_tmp)},
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10,
         )
         assert probe.returncode == 0, probe.stderr
@@ -913,6 +922,28 @@ def test_incomplete_installation_is_not_publishable(installation):
     (source / ".update-incomplete").write_text("interrupted", encoding="utf-8")
     with pytest.raises(runtime.RuntimeIdentityError):
         prepare()
+
+
+def test_pending_source_completion_blocks_generation_reuse_until_cleared(
+    installation, monkeypatch,
+):
+    from hermes_cli.venv_sync import arm_completion, clear_completion
+    from pm import environments
+
+    source, _, _, _, _, prepare = installation
+    monkeypatch.setattr(environments, "installs_root", lambda: source.parent / "install-state")
+    # An existing content publication must not bypass an unfinished update tail.
+    prepare()
+    pending = arm_completion(source)
+    with pytest.raises(runtime.RuntimeIdentityError, match="source-completion-pending"):
+        prepare()
+    assert pending.is_file()
+
+    clear_completion(source)
+    prepared = prepare()
+    observed = _finish(_launch(prepared))
+    assert observed["late"] == "old"
+    assert observed["dynamic"] == "old"
 
 
 def test_installed_metadata_can_locate_data_outside_site_packages(installation, monkeypatch):

@@ -63,6 +63,8 @@ def installation_mutation_lock(module_root=None, *, blocking=True):
 
     The UI update marker is deliberately not reused: it is profile-local,
     read-then-write, and fails open. OS locks are released on process death.
+
+    Locks live in the shared user cache, never a profile's scratch TMPDIR.
     """
     if os.environ.get(_GENERATION_ENV):
         raise _error("immutable workers cannot mutate their installed runtime")
@@ -81,12 +83,12 @@ def installation_mutation_lock(module_root=None, *, blocking=True):
         raise BlockingIOError(errno.EWOULDBLOCK, "runtime installation is being mutated")
     with ExitStack() as stack:
         stack.callback(mutex.release)
+        lock_dir = _runtime_storage_root().parent / "installation-locks"
+        lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         for key in sorted(map(str, keys)):
             if key in held:
                 continue
             digest = hashlib.sha256(key.encode()).hexdigest()
-            lock_dir = Path(tempfile.gettempdir()) / "hermes-installation-locks"
-            lock_dir.mkdir(mode=0o700, exist_ok=True)
             handle = stack.enter_context((lock_dir / digest).open("a+b"))
             if os.name == "nt":
                 import msvcrt
@@ -614,12 +616,17 @@ def _installed_resources(roots, mappings):
 
 def prepare_runtime_generation(expected_identity, *, workspace=None, profile_home=None, project_plugins_enabled: bool | None = None):
     from hermes_cli.kanban_runtime import RuntimeIdentity, runtime_identity, same_code_identity, _RUNTIME_RESOURCE_ROOTS
+    from hermes_cli.venv_sync import completion_pending_path
     expected = expected_identity if isinstance(expected_identity, RuntimeIdentity) else RuntimeIdentity.from_value(expected_identity)
     source = Path(expected.module_root).resolve()
     with installation_mutation_lock(source):
-        for marker in (".update-incomplete", ".lazy-refresh-incomplete"):
-            if (source / marker).exists():
-                raise _error(f"runtime installation needs recovery: {marker}")
+        for marker in (
+            source / ".update-incomplete",
+            source / ".lazy-refresh-incomplete",
+            completion_pending_path(source),
+        ):
+            if marker.exists():
+                raise _error(f"runtime installation needs recovery: {marker.name}")
         current = runtime_identity(source)
         if not same_code_identity(expected, current):
             raise _error("source runtime changed before generation preparation")

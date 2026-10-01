@@ -264,6 +264,8 @@ def _commit_completion(
     same_card_handoff: bool,
     same_card_changes: bool,
     expected_run_id: Optional[int],
+    force: bool,
+    pr_acceptance: Any,
     now: int,
     handoff_summary: Optional[str],
     summary: Optional[str],
@@ -274,11 +276,23 @@ def _commit_completion(
     run_id: Optional[int] = None
     synthetic_run_id: Optional[int] = None
     accepted_task_ids: list[str] = []
-    with _kb.write_txn(conn):
+    with _artifact_write_txn(conn) as staged_copies:
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
             return False, None, None, accepted_task_ids
+        trow = conn.execute(
+            "SELECT status, claim_lock, current_run_id, worker_pid, worker_started_at "
+            "FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if trow is None or (expected_run_id is not None and trow["current_run_id"] != expected_run_id):
+            return False, None, None, accepted_task_ids
+        if expected_run_id is None and not force and _kb._claim_is_live(trow):
+            raise _kb.LiveClaimError(task_id)
+        if pr_acceptance is not None:
+            from hermes_cli.kanban_pr_acceptance_store import record_acceptance
+            if not record_acceptance(conn, task_id, pr_acceptance):
+                return False, None, None, accepted_task_ids
         if _completion_contract_snapshot(conn, task_id) != preflight_contract:
             contract_err = _kb.CompletionContractError(
                 task_id,
@@ -391,6 +405,7 @@ def _commit_completion(
                            claim_lock   = NULL,
                            claim_expires= NULL,
                            worker_pid   = NULL,
+                           worker_started_at = NULL,
                            block_kind   = NULL,
                            block_recurrences = 0
                 """ + assignee_sql + """
@@ -428,7 +443,7 @@ def _commit_completion(
                     (lifecycle.get("candidate_run_id"), task_id),
                 )
             if isinstance(metadata, dict):
-                _stage_completion_artifacts(conn, task_id, metadata, now)
+                staged_copies.extend(_stage_completion_artifacts(conn, task_id, metadata, now))
             run_outcome = handoff_kind or "completed"
             run_id = _kb._end_run(
                 conn,
@@ -535,7 +550,7 @@ def complete_task(
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     verdict: Optional[str] = None,
-    fire_lifecycle_hook: bool = True,
+    fire_lifecycle_hook: bool = True, force: bool = False,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -546,6 +561,8 @@ def complete_task(
     ``created_cards`` are verified first — a phantom id raises
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
+    Non-review completion requires substantive result/summary evidence.
+    A live worker's run requires ``expected_run_id`` or explicit ``force``.
     """
     task_before = _kb.get_task(conn, task_id)
     typed_phase, same_card_handoff, same_card_changes = _completion_modes(
@@ -579,6 +596,7 @@ def complete_task(
         return False
     preflight_contract = _completion_contract_snapshot(conn, task_id)
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
+    _gate_empty_completion(conn, task_id, result=result, summary=summary)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
@@ -628,6 +646,13 @@ def complete_task(
                     )
                 raise
     handoff_summary = summary if summary is not None else result
+    from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance
+    pr_acceptance = (
+        None if same_card_handoff or same_card_changes
+        else prepare_acceptance(conn, task_id, expected_run_id, metadata)
+    )
+    if pr_acceptance is False:
+        return False
     committed, run_id, boundary_error, accepted_task_ids = _commit_completion(
         conn,
         task_id,
@@ -639,6 +664,8 @@ def complete_task(
         same_card_handoff=same_card_handoff,
         same_card_changes=same_card_changes,
         expected_run_id=expected_run_id,
+        force=force,
+        pr_acceptance=pr_acceptance,
         now=now,
         handoff_summary=handoff_summary,
         summary=summary,
@@ -723,15 +750,68 @@ def _gate_created_cards(
         raise _kb.HallucinatedCardsError(phantom_cards, task_id)
     return verified_cards
 
-def _stage_completion_artifacts(conn: sqlite3.Connection, task_id: str, metadata: dict, now: int) -> None:
-    """Copy scratch artifacts to the attachments dir and record each as an attachment row."""
-    _persist_scratch_completion_artifacts(conn, task_id, metadata)
-    for stored_path in metadata.pop("_staged_artifacts", []):
-        path = Path(stored_path)
-        _insert_completion_attachment(
-            conn, task_id, filename=path.name, stored_path=str(path),
-            size=path.stat().st_size, created_at=now,
+def _gate_empty_completion(
+    conn: sqlite3.Connection, task_id: str, *, result: Optional[str], summary: Optional[str],
+) -> None:
+    row = conn.execute("SELECT status, result FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or row["status"] == "review":
+        return
+    if any(value is not None and str(value).strip() for value in (result, summary, row["result"])):
+        return
+    with _kb.write_txn(conn):
+        _kb._append_event(
+            conn, task_id, "completion_blocked_empty_result",
+            {"result_preview": _kb._first_line(result, 200) or None,
+             "summary_preview": _kb._first_line(summary, 200) or None},
         )
+    raise _kb.EmptyCompletionError(task_id)
+
+
+def _discard_staged_copies(copies: Iterable[Path], directory: Path) -> None:
+    for path in copies:
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
+    with contextlib.suppress(OSError):
+        directory.rmdir()
+
+
+@contextlib.contextmanager
+def _artifact_write_txn(conn: sqlite3.Connection):
+    """Discard newly copied artifacts if their database transition rolls back."""
+    staged: list[Path] = []
+    try:
+        with _kb.write_txn(conn):
+            yield staged
+    except Exception:
+        if staged:
+            _discard_staged_copies(staged, staged[0].parent)
+        raise
+
+
+def _stage_completion_artifacts(
+    conn: sqlite3.Connection, task_id: str, metadata: dict, now: int, *,
+    uploaded_by: str = "kanban_complete",
+) -> list[Path]:
+    _persist_scratch_completion_artifacts(conn, task_id, metadata)
+    staged = [Path(path) for path in metadata.pop("_staged_artifacts", [])]
+    try:
+        for path in staged:
+            _insert_completion_attachment(
+                conn, task_id, filename=path.name, stored_path=str(path),
+                size=path.stat().st_size, created_at=now, uploaded_by=uploaded_by,
+            )
+    except Exception:
+        if staged:
+            _discard_staged_copies(staged, staged[0].parent)
+        raise
+    return staged
+
+
+def _cleaned_artifact_paths(metadata: Any) -> list[str]:
+    raw = metadata.get("artifacts") if isinstance(metadata, dict) else None
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [path.strip() for path in raw if isinstance(path, str) and path.strip()]
 
 def _completed_event_payload(
     result: Optional[str], event_summary: Optional[str], verified_cards: list[str], metadata: Any,
@@ -740,11 +820,6 @@ def _completed_event_payload(
     notifiers / dashboard WS render without a second round-trip; verified
     cards; and ``metadata["artifacts"]`` promoted so the notifier can upload
     them as native attachments without fetching the run row."""
-    # Mirror CLI's _show_voice_status: include STT/TTS provider availability so the user can tell at a
-    # glance *why* voice mode isn't working ("STT provider: MISSING ..." is the common case). ``record_key``
-    # mirrors the configured ``voice.record_key`` so the TUI can both bind it (frontend
-    # ``isVoiceToggleKey``) and display it in /voice status — previously the TUI hardcoded Ctrl+B and
-    # ignored the config (#18994).
     payload: dict = {
         "result_len": len(result) if result else 0,
         "summary": _kb._first_line(event_summary, 400) or None,
@@ -841,11 +916,7 @@ def _persist_scratch_completion_artifacts(
     changed = False
 
     def _discard_copies() -> None:
-        for copied in used_destinations:
-            with contextlib.suppress(OSError):
-                copied.unlink(missing_ok=True)
-        with contextlib.suppress(OSError):
-            attachment_dir.rmdir()
+        _discard_staged_copies(used_destinations, attachment_dir)
 
     for item in raw_artifacts:
         artifact = str(item).strip() if isinstance(item, str) else ""
@@ -913,16 +984,16 @@ def _copy_capped(src: Path, dest: Path, artifact: str) -> None:
 
 def _insert_completion_attachment(
     conn: sqlite3.Connection, task_id: str, *, filename: str, stored_path: str, size: int,
-    created_at: int,
+    created_at: int, uploaded_by: str = "kanban_complete",
 ) -> None:
     """Record a worker-produced artifact in the existing attachment table."""
     conn.execute(
         "INSERT INTO task_attachments "
         "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
-        "VALUES (?, ?, ?, NULL, ?, 'kanban_complete', ?)",
-        (task_id, filename, stored_path, size, created_at),
+        "VALUES (?, ?, ?, NULL, ?, ?, ?)",
+        (task_id, filename, stored_path, size, uploaded_by, created_at),
     )
-    _kb._append_event(conn, task_id, "attached", {"filename": filename, "size": size, "by": "kanban_complete"})
+    _kb._append_event(conn, task_id, "attached", {"filename": filename, "size": size, "by": uploaded_by})
 
 def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> Path:
     """Return a non-conflicting path under ``directory`` for ``filename``."""
@@ -988,6 +1059,36 @@ def edit_completed_task_result(
         )
     return True
 
+
+def edit_task(
+    conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
+    body: Optional[str] = None, priority: Optional[int] = None,
+    result: Optional[str] = None, summary: Optional[str] = None,
+    metadata: Optional[dict] = None, board: Optional[str] = None,
+) -> bool:
+    """Edit through the goal-revision boundary; result edits cannot rewrite evidence."""
+    from hermes_cli.kanban_db_connect import composite_write_txn
+    if all(value is None for value in (title, body, priority, result)):
+        return False
+    with composite_write_txn(conn):
+        task = _kb.get_task(conn, task_id)
+        if task is None or (result is not None and task.status != "done"):
+            return False
+        if title is not None or body is not None:
+            _kb.update_task(
+                conn, task_id, expected_version=task.version, reason="kanban edit",
+                **{key: value for key, value in (("title", title), ("body", body)) if value is not None},
+            )
+        if priority is not None:
+            _kb.set_priority(conn, task_id, priority)
+        if result is not None:
+            edit_completed_task_result(conn, task_id, result=result, summary=summary, metadata=metadata)
+            _kb.notify_task_updated(
+                conn, task_id, ["result", "summary"] + (["metadata"] if metadata is not None else []),
+                board=board,
+            )
+    return True
+
 def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
@@ -1036,6 +1137,7 @@ def request_review(
 
     summary = _kb.redact_review_value(summary)
     metadata = _kb.redact_review_value(metadata)
+    metadata = _merge_completion_prose_artifacts(conn, task_id, metadata, summary=summary, result=None)
     preflight_contract = _completion_contract_snapshot(conn, task_id)
     try:
         metadata, _handoff = _kb._prepare_completion_handoff(conn, task_id, metadata)
@@ -1083,7 +1185,7 @@ def request_review(
                 return _ret(False, str(error))
     contract_err: Optional[_kb.CompletionContractError] = None
     synthetic_run_id: Optional[int] = None
-    with _kb.write_txn(conn):
+    with _artifact_write_txn(conn) as staged_copies:
         # Re-read the card inside the txn: a review claim can land between the
         # preflight check above and the mutation below.
         if typed_code and typed_code.get("review_mode") == "same_card":
@@ -1105,25 +1207,19 @@ def request_review(
             if not _parents_satisfied(conn, task_id):
                 return _ret(False, "parent dependencies are not satisfied")
             trow = conn.execute(
-                "SELECT assignee, status, claim_lock, current_run_id "
+                "SELECT assignee, status, claim_lock, current_run_id, worker_pid, worker_started_at "
                 "FROM tasks WHERE id = ?", (task_id,),
             ).fetchone()
             if trow is None:
                 return _ret(False, "task not found")
             # Refuse to clear a live worker's claim without proof of ownership
             # (expected_run_id) or an explicit human override (force=True).
-            if (
-                expected_run_id is None
-                and not force
-                and trow["status"] == "running"
-                and trow["claim_lock"] is not None
-            ):
+            if expected_run_id is None and not force and _kb._claim_is_live(trow):
                 return _ret(
                     False, "task is running under a live claim; pass expected_run_id "
                     "(worker ownership) or force=True (explicit operator "
                     "override) instead of clearing the live run's claim",
                 )
-            implementer = trow["assignee"]
             if reviewer is None:
                 reviewer = _prior_reviewer(conn, task_id)
                 if reviewer is False:
@@ -1133,6 +1229,14 @@ def request_review(
                         "malformed); pass reviewer= explicitly",
                     )
             reviewer = _kb._canonical_assignee(reviewer)
+            implementer = None
+            if trow["current_run_id"] is not None:
+                arow = conn.execute(
+                    "SELECT profile FROM task_runs WHERE id = ?", (trow["current_run_id"],),
+                ).fetchone()
+                implementer = arow["profile"] if arow else None
+            if implementer is None and trow["assignee"] != reviewer:
+                implementer = trow["assignee"]
             if typed_code:
                 stamp_run_id = expected_run_id or trow["current_run_id"]
                 if stamp_run_id is None:
@@ -1184,7 +1288,8 @@ def request_review(
                    SET status        = 'review',
                        claim_lock    = NULL,
                        claim_expires = NULL,
-                       worker_pid    = NULL
+                       worker_pid    = NULL,
+                       worker_started_at = NULL
                 """ + assignee_sql + """
                  WHERE id = ?
                    AND status IN ('running', 'ready')
@@ -1200,6 +1305,10 @@ def request_review(
                 return _ret(
                     False, "task is not in running/ready (or expected_run_id did not match the current run)",
                 )
+            if isinstance(metadata, dict):
+                staged_copies.extend(_stage_completion_artifacts(
+                    conn, task_id, metadata, int(time.time()), uploaded_by="kanban_request_review",
+                ))
             if synthetic_run_id is not None:
                 run_id = synthetic_run_id
                 _finish_synthetic_run(
@@ -1214,6 +1323,7 @@ def request_review(
                 run_id = _kb._end_or_synthesize_run(
                     conn, task_id, outcome="review_requested", status="review",
                     summary=summary, metadata=metadata, synthesize=bool(summary or metadata),
+                    profile=implementer,
                 )
             lifecycle = metadata.get("lifecycle") if isinstance(metadata, dict) else None
             if isinstance(lifecycle, dict):
@@ -1230,6 +1340,7 @@ def request_review(
                     "implementer": implementer,
                     "reviewer": reviewer,
                     "lifecycle": lifecycle,
+                    **({"artifacts": _cleaned_artifact_paths(metadata)} if _cleaned_artifact_paths(metadata) else {}),
                 },
                 run_id=run_id,
             )

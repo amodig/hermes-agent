@@ -500,10 +500,10 @@ def _persist_update(
     actor: str,
     goal_row: sqlite3.Row,
     acceptance_before: dict[str, str],
-) -> tuple[list[str], list[dict[str, Any]], list[tuple[Optional[int], Optional[str]]]]:
+) -> tuple[list[str], list[dict[str, Any]], list[tuple[Optional[int], Optional[str], Any]]]:
     changed_fields = list(plan.changed_fields)
     goal_invalidated: list[dict[str, Any]] = []
-    goal_terminations: list[tuple[Optional[int], Optional[str]]] = []
+    goal_terminations: list[tuple[Optional[int], Optional[str], Any]] = []
     goal_revision = None
     goal_revision_id = plan.goal_revision_id
     # Fail before any mutation when there is nothing to acknowledge: the caller
@@ -714,8 +714,8 @@ def update_task(
         )
         _kb.notify_task_updated(conn, other_task_id, ("version", "status"))
     _kb.notify_task_updated(conn, task_id, changed_fields or ["version"])
-    for pid, claim_lock in goal_terminations:
-        _kb._terminate_reclaimed_worker(pid, claim_lock)
+    for pid, claim_lock, started_at in goal_terminations:
+        _kb._terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
     for entry in goal_invalidated:
         _kb.notify_task_updated(
             conn, entry["id"], ("status", "version", "completed_at", "candidate_run_id", "result"),
