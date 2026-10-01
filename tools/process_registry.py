@@ -77,6 +77,7 @@ WATCH_GLOBAL_COOLDOWN_SECONDS = 30
 # exist on the PATH while the user D-Bus session is unavailable — common for system services and
 # containers), and cache the result for the process lifetime. See #70716.
 _SYSTEMD_SCOPE_AVAILABLE: Optional[bool] = None
+_SLICE_INHERIT_SUPPORTED: Optional[bool] = None
 _SYSTEMD_SCOPE_PROBE_LOCK = threading.Lock()
 _SYSTEMD_SCOPE_PROBED_AT = 0.0
 _SYSTEMD_SCOPE_FAILURE_TTL_SECONDS = 60.0
@@ -124,24 +125,53 @@ def _worker_memory_max_bytes() -> int:
     return min(override_bound, safe_bound) if override_bound else safe_bound
 
 
-def _systemd_scope_argv(binary: str, unit_name: str, *argv: str) -> List[str]:
+def _systemd_scope_argv(
+    binary: str, unit_name: str, *argv: str, slice_inherit: bool = True,
+) -> List[str]:
     """``systemd-run --user --scope`` argv shared by the probe and real spawns.
     ``--collect`` self-cleans the scope after exit; ``--unit`` names it for systemctl.
-    ``--slice-inherit`` keeps the scope inside the CALLER's slice instead of the
-    default ``app.slice``: a worker gets its own cgroup (so an OOM in it cannot
-    take the gateway down) while still counting against the shared ancestor
-    budget. Without it the worker silently escapes that budget, and a worker
-    that must survive a gateway restart is killed with the slice it left.
-    systemd too old to know the flag fails the availability probe, so the
-    restart-safe route fails closed instead of launching outside the budget."""
+    ``slice_inherit`` adds ``--slice-inherit``, which keeps the scope inside the
+    CALLER's slice instead of the default ``app.slice``: a worker gets its own
+    cgroup (so an OOM in it cannot take the gateway down) while still counting
+    against the shared ancestor budget. It is a separate capability from "can we
+    create a scope at all" (systemd >= 248) precisely so a host without it keeps
+    the isolating legacy scope for ordinary background executors, while the
+    restart-safe worker route, which must stay inside the slice, fails closed."""
+    slice_args = ["--slice-inherit"] if slice_inherit else []
     return [
-        binary, "--user", "--scope", "--quiet", "--slice-inherit",
+        binary, "--user", "--scope", "--quiet", *slice_args,
         "--unit", unit_name, "--collect",
         "--property", "MemoryAccounting=yes",
         "--property", f"MemoryMax={_worker_memory_max_bytes()}",
         "--property", "OOMPolicy=kill",
         "--", *argv,
     ]
+
+
+def _slice_inherit_supported() -> bool:
+    """Whether this ``systemd-run`` knows ``--slice-inherit`` (systemd >= 248).
+
+    Probed from ``--help`` (no user bus needed) and cached for the process
+    lifetime: it is a package capability, so it only changes across an upgrade and
+    the next gateway start re-probes. False is NOT a reason to skip isolation —
+    only a reason for the restart-safe route to refuse.
+    """
+    global _SLICE_INHERIT_SUPPORTED
+    if _SLICE_INHERIT_SUPPORTED is not None:
+        return _SLICE_INHERIT_SUPPORTED
+    supported = False
+    if _IS_LINUX:
+        try:
+            import shutil
+
+            binary = shutil.which("systemd-run")
+            if binary:
+                result = subprocess.run([binary, "--help"], capture_output=True, timeout=3)
+                supported = b"--slice-inherit" in (result.stdout or b"")
+        except Exception as exc:
+            logger.debug("systemd-run --slice-inherit capability probe failed: %s", exc)
+    _SLICE_INHERIT_SUPPORTED = supported
+    return supported
 
 
 def _systemd_scope_cached() -> Optional[bool]:
@@ -178,7 +208,10 @@ def _systemd_run_user_scope_available() -> bool:
                     # Unique unit avoids collisions; the timeout bounds D-Bus.
                     probe_unit = f"hermes-probe-scope-{os.getpid()}-{uuid.uuid4().hex[:8]}"
                     result = subprocess.run(
-                        _systemd_scope_argv(binary, probe_unit, "/bin/true"), capture_output=True, timeout=3,
+                        _systemd_scope_argv(
+                            binary, probe_unit, "/bin/true", slice_inherit=False,
+                        ),
+                        capture_output=True, timeout=3,
                     )
                     available = result.returncode == 0
                     if not available:
@@ -215,7 +248,9 @@ def _build_systemd_scope_argv(shell_argv: List[str], unit_suffix: str) -> List[s
     memory accounting, so an OOM in the worker cannot kill the gateway cgroup.
 
     ``--collect`` makes the transient scope self-clean after exit; ``--unit`` gives it a recognisable name
-    for ``systemctl --user status`` / journalctl. See #70716.
+    for ``systemctl --user status`` / journalctl. ``--slice-inherit`` is added when this systemd knows it,
+    keeping the scope inside the caller's slice; without it the legacy scope still isolates the executor
+    (an OOM cannot take the gateway down), it just lands in the default ``app.slice``. See #70716.
     """
     import shutil
 
@@ -223,7 +258,10 @@ def _build_systemd_scope_argv(shell_argv: List[str], unit_suffix: str) -> List[s
     if binary is None:
         # Caller should have probed availability; never pass None into Popen anyway.
         return shell_argv
-    return _systemd_scope_argv(binary, f"hermes-worker-{unit_suffix}", *shell_argv)
+    return _systemd_scope_argv(
+        binary, f"hermes-worker-{unit_suffix}", *shell_argv,
+        slice_inherit=_slice_inherit_supported(),
+    )
 
 
 def restart_safe_gateway_child_argv(
@@ -245,6 +283,16 @@ def restart_safe_gateway_child_argv(
         raise RuntimeError(
             "cannot create restart-safe systemd scope for gateway child: "
             "systemd-run --user --scope is unavailable"
+        )
+    if not _slice_inherit_supported():
+        # This route exists to keep a child inside the SHARED slice budget as well
+        # as out of the service cgroup. Legacy scopes isolate but land in
+        # ``app.slice``, so refusing is the only honest answer; ordinary
+        # background executors still get that legacy scope.
+        raise RuntimeError(
+            "cannot create restart-safe systemd scope for gateway child: this "
+            "systemd-run does not support --slice-inherit, so the scope cannot "
+            "stay inside the caller's slice"
         )
     scoped = _build_systemd_scope_argv(command, unit_suffix=unit_suffix)
     if scoped == command:

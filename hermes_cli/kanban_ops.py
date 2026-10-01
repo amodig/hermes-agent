@@ -111,6 +111,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"Reclaimed:    {res.reclaimed}")
     for label, items in (
         ("Crashed:     ", res.crashed),
+        ("Interrupted: ", res.interrupted),
         ("Timed out:   ", res.timed_out),
         ("Stale:       ", res.stale),
         ("Auto-blocked:", res.auto_blocked),

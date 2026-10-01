@@ -2806,3 +2806,39 @@ def test_model_not_found_notice_absent_when_fallback_chain_configured(monkeypatc
     text = _format_async(evt)
     assert text.count("SUBAGENT MODEL REJECTED") == 1
     assert "No fallback chain is configured" not in text
+
+
+def test_legacy_systemd_keeps_isolation_and_refuses_the_slice_bound_route(monkeypatch):
+    """One invariant for the capability split.
+
+    ``--slice-inherit`` needs systemd >= 248. On a host without it, ordinary
+    background executors must keep their isolating legacy scope — otherwise a
+    memory-heavy job can again get the whole gateway cgroup OOM-killed — while the
+    restart-safe route, whose contract is "stay inside the shared slice", must
+    refuse instead of silently landing in ``app.slice``.
+    """
+    import tools.process_registry as pr
+
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/systemd-run")
+    monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", True)
+    monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: True)
+    monkeypatch.setenv("INVOCATION_ID", "fixture")
+
+    monkeypatch.setattr(pr, "_SLICE_INHERIT_SUPPORTED", False)
+    legacy = pr._build_systemd_scope_argv(["/bin/true"], unit_suffix="legacy")
+    assert legacy[0] == "/usr/bin/systemd-run", "generic executors keep their scope"
+    assert "--slice-inherit" not in legacy
+    assert any(part.startswith("MemoryMax=") for part in legacy), "isolation properties survive"
+    with pytest.raises(RuntimeError, match="slice-inherit"):
+        pr.restart_safe_gateway_child_argv(["/bin/true"], unit_suffix="legacy")
+
+    monkeypatch.setattr(pr, "_SLICE_INHERIT_SUPPORTED", True)
+    assert "--slice-inherit" in pr._build_systemd_scope_argv(["/bin/true"], unit_suffix="modern")
+    assert "--slice-inherit" in pr.restart_safe_gateway_child_argv(
+        ["/bin/true"], unit_suffix="modern",
+    )
+    # The scope-availability probe must not depend on the newer flag, or a legacy
+    # host would report "no scopes at all" and lose isolation for everything.
+    assert "--slice-inherit" not in pr._systemd_scope_argv(
+        "/usr/bin/systemd-run", "probe", "/bin/true", slice_inherit=False,
+    )
