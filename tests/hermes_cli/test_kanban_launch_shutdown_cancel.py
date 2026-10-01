@@ -241,25 +241,20 @@ def test_only_proven_shutdown_excuses_a_launch_failure(conn, switch, monkeypatch
         assert _spawn_refused_phase(conn, tid) is None
         assert _row(conn, tid)["consecutive_failures"] == 0
 
-
-def test_launch_failure_classification(monkeypatch):
-    """The conversion helper's three branches, and its provider of evidence."""
+    # ...and that conversion is exactly this helper's job, so pin its branches.
     from hermes_cli import kanban_worker_runtime as kwr
 
     monkeypatch.setattr(kbd, "_user_manager_stopping", lambda: True)
     with pytest.raises(RuntimeIdentityError):
         kwr._launch_failure_or_shutdown(RuntimeIdentityError("bad identity"), "t_x")
-
     already = kwr.WorkerLaunchInterrupted("cancelled by drain")
     with pytest.raises(kwr.WorkerLaunchInterrupted) as kept:
         kwr._launch_failure_or_shutdown(already, "t_x")
     assert kept.value is already
-
     original = RuntimeError("systemd-run exploded")
     with pytest.raises(kwr.WorkerLaunchInterrupted) as converted:
         kwr._launch_failure_or_shutdown(original, "t_x")
     assert converted.value.__cause__ is original
-
     monkeypatch.setattr(kbd, "_user_manager_stopping", lambda: False)
     with pytest.raises(RuntimeError) as unchanged:
         kwr._launch_failure_or_shutdown(original, "t_x")

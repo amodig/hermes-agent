@@ -163,25 +163,46 @@ def test_positive_host_change_pauses_the_run_exactly_once(conn, monkeypatch):
     ).fetchone()
     assert unblocked["n"] == 1
 
+    # A SECOND interruption must not escalate the card. ``block_kind``/
+    # ``block_recurrences`` survive an unblock by design, so routing these
+    # through the operator block-loop breaker would reach
+    # ``BLOCK_RECURRENCE_LIMIT`` and move the card to ``triage`` — a status
+    # ``unblock_task`` cannot release and the auto-decomposer rewrites.
+    _claim(conn, tid, monkeypatch=monkeypatch)
+    # ``_claim`` re-records the claim-time epoch; make the live host the new one.
+    monkeypatch.setattr(kb, "_current_host_epoch", lambda: NEW_EPOCH)
+    assert _reclaim(conn).interrupted == [tid]
+    row = _row(conn, tid)
+    assert row["status"] == "blocked", "a repeat interruption stays operator-recoverable"
+    assert row["block_recurrences"] == 0, "an interruption is not an operator block loop"
+    assert row["block_kind"] is None
+    assert _events(conn, tid, "block_loop_detected") == []
+    assert kb.unblock_task(conn, tid) is True
+    assert _row(conn, tid)["status"] == "ready"
 
-def test_only_positive_provenance_exempts_a_card(conn, monkeypatch):
-    """Every unproven case keeps its pre-existing behavior: no pause."""
-    _liveness(monkeypatch, True)
-    cases: list[tuple[str, str | None, str, dict]] = [
-        ("legacy receipt", None, NEW_EPOCH, {}),
-        ("malformed epoch", "not-an-epoch", NEW_EPOCH, {}),
-        ("right characters, wrong grouping", "1111111-11111-1111-1111-111111111111:10",
-         NEW_EPOCH, {}),
-        ("noncanonical 32-hex then 4", "11111111111111111111111111111111-1111:10",
-         NEW_EPOCH, {}),
-        ("trailing hyphen", "11111111-1111-1111-1111-111111111111-:10", NEW_EPOCH, {}),
-        ("unreadable live host", OLD_EPOCH, "", {}),
-        ("foreign run claim", OLD_EPOCH, NEW_EPOCH, {"run_claim": "otherhost:5",
-                                                    "task_claim": "otherhost:5"}),
-        ("conflicting task claim", OLD_EPOCH, NEW_EPOCH, {"task_claim": "otherhost:9"}),
+
+def test_provenance_rule_decides_between_a_pause_and_a_crash(conn, monkeypatch):
+    """Positive provenance pauses; every unproven case keeps ordinary behavior."""
+    cases = [
+        # name, recorded epoch, live epoch, task mutation, worker alive, expected
+        ("legacy receipt", None, NEW_EPOCH, {}, True, "untouched"),
+        ("malformed epoch", "not-an-epoch", NEW_EPOCH, {}, True, "untouched"),
+        ("right characters, wrong grouping",
+         "1111111-11111-1111-1111-111111111111:10", NEW_EPOCH, {}, True, "untouched"),
+        ("noncanonical 32-hex then 4",
+         "11111111111111111111111111111111-1111:10", NEW_EPOCH, {}, True, "untouched"),
+        ("trailing hyphen", "11111111-1111-1111-1111-111111111111-:10", NEW_EPOCH, {},
+         True, "untouched"),
+        ("unreadable live host", OLD_EPOCH, "", {}, True, "untouched"),
+        ("foreign run claim", OLD_EPOCH, NEW_EPOCH,
+         {"run_claim": "otherhost:5", "task_claim": "otherhost:5"}, True, "untouched"),
+        ("conflicting task claim", OLD_EPOCH, NEW_EPOCH, {"task_claim": "otherhost:9"},
+         True, "untouched"),
+        ("same boot worker death", OLD_EPOCH, OLD_EPOCH, {}, False, "crash"),
     ]
-    for name, recorded, live, mutation in cases:
+    for name, recorded, live, mutation, alive, expected in cases:
         with pytest.MonkeyPatch.context() as patch:
+            _liveness(patch, alive)
             tid = kb.create_task(conn, title=name, assignee="w")
             run_id = _claim(conn, tid, monkeypatch=patch)
             if mutation:
@@ -206,28 +227,22 @@ def test_only_positive_provenance_exempts_a_card(conn, monkeypatch):
             patch.setattr(kb, "_current_host_epoch", lambda live=live: live)
             result = _reclaim(conn)
 
-            # Earlier cases in this table stay ``running`` on the same board, so
-            # every assertion is scoped to this case's own card.
+            # Earlier cases in this table share the board, so every assertion is
+            # scoped to this case's own card.
+            if expected == "crash":
+                # Every earlier card is still ``running`` and shares the same
+                # liveness answer, so scope to this card.
+                assert tid in result.crashed, name
+                assert tid not in result.interrupted, name
+                assert _row(conn, tid)["consecutive_failures"] == 1, name
+                assert _events(conn, tid, "blocked") == []
+                continue
             assert tid not in result.interrupted, f"{name} must not be exempted"
             row = _row(conn, tid)
             assert row["status"] == "running", f"{name}: card must be left alone"
             assert row["consecutive_failures"] == 0, f"{name}: nothing may be charged"
             assert _run_row(conn, run_id)["ended_at"] is None, f"{name}: run must stay open"
             assert _events(conn, tid, "blocked") == []
-
-
-def test_same_boot_worker_death_is_still_an_ordinary_crash(conn, monkeypatch):
-    """The complement of the rule above: a missing worker on the SAME boot counts."""
-    _liveness(monkeypatch, False)
-    tid = kb.create_task(conn, title="same boot crash", assignee="w")
-    _claim(conn, tid, monkeypatch=monkeypatch)
-
-    result = _reclaim(conn)
-
-    assert (result.interrupted, result.crashed) == ([], [tid])
-    row = _row(conn, tid)
-    assert (row["status"], row["consecutive_failures"]) == ("ready", 1)
-    assert _events(conn, tid, "blocked") == []
 
 
 @pytest.mark.parametrize("lane", ["ready", "review"])

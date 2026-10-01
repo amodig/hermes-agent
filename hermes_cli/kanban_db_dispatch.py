@@ -969,8 +969,9 @@ def pause_interrupted_run(
     a NULL or foreign claim proves nothing and is refused rather than guessed.
     No failure is charged and none is reset, and the old PID is never probed or
     signalled, because after a reboot it may already belong to another process.
-    The block routes through the same taxonomy an explicit ``kanban_block`` uses,
-    so ``recompute_ready`` leaves the card alone until ``unblock_task``.
+    The sticky ``blocked`` event keeps ``recompute_ready`` off the card until
+    ``unblock_task``; the operator's block-loop columns are deliberately left
+    alone so a repeat interruption cannot escalate the card to ``triage``.
     """
     host_prefix = _kb._host_prefix()
     with _kb.write_txn(conn):
@@ -998,22 +999,28 @@ def pause_interrupted_run(
             # claimer, or a newer local claim from a rebuild of the same card.
             # Ownership is not ours to infer, so refuse rather than clear it.
             return False
-        previous_recurrences = int(_kb._row_get(task, "block_recurrences") or 0)
-        previous_kind = _kb.normalize_block_kind(_kb._row_get(task, "block_kind"))
-        if previous_kind is None and previous_recurrences > 0:
-            previous_kind = _kb._latest_block_cause(conn, task_id)
         retry_status = _kb._retry_status_for_run(conn, task_id, run_id)
-        new_status, event_kind, set_sql, params, payload = _kb._route_block(
-            _INTERRUPT_BLOCK_KIND, reason, retry_status,
-            prev_kind=previous_kind, prev_recurrences=previous_recurrences,
-        )
+        # Deliberately NOT ``_route_block``: its unblock-loop breaker counts
+        # repeated same-cause blocks and routes the card to ``triage`` past
+        # ``BLOCK_RECURRENCE_LIMIT``. An infrastructure interruption is not an
+        # operator block loop, and a second reboot must not move the card into
+        # ``triage`` — ``unblock_task`` cannot release that status, while the
+        # auto-decomposer scans exactly that lane and may rewrite the card. The
+        # sticky ``blocked`` event alone is what the resume contract needs, so
+        # the operator's block-loop columns are left untouched.
+        event_kind = "blocked"
+        payload = {
+            "reason": reason,
+            "kind": _INTERRUPT_BLOCK_KIND,
+            "cause": _kb.normalized_block_cause(_INTERRUPT_BLOCK_KIND),
+            "source_status": retry_status,
+        }
         cur = conn.execute(
-            f"UPDATE tasks SET status = '{new_status}', claim_lock = NULL, "
-            "claim_expires = NULL, worker_pid = NULL, "
-            f"{set_sql} "
+            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status = 'running' AND current_run_id = ? "
             "  AND claim_lock IS ? AND worker_pid IS ?",
-            (*params, task_id, run_id, task["claim_lock"], task["worker_pid"]),
+            (task_id, run_id, task["claim_lock"], task["worker_pid"]),
         )
         if cur.rowcount != 1:
             return False
