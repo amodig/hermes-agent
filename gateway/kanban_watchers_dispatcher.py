@@ -128,12 +128,16 @@ class _KanbanDispatcher:
 
     CORRUPT_BOARD_RETRY_AFTER_SECONDS = 300
 
-    def __init__(self, kb: Any, settings: _DispatcherSettings, should_stop=None) -> None:
+    def __init__(self, kb: Any, settings: _DispatcherSettings, should_stop=None,
+                 grant_guard=None) -> None:
         self.kb = kb
         self.settings = settings
         # Called on every tick so a drain/stop that starts mid-tick cancels the
         # launches still in flight instead of granting them to a dying gateway.
         self.should_stop = should_stop
+        # Held across the final stop re-check and the grant, so a drain cannot
+        # land between the decision and the grant (see the gateway mixin).
+        self.grant_guard = grant_guard
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
         _kbd()._freeze_runtime_identity()
 
@@ -190,7 +194,8 @@ class _KanbanDispatcher:
             # process (see the matching note in the notifier collector).
             conn = _kbc().connect(board=slug)
             return _kbd().dispatch_once(
-                conn, board=slug, should_stop=self.should_stop, **kwargs,
+                conn, board=slug, should_stop=self.should_stop,
+                grant_guard=self.grant_guard, **kwargs,
             )
         except Exception as exc:
             if self.is_corrupt_board_db_error(exc):

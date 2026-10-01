@@ -4896,7 +4896,9 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
         # detached diagnostics: those can run for seconds, and the embedded
         # kanban dispatcher must stop granting work the moment we are asked to
         # go away (a granted worker would outlive this gateway's intent).
-        runner._draining = True
+        from gateway.run_shutdown import _apply_lifecycle_flags
+
+        _apply_lifecycle_flags(runner, _draining=True)
 
         # Planned --replace takeover (sibling marked this PID): exit 0 so systemd won't revive us.
         def _takeover() -> bool:

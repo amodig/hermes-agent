@@ -10,7 +10,9 @@ in ``kanban_watchers_common``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -37,6 +39,10 @@ _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
 _GC_INTERVAL_SECONDS = 3600.0
 _HEALTH_WINDOW = 6
+# A grant is a bounded pipe write to an already-verdicted worker, so waiting for
+# the boundary is normally microseconds. The timeout only exists so a wedged
+# grant can never stall shutdown.
+_GRANT_GUARD_TIMEOUT_SECONDS = 2.0
 
 
 class GatewayKanbanWatchersMixin:
@@ -77,6 +83,63 @@ class GatewayKanbanWatchersMixin:
         if getattr(self, "_draining", False) or getattr(self, "_external_drain_active", False):
             return True
         return not bool(getattr(self, "_running", True))
+
+    def _kanban_grant_lock(self) -> "threading.Lock":
+        """Lock serializing the stop transition against a worker grant.
+
+        The dispatcher's launch runs in a worker thread while the drain/stop flags
+        are set from the event loop or from a signal handler, so "read the flag,
+        then grant" is not atomic by itself: a drain landing between the two is
+        invisible to a grant that has already decided, and because a completed
+        grant is final by contract that worker then outlives the drain.
+
+        Holding this lock across the stop re-check and the grant makes the
+        boundary deterministic instead: the drain takes effect either BEFORE the
+        decision (the launch is cancelled) or AFTER the grant (that worker is
+        already final and survives). Flag reads outside the guarded region still
+        need no lock.
+        """
+        lock = getattr(self, "_kanban_grant_lock_handle", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._kanban_grant_lock_handle = lock
+        return lock
+
+    def _kanban_transition(self, **flags: bool) -> None:
+        """Set drain/stop flags under the grant lock so they cannot race a grant.
+
+        The timeout exists only so a wedged grant cannot stall shutdown: it set a
+        flag because the gateway is going away, which must always succeed.
+        """
+        lock = self._kanban_grant_lock()
+        acquired = lock.acquire(timeout=_GRANT_GUARD_TIMEOUT_SECONDS)
+        if not acquired:
+            logger.warning(
+                "kanban dispatcher: grant boundary busy for %.1fs; applying %s anyway",
+                _GRANT_GUARD_TIMEOUT_SECONDS, ", ".join(sorted(flags)),
+            )
+        try:
+            for name, value in flags.items():
+                setattr(self, name, value)
+        finally:
+            if acquired:
+                lock.release()
+
+    @contextlib.contextmanager
+    def _kanban_grant_guard(self):
+        """Hold the grant boundary across the stop re-check and the grant itself."""
+        lock = self._kanban_grant_lock()
+        acquired = lock.acquire(timeout=_GRANT_GUARD_TIMEOUT_SECONDS)
+        if not acquired:
+            logger.warning(
+                "kanban dispatcher: grant boundary busy for %.1fs; granting without it",
+                _GRANT_GUARD_TIMEOUT_SECONDS,
+            )
+        try:
+            yield
+        finally:
+            if acquired:
+                lock.release()
 
     def _release_kanban_dispatcher_lock(self) -> None:
         """Clear notifier-visible ownership before releasing the OS lock."""
@@ -283,7 +346,11 @@ class GatewayKanbanWatchersMixin:
         # The in-flight tick must see a drain/stop the moment it starts (the
         # signal handler sets ``_draining`` before any diagnostics), so read the
         # live flags instead of sampling them once at boot.
-        dispatcher = _KanbanDispatcher(_kb, settings, should_stop=self._kanban_shutdown_requested)
+        dispatcher = _KanbanDispatcher(
+            _kb, settings,
+            should_stop=self._kanban_shutdown_requested,
+            grant_guard=self._kanban_grant_guard,
+        )
 
         # Initial delay so adapters are wired before workers spawn (matches the notifier).
         await asyncio.sleep(5)

@@ -1985,6 +1985,7 @@ def dispatch_once(
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
     should_stop: Optional[Callable[[], bool]] = None,
+    grant_guard: Optional[Callable[[], Any]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -2014,6 +2015,7 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
             should_stop=should_stop,
+            grant_guard=grant_guard,
         )
 
     try:
@@ -2156,6 +2158,20 @@ def _record_granted_spawn(
     return True
 
 
+def _grant_boundary(grant_guard) -> Any:
+    """Context manager holding the caller's grant boundary; a no-op without one.
+
+    ``grant_guard`` comes from the owning gateway, which holds the same lock while
+    it sets its drain/stop flags, so the two cannot interleave: the stop transition
+    takes effect either before the guarded decision or after the grant. Callers
+    with no gateway (the standalone daemon, the CLI) pass nothing and get the
+    plain unconditioned check.
+    """
+    if grant_guard is None:
+        return contextlib.nullcontext()
+    return grant_guard()
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2171,6 +2187,7 @@ def _dispatch_lane_task(
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
     should_stop=None,
+    grant_guard=None,
 ) -> bool:
     """Guard, verify, claim, resolve, and spawn one ready/review row.
 
@@ -2325,16 +2342,16 @@ def _dispatch_lane_task(
             launch_identity = launch.runtime_identity
             preparation_id = launch.preparation_id
             if launch.grant:
-                # Final barrier. This is a FENCE, not a lock: a drain that begins
-                # in the instant between this check and the grant still lands a
-                # granted worker, and that is the intended contract — in-flight
-                # granted work finishes and survives a gateway restart, the same
-                # property that keeps existing workers alive across one. Revoking
-                # a grant here would mean cancelling a worker that may already be
-                # past its bootstrap, which the contract forbids; only UNGRANTED
-                # launches are cancelled.
-                _check_not_stopping(should_stop, claimed.id)
-                launch.grant(int(claimed.current_run_id), claimed.claim_lock)
+                # Final barrier, held under the caller's grant boundary so the stop
+                # transition cannot land between the decision and the grant: the
+                # drain either takes effect before the decision (launch cancelled)
+                # or after the grant (that worker is already final and survives).
+                # It is a fence, not a revoker: revoking would mean cancelling a
+                # worker that may already be past its bootstrap, which the contract
+                # forbids.
+                with _grant_boundary(grant_guard):
+                    _check_not_stopping(should_stop, claimed.id)
+                    launch.grant(int(claimed.current_run_id), claimed.claim_lock)
                 return _record_granted_spawn(
                     conn, claimed, launch, str(workspace), result, board, _count_spawn,
                 )
@@ -2555,6 +2572,7 @@ def _dispatch_once_locked(
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
     should_stop: Optional[Callable[[], bool]] = None,
+    grant_guard: Optional[Callable[[], Any]] = None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2605,7 +2623,7 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
-        should_stop=should_stop,
+        should_stop=should_stop, grant_guard=grant_guard,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0

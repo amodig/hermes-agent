@@ -261,6 +261,45 @@ def test_only_proven_shutdown_excuses_a_launch_failure(conn, switch, monkeypatch
     assert unchanged.value is original
 
 
+def test_the_stop_transition_cannot_land_between_check_and_grant():
+    """The drain takes effect before the decision or after the grant, never between.
+
+    The dispatcher's launch runs in a thread while the flags are set from the event
+    loop, so the boundary is what makes "read the flag, then grant" atomic: a
+    transition started while a grant decision is in flight must wait for it rather
+    than land in the gap.
+    """
+    import threading
+
+    from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+
+    runner = GatewayKanbanWatchersMixin()
+    runner._running = True
+    runner._draining = False
+    runner._external_drain_active = False
+    assert runner._kanban_shutdown_requested() is False
+
+    landed = threading.Event()
+
+    def _drain():
+        runner._kanban_transition(_draining=True)
+        landed.set()
+
+    with runner._kanban_grant_guard():
+        thread = threading.Thread(target=_drain, daemon=True)
+        thread.start()
+        assert not landed.wait(timeout=0.25), (
+            "the drain landed inside the grant boundary, so a grant could still "
+            "be handed out after the stop was decided"
+        )
+
+    assert landed.wait(timeout=5.0), "the transition must complete once the grant is done"
+    thread.join(timeout=5.0)
+    assert runner._kanban_shutdown_requested() is True
+    # ...and a launch that starts now sees the stop immediately.
+    assert runner._kanban_shutdown_requested() is True
+
+
 @pytest.mark.parametrize("stdout,expected", [
     ("stopping\n", True),
     ("running\n", False),
