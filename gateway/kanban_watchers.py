@@ -46,13 +46,22 @@ class GatewayKanbanWatchersMixin:
         return getattr(self, "_kanban_dispatcher_lock_handle", None) is not None
 
     def _kanban_shutdown_requested(self) -> bool:
-        """True once this gateway is draining or stopping.
+        """True once this gateway must stop granting new Kanban work.
 
-        The dispatcher polls this inside its tick so a launch in flight is
-        cancelled rather than granted to a gateway that will not outlive it.
+        Covers the one-way shutdown drain (``_draining``), the stopping gateway
+        (``not _running``), and the REVERSIBLE external drain
+        (``_external_drain_active``, engaged by ``.drain_request.json``). The
+        external drain sets only its own flag while ``draining`` is advertised, so
+        omitting it would let the dispatcher keep claiming and granting workers
+        through the quiesce window — the same rule the cron dispatch gate applies
+        (``can_dispatch = not (runner._draining or
+        runner._external_drain_active)``).
+
         ``getattr``-guarded: shutdown-path tests build bare runners.
         """
-        return bool(getattr(self, "_draining", False)) or not bool(getattr(self, "_running", True))
+        if getattr(self, "_draining", False) or getattr(self, "_external_drain_active", False):
+            return True
+        return not bool(getattr(self, "_running", True))
 
     def _release_kanban_dispatcher_lock(self) -> None:
         """Clear notifier-visible ownership before releasing the OS lock."""
