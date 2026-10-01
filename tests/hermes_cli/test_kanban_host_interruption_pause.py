@@ -8,7 +8,7 @@ the contracts that break independently:
 * what does and does not count as proof of a new instantiation;
 * what the operator gets back on unblock (phase, pins, graph).
 
-The epoch swap is INJECTED (``kb._current_host_epoch`` is monkeypatched); none of
+The epoch swap is INJECTED (``kanban_runtime.current_host_epoch`` is monkeypatched); none of
 this is a real reboot, which needs a disposable host.
 """
 
@@ -22,6 +22,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_runtime as _kr
 
 OLD_EPOCH = "11111111-1111-1111-1111-111111111111:10"
 NEW_EPOCH = "22222222-2222-2222-2222-222222222222:20"
@@ -67,7 +68,7 @@ def _forbid_pid_use(monkeypatch: pytest.MonkeyPatch) -> None:
 def _claim(conn, tid: str, *, lane: str = "ready", epoch: str = OLD_EPOCH,
            monkeypatch) -> int:
     """Claim ``tid`` as this host with a recorded epoch; returns the run id."""
-    monkeypatch.setattr(kb, "_current_host_epoch", lambda: epoch)
+    monkeypatch.setattr(_kr, "current_host_epoch", lambda: epoch)
     claimer = f"{kb._claimer_id().split(':', 1)[0]}:t"
     if lane == "review":
         assert kb.claim_review_task(conn, tid, claimer=claimer) is not None
@@ -124,7 +125,7 @@ def test_positive_host_change_pauses_the_run_exactly_once(conn, monkeypatch):
     tid = kb.create_task(conn, title="reused pid", assignee="w")
     run_id = _claim(conn, tid, monkeypatch=monkeypatch)
 
-    monkeypatch.setattr(kb, "_current_host_epoch", lambda: NEW_EPOCH)
+    monkeypatch.setattr(_kr, "current_host_epoch", lambda: NEW_EPOCH)
     result = _reclaim(conn)
 
     assert (result.interrupted, result.crashed, result.auto_blocked) == ([tid], [], [])
@@ -170,7 +171,7 @@ def test_positive_host_change_pauses_the_run_exactly_once(conn, monkeypatch):
     # ``unblock_task`` cannot release and the auto-decomposer rewrites.
     _claim(conn, tid, monkeypatch=monkeypatch)
     # ``_claim`` re-records the claim-time epoch; make the live host the new one.
-    monkeypatch.setattr(kb, "_current_host_epoch", lambda: NEW_EPOCH)
+    monkeypatch.setattr(_kr, "current_host_epoch", lambda: NEW_EPOCH)
     assert _reclaim(conn).interrupted == [tid]
     row = _row(conn, tid)
     assert row["status"] == "blocked", "a repeat interruption stays operator-recoverable"
@@ -224,7 +225,7 @@ def test_provenance_rule_decides_between_a_pause_and_a_crash(conn, monkeypatch):
             elif recorded != OLD_EPOCH:
                 _set_recorded_epoch(conn, run_id, recorded)
 
-            patch.setattr(kb, "_current_host_epoch", lambda live=live: live)
+            patch.setattr(_kr, "current_host_epoch", lambda live=live: live)
             result = _reclaim(conn)
 
             # Earlier cases in this table share the board, so every assertion is
@@ -270,7 +271,7 @@ def test_unblock_restores_the_recorded_phase_and_keeps_pins_and_graph(
     before = _row(conn, tid)
     run_id = _claim(conn, tid, lane=lane, monkeypatch=monkeypatch)
 
-    monkeypatch.setattr(kb, "_current_host_epoch", lambda: NEW_EPOCH)
+    monkeypatch.setattr(_kr, "current_host_epoch", lambda: NEW_EPOCH)
     assert _reclaim(conn).interrupted == [tid]
     assert _events(conn, tid, "blocked")[0]["retry_status"] == lane
     assert _run_row(conn, run_id)["outcome"] == "interrupted"

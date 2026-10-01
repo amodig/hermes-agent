@@ -1048,7 +1048,7 @@ def pause_host_interrupted_runs(conn: sqlite3.Connection) -> list[str]:
     reboot may already belong to an unrelated process, so nothing here may
     defer on, probe, or signal it. Returns the paused task ids.
     """
-    current_epoch = _kb._current_host_epoch()
+    current_epoch = _kr.current_host_epoch()
     if not current_epoch:
         # No readable identity (non-Linux, no /proc): never fail closed on a guess.
         return []
@@ -2754,6 +2754,7 @@ from hermes_cli import kanban_db_connect as _kbc  # noqa: E402
 from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402
 
 from hermes_cli import kanban_worker_runtime as _kwr  # noqa: E402
+from hermes_cli import kanban_runtime as _kr  # noqa: E402
 
 WorkerLaunch = _kwr.WorkerLaunch
 WorkerLaunchInterrupted = _kwr.WorkerLaunchInterrupted

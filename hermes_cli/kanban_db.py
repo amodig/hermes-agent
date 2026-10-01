@@ -1322,23 +1322,8 @@ def _host_prefix() -> str:
     return f"{_claimer_id().split(':', 1)[0]}:"
 
 
-def _current_host_epoch() -> str:
-    """This host instantiation's identity (``"<boot_id>:<pid1_start>"``); "" when unreadable.
-
-    Recorded on new runs as additive provenance so a later dispatcher tick can
-    tell "my worker died" from "the host that owned this claim is gone" (#43).
-    Late import: ``kanban_db`` must stay importable without the ``gateway``
-    package (same reason as ``_system_memory_sample``).
-    """
-    try:
-        from gateway.drain_control import current_instantiation_epoch
-
-        return str(current_instantiation_epoch() or "")
-    except Exception:
-        return ""
-
-
 # --- Task creation / mutation ---
+
 
 def _validate_model_override(model: Optional[str], provider: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     """Strip both; a provider without a model is rejected (a bare ``--provider``

@@ -39,6 +39,10 @@ _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
 _GC_INTERVAL_SECONDS = 3600.0
 _HEALTH_WINDOW = 6
+# Guards first construction of a runner's grant lock. Two threads can otherwise
+# both observe a missing handle and install different locks, which would let the
+# stop transition slip between the final check and the grant.
+_GRANT_LOCK_INIT = threading.Lock()
 # A grant is a bounded pipe write to an already-verdicted worker, so waiting for
 # the boundary is normally microseconds. The timeout only exists so a wedged
 # grant can never stall shutdown.
@@ -101,8 +105,14 @@ class GatewayKanbanWatchersMixin:
         """
         lock = getattr(self, "_kanban_grant_lock_handle", None)
         if lock is None:
-            lock = threading.Lock()
-            self._kanban_grant_lock_handle = lock
+            # Double-checked: the dispatch thread and the shutdown path can reach
+            # this on their first call at the same moment, and two different locks
+            # would let the stop transition slip past the boundary.
+            with _GRANT_LOCK_INIT:
+                lock = getattr(self, "_kanban_grant_lock_handle", None)
+                if lock is None:
+                    lock = threading.Lock()
+                    self._kanban_grant_lock_handle = lock
         return lock
 
     def _kanban_transition(self, **flags: bool) -> None:

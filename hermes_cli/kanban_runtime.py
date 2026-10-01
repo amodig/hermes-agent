@@ -107,6 +107,24 @@ def _module_root(module_root: Optional[os.PathLike[str] | str] = None) -> Path:
     return Path(module_root or Path(__file__).resolve().parents[1]).resolve()
 
 
+def current_host_epoch() -> str:
+    """This host instantiation's identity (``"<boot_id>:<pid1_start>"``); "" when unreadable.
+
+    Recorded on new Kanban runs as additive provenance so a later dispatcher tick
+    can tell "my worker died" from "the host that owned this claim is gone" (#43).
+    Lives here, beside ``runtime_identity``, because it is provenance captured with
+    the identity rather than board behaviour; the gate that OWNS the epoch format
+    is ``gateway.drain_control``. Late import keeps this module importable without
+    the gateway package.
+    """
+    try:
+        from gateway.drain_control import current_instantiation_epoch
+
+        return str(current_instantiation_epoch() or "")
+    except Exception:
+        return ""
+
+
 def process_start_time(pid: Optional[int] = None) -> int:
     """Return a PID-reuse-resistant process start marker on every platform."""
     pid = int(pid or os.getpid())
