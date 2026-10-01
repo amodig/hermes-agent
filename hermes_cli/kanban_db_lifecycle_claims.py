@@ -153,6 +153,12 @@ def _claim_and_open_run(
         "branch_name, lifecycle_contract FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     run_metadata = dict(runtime_claim or {})
+    host_epoch = _kb._current_host_epoch()
+    if host_epoch:
+        # Additive provenance, outside the sealed runtime-identity fingerprint:
+        # the reclaim path uses it to tell a dead worker from a replaced host
+        # (#43). Historical runs are deliberately left untouched.
+        run_metadata["host_epoch"] = host_epoch
     if pr_continuation:
         run_metadata["pr_continuation"] = dict(pr_continuation)
     contract = safe_decode_contract(_kb._row_get(trow, "lifecycle_contract"))

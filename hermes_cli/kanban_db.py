@@ -313,9 +313,9 @@ def notify_task_updated(
 # DispatchResult counters whose non-zero value means the tick did something.
 _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "crashed", "stale",
-    "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
-    "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
-    "skipped_nonspawnable",
+    "timed_out", "auto_blocked", "rate_limited", "interrupted",
+    "auto_assigned_default", "respawn_guarded", "skipped_per_profile_capped",
+    "skipped_unassigned", "skipped_nonspawnable",
 )
 
 
@@ -1109,7 +1109,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
     profile             TEXT,
     step_key            TEXT,
     status              TEXT NOT NULL,
-    -- status: running | done | blocked | crashed | timed_out | failed | released
+    -- status: running | done | blocked | interrupted | crashed | timed_out | failed | released
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
@@ -1320,6 +1320,22 @@ def _claimer_id() -> str:
 def _host_prefix() -> str:
     """``"<host>:"`` prefix shared by every claim lock issued from this host."""
     return f"{_claimer_id().split(':', 1)[0]}:"
+
+
+def _current_host_epoch() -> str:
+    """This host instantiation's identity (``"<boot_id>:<pid1_start>"``); "" when unreadable.
+
+    Recorded on new runs as additive provenance so a later dispatcher tick can
+    tell "my worker died" from "the host that owned this claim is gone" (#43).
+    Late import: ``kanban_db`` must stay importable without the ``gateway``
+    package (same reason as ``_system_memory_sample``).
+    """
+    try:
+        from gateway.drain_control import current_instantiation_epoch
+
+        return str(current_instantiation_epoch() or "")
+    except Exception:
+        return ""
 
 
 # --- Task creation / mutation ---
@@ -2476,6 +2492,9 @@ _RUN_OUTCOME_TERMINAL_STATUS = {
     "validation_requested": "validation",
     "changes_requested": "changes_requested",
     "blocked": "blocked",
+    # A run ended by host re-instantiation leaves the card sticky-blocked for the
+    # operator, so a goal loop must see it as blocked, not as a retryable failure.
+    "interrupted": "blocked",
     "dependency_wait": "blocked",
 }
 

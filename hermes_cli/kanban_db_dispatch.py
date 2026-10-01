@@ -117,6 +117,10 @@ class DispatchResult:
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
+    interrupted: list[str] = field(default_factory=list)
+    """Task ids paused because the host that owned their in-flight run was
+    re-instantiated (reboot / container restart). Not a crash and not a breaker
+    trip: no failure was charged and the card waits for ``unblock_task``."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
     timed_out: list[str] = field(default_factory=list)
@@ -766,13 +770,17 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
     return sweep
 
 
-def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
+def _account_crashes(
+    conn: sqlite3.Connection, crash_details: list, *, failure_limit: Optional[int] = None,
+) -> list[str]:
     """Count each crash against the breaker; returns the task ids it tripped.
 
     Protocol violations get a BOUNDED violation-only budget independent of
     ``consecutive_failures`` (per-task ``max_retries`` takes precedence);
     systemic same-error crashes (>= 3 identical fingerprints this tick) trip
-    immediately.
+    immediately. ``failure_limit`` is the dispatcher's configured
+    ``kanban.failure_limit``; ``None`` keeps ``DEFAULT_FAILURE_LIMIT`` for
+    direct callers.
     """
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
@@ -816,7 +824,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 conn, tid,
                 error=error_text,
                 outcome="crashed",
-                failure_limit=1 if is_systemic else None,
+                failure_limit=1 if is_systemic else failure_limit,
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer},
@@ -826,7 +834,9 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     return auto_blocked
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection, *, failure_limit: Optional[int] = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Restores the source phase immediately (no waiting for the claim TTL), for
@@ -835,10 +845,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     violation-only retry budget; ``KANBAN_RATE_LIMIT_EXIT_CODE`` is a quota
     wall, released WITHOUT counting a failure and surfaced via the
     ``_last_rate_limited`` attribute (the return stays crashed-only).
+
+    ``failure_limit`` forwards the dispatcher's configured ``kanban.failure_limit``
+    to the breaker; ``None`` keeps ``DEFAULT_FAILURE_LIMIT`` for direct callers.
     """
     sweep = _reclaim_dead_workers(conn)
     # Outside the main txn: account each crash and maybe trip the breaker.
-    auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
+    auto_blocked = (
+        _account_crashes(conn, sweep.crash_details, failure_limit=failure_limit)
+        if sweep.crash_details else []
+    )
     # Side-channel attributes keep the public ``list[str]`` return stable;
     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
     # requeues did NOT count a failure and are NOT crashes.
@@ -873,6 +889,181 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 **hook_fields,
             )
     return sweep.crashed
+
+
+# Typed block reasons for a card the dispatcher interrupted on purpose. Both
+# hand the card back to the operator exactly like an explicit ``kanban_block``
+# (sticky, no auto-recovery), and neither is a crash or a breaker trip.
+HOST_RESTART_BLOCK_REASON = "host_restarted"
+LAUNCH_STOPPED_BLOCK_REASON = "gateway_stopping"
+_INTERRUPT_BLOCK_KIND = "needs_input"
+
+
+def _instantiation_changed(recorded: str, current: str) -> bool:
+    """Late-bound ``gateway.drain_control.instantiation_changed``; False when unavailable.
+
+    Failing closed (False = "not proven changed") keeps legacy receipts and
+    hosts without the gateway package on their existing reclaim behavior.
+    """
+    try:
+        from gateway.drain_control import instantiation_changed
+    except Exception:
+        return False
+    return bool(instantiation_changed(recorded, current))
+
+
+def _user_manager_stopping() -> bool:
+    """True only on POSITIVE native evidence that the user manager is stopping.
+
+    Covers the user-manager shutdown race that can precede the gateway's own
+    signal: the scope route then fails while no drain flag is set yet. A timeout,
+    a missing ``systemctl``, an inaccessible bus, ``degraded``, and arbitrary
+    error text are NOT evidence — those stay ordinary launch failures.
+    """
+    try:
+        from hermes_cli.gateway import _run_systemctl
+
+        result = _run_systemctl(
+            ["is-system-running"], timeout=5, capture_output=True, text=True, check=False,
+        )
+    except Exception:
+        return False
+    return (result.stdout or "").strip().lower() == "stopping"
+
+
+def _locally_owned_running_runs(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """``running`` cards whose CURRENT, unfinished run was claimed by this host.
+
+    Ownership comes from the run's recorded claim prefix, not the task's: a
+    half-cleaned claim can leave ``tasks.claim_lock`` NULL while the run still
+    records ours (the orphan case ``reconcile_orphaned_running`` handles). A NULL
+    or foreign run claim proves nothing about which host owns the worker, so it
+    is skipped rather than guessed.
+    """
+    host_prefix = _kb._host_prefix()
+    rows = conn.execute(
+        "SELECT t.id AS task_id, t.current_run_id AS run_id, "
+        "       r.claim_lock AS run_claim, r.metadata AS run_metadata "
+        "FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running' AND r.ended_at IS NULL"
+    ).fetchall()
+    return [
+        row for row in rows
+        if str(_kb._row_get(row, "run_claim") or "").startswith(host_prefix)
+    ]
+
+
+def _run_host_epoch(row: sqlite3.Row) -> str:
+    """The ``host_epoch`` recorded on a run, or "" for legacy/unknown receipts."""
+    return str(_kb._json_dict(_kb._row_get(row, "run_metadata")).get("host_epoch") or "")
+
+
+def pause_interrupted_run(
+    conn: sqlite3.Connection, task_id: str, run_id: int, *,
+    reason: str, error: str, extra_payload: Optional[dict] = None,
+) -> bool:
+    """Atomically pause ONE interrupted card: sticky block, run closed as ``interrupted``.
+
+    One txn, one compare-and-swap over (still ``running``, still that current run,
+    observed claim/PID). Ownership must be THIS host's claim on that exact run —
+    a NULL or foreign claim proves nothing and is refused rather than guessed.
+    No failure is charged and none is reset, and the old PID is never probed or
+    signalled, because after a reboot it may already belong to another process.
+    The block routes through the same taxonomy an explicit ``kanban_block`` uses,
+    so ``recompute_ready`` leaves the card alone until ``unblock_task``.
+    """
+    host_prefix = _kb._host_prefix()
+    with _kb.write_txn(conn):
+        task = conn.execute(
+            "SELECT status, claim_lock, worker_pid, current_run_id, "
+            "       block_kind, block_recurrences "
+            "FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if task is None or task["status"] != "running":
+            return False
+        if int(_kb._row_get(task, "current_run_id") or 0) != int(run_id):
+            return False
+        run = conn.execute(
+            "SELECT claim_lock, ended_at FROM task_runs WHERE id = ? AND task_id = ?",
+            (run_id, task_id),
+        ).fetchone()
+        if run is None or _kb._row_get(run, "ended_at") is not None:
+            return False
+        run_claim = str(_kb._row_get(run, "claim_lock") or "")
+        if not run_claim.startswith(host_prefix):
+            return False
+        task_claim = _kb._row_get(task, "claim_lock")
+        if task_claim is not None and str(task_claim) != run_claim:
+            # The card carries a claim this run does not own: either a foreign
+            # claimer, or a newer local claim from a rebuild of the same card.
+            # Ownership is not ours to infer, so refuse rather than clear it.
+            return False
+        previous_recurrences = int(_kb._row_get(task, "block_recurrences") or 0)
+        previous_kind = _kb.normalize_block_kind(_kb._row_get(task, "block_kind"))
+        if previous_kind is None and previous_recurrences > 0:
+            previous_kind = _kb._latest_block_cause(conn, task_id)
+        retry_status = _kb._retry_status_for_run(conn, task_id, run_id)
+        new_status, event_kind, set_sql, params, payload = _kb._route_block(
+            _INTERRUPT_BLOCK_KIND, reason, retry_status,
+            prev_kind=previous_kind, prev_recurrences=previous_recurrences,
+        )
+        cur = conn.execute(
+            f"UPDATE tasks SET status = '{new_status}', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, "
+            f"{set_sql} "
+            "WHERE id = ? AND status = 'running' AND current_run_id = ? "
+            "  AND claim_lock IS ? AND worker_pid IS ?",
+            (*params, task_id, run_id, task["claim_lock"], task["worker_pid"]),
+        )
+        if cur.rowcount != 1:
+            return False
+        provenance = {"reason": reason, "retry_status": retry_status, **(extra_payload or {})}
+        payload.update({"run_id": run_id, **provenance})
+        ended_run_id = _kb._end_run(
+            conn, task_id, outcome="interrupted", status="interrupted", error=error,
+            metadata=provenance,
+        )
+        _kb._append_event(
+            conn, task_id, event_kind, payload, run_id=ended_run_id or run_id,
+        )
+    return True
+
+
+def pause_host_interrupted_runs(conn: sqlite3.Connection) -> list[str]:
+    """Pause locally owned ``running`` cards left behind by a replaced host instantiation.
+
+    Must run BEFORE every other reclaim path: a PID that was alive before a
+    reboot may already belong to an unrelated process, so nothing here may
+    defer on, probe, or signal it. Returns the paused task ids.
+    """
+    current_epoch = _kb._current_host_epoch()
+    if not current_epoch:
+        # No readable identity (non-Linux, no /proc): never fail closed on a guess.
+        return []
+    paused: list[str] = []
+    for row in _locally_owned_running_runs(conn):
+        recorded_epoch = _run_host_epoch(row)
+        if not recorded_epoch or not _instantiation_changed(recorded_epoch, current_epoch):
+            continue
+        if pause_interrupted_run(
+            conn, row["task_id"], int(row["run_id"]),
+            reason=HOST_RESTART_BLOCK_REASON,
+            error=(
+                f"host instantiation changed ({recorded_epoch} -> {current_epoch}); "
+                "worker not signalled, card paused for the operator"
+            ),
+            extra_payload={
+                "host_epoch": current_epoch,
+                "recorded_host_epoch": recorded_epoch,
+            },
+        ):
+            paused.append(row["task_id"])
+        else:
+            _kb._log.debug(
+                "kanban reclaim: host-interruption pause for %s lost its compare-and-swap",
+                row["task_id"],
+            )
+    return paused
 
 
 def _record_task_failure(
@@ -1786,6 +1977,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -1794,6 +1986,10 @@ def dispatch_once(
     frames. The loser returns an empty ``DispatchResult`` with
     ``skipped_locked=True`` and writes nothing; the lock is keyed on the
     resolved DB path so unrelated boards tick in parallel.
+
+    ``should_stop`` lets the owning gateway/daemon cancel in-flight launches as
+    soon as it starts draining, so no worker is handed a card by a process that
+    is going away.
     """
     _freeze_runtime_identity()
     def _locked_tick() -> DispatchResult:
@@ -1810,6 +2006,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            should_stop=should_stop,
         )
 
     try:
@@ -1861,6 +2058,97 @@ def _note_claim_hold(
         result.respawn_guarded.append((task_id, "active_pr"))
 
 
+def _launch_failure_phase(exc: BaseException) -> str:
+    """Accurate ``spawn_refused`` phase for one launch exception.
+
+    Reporting every refusal as ``runtime_identity`` blamed the sealed runtime
+    fingerprint for ordinary scope/launch failures, which sent operators after
+    identity corruption that was not there.
+    """
+    try:
+        from hermes_cli.kanban_runtime import RuntimeIdentityError
+    except Exception:
+        return "launch"
+    return "runtime_identity" if isinstance(exc, RuntimeIdentityError) else "launch"
+
+
+def _note_launch_cancelled(task_id: str, error: str, result: "DispatchResult") -> None:
+    """Record a launch the dispatcher cancelled on purpose.
+
+    The card was never claimed, so there is nothing to undo in the DB and
+    nothing to charge: no failure, no ``spawn_refused`` event, still queued.
+    """
+    result.interrupted.append(task_id)
+    _kb._log.info(
+        "kanban dispatcher: launch of %s cancelled for shutdown/drain (%s)",
+        task_id, error[:200],
+    )
+
+
+def _pause_claimed_run_for_shutdown(
+    conn: sqlite3.Connection, claimed, result: "DispatchResult", exc: BaseException,
+) -> bool:
+    """Cancel a claimed-but-ungranted launch and pause that exact run.
+
+    The worker never received the grant, so no Kanban tool call can be in flight
+    against this card; the run is closed as ``interrupted`` and the card waits
+    for the operator instead of spending a retry on a shutdown.
+    """
+    if pause_interrupted_run(
+        conn, claimed.id, int(claimed.current_run_id or 0),
+        reason=LAUNCH_STOPPED_BLOCK_REASON,
+        error=str(exc)[:500],
+    ):
+        result.interrupted.append(claimed.id)
+        return True
+    # The worker is already cancelled, so a lost compare-and-swap leaves a card
+    # whose run has no live owner. Say so loudly: the next tick reclaims it as a
+    # crash, and an operator needs the reason.
+    _kb._log.warning(
+        "kanban dispatcher: cancelled launch of %s could not pause its run %s; "
+        "it will be reclaimed as a crash",
+        claimed.id, claimed.current_run_id,
+    )
+    return False
+
+
+def _record_granted_spawn(
+    conn: sqlite3.Connection, claimed, launch: "WorkerLaunch", workspace: str,
+    result: "DispatchResult", board: Optional[str], count_spawn,
+) -> bool:
+    """Bookkeeping for a worker that has ALREADY received its grant.
+
+    A failure here is an observability problem, not a launch failure: the run is
+    owned by a live, verified worker, so cancelling it would abandon work that is
+    already running and charging a retry would schedule a duplicate beside it.
+    Each step is isolated so a broken hook cannot skip the durable PID write.
+    """
+    def _step(label: str, action) -> None:
+        try:
+            action()
+        except Exception as exc:
+            _kb._log.warning(
+                "kanban dispatcher: post-grant %s failed for %s; "
+                "worker %s keeps its run: %s",
+                label, claimed.id, launch.pid, exc,
+            )
+
+    _step("claimed hook", lambda: _kb._fire_task_hook(
+        "kanban_task_claimed", claimed, claimed.id, claimed.current_run_id,
+    ))
+    if launch.pid:
+        _step("worker pid", lambda: _set_worker_pid(
+            conn, claimed.id, int(launch.pid), runtime_identity=launch.runtime_identity,
+            preparation_id=launch.preparation_id,
+        ))
+    _step("spawned hook", lambda: _kb._fire_worker_spawned_hook(
+        conn, claimed, workspace, launch.pid, board=board,
+    ))
+    result.spawned.append((claimed.id, claimed.assignee or "", workspace))
+    count_spawn(claimed.assignee)
+    return True
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -1875,8 +2163,16 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    should_stop=None,
 ) -> bool:
-    """Guard, verify, claim, resolve, and spawn one ready/review row."""
+    """Guard, verify, claim, resolve, and spawn one ready/review row.
+
+    ``should_stop`` is polled before the workspace/preparation work, after it
+    (before the claim), and immediately before the grant. A launch cancelled by
+    a drain charges no failure; a cancellation landing after the claim also
+    pauses that exact run for the operator. Nothing after a successful grant is
+    ever cancelled — that worker owns the card and survives a gateway restart.
+    """
     task_id = row["id"]
     profile_exists = _profile_exists_fn()
     if profile_exists is not None and not profile_exists(assignee):
@@ -1929,13 +2225,20 @@ def _dispatch_lane_task(
                 skills=list(dict.fromkeys([*(preflight.skills or []), "sdlc-review"])),
             )
         try:
+            _check_not_stopping(should_stop, task_id)
             if spawn_task.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(spawn_task, board=board)
             else:
                 workspace = _kbw.resolve_workspace(spawn_task, board=board)
-            launch = _default_spawn(spawn_task, str(workspace), board=board, defer_grant=True)
+            launch = _default_spawn(
+                spawn_task, str(workspace), board=board, defer_grant=True,
+                should_stop=should_stop,
+            )
             if not isinstance(launch, WorkerLaunch):
                 raise RuntimeError("default worker spawn did not return a fenced launch")
+            # Everything expensive is done; a drain that arrived meanwhile must
+            # not reach the claim.
+            _check_not_stopping(should_stop, task_id)
             claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
             claimed = claim(
                 conn,
@@ -1953,6 +2256,11 @@ def _dispatch_lane_task(
                     launch.cancel()
                 _note_claim_hold(conn, task_id, result)
                 return False
+        except WorkerLaunchInterrupted as exc:
+            if launch is not None and launch.cancel:
+                launch.cancel()
+            _note_launch_cancelled(task_id, str(exc), result)
+            return False
         except Exception as exc:
             if launch is not None and launch.cancel:
                 launch.cancel()
@@ -1961,7 +2269,7 @@ def _dispatch_lane_task(
                     conn,
                     task_id,
                     "spawn_refused",
-                    {"phase": "runtime_identity", "error": str(exc)[:1000]},
+                    {"phase": _launch_failure_phase(exc), "error": str(exc)[:1000]},
                 )
             if _record_task_failure(
                 conn,
@@ -2010,9 +2318,12 @@ def _dispatch_lane_task(
             launch_identity = launch.runtime_identity
             preparation_id = launch.preparation_id
             if launch.grant:
+                # Final barrier: past the grant the worker owns the card, so
+                # nothing below may cancel it, pause it, or charge a retry.
+                _check_not_stopping(should_stop, claimed.id)
                 launch.grant(int(claimed.current_run_id), claimed.claim_lock)
-                _kb._fire_task_hook(
-                    "kanban_task_claimed", claimed, claimed.id, claimed.current_run_id,
+                return _record_granted_spawn(
+                    conn, claimed, launch, str(workspace), result, board, _count_spawn,
                 )
         else:
             pid = launch
@@ -2027,6 +2338,11 @@ def _dispatch_lane_task(
         result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
         _count_spawn(claimed.assignee)
         return True
+    except WorkerLaunchInterrupted as exc:
+        if launch is not None and launch.cancel:
+            launch.cancel()
+        _pause_claimed_run_for_shutdown(conn, claimed, result, exc)
+        return False
     except Exception as exc:
         if launch is not None and launch.cancel:
             launch.cancel()
@@ -2095,11 +2411,14 @@ def _run_reclaim_phase(
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
+    # Host re-instantiation outranks every path below: an old PID may already be
+    # reused, so nothing after this may probe, defer on, or signal it.
+    result.interrupted = pause_host_interrupted_runs(conn)
     result.reclaimed = _kb.release_stale_claims(conn)
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(conn, failure_limit=failure_limit)
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
@@ -2222,6 +2541,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2272,10 +2592,13 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        should_stop=should_stop,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
     for row in ready_rows:
+        if _stop_requested(should_stop):
+            break
         if ready_budget is not None and spawned >= ready_budget:
             break
         row_assignee = row["assignee"]
@@ -2297,6 +2620,8 @@ def _dispatch_once_locked(
     # checks the FULL shared ``spawn_budget`` — the reservation above caps the
     # ready lane, it grants no extra capacity here.
     for row in review_rows:
+        if _stop_requested(should_stop):
+            break
         if spawn_budget is not None and spawned >= spawn_budget:
             break
         if not row["assignee"]:
@@ -2373,6 +2698,7 @@ def run_daemon(
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
+                    should_stop=stop_event.is_set,
                 )
             if on_tick is not None:
                 with contextlib.suppress(Exception):
@@ -2393,6 +2719,9 @@ from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402
 from hermes_cli import kanban_worker_runtime as _kwr  # noqa: E402
 
 WorkerLaunch = _kwr.WorkerLaunch
+WorkerLaunchInterrupted = _kwr.WorkerLaunchInterrupted
+_stop_requested = _kwr._stop_requested
+_check_not_stopping = _kwr._check_not_stopping
 _recent_worker_exits = _kwr._recent_worker_exits
 _worker_pid_aliases = _kwr._worker_pid_aliases
 _worker_processes = _kwr._worker_processes
@@ -2422,5 +2751,8 @@ def _default_spawn(
     *,
     board: Optional[str] = None,
     defer_grant: bool = False,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> WorkerLaunch | int:
-    return _kwr._default_spawn(task, workspace, board=board, defer_grant=defer_grant)
+    return _kwr._default_spawn(
+        task, workspace, board=board, defer_grant=defer_grant, should_stop=should_stop,
+    )

@@ -49,6 +49,58 @@ class WorkerLaunch:
     launcher_pid: Optional[int] = None
 
 
+class WorkerLaunchInterrupted(RuntimeError):
+    """A launch cancelled on purpose because the gateway is draining or stopping.
+
+    Deliberately NOT a ``RuntimeIdentityError`` and NOT an ordinary spawn
+    failure: nothing about the task, the runtime or the scope is wrong, so the
+    caller must neither charge a retry nor report identity corruption.
+    """
+
+
+def _stop_requested(should_stop: Optional[Callable[[], bool]]) -> bool:
+    """Whether a caller-supplied cancellation predicate now asks us to stop.
+
+    A broken predicate must never wedge dispatch, so it reads as "not yet" and
+    the ordinary failure paths still apply.
+    """
+    if should_stop is None:
+        return False
+    try:
+        return bool(should_stop())
+    except Exception:
+        return False
+
+
+def _check_not_stopping(should_stop: Optional[Callable[[], bool]], task_id: str) -> None:
+    """Abort a launch that would hand work to a gateway which is going away."""
+    if _stop_requested(should_stop):
+        raise WorkerLaunchInterrupted(
+            f"launch of {task_id} cancelled: gateway is draining or stopping"
+        )
+
+
+def _launch_failure_or_shutdown(exc: BaseException, task_id: str) -> None:
+    """Re-raise a launch failure, or classify it as an infrastructure shutdown.
+
+    Runs WHERE the launch failed, so the user-manager evidence is sampled next to
+    the failure instead of after it has propagated through unrelated handlers —
+    otherwise a caller could excuse the wrong exception just because a shutdown
+    started concurrently. Runtime-identity corruption is never shutdown evidence,
+    and neither is anything the user manager is not positively reporting as
+    ``stopping``; both re-raise unchanged.
+    """
+    from hermes_cli.kanban_runtime import RuntimeIdentityError
+
+    if isinstance(exc, (WorkerLaunchInterrupted, RuntimeIdentityError)):
+        raise exc
+    if _dispatcher()._user_manager_stopping():
+        raise WorkerLaunchInterrupted(
+            f"launch of {task_id} interrupted: the user manager is stopping ({exc})"
+        ) from exc
+    raise exc
+
+
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
 # ``dispatch_once`` and read by ``detect_crashed_workers`` to classify a dead-pid
 # task. Entry: ``pid -> (raw_wait_status, reaped_at_epoch)``; raw status kept so
@@ -484,8 +536,17 @@ def _default_spawn(
     *,
     board: Optional[str] = None,
     defer_grant: bool = False,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> WorkerLaunch | int:
-    """Start a worker and verify its identity before granting Kanban access."""
+    """Start a worker and verify its identity before granting Kanban access.
+
+    ``should_stop`` is polled at every long step (before preparation, after
+    runtime-generation preparation, before the scope is created, during the
+    bootstrap waits) so a gateway that starts draining mid-launch hands nothing
+    to a worker that would outlive it: :class:`WorkerLaunchInterrupted` unwinds
+    and the prepared worker is cancelled.
+    """
+    _check_not_stopping(should_stop, task.id)
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
@@ -626,6 +687,10 @@ def _default_spawn(
         _close_resources()
 
     try:
+        # After the expensive runtime-generation preparation and before any
+        # scope exists: a drain observed here costs one prepared generation and
+        # nothing else.
+        _check_not_stopping(should_stop, task.id)
         cmd = dispatcher._restart_safe_worker_argv(
             task, generation.command_prefix + cli_args,
             preparation_id=preparation_id if defer_grant else None,
@@ -653,6 +718,7 @@ def _default_spawn(
         deadline = time.monotonic() + _BOOTSTRAP_PHASE_TIMEOUT_SECONDS
         payload = None
         while time.monotonic() < deadline:
+            _check_not_stopping(should_stop, task.id)
             if preparation_path.is_file():
                 try:
                     payload = json.loads(preparation_path.read_text(encoding="utf-8"))
@@ -686,6 +752,7 @@ def _default_spawn(
         post_deadline = time.monotonic() + _BOOTSTRAP_PHASE_TIMEOUT_SECONDS
         post_payload = None
         while time.monotonic() < post_deadline:
+            _check_not_stopping(should_stop, task.id)
             if preparation_path.is_file():
                 try:
                     candidate = json.loads(preparation_path.read_text(encoding="utf-8"))
@@ -739,9 +806,10 @@ def _default_spawn(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
-    except Exception:
+    except Exception as exc:
         _cancel()
-        raise
+        # Classified here, where the scope route or bootstrap actually failed.
+        _launch_failure_or_shutdown(exc, task.id)
 
 from hermes_cli import kanban_db as _kb
 def _pid_alive(pid: Optional[int]) -> bool:

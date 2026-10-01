@@ -13,6 +13,7 @@ import sys
 import sysconfig
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -78,10 +79,17 @@ def worker_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 @pytest.fixture
 def forbid_worker_spawn(monkeypatch: pytest.MonkeyPatch):
     real_popen = subprocess.Popen
+    # The one process a failing launch is allowed to run: a bounded, read-only
+    # user-manager state query. It launches nothing and is the evidence the
+    # shutdown-race rule requires; every other subprocess means the launch path
+    # did not fail closed.
+    manager_state_probe = ("systemctl", "--user", "is-system-running")
 
     def guarded_popen(cmd, *args, **kwargs):
         # Runtime identity reads Git provenance before checking the worker scope.
         if cmd[:2] == ["git", "-C"] and cmd[3:] == ["rev-parse", "HEAD"]:
+            return real_popen(cmd, *args, **kwargs)
+        if tuple(cmd) == manager_state_probe:
             return real_popen(cmd, *args, **kwargs)
         pytest.fail(f"unsafe worker spawn: {cmd!r}")
 
@@ -585,3 +593,193 @@ os._exit(0)
             time.sleep(0.02)
         conn.close()
         generations.sweep_runtime_generations()
+
+
+def _unit_property(unit: str, name: str) -> str:
+    completed = subprocess.run(
+        ["systemctl", "--user", "show", unit, f"--property={name}"],
+        check=True, capture_output=True, text=True, timeout=15,
+    )
+    return completed.stdout.strip().partition("=")[2]
+
+
+def _proc_cgroup(pid: int) -> str:
+    for line in Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8").splitlines():
+        if line.startswith("0::"):
+            return line[3:]
+    raise AssertionError(f"PID {pid} has no unified cgroup")
+
+
+@pytest.mark.linux_only
+@pytest.mark.live_system_guard_bypass  # cleanup signals our start-time-verified worker
+def test_worker_survives_a_real_user_service_restart(tmp_path, monkeypatch):
+    """A REAL ``systemctl --user restart`` must not take the granted worker down.
+
+    ``tests/cron/test_restart_safe_worker.py::
+    test_managed_gateway_restart_preserves_active_worker_and_single_side_effect``
+    SIGTERMs a harness subprocess; it never restarts a service, so it cannot
+    establish restart survival. This test starts a uniquely named transient user
+    service in the same slice the gateway occupies, has that service launch its
+    child through the real restart-safe scope, restarts the service for real, and
+    then observes the worker itself: same PID, same start time, same cgroup, and
+    a cgroup that is a SIBLING of the service inside the shared slice. Finally it
+    releases the worker and requires exactly one side effect.
+    """
+    from tools import process_registry
+
+    if not process_registry._systemd_run_user_scope_available():
+        pytest.skip("systemd-run --user --scope is unavailable on this host")
+
+    base = tmp_path / "service-smoke"
+    base.mkdir()
+    started = base / "started"
+    release = base / "release"
+    side_effect = base / "side-effect"
+    info = base / "worker.json"
+    worker_py = base / "worker.py"
+    worker_py.write_text(
+        "import pathlib, time\n"
+        f"started = pathlib.Path({str(started)!r})\n"
+        f"release = pathlib.Path({str(release)!r})\n"
+        f"side_effect = pathlib.Path({str(side_effect)!r})\n"
+        "started.write_text('started')\n"
+        "deadline = time.monotonic() + 60\n"
+        "while not release.exists() and time.monotonic() < deadline:\n"
+        "    time.sleep(0.05)\n"
+        "if not release.exists():\n"
+        "    raise SystemExit('release timeout')\n"
+        "with side_effect.open('a') as handle:\n"
+        "    handle.write('once\\n')\n",
+        encoding="utf-8",
+    )
+    suffix = f"issue43-smoke-{uuid.uuid4().hex[:8]}"
+    unit = f"{suffix}.service"
+    harness_py = base / "harness.py"
+    harness_py.write_text(
+        "import json, os, pathlib, subprocess, sys, time\n"
+        f"sys.path.insert(0, {str(Path(kbd.__file__).resolve().parents[1])!r})\n"
+        "os.environ.setdefault('INVOCATION_ID', 'issue43-smoke')\n"
+        "from tools import process_registry\n"
+        "process_registry._is_supervised_gateway_process = lambda: True\n"
+        f"argv = process_registry.restart_safe_gateway_child_argv(\n"
+        f"    [sys.executable, '-B', {str(worker_py)!r}], unit_suffix={suffix!r})\n"
+        "proc = subprocess.Popen(argv, start_new_session=True)\n"
+        "# ``systemd-run --scope`` moves the command into its scope asynchronously,\n"
+        "# so read the cgroup only once it has settled, or we record the service's.\n"
+        "cgroup = ''\n"
+        "deadline = time.monotonic() + 10\n"
+        "while time.monotonic() < deadline:\n"
+        "    cgroup = pathlib.Path('/proc/%d/cgroup' % proc.pid).read_text().strip()\n"
+        "    cgroup = cgroup.splitlines()[-1][3:]\n"
+        "    if cgroup.endswith('.scope'):\n"
+        "        break\n"
+        "    time.sleep(0.02)\n"
+        f"pathlib.Path({str(info)!r}).write_text(\n"
+        "    json.dumps({'pid': proc.pid, 'cgroup': cgroup, 'launcher_pid': os.getpid()}))\n"
+        "while True:\n"
+        "    time.sleep(0.2)\n",
+        encoding="utf-8",
+    )
+    worker_pid = None
+    worker_start_time = None
+    try:
+        subprocess.run(
+            # Same slice the CTO gateway occupies: the worker must stay inside
+            # that shared budget, not escape to app.slice.
+            ["systemd-run", "--user", "--unit", unit,
+             "--slice=agents-controls.slice", "--collect",
+             sys.executable, "-B", str(harness_py)],
+            check=True, capture_output=True, text=True, timeout=30,
+        )
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not (info.is_file() and started.is_file()):
+            time.sleep(0.05)
+        assert info.is_file(), "the launcher service never recorded its worker"
+        record = json.loads(info.read_text(encoding="utf-8"))
+        worker_pid = int(record["pid"])
+        worker_cgroup = str(record["cgroup"])
+        worker_start_time = process_start_time(worker_pid)
+        assert worker_cgroup.endswith(f"hermes-worker-{suffix}.scope"), worker_cgroup
+
+        service_cgroup = _unit_property(unit, "ControlGroup")
+        launcher_before = _unit_property(unit, "MainPID")
+        assert service_cgroup, "the fixture service has no cgroup"
+        budget = service_cgroup.rsplit("/", 1)[0]
+        assert worker_cgroup.startswith(budget + "/"), (
+            f"worker {worker_cgroup} left the launcher's shared slice {budget}"
+        )
+        assert not worker_cgroup.startswith(service_cgroup + "/"), (
+            "the worker must be a sibling of the launcher service, not inside it"
+        )
+        assert record["launcher_pid"] != worker_pid
+
+        # Claim the card BEFORE the restart so the assertion below is about a
+        # claim that genuinely spans it, not a claim created afterwards.
+        monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+        conn = sqlite3.connect(base / "restart.db")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(kb.SCHEMA_SQL)
+        kb._ensure_lifecycle_schema(conn)
+        kb._ensure_goal_revision_schema(conn)
+        task_id = kb.create_task(
+            conn, title="granted worker", assignee="coder", initial_status="blocked",
+            workspace_kind="scratch", workspace_path=str(base),
+        )
+        promoted, reason = kb.promote_task(conn, task_id, actor="test")
+        assert promoted, reason
+        claimed = kb.claim_task(
+            conn, task_id, claimer=f"{kb._claimer_id().split(':', 1)[0]}:smoke",
+        )
+        assert claimed is not None
+        kbd._set_worker_pid(conn, task_id, worker_pid)
+        run_id_before = claimed.current_run_id
+        claim_lock_before = claimed.claim_lock
+
+        subprocess.run(
+            ["systemctl", "--user", "restart", unit],
+            check=True, capture_output=True, text=True, timeout=30,
+        )
+        assert _unit_property(unit, "MainPID") != launcher_before, "service did not restart"
+        assert kbd._pid_alive(worker_pid), "the service restart killed the worker"
+        assert process_start_time(worker_pid) == worker_start_time
+        assert _proc_cgroup(worker_pid) == worker_cgroup
+
+        # The claim that existed across the restart is intact, and a replacement
+        # dispatcher leaves a worker the restart did not kill alone.
+        survived = kb.get_task(conn, task_id)
+        assert survived.status == "running"
+        assert survived.current_run_id == run_id_before
+        assert survived.claim_lock == claim_lock_before
+        assert survived.worker_pid == worker_pid
+        result = kbd.DispatchResult()
+        kbd._run_reclaim_phase(
+            conn, result, stale_timeout_seconds=0, failure_limit=3,
+            reconcile_orphans=True,
+        )
+        assert (result.interrupted, result.crashed, result.reclaimed) == ([], [], 0)
+        assert kb.get_task(conn, task_id).status == "running"
+        conn.close()
+
+        release.write_text("go", encoding="utf-8")
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not side_effect.is_file():
+            time.sleep(0.05)
+        assert side_effect.read_text(encoding="utf-8").splitlines() == ["once"]
+    finally:
+        subprocess.run(
+            ["systemctl", "--user", "stop", unit],
+            check=False, capture_output=True, text=True, timeout=30,
+        )
+        subprocess.run(
+            ["systemctl", "--user", "stop", f"hermes-worker-{suffix}.scope"],
+            check=False, capture_output=True, text=True, timeout=30,
+        )
+        if worker_pid is not None:
+            deadline = time.monotonic() + 5
+            while kbd._pid_alive(worker_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if kbd._pid_alive(worker_pid) and process_start_time(worker_pid) == worker_start_time:
+                try:
+                    os.kill(worker_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass

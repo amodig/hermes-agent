@@ -1870,6 +1870,9 @@ class GatewayShutdownMixin:
     ) -> None:
         """Stop the gateway and disconnect all adapters."""
         from gateway.run import GatewayRunner
+        # Before anything can await: from here on this gateway grants no new
+        # kanban work, so a launch in flight cancels instead of being handed out.
+        self._draining = True
         # getattr-guard: shutdown-path tests build bare runners via object.__new__ that lack the
         # liveness-guard machinery.
         _stop_guards = getattr(self, "_stop_loop_liveness_guards", None)

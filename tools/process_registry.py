@@ -126,9 +126,17 @@ def _worker_memory_max_bytes() -> int:
 
 def _systemd_scope_argv(binary: str, unit_name: str, *argv: str) -> List[str]:
     """``systemd-run --user --scope`` argv shared by the probe and real spawns.
-    ``--collect`` self-cleans the scope after exit; ``--unit`` names it for systemctl."""
+    ``--collect`` self-cleans the scope after exit; ``--unit`` names it for systemctl.
+    ``--slice-inherit`` keeps the scope inside the CALLER's slice instead of the
+    default ``app.slice``: a worker gets its own cgroup (so an OOM in it cannot
+    take the gateway down) while still counting against the shared ancestor
+    budget. Without it the worker silently escapes that budget, and a worker
+    that must survive a gateway restart is killed with the slice it left.
+    systemd too old to know the flag fails the availability probe, so the
+    restart-safe route fails closed instead of launching outside the budget."""
     return [
-        binary, "--user", "--scope", "--quiet", "--unit", unit_name, "--collect",
+        binary, "--user", "--scope", "--quiet", "--slice-inherit",
+        "--unit", unit_name, "--collect",
         "--property", "MemoryAccounting=yes",
         "--property", f"MemoryMax={_worker_memory_max_bytes()}",
         "--property", "OOMPolicy=kill",

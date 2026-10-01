@@ -230,7 +230,9 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
     assert requested.payload["summary"] == "Implementation and focused tests are ready."
     implementation_run = _run(kb.list_runs(conn, task_id), "review_requested")
     assert implementation_run.summary == "Implementation and focused tests are ready."
-    assert implementation_run.metadata == {"commit": "abc123"}
+    # The caller's handoff metadata must survive; the run also carries additive
+    # provenance (e.g. the host instantiation epoch), so do not pin the whole dict.
+    assert implementation_run.metadata["commit"] == "abc123"
 
     review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
     assert review is not None

@@ -45,6 +45,15 @@ class GatewayKanbanWatchersMixin:
     def _owns_kanban_dispatcher_lock(self) -> bool:
         return getattr(self, "_kanban_dispatcher_lock_handle", None) is not None
 
+    def _kanban_shutdown_requested(self) -> bool:
+        """True once this gateway is draining or stopping.
+
+        The dispatcher polls this inside its tick so a launch in flight is
+        cancelled rather than granted to a gateway that will not outlive it.
+        ``getattr``-guarded: shutdown-path tests build bare runners.
+        """
+        return bool(getattr(self, "_draining", False)) or not bool(getattr(self, "_running", True))
+
     def _release_kanban_dispatcher_lock(self) -> None:
         """Clear notifier-visible ownership before releasing the OS lock."""
         handle = getattr(self, "_kanban_dispatcher_lock_handle", None)
@@ -247,7 +256,10 @@ class GatewayKanbanWatchersMixin:
         _load_config, _kb, kanban_cfg = boot
         settings = _resolve_dispatcher_settings(kanban_cfg, _kb)
         interval = settings.interval
-        dispatcher = _KanbanDispatcher(_kb, settings)
+        # The in-flight tick must see a drain/stop the moment it starts (the
+        # signal handler sets ``_draining`` before any diagnostics), so read the
+        # live flags instead of sampling them once at boot.
+        dispatcher = _KanbanDispatcher(_kb, settings, should_stop=self._kanban_shutdown_requested)
 
         # Initial delay so adapters are wired before workers spawn (matches the notifier).
         await asyncio.sleep(5)
