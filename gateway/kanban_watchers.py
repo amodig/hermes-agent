@@ -45,6 +45,21 @@ class GatewayKanbanWatchersMixin:
     def _owns_kanban_dispatcher_lock(self) -> bool:
         return getattr(self, "_kanban_dispatcher_lock_handle", None) is not None
 
+    def _kanban_drain_engaged(self) -> bool:
+        """Whether a DELIBERATE drain is engaged, as opposed to a stopping gateway.
+
+        Health telemetry uses this: a drain leaves queued work pending on purpose,
+        so the stuck-queue counters and their alerts must not accumulate. A
+        gateway that is merely stopping (``_running`` false) is deliberately NOT
+        included — the watcher loop exits on its next check, so one partial tick
+        cannot reach the alert window, and keying this off ``_running`` would
+        change the per-tick probe accounting mid-iteration.
+        """
+        return bool(
+            getattr(self, "_draining", False)
+            or getattr(self, "_external_drain_active", False)
+        )
+
     def _kanban_shutdown_requested(self) -> bool:
         """True once this gateway must stop granting new Kanban work.
 
@@ -314,20 +329,27 @@ class GatewayKanbanWatchersMixin:
                         await _to_thread_process_service(dispatcher.auto_decompose_tick, _ad_per_tick)
                     results = await _to_thread_process_service(dispatcher.tick_once)
                     any_spawned = _log_spawn_results(results)
-                    pending_ids = await _to_thread_process_service(dispatcher.spawnable_ids)
-                    # Guard holds stay visible even when another card spawned:
-                    # the operator question is "why is THIS card queued?", not
-                    # "is the board idle?".
-                    holds = guarded_holds(results)
-                    guarded_ticks = guarded_ticks + 1 if holds else 0
-                    if holds:
-                        guard_holds = holds
-                    # The stuck signal counts only pending work the guard does
-                    # not already explain, so a guard hold cannot masquerade as
-                    # a profile/PATH failure.
-                    held_ids = {label for label, _reason in holds}
-                    unexplained = [task_id for task_id in pending_ids if task_id not in held_ids]
-                    bad_ticks = bad_ticks + 1 if unexplained and not any_spawned else 0
+                    if self._kanban_drain_engaged():
+                        # A deliberate drain is not a stuck queue: dispatch is
+                        # disabled on purpose, so the pending-work and guard
+                        # counters (and their alerts) must not accumulate.
+                        bad_ticks = 0
+                        guarded_ticks = 0
+                    else:
+                        pending_ids = await _to_thread_process_service(dispatcher.spawnable_ids)
+                        # Guard holds stay visible even when another card spawned:
+                        # the operator question is "why is THIS card queued?", not
+                        # "is the board idle?".
+                        holds = guarded_holds(results)
+                        guarded_ticks = guarded_ticks + 1 if holds else 0
+                        if holds:
+                            guard_holds = holds
+                        # The stuck signal counts only pending work the guard does
+                        # not already explain, so a guard hold cannot masquerade as
+                        # a profile/PATH failure.
+                        held_ids = {label for label, _reason in holds}
+                        unexplained = [task_id for task_id in pending_ids if task_id not in held_ids]
+                        bad_ticks = bad_ticks + 1 if unexplained and not any_spawned else 0
                 now = int(time.time())
                 if guarded_ticks >= _HEALTH_WINDOW and now - last_guard_warn_at >= 300:
                     logger.warning(

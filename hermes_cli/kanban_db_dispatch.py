@@ -2325,8 +2325,14 @@ def _dispatch_lane_task(
             launch_identity = launch.runtime_identity
             preparation_id = launch.preparation_id
             if launch.grant:
-                # Final barrier: past the grant the worker owns the card, so
-                # nothing below may cancel it, pause it, or charge a retry.
+                # Final barrier. This is a FENCE, not a lock: a drain that begins
+                # in the instant between this check and the grant still lands a
+                # granted worker, and that is the intended contract — in-flight
+                # granted work finishes and survives a gateway restart, the same
+                # property that keeps existing workers alive across one. Revoking
+                # a grant here would mean cancelling a worker that may already be
+                # past its bootstrap, which the contract forbids; only UNGRANTED
+                # launches are cancelled.
                 _check_not_stopping(should_stop, claimed.id)
                 launch.grant(int(claimed.current_run_id), claimed.claim_lock)
                 return _record_granted_spawn(
