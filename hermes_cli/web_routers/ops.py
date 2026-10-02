@@ -337,7 +337,6 @@ async def list_credential_pool(profile: Optional[str] = None):
     from agent.credential_pool import load_pool
     from hermes_cli.auth import read_credential_pool
 
-    @_config_profile_scope("default")
     def _run():
         providers = []
         # read_credential_pool(None) lists every provider with pooled entries;
@@ -356,10 +355,9 @@ async def list_credential_pool(profile: Optional[str] = None):
                 })
         return {"providers": providers}
 
-    # A named profile reads only its own auth.json (#111724), and the store path
-    # resolves at call time — so the pool the dashboard shows is the one the
-    # requested profile's agent would actually use.
-    return await config_scoped_to_thread(profile, _run)
+    # Omitted profile keeps the shared-root pool; an explicit profile must not
+    # be overwritten by a nested default scope.
+    return await config_scoped_to_thread(profile or "default", _run)
 
 
 @router.post("/api/credentials/pool")
@@ -378,7 +376,6 @@ async def add_credential_pool_entry(body: CredentialPoolAdd, profile: Optional[s
     if not provider or not api_key:
         raise HTTPException(status_code=400, detail="provider and api_key are required")
 
-    @_config_profile_scope("default")
     def _run():
         try:
             pool = load_pool(provider)
@@ -418,7 +415,7 @@ async def add_credential_pool_entry(body: CredentialPoolAdd, profile: Optional[s
             _log.exception("POST /api/credentials/pool failed")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    return await config_scoped_to_thread(profile, _run)
+    return await config_scoped_to_thread(profile or "default", _run)
 
 
 @router.delete("/api/credentials/pool/{provider}/{index}")
@@ -440,7 +437,6 @@ async def remove_credential_pool_entry(provider: str, index: int, profile: Optio
 
     provider = (provider or "").strip().lower()
 
-    @_config_profile_scope("default")
     def _run():
         try:
             pool = load_pool(provider)
@@ -472,7 +468,7 @@ async def remove_credential_pool_entry(provider: str, index: int, profile: Optio
         return {"ok": True, "provider": provider, "count": len(pool.entries()), "cleaned": cleaned, "hints": hints}
 
     return await config_scoped_to_thread(
-        destructive_profile(profile, "DELETE /api/credentials/pool/{provider}/{index}"), _run)
+        destructive_profile(profile, "DELETE /api/credentials/pool/{provider}/{index}") or "default", _run)
 
 
 # --- Memory provider: setup is dashboard-native only via get_config_schema();

@@ -264,7 +264,6 @@ def test_import_scrubs_typed_handoff_paths_and_requeues_candidate(kanban_root, t
             conn,
             title="typed review",
             assignee="reviewer",
-            initial_status="blocked",
             lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
         )
         kb.link_tasks(conn, implementation, review, requirement="phase_finished")

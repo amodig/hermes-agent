@@ -60,6 +60,12 @@ restart so new gateways cannot deadlock against the updater waiting for them.
 Automatic startup repair and lazy dependency requests refuse a busy installation
 without waiting; lock contention does not consume a recovery retry.
 
+Interrupted Git-pull recovery takes its checkout-local restore claim before
+trying the installation mutation lock. Concurrent launches wait for that restore
+and relaunch from the repaired tree; a live updater still causes a nonblocking
+refusal. A checkout filesystem without file locking keeps its existing recovery
+fallback, but the shared-cache installation lock must still be acquired.
+
 Ordinary source startup retains upstream's pending-tail recovery policy. Sealed
 Kanban workers instead use their captured interpreter and import roots: bootstrap
 does not select or activate the mutable installation's PM environment, dependency

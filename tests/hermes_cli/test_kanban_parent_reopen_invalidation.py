@@ -319,14 +319,14 @@ def test_recursive_reopen_retracts_each_candidate_once(conn, request, reopen):
         parent_id, _ = _accepted_candidate(conn)
     else:
         parent_id = kb.create_task(conn, title="ancestor", assignee="planner")
-        assert kb.complete_task(conn, parent_id)
+        assert kb.complete_task(conn, parent_id, summary="ancestor result")
     bridge = kb.create_task(conn, title="bridge", parents=[parent_id])
-    assert kb.complete_task(conn, bridge)
+    assert kb.complete_task(conn, bridge, summary="bridge result")
     candidate, review = _accepted_candidate(
         conn, parents=[bridge], review_mode="separate_card",
     )
     nested_bridge = kb.create_task(conn, title="nested bridge", parents=[review])
-    assert kb.complete_task(conn, nested_bridge)
+    assert kb.complete_task(conn, nested_bridge, summary="nested bridge result")
     nested, _ = _accepted_candidate(conn, parents=[nested_bridge])
     ready = kb.create_task(conn, title="ready descendant", parents=[nested])
     in_review = kb.create_task(conn, title="review descendant", parents=[nested], assignee="builder")
@@ -393,13 +393,16 @@ def test_recursive_reopen_retracts_each_candidate_once(conn, request, reopen):
 def test_outer_rollback_preserves_descendants_events_and_worker(conn, monkeypatch):
     parent_id, _ = _accepted_candidate(conn)
     bridge = kb.create_task(conn, title="bridge", parents=[parent_id])
-    assert kb.complete_task(conn, bridge)
+    assert kb.complete_task(conn, bridge, summary="bridge result")
     candidate, review = _accepted_candidate(
         conn, parents=[bridge], review_mode="separate_card",
     )
     running = kb.create_task(conn, title="running descendant", parents=[review], assignee="worker")
     claimed = kb.claim_task(conn, running)
     assert claimed is not None
+    # Model a live, fingerprinted worker rather than an unverified fake PID.
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: "test-boot:1|777")
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == 424242)
     kbd._set_worker_pid(conn, running, 424242)
     tables = ("tasks", "task_runs", "task_events", "task_comments", "task_goal_revisions")
     before = {

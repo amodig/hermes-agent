@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+
 
 def _make_task(kb, *, assignee: str):
     return kb.Task(

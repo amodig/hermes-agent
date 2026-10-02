@@ -92,7 +92,7 @@ def test_tagless_channel_check_apply_is_pinned_not_branch_tip(source, monkeypatc
     assert name in capsys.readouterr().out
     assert git(source.root, "rev-parse", "HEAD") == source.commits[0]
     completed = []
-    monkeypatch.setattr(update_cmd, "_complete_source_update", lambda request: completed.append(deepcopy(request)))
+    monkeypatch.setattr(update_cmd, "_complete_source_update", lambda request, **kwargs: completed.append(deepcopy(request)))
     args = source.parser.parse_args(["update", "--channel", name, "--yes"])
     update_cmd._cmd_update_impl(args, False)
     assert git(source.root, "rev-parse", "HEAD") == source.commits[1]
@@ -269,7 +269,7 @@ def test_real_http_reader_resolves_tagless_build_through_cli(source, monkeypatch
                                             channel=name, force=True)
     assert status.get("targetSha") == source.commits[1], status
     completed = []
-    monkeypatch.setattr(update_cmd, "_complete_source_update", lambda req: completed.append(req))
+    monkeypatch.setattr(update_cmd, "_complete_source_update", lambda req, **kwargs: completed.append(req))
     update_cmd._cmd_update_impl(source.parser.parse_args(["update", "--channel", name]), False)
     assert git(source.root, "rev-parse", "HEAD") == source.commits[1]
     assert completed[0]["expected_sha"] == source.commits[1]
@@ -355,7 +355,7 @@ def test_retirement_refuses_to_downgrade_newer_source(
         monkeypatch.setattr(update_cmd, "_prepare_git_command", lambda: (True, ["git"], False))
     original = deepcopy(saved(source))
     completed = []
-    monkeypatch.setattr(update_cmd, "_complete_source_update", lambda request: completed.append(request))
+    monkeypatch.setattr(update_cmd, "_complete_source_update", lambda request, **kwargs: completed.append(request))
     with pytest.raises(ValueError, match="newer|downgrade"):
         source_releases.resolve_source_target(retired_channel_archive.name,
                                               None if transport == "zip" else ["git"], source.root)
@@ -384,7 +384,7 @@ def test_tagless_zip_apply_uses_pinned_source_archive(source, monkeypatch, dirty
     monkeypatch.setattr(urllib.request, "urlretrieve", download)
     monkeypatch.setattr(update_cmd, "_prepare_git_command", lambda: (True, ["git"], False))
     completed = []
-    monkeypatch.setattr(update_cmd, "_complete_source_update", lambda req: completed.append(deepcopy(req)))
+    monkeypatch.setattr(update_cmd, "_complete_source_update", lambda req, **kwargs: completed.append(deepcopy(req)))
     if dirty:
         (source.root / "notes.txt").write_text("do not remove")
         with pytest.raises(SystemExit):
@@ -460,7 +460,7 @@ def test_source_branch_record_has_no_bundle_and_explicit_branch_is_separate(sour
     monkeypatch.setattr(source_releases, "_resolve_channel", forbidden)
     set_install_channel("unavailable-preview", source.root)
     completed = []
-    monkeypatch.setattr(update_cmd, "_complete_source_update", lambda request: completed.append(request))
+    monkeypatch.setattr(update_cmd, "_complete_source_update", lambda request, **kwargs: completed.append(request))
     update_cmd._cmd_update_impl(source.parser.parse_args(["update", "--branch", "main"]), False)
     assert git(source.root, "rev-parse", "HEAD") == source.commits[2]
     assert "channel_retirement" not in completed[0]
@@ -477,7 +477,7 @@ def test_changed_checkout_cannot_repin_selected_channel_during_apply(source, mon
         return before
     monkeypatch.setattr(update_cmd, "_pull_updates", moved)
     completed = []
-    monkeypatch.setattr(update_cmd, "_complete_source_update", lambda req: completed.append(req))
+    monkeypatch.setattr(update_cmd, "_complete_source_update", lambda req, **kwargs: completed.append(req))
     with pytest.raises(SystemExit):
         update_cmd._cmd_update_impl(source.parser.parse_args(["update"]), False)
     assert not completed

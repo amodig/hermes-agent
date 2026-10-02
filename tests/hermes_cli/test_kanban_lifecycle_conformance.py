@@ -46,20 +46,8 @@ from tests.hermes_cli import kanban_conformance_fixture as MODULE
 
 class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
 
-    def _move(self, trace: list[str], alias: str, operation) -> None:
-        before = self._task(self.ids[alias]).status
-        result = operation()
-        self.assertNotEqual(result, False)
-        after = self._task(self.ids[alias]).status
-        trace.append(f"{alias}:{before}->{after}")
-
-    def _load_fixture(self) -> dict:
-        fixture = json.loads(MODULE.FIXTURE.read_text(encoding="utf-8"))
-        self.assertEqual(fixture["fixture_version"], 0)
-        return fixture
-
     def test_separate_card_fixture_releases_acceptance_in_order(self) -> None:
-        fixture = self._load_fixture()
+        fixture = json.loads(MODULE.FIXTURE.read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-git-") as raw_repo:
             repo = Path(raw_repo)
             MODULE._git(repo, "init", "-q")
@@ -100,17 +88,21 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
                 initial_status=validation_spec["status"],
                 lifecycle_contract={"kind": "validation", "candidate_task_id": implementation},
             )
-            self.ids = {"implementation": implementation, "review": review, "validation": validation}
+            ids = {"implementation": implementation, "review": review, "validation": validation}
             for edge in fixture["edges"]:
-                parent = self.ids[edge["parent"]]
-                child = self.ids[edge["child"]]
+                parent = ids[edge["parent"]]
+                child = ids[edge["child"]]
                 kb.link_tasks(self.conn, parent, child, requirement=edge["requirement"])
 
-            trace: list[str] = []
-            self._move(trace, "implementation", lambda: kb.unblock_task(self.conn, implementation))
+            # The v0 fixture parks every card explicitly. Release the manual
+            # holds before testing automatic dependency-driven scheduling.
+            for role in (review, validation):
+                self.assertTrue(kb.unblock_task(self.conn, role))
+                self.assertFalse(kb.evaluate_dependencies(self.conn, role)["satisfied"])
+                self.assertEqual(self._task(role).status, "todo")
+            self.assertTrue(kb.unblock_task(self.conn, implementation))
             impl_run = kb.claim_task(self.conn, implementation, claimer="implementer:conformance")
             self.assertIsNotNone(impl_run)
-            trace.append("implementation:ready->running")
             self.assertTrue(
                 kb.complete_task(
                     self.conn,
@@ -135,13 +127,12 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
                 get_lifecycle_state(self.conn, implementation)["acceptance"],
                 "pending",
             )
-            trace.append("implementation:running->done")
+            self.assertEqual(self._task(implementation).status, "done")
             self.assertEqual(self._task(review).status, "review")
-            trace.append("review:blocked->review")
+            self.assertIsNone(kb.claim_task(self.conn, validation, claimer="tester:too-early"))
 
             review_run = kb.claim_review_task(self.conn, review, claimer="reviewer:conformance")
             self.assertIsNotNone(review_run, msg=f"review status={self._task(review).status} dependencies={kb.evaluate_dependencies(self.conn, review)}")
-            trace.append("review:review->running")
             self.assertTrue(
                 kb.complete_task(
                     self.conn,
@@ -152,13 +143,11 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
                     metadata={"reviewed_head_sha": head_sha},
                 )
             )
-            trace.append("review:running->done")
+            self.assertEqual(self._task(review).status, "done")
             self.assertEqual(self._task(validation).status, "ready")
-            trace.append("validation:blocked->ready")
 
             validation_run = kb.claim_task(self.conn, validation, claimer="tester:conformance")
             self.assertIsNotNone(validation_run)
-            trace.append("validation:ready->running")
             with patch.object(kb, "_fire_task_hook") as fire_hook:
                 self.assertTrue(
                     kb.complete_task(
@@ -185,13 +174,11 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
                 candidate_completion_calls[0].kwargs["summary"],
                 "Validation passed on reviewed head",
             )
-            trace.append("validation:running->done")
+            self.assertEqual(self._task(validation).status, "done")
             acceptance = get_lifecycle_state(self.conn, implementation)
             self.assertEqual(acceptance["acceptance"], "accepted")
             self.assertEqual(acceptance["review_verdict"], "APPROVE")
             self.assertEqual(acceptance["validation_verdict"], "PASS")
-            trace.append("implementation:acceptance=pending->accepted")
-            self.assertEqual(trace[-1], fixture["expected_trace"][-1])
 
     def test_same_card_review_waits_for_validation_before_terminal_completion(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-validation-") as raw_repo:
@@ -226,7 +213,6 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
                 self.conn,
                 title="same-card validation",
                 assignee="tester",
-                initial_status="blocked",
                 lifecycle_contract={
                     "kind": "validation",
                     "candidate_task_id": implementation,
@@ -461,7 +447,6 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
                 self.conn,
                 title="Archived negative verdict review",
                 assignee="reviewer",
-                initial_status="blocked",
                 lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
             )
             kb.link_tasks(self.conn, implementation, review, requirement="phase_finished")
@@ -677,7 +662,6 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
                 self.conn,
                 title="identity review",
                 assignee="alice",
-                initial_status="blocked",
                 lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
             )
             kb.link_tasks(self.conn, implementation, review, requirement="phase_finished")
@@ -689,6 +673,7 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
                     self.conn,
                     implementation,
                     expected_run_id=implementation_run.current_run_id,
+                    summary="Implemented lifecycle.py at the recorded candidate head",
                     metadata={
                         "base_sha": base_sha,
                         "head_sha": head_sha,
@@ -742,13 +727,11 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
         child = kb.create_task(
             self.conn,
             title="malformed dependency child",
-            initial_status="blocked",
             parents=(parent,),
         )
         unrelated = kb.create_task(
             self.conn,
             title="unrelated ready task",
-            initial_status="blocked",
         )
         with kb.write_txn(self.conn):
             self.conn.execute(
@@ -758,7 +741,9 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
         projection = kb.evaluate_dependencies(self.conn, child)
         self.assertFalse(projection["satisfied"])
         self.assertEqual(projection["blockers"][0]["code"], "lifecycle_unclassified")
-        self.assertEqual(kb.recompute_ready(self.conn), 1)
+        kb.recompute_ready(self.conn)
+        self.assertEqual(self._task(child).status, "todo")
+        self.assertIsNone(kb.claim_task(self.conn, child, claimer="worker"))
         self.assertEqual(self._task(unrelated).status, "ready")
 
     def test_legacy_null_contracts_remain_schedulable(self) -> None:
@@ -797,7 +782,6 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
             self.conn,
             title="legacy dependent",
             assignee="worker",
-            initial_status="blocked",
             parents=(parent,),
         )
         with kb.write_txn(self.conn):
@@ -906,7 +890,8 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
         )
         claimed = kb.claim_task(self.conn, running)
         self.assertIsNotNone(claimed)
-        kbd._set_worker_pid(self.conn, running, 424242)
+        with patch.object(kbd, "_process_fingerprint", return_value="424242:start"):
+            kbd._set_worker_pid(self.conn, running, 424242)
         affected = (child, candidate, review, bridge, nested, ready, in_review, running)
         before = {tid: self._task(tid) for tid in (upstream, gate, sibling, untouched, *affected)}
         tables = ("tasks", "task_links", "task_runs", "task_events", "task_comments")
@@ -938,9 +923,12 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
         })
         self.conn.execute("DROP TRIGGER reject_link_acceptance")
 
-        def terminate_after_commit(pid, claim_lock):
+        def terminate_after_commit(pid, claim_lock, *, started_at):
             self.assertFalse(self.conn.in_transaction)
-            self.assertEqual((pid, claim_lock), (424242, claimed.claim_lock))
+            self.assertEqual(
+                (pid, claim_lock, started_at),
+                (424242, claimed.claim_lock, "424242:start"),
+            )
             self.assertEqual(kb.latest_run(self.conn, running).outcome, "reclaimed")
             for tid in (candidate, nested):
                 changes = [e for e in kb.list_events(self.conn, tid) if e.kind == "acceptance_changed"]
@@ -985,22 +973,16 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
         gate = kb.create_task(self.conn, title="new unfinished dependency")
         other_gate = kb.create_task(self.conn, title="existing unfinished dependency")
         satisfied = kb.create_task(self.conn, title="completed dependency")
-        self.assertTrue(kb.complete_task(self.conn, satisfied))
-        for status in ("done", "review", "running"):
+        self.assertTrue(kb.complete_task(self.conn, satisfied, summary="Dependency work finished"))
+        for status in ("done", "review"):
             with self.subTest(status=status):
-                claimed = None
                 if status == "done":
                     child, _ = self._completed_candidate()
                 else:
                     child = kb.create_task(
                         self.conn, title=f"{status} child", assignee="worker",
                     )
-                    if status == "review":
-                        self.assertTrue(kb.request_review(self.conn, child, reviewer="reviewer"))
-                    else:
-                        claimed = kb.claim_task(self.conn, child)
-                        self.assertIsNotNone(claimed)
-                        kbd._set_worker_pid(self.conn, child, 424242)
+                    self.assertTrue(kb.request_review(self.conn, child, reviewer="reviewer"))
                 # Existing historical blockers must not make a satisfied new link
                 # retract unrelated work, nor make an identical link non-idempotent.
                 with kb.write_txn(self.conn):
@@ -1015,24 +997,9 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
                 kb.link_tasks(self.conn, satisfied, child)
                 self.assertEqual(self._task(child), before)
                 self.assertEqual(kb.list_events(self.conn, child), events)
-                if claimed is not None:
-                    with self.assertRaises(kb.TaskUpdateConflict):
-                        kb.link_tasks(
-                            self.conn, other_gate, child,
-                            expected_parent_version=self._task(other_gate).version,
-                            expected_child_version=before.version, reason="cannot rebind a claim",
-                        )
-                    self.assertEqual(self._task(child), before)
-                    self.assertIsNone(self.conn.execute(
-                        "SELECT requirement FROM task_links WHERE parent_id = ? AND child_id = ?",
-                        (other_gate, child),
-                    ).fetchone()["requirement"])
                 with patch.object(kb, "_terminate_reclaimed_worker") as terminate:
                     kb.link_tasks(self.conn, gate, child, requirement="phase_finished")
-                    if claimed is None:
-                        terminate.assert_not_called()
-                    else:
-                        terminate.assert_called_once_with(424242, claimed.claim_lock)
+                    terminate.assert_not_called()
                 task = self._task(child)
                 self.assertEqual(task.status, "todo")
                 self.assertEqual(task.version, before.version + 1)
@@ -1050,12 +1017,59 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
                     self.assertEqual(
                         [(e["old"], e["new"]) for e in changes], [("accepted", acceptance)],
                     )
-                if claimed is not None:
-                    self.assertEqual(kb.latest_run(self.conn, child).outcome, "reclaimed")
+
+    def test_running_dependency_links_preserve_claim_and_require_run_ownership(self) -> None:
+        gate = kb.create_task(self.conn, title="unfinished dependency")
+        child = kb.create_task(self.conn, title="owned worker", assignee="worker")
+        claimed = kb.claim_task(self.conn, child)
+        self.assertIsNotNone(claimed)
+        with patch.object(kbd, "_process_fingerprint", return_value="424242:start"):
+            kbd._set_worker_pid(self.conn, child, 424242)
+        before = self._task(child)
+        run_before = kb.latest_run(self.conn, child)
+        snapshot = tuple(self.conn.iterdump())
+        with patch.object(kb, "_terminate_reclaimed_worker") as terminate:
+            for run_id in (None, claimed.current_run_id + 1):
+                with self.subTest(run_id=run_id), self.assertRaises(ValueError):
+                    kb.link_tasks(
+                        self.conn, gate, child, requirement="phase_finished",
+                        expected_child_run_id=run_id,
+                    )
+                self.assertEqual(tuple(self.conn.iterdump()), snapshot)
+            kb.link_tasks(
+                self.conn, gate, child, requirement="phase_finished",
+                expected_child_run_id=claimed.current_run_id,
+            )
+            self.assertFalse(kb.evaluate_dependencies(self.conn, child)["satisfied"])
+            self.assertEqual(self._task(child), before)
+            self.assertEqual(kb.latest_run(self.conn, child), run_before)
+            linked_snapshot = tuple(self.conn.iterdump())
+            kb.link_tasks(
+                self.conn, gate, child, requirement="phase_finished",
+                expected_child_run_id=claimed.current_run_id,
+            )
+            self.assertEqual(tuple(self.conn.iterdump()), linked_snapshot)
+            # Ownership permits adding a dependency before a block handoff,
+            # not rebinding an existing edge underneath an active claim.
+            with kb.write_txn(self.conn):
+                self.conn.execute(
+                    "UPDATE task_links SET requirement = NULL WHERE parent_id = ? AND child_id = ?",
+                    (gate, child),
+                )
+            legacy_snapshot = tuple(self.conn.iterdump())
+            with self.assertRaises(kb.TaskUpdateConflict):
+                kb.link_tasks(
+                    self.conn, gate, child, requirement="phase_finished",
+                    expected_child_run_id=claimed.current_run_id,
+                    expected_parent_version=self._task(gate).version,
+                    expected_child_version=before.version, reason="cannot rebind a claim",
+                )
+            self.assertEqual(tuple(self.conn.iterdump()), legacy_snapshot)
+            terminate.assert_not_called()
 
     def test_archived_children_reject_changed_dependencies(self) -> None:
         parent = kb.create_task(self.conn, title="completed dependency")
-        self.assertTrue(kb.complete_task(self.conn, parent))
+        self.assertTrue(kb.complete_task(self.conn, parent, summary="Dependency work finished"))
         archived = kb.create_task(self.conn, title="archived child", parents=[parent])
         self.assertTrue(kb.archive_task(self.conn, archived))
         candidate, _ = self._completed_candidate(parents=[archived])
@@ -1093,7 +1107,7 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
 
     def test_dependency_invalidation_stops_at_unchanged_archived_boundary(self) -> None:
         parent = kb.create_task(self.conn, title="completed branch")
-        self.assertTrue(kb.complete_task(self.conn, parent))
+        self.assertTrue(kb.complete_task(self.conn, parent, summary="Branch work finished"))
         archived = kb.create_task(self.conn, title="archived boundary", parents=[parent])
         self.assertTrue(kb.archive_task(self.conn, archived))
         candidate, _ = self._completed_candidate(parents=[archived])
@@ -1767,7 +1781,7 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
         for phase in ("review", "blocked", "running"):
             with self.subTest(phase=phase):
                 parent = kb.create_task(self.conn, title=f"{phase} ancestor")
-                self.assertTrue(kb.complete_task(self.conn, parent))
+                self.assertTrue(kb.complete_task(self.conn, parent, summary="Ancestor work finished"))
                 child = kb.create_task(
                     self.conn, title=f"{phase} descendant", assignee="builder",
                     parents=[parent], workspace_kind="dir", workspace_path=str(repo),
@@ -1806,7 +1820,7 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
                 self.assertEqual(invalidated.version, before.version + 1)
                 self.assertEqual(invalidated.status, "blocked" if phase == "blocked" else "todo")
                 kb.recompute_ready(self.conn)
-                self.assertTrue(kb.complete_task(self.conn, parent))
+                self.assertTrue(kb.complete_task(self.conn, parent, summary="Reopened ancestor work finished"))
                 kb.recompute_ready(self.conn)
                 if phase == "blocked":
                     self.assertEqual(self._task(child).status, "blocked")
@@ -2515,15 +2529,23 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
         with tempfile.TemporaryDirectory(prefix="kanban-conformance-recovery-") as raw:
             source = Path(raw) / "install"
             MODULE._make_runtime_fixture(source)
-            for name in ("main.py", "_subprocess_compat.py", "_startup_fast.py"):
+            for name in ("main.py", "_subprocess_compat.py", "_startup_fast.py",
+                         "_parser.py", "_early_recovery.py"):
                 shutil.copy2(MODULE.RUNTIME_ROOT / "hermes_cli" / name, source / "hermes_cli" / name)
-            shutil.copy2(MODULE.RUNTIME_ROOT / "hermes_bootstrap.py", source / "hermes_bootstrap.py")
-            recovery_marker = Path(raw) / "recovery-mutated-install"
-            (source / "hermes_cli" / "_early_recovery.py").write_text(
-                "from pathlib import Path\n"
-                f"def recover_if_needed():\n    Path({str(recovery_marker)!r}).touch()\n",
-                encoding="utf-8",
+            for name in ("hermes_bootstrap.py", "hermes_constants.py", "hermes_constants_scratch.py"):
+                shutil.copy2(MODULE.RUNTIME_ROOT / name, source / name)
+            shutil.copytree(
+                MODULE.RUNTIME_ROOT / "pm", source / "pm",
+                ignore=shutil.ignore_patterns("__pycache__"),
             )
+            recovery_marker = Path(raw) / "recovery-mutated-install"
+            # Keep the real interrupted-pull guard; record any dependency
+            # recovery invocation without allowing an installer to run.
+            with (source / "hermes_cli" / "_early_recovery.py").open("a", encoding="utf-8") as handle:
+                handle.write(
+                    f"\ndef recover_if_needed(*args, **kwargs):\n"
+                    f"    Path({str(recovery_marker)!r}).touch()\n"
+                )
             prepared = MODULE._prepare_fixture_generation(source)
             try:
                 completed = subprocess.run(
@@ -2538,20 +2560,25 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
 
     def test_early_recovery_defers_to_live_installation_lock(self) -> None:
         script = """
+import importlib
 import sys
 from pathlib import Path
 from hermes_cli import _early_recovery as recovery
-from hermes_cli import _install_repair as repair
 from hermes_cli import kanban_runtime_generation as generations
+from pm import client, paths
 generations._runtime_storage_root = lambda: Path(sys.argv[2])
 root = Path(sys.argv[1])
-def install(*args):
+paths.repo_root = lambda: root
+engine = importlib.import_module("pm.install")
+# This child runs the real PM mutation entrypoint and kernel locks, but never
+# downloads or builds dependencies. Only the package's build is a test double.
+client.sync_venv = engine.sync_venv
+package = engine.get_package("venv")
+package.expected_stamp = lambda *args, **kwargs: "conformance-repair"
+def install(*args, **kwargs):
     (root / "installer-ran").touch()
-    return True
-recovery._probe_broken_packages = lambda: ["PyYAML"]
-recovery._run_repair_install = install
-repair.run_core_install = install
-recovery.recover_if_needed(project_root=root, argv=[])
+package.apply = install
+assert recovery.recover_if_needed(project_root=root, argv=[]) is (sys.argv[3] == "recover")
 """
         for marker in (".update-incomplete", ".lazy-refresh-incomplete"):
             with self.subTest(marker=marker), tempfile.TemporaryDirectory(
@@ -2563,21 +2590,27 @@ recovery.recover_if_needed(project_root=root, argv=[])
                     encoding="utf-8",
                 )
                 (source / marker).write_text("pid=0\n", encoding="utf-8")
-                env = {**os.environ, "PYTHONPATH": str(MODULE.RUNTIME_ROOT), "TMPDIR": raw}
+                env = {
+                    **os.environ, "PYTHONPATH": str(MODULE.RUNTIME_ROOT), "TMPDIR": raw,
+                    "HOME": raw, "USERPROFILE": raw,
+                    "HERMES_RUNTIME_DIR": str(source / "tools"),
+                }
+                env.pop("HERMES_INSTALL_ROOT", None)
                 command = [sys.executable, "-c", script, raw, str(source / "runtime-storage")]
                 # Other test files share the interpreter installation, not this fixture's locks.
                 with patch.object(generations, "_runtime_storage_root", lambda: source / "runtime-storage"), generations.installation_mutation_lock(source):
                     deferred = subprocess.run(
-                        command, env=env, capture_output=True, text=True, timeout=10,
+                        command + ["defer"], env=env, capture_output=True, text=True, timeout=10,
                     )
                 self.assertEqual(deferred.returncode, 0, deferred.stderr)
                 self.assertFalse((source / "installer-ran").exists())
-                self.assertTrue((source / marker).exists())
+                self.assertEqual((source / marker).read_text(encoding="utf-8"), "pid=0\n")
                 recovered = subprocess.run(
-                    command, env=env, capture_output=True, text=True, timeout=10,
+                    command + ["recover"], env=env, capture_output=True, text=True, timeout=10,
                 )
                 self.assertEqual(recovered.returncode, 0, recovered.stderr)
                 self.assertTrue((source / "installer-ran").exists())
+                self.assertFalse((source / marker).exists())
 
     def test_reaped_launcher_exit_uses_verified_worker_pid(self) -> None:
         launcher_pid = 2_147_482_999
@@ -2741,7 +2774,6 @@ recovery.recover_if_needed(project_root=root, argv=[])
                 self.conn,
                 title="Review race fixture",
                 assignee="reviewer",
-                initial_status="blocked",
                 lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
             )
             kb.link_tasks(self.conn, implementation, review, requirement="phase_finished")
@@ -3397,7 +3429,6 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
                     conn,
                     title="Phase-aware validation",
                     assignee="tester",
-                    initial_status="blocked",
                     lifecycle_contract={"kind": "validation", "candidate_task_id": implementation},
                 )
                 kb.link_tasks(conn, implementation, validation, requirement="review_approved")
@@ -3505,7 +3536,7 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
                 self.assertEqual(asked[-1].payload["implementer"], "implementer")
                 # Downstream validation stays gated until the review approves.
                 with kbc.connect_closing() as conn:
-                    self.assertEqual(kb.get_task(conn, validation).status, "blocked")
+                    self.assertFalse(kb.evaluate_dependencies(conn, validation)["satisfied"])
                 self.assertFalse(self._claims(validation))
 
                 # Judged in the implementation phase, with the card's whole-goal
@@ -3776,7 +3807,7 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
                 self.assertEqual(elapsed["head_sha"], head)
                 self.assertEqual(elapsed["candidate_run_id"], candidate_run_id)
                 with kbc.connect_closing() as conn:
-                    self.assertEqual(kb.get_task(conn, validation).status, "blocked")
+                    self.assertFalse(kb.evaluate_dependencies(conn, validation)["satisfied"])
                 self.assertFalse(self._claims(validation))
 
         for verdict, expected in (("PASS", "accepted"), ("FAIL", "rejected")):
@@ -4010,6 +4041,7 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
                     with kbc.connect_closing() as conn:
                         goal_before = kb.get_effective_goal(conn, tid)
                         task_before = kb.get_task(conn, tid)
+                        validation_before = kb.get_task(conn, validation)
                     metadata = {"base_sha": base, "head_sha": head}
                     if index == 0:
                         # One case relies on the verified Git diff for
@@ -4037,8 +4069,7 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
                     )
                     self.assertEqual(handoff["head_sha"], head)
                     self.assertIn("phase.py", handoff["changed_files"])
-                    self.assertEqual(validation_after.id, validation)
-                    self.assertEqual(validation_after.status, "blocked")
+                    self.assertEqual(validation_after, validation_before)
                     self.assertFalse(self._claims(validation))
 
 

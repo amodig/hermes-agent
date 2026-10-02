@@ -12,7 +12,6 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import threading
 import time
 
 import pytest
@@ -23,16 +22,7 @@ from agent.credential_pool import STATUS_DEAD, CredentialPool, PooledCredential
 
 
 def _pool(provider: str) -> CredentialPool:
-    pool = CredentialPool.__new__(CredentialPool)
-    pool._lock = threading.RLock()
-    pool._entries = []
-    pool._active_leases = {}
-    pool._current_id = None
-    pool._max_concurrent = 2
-    pool._unmatched_rotation_streak = 0
-    pool._persisted_token_pairs = {}
-    pool.provider = provider
-    return pool
+    return CredentialPool(provider, [])
 
 
 def _entry(provider: str, source: str = "device_code") -> PooledCredential:

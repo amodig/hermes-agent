@@ -38,6 +38,12 @@ _MANIFEST = "generation.json"
 _OWNER = ".hermes-kanban-runtime-owner.json"
 _TREE_EXCLUDES = {".git", ".hg", ".svn", "__pycache__"}
 _SOURCE_EXCLUDES = {"venv", ".venv", ".pytest_cache", ".ruff_cache", ".mypy_cache"}
+# Frontend/tooling workspaces are not worker dependencies. Do not apply this
+# exclusion to plugin/skill-owned node_modules or captured Python import roots.
+_SOURCE_NODE_WORKSPACES = {
+    ".", "apps/bootstrap-installer", "apps/desktop", "apps/shared",
+    "ui-tui", "ui-tui/packages/hermes-ink", "web", "tests-js", "website",
+}
 
 
 def _runtime_storage_root() -> Path:
@@ -159,6 +165,7 @@ def _members(root: Path, *, source=False, exclude=()):
                 f"{relative}/{name}" if relative else name, name, exclude,
             )
             and not (source and (name in _SOURCE_EXCLUDES or (base / name / "pyvenv.cfg").is_file()))
+            and not (source and name == "node_modules" and relative in _SOURCE_NODE_WORKSPACES)
         )
         yield relative + "/", base
         for name in sorted(files):

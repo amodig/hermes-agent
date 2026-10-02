@@ -1418,7 +1418,7 @@ def _pr_urls_in(text: Optional[str]) -> list[str]:
     """Distinct GitHub PR URLs mentioned in one comment body (arrival order)."""
     if not text:
         return []
-    return list(dict.fromkeys(_RESPAWN_GUARD_PR_URL_RE.findall(text)))
+    return list(dict.fromkeys(_RESPAWN_GUARD_PR_URL_RE.findall(_kb._lossy_text(text))))
 
 
 def _recorded_pr_urls(

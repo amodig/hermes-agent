@@ -36,6 +36,7 @@ from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_diagnostics as kd
 from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_path, _safe_attachment_name
+from hermes_cli.kanban_db_lifecycle_completion import set_priority
 
 log = logging.getLogger(__name__)
 
@@ -762,7 +763,7 @@ def _apply_status(conn, task_id: str, s: str, p, unknown_detail: str) -> bool:
 
 
 def _set_priority(conn, task_id: str, priority: int, board: Optional[str]) -> None:
-    kanban_db.edit_task(conn, task_id, priority=int(priority), board=board)
+    set_priority(conn, task_id, priority, board=board)
 
 
 def _apply_model_override(conn, task_id: str, p) -> bool:
@@ -807,11 +808,11 @@ def _open_parent_refusal(conn, task_id: str, s: str) -> Optional[str]:
     for a refused ``done``/``review`` name the open parents instead of the generic text."""
     if s not in ("done", "review"):
         return None
-    blockers = kanban_db.unsatisfied_parents(conn, task_id)
+    blockers = _parents_blocking_ready(conn, task_id)
     if not blockers:
         return None
-    detail = ", ".join(f"{pid} ({status})" for pid, status in blockers)
-    return f"cannot move {task_id} to {s!r}: unsatisfied parent dependencies: {detail}; complete the parents first (done or archived)"
+    detail = ", ".join(f"{b['id']} ({b['status']}): {b['code']}" for b in blockers)
+    return f"cannot move {task_id} to {s!r}: unsatisfied parent dependencies: {detail}"
 
 
 def _requested_transition(payload: UpdateTaskBody) -> Optional[str]:
@@ -942,8 +943,6 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 with _map_errors(400, ValueError, RuntimeError):
                     ok = apply(conn, task_id, payload)
                 _require_ok(ok)
-        if payload.priority is not None:
-            _set_priority(conn, task_id, payload.priority, board)
         wants_cas_update = bool(cas_fields & set(sent))
         if wants_cas_update:
             _patch_title_body(
@@ -953,14 +952,17 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 board,
                 expected_version=request_version,
             )
-        # Domain status/assignment/priority/override mutators record their own
-        # events, but this route owns the optimistic-concurrency version.
+        # Goal CAS must see the request version before reprioritization bumps it.
+        if payload.priority is not None:
+            _set_priority(conn, task_id, payload.priority, board)
+        # Goal and priority mutators own their version bumps. The route supplies
+        # one only for status/assignment/override-only requests.
         if (
             not wants_cas_update
+            and payload.priority is None
             and (
                 payload.status is not None
                 or payload.assignee is not None
-                or payload.priority is not None
                 or any(wanted(payload) for wanted, _, _ in _OVERRIDE_OPS)
             )
         ):

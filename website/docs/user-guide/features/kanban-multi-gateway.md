@@ -34,7 +34,9 @@ Before granting a worker claim, the dispatcher prepares an immutable generation
 containing Hermes, installed dependencies and package resources, and the Python
 interpreter and standard library. The worker starts inside that generation before
 importing Hermes. Its identity records both source provenance and the captured
-dependency content.
+dependency content. Source-checkout captures omit `node_modules` in the repository
+root and first-party frontend/tooling workspaces; plugin- and skill-owned
+dependencies, bundled resources, and built frontend assets remain captured.
 
 Managed updates, dependency installation, and recovery coordinate with generation
 preparation. Existing workers retain their captured runtime across updates and

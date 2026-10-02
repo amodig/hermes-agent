@@ -26,6 +26,9 @@ def homes(tmp_path, monkeypatch):
     are recorded in ``violations`` because the uninstall steps catch and log
     exceptions, so a raised AssertionError alone would leave the test green.
     """
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     home = tmp_path / "hermes-home"
     home.mkdir()
     project_root = tmp_path / "checkout"

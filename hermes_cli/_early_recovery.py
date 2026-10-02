@@ -458,14 +458,15 @@ def restore_interrupted_pull(project_root: Path | None = None) -> bool:
             return False
         from hermes_cli.kanban_runtime_generation import installation_mutation_lock
 
-        with installation_mutation_lock(root, blocking=False), _restore_claim(marker.parent) as claimed:
+        with _restore_claim(marker.parent) as claimed:
             if not claimed:
                 print("⚠ Another Hermes launch is still repairing the checkout after an interrupted "
                       "`hermes update`; if this one fails, launch again in a moment.", file=sys.stderr)
                 return False
             if not marker.is_file():
                 return True  # another launch finished while this one started: rerun from its tree
-            return _restore_holding_claim(root, marker)
+            with installation_mutation_lock(root, blocking=False):
+                return _restore_holding_claim(root, marker)
     except BlockingIOError:
         return False  # A live updater owns the source; never wait on a parent probe.
     except (OSError, subprocess.SubprocessError, ValueError) as exc:

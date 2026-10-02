@@ -856,13 +856,13 @@ def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
     rate-limited entry does (a redeemed banked reset restores the whole account; a still-exhausted
     entry just re-freezes with fresh metadata on its next 429).
     """
-    from agent.credential_pool import _borrowed_single_use_pool_root, _profile_owns_pool_provider
+    from agent.credential_pool import _borrowed_pool_root, _profile_owns_pool_provider
     from hermes_cli.auth import _auth_store_lock, _load_auth_store, _save_auth_store
     cleared = 0
     try:
         # Same owner rule as ``persist_pool_entries``: a profile with no Codex rows of its own
         # borrows the global-root pool, so the cooldown must clear where the rows actually live.
-        target = None if _profile_owns_pool_provider("openai-codex") else _borrowed_single_use_pool_root()
+        target = None if _profile_owns_pool_provider("openai-codex") else _borrowed_pool_root()
         with _auth_store_lock(target_path=target):
             auth_store = _load_auth_store(target)
             for entry in _codex_pool_dicts(_pool_entries(auth_store, "openai-codex")):

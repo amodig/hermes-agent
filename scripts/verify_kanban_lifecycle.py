@@ -178,9 +178,6 @@ expected = runtime.RuntimeIdentity.from_value(
 gateway_profile.mkdir(parents=True, exist_ok=True)
 worker_profile = gateway_profile.parent / "verify"
 worker_profile.mkdir(parents=True, exist_ok=True)
-from hermes_cli.profiles import resolve_profile_env
-if Path(resolve_profile_env("verify")).resolve() != worker_profile:
-    raise RuntimeError("native worker profile selection did not resolve the child profile")
 board_home.mkdir(parents=True, exist_ok=True)
 gateway_profile.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
 # Keep the native child on its constructor/grant fence with a local-only,
@@ -193,6 +190,9 @@ worker_profile.joinpath("config.yaml").write_text(
     "  api_key: synthetic-issue22-key\n",
     encoding="utf-8",
 )
+from hermes_cli.profiles import resolve_profile_env
+if Path(resolve_profile_env("verify")).resolve() != worker_profile:
+    raise RuntimeError("native worker profile selection did not resolve the child profile")
 if "" not in sys.path:
     sys.path.insert(0, "")
 if str(gateway_profile) not in sys.path:
@@ -340,13 +340,20 @@ try:
                 and runtime.same_runtime_identity(launch.runtime_identity, persisted)
             )
 
-        sentinels = (
-            "sessions/secret-sentinel.txt",
-            "credentials.sentinel",
-            "state.db",
-            "kanban.db",
-            ".env.sentinel",
-        )
+        # Profile homes live in the probe's own temp root, which is NOT under
+        # the source runtime root — match the seeded files by their known
+        # profile-relative tails, never by relative_to(runtime_root).
+        sentinel_tails = {
+            f"profiles/{profile_name}/{sentinel}"
+            for profile_name in ("gateway", "verify")
+            for sentinel in (
+                "sessions/secret-sentinel.txt",
+                "credentials.sentinel",
+                "state.db",
+                "kanban.db",
+                ".env.sentinel",
+            )
+        }
         profile_marker_values = tuple(
             marker
             for markers in profile_markers.values()
@@ -358,21 +365,35 @@ try:
                 path.relative_to(snapshot).as_posix()
                 for path in snapshot.rglob("*")
             }
-            no_profile_state = not any(
-                name == sentinel or name.endswith("/" + sentinel)
-                for sentinel in sentinels
+            leaked_members = sorted(
+                name
                 for name in payload_names
+                if any(name.endswith("/" + tail) or name == tail for tail in sentinel_tails)
             )
+            if leaked_members:
+                proof["diagnostics"].append(
+                    "generated profile files leaked into runtime payload: "
+                    + ", ".join(leaked_members)
+                )
             payload_bytes = (
                 path.read_bytes()
                 for path in snapshot.rglob("*")
                 if path.is_file()
             )
-            return no_profile_state and not any(
-                marker.encode("utf-8") in content
+            if leaked_members:
+                return False
+            leaked_markers = [
+                marker
                 for content in payload_bytes
                 for marker in profile_marker_values
-            )
+                if marker.encode("utf-8") in content
+            ]
+            if leaked_markers:
+                proof["diagnostics"].append(
+                    "generated profile secret/state markers leaked into runtime payload: "
+                    + ", ".join(sorted(set(leaked_markers)))
+                )
+            return not leaked_markers
 
         # The native launcher reaches worker_bootstrap_after_constructor before
         # any model request.  Keep its normal argv and cancel from the grant
@@ -645,6 +666,14 @@ def _dispatcher_materialization_check(
             diagnostics.append(
                 f"dispatcher materialization probe exited with status {result.returncode}"
             )
+            if result.stderr.strip():
+                diagnostics.append(
+                    f"probe stderr: {result.stderr.strip()[-2000:]}"
+                )
+            if result.stdout.strip():
+                diagnostics.append(
+                    f"probe stdout: {result.stdout.strip()[-2000:]}"
+                )
             return {
                 "status": "failed",
                 "diagnostics": diagnostics,

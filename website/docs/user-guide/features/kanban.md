@@ -911,6 +911,12 @@ All routes are mounted under `/api/plugins/kanban/` and protected by the dashboa
 | `GET` | `/config` | Read `dashboard.kanban` preferences from `config.yaml` — `default_tenant`, `lane_by_profile`, `include_archived_by_default`, `render_markdown` |
 | `WS` | `/events?since=<event_id>` | Live stream of `task_events` rows. Without `since` the stream starts at the board's current tail (the `/board` snapshot already holds the past); pass `since=<latest_event_id>` to catch up from there, or `since=0` to replay history |
 
+Single-task `PATCH` is atomic, including combined title/body and priority edits.
+Send the task's current `version` as `expected_version` to reject stale edits:
+a mismatch returns `409` without applying any fields or firing update hooks.
+Priority edits advance the task version, so use the returned task's `version`
+for the next edit.
+
 Every handler is a thin wrapper — the plugin is ~700 lines of Python (router + WebSocket tail + bulk batcher + config reader) and adds no new business logic. A tiny `_conn()` helper auto-initializes `kanban.db` on every read and write, so a fresh install works whether the user opened the dashboard first, hit the REST API directly, or ran `hermes kanban init`.
 
 ### Dashboard config
@@ -1401,7 +1407,7 @@ Runs are exposed on the dashboard (Run History section in the drawer, one colour
 
 **Bulk close caveat.** `hermes kanban complete a b c --summary X` is refused — structured handoff is per-run, so copy-pasting the same summary to N tasks is almost always wrong. Bulk close *without* `--summary` / `--metadata` still works for the common "I finished a pile of admin tasks" case.
 
-**Dependency refusal on complete names the parents.** `kanban_complete` / `hermes kanban complete` / the dashboard's "mark done" and "request review" actions (single and bulk) on a card whose direct parent is not `done`/`archived` (a parent reopened mid-run, or an edge that predates the running-child refusal) reports `unsatisfied parent dependencies: t_… (todo)` instead of the generic "unknown id, stale run, or already terminal" text; the card stays in-flight. `kanban_show` lists the same parents under `unsatisfied_parents`, and `hermes kanban show` / `hermes kanban diagnostics` / the dashboard raise a `running_with_open_parents` warning on a running card in that state. Finish the parent or `hermes kanban unlink <parent> <child>`; there is no force path through the dependency gate.
+**Dependency refusal on complete names the parents.** `kanban_complete` / `hermes kanban complete` / the dashboard's "mark done" and "request review" actions (single and bulk) use the same dependency evaluator as dispatch. Blocking parents are reported as `unsatisfied parent dependencies: t_… (todo)` instead of the generic "unknown id, stale run, or already terminal" text; the card stays in-flight. This includes graph-role semantics: a decomposition root does not block its own children, and candidate evidence can satisfy a review/test dependency before final acceptance. `kanban_show` lists the same blockers under `unsatisfied_parents`, and `hermes kanban show` / `hermes kanban diagnostics` / the dashboard raise a `running_with_open_parents` warning on a running card in that state. Satisfy the dependency or `hermes kanban unlink <parent> <child>`; there is no force path through the dependency gate.
 
 **Live-claim guard on complete.** A `running` task whose worker holds a live claim is only completed by that worker (`kanban_complete` from inside the run) or by an explicit operator override: `hermes kanban complete <id> --force` and the dashboard's "mark done" action. A claim-less `hermes kanban complete <id>` or an orchestrator session's `kanban_complete` is refused with a pointer to `--force` / `hermes kanban reclaim`, so a second session can no longer close a live worker's run underneath it. Completing `ready`, `blocked` or `review` cards without a claim is unchanged.
 

@@ -698,6 +698,7 @@ def _handle_show(args: dict, **kw) -> str:
     with _board(board) as (kb, conn):
         task = _existing_task(kb, conn, tid)
         effective_goal = kb.get_effective_goal(conn, tid)
+        dependencies = kb.evaluate_dependencies(conn, tid)
         return json.dumps({
             "task": _fields(task, _TASK_FIELDS),
             "effective_goal": effective_goal,
@@ -705,10 +706,12 @@ def _handle_show(args: dict, **kw) -> str:
             # Live dispatcher guard; ready/review cards can be held while queued.
             "dispatch_guard": kb.get_dispatch_guard(conn, tid, board=board),
             "parents": kb.parent_ids(conn, tid),
-            # Non-terminal parents; on a running card this means the dependency
-            # gate is not holding it and kanban_complete will refuse.
+            "dependencies": dependencies,
             "unsatisfied_parents": [
-                {"id": pid, "status": status} for pid, status in kb.unsatisfied_parents(conn, tid)],
+                {"id": parent.id, "status": parent.status}
+                for item in dependencies["blockers"]
+                if (parent := kb.get_task(conn, item["parent_id"])) is not None
+            ],
             "children": kb.child_ids(conn, tid),
             "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
             # Capped; full log via CLI.
@@ -841,12 +844,15 @@ def _handle_complete(args: dict, **kw) -> str:
             # complete_task reports every refusal as bare False; a reopened or
             # never-finished parent is the actionable one. Name the blockers so
             # the worker/operator completes the parents instead of re-running.
-            blockers = kb.unsatisfied_parents(conn, tid)
+            blockers = kb.evaluate_dependencies(conn, tid)["blockers"]
             if blockers:
-                detail = ", ".join(f"{pid} ({status})" for pid, status in blockers)
+                detail = ", ".join(
+                    f"{item['parent_id']} ({parent.status if parent else item['code']}): {item['message']}"
+                    for item in blockers
+                    for parent in [kb.get_task(conn, item["parent_id"])]
+                )
                 raise _Reject(
-                    f"could not complete {tid}: unsatisfied parent dependencies: "
-                    f"{detail}; complete the parents first (done or archived)")
+                    f"could not complete {tid}: unsatisfied parent dependencies: {detail}")
             _check(False, (task.last_failure_error if task else None) or
                    f"could not complete {tid} (unknown id, stale run, or already terminal)")
         run = kb.latest_run(conn, tid)

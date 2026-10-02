@@ -133,8 +133,15 @@ def test_killed_pull_is_restored_on_next_launch_and_update_reruns(checkout, monk
         import errno
         import fcntl
 
-        def no_locks(*_a):
-            raise OSError(errno.ENOLCK, "No locks available")
+        real_flock = fcntl.flock
+        claim = root / ".git" / er._RESTORE_CLAIM
+
+        def no_locks(fd, operation):
+            # Only the checkout's filesystem lacks locking; the installation
+            # mutation lock in the shared user cache must remain fail-closed.
+            if claim.exists() and os.path.samestat(os.fstat(fd), claim.stat()):
+                raise OSError(errno.ENOLCK, "No locks available")
+            return real_flock(fd, operation)
 
         monkeypatch.setattr(fcntl, "flock", no_locks)
     assert er.restore_interrupted_pull(root) is True, "restored files mean the caller must relaunch"

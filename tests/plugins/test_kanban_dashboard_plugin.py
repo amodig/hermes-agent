@@ -384,9 +384,19 @@ def test_patch_expected_version_rejects_side_effects(client):
 
     refreshed = client.patch(
         f"/api/plugins/kanban/tasks/{task['id']}",
-        json={"title": "fresh title"},
+        json={
+            "expected_version": stale_version,
+            "title": "fresh title",
+            "body": "fresh body",
+            "priority": 7,
+        },
     )
     assert refreshed.status_code == 200, refreshed.text
+    updated = refreshed.json()["task"]
+    assert (updated["title"], updated["body"], updated["priority"]) == (
+        "fresh title", "fresh body", 7,
+    )
+    assert updated["version"] > stale_version
 
     response = client.patch(
         f"/api/plugins/kanban/tasks/{task['id']}",
@@ -394,12 +404,17 @@ def test_patch_expected_version_rejects_side_effects(client):
             "expected_version": stale_version,
             "assignee": "new",
             "title": "stale title",
+            "body": "stale body",
+            "priority": 99,
         },
     )
     assert response.status_code == 409
     current = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
     assert current["assignee"] == "old"
     assert current["title"] == "fresh title"
+    assert current["body"] == "fresh body"
+    assert current["priority"] == 7
+    assert current["version"] == updated["version"]
 
 @pytest.mark.parametrize("status", ["done", "review"])
 @pytest.mark.parametrize("kind", ["code", "general"])

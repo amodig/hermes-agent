@@ -59,13 +59,15 @@ def test_link_tasks_resolves_titles_both_sides(kanban_home, api):
 
     # The child's detail: parents resolve, children stay empty.
     detail = api.get(f"/api/plugins/kanban/tasks/{child}").json()
-    assert detail["links"] == {"parents": [parent], "children": []}
+    assert detail["links"]["parents"] == [parent]
+    assert detail["links"]["children"] == []
     assert [(row["id"], row["title"]) for row in detail["link_tasks"]] == [(parent, "Parent title")]
     assert detail["link_tasks"][0]["status"]
 
     # The parent's detail: children resolve.
     detail = api.get(f"/api/plugins/kanban/tasks/{parent}").json()
-    assert detail["links"] == {"parents": [], "children": [child]}
+    assert detail["links"]["parents"] == []
+    assert detail["links"]["children"] == [child]
     assert [(row["id"], row["title"]) for row in detail["link_tasks"]] == [(child, "Child title")]
 
 
@@ -77,5 +79,5 @@ def test_link_tasks_empty_when_no_links(kanban_home, api):
         conn.close()
 
     detail = api.get(f"/api/plugins/kanban/tasks/{task_id}").json()
-    assert detail["links"] == {"parents": [], "children": []}
+    assert detail["links"]["parents"] == detail["links"]["children"] == []
     assert detail["link_tasks"] == []

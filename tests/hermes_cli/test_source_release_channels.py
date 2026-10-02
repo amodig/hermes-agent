@@ -148,7 +148,7 @@ def test_source_check_and_apply_land_on_selected_release(releases, monkeypatch, 
     monkeypatch.setattr(main, "_pause_windows_gateways_for_update", lambda: None)
     monkeypatch.setattr(update_cmd, "_prepare_git_command", lambda: (False, ["git"], False))
     applied = []
-    monkeypatch.setattr(update_cmd, "_complete_source_update", lambda request: applied.append(request))
+    monkeypatch.setattr(update_cmd, "_complete_source_update", lambda request, **kwargs: applied.append(request))
     args = SimpleNamespace(branch=None, channel=None, force_venv=True)
     update_cmd._cmd_update_impl(args, False)
     expected = releases.commits[1 if channel == "stable" else 2]

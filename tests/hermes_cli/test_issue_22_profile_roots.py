@@ -62,6 +62,38 @@ def test_dispatcher_materialization_ignores_churning_profile_state(tmp_path: Pat
     assert check["evidence"]["runtime_identity"]["module_root"] == str(REPOSITORY)
 
 
+def test_source_snapshot_omits_frontend_dependencies_but_keeps_runtime_resources(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    snapshot = tmp_path / "snapshot"
+    omitted = (
+        "node_modules/dev-tool/index.js",
+        "apps/desktop/node_modules/electron/index.js",
+        "ui-tui/node_modules/react/index.js",
+        "ui-tui/packages/hermes-ink/node_modules/react/index.js",
+        "web/node_modules/vite/index.js",
+        "tests-js/node_modules/vitest/index.js",
+        "website/node_modules/docusaurus/index.js",
+    )
+    retained = (
+        "plugins/provider/node_modules/sdk/index.js",
+        "skills/helper/node_modules/sdk/index.js",
+        "scripts/whatsapp-bridge/node_modules/bridge/index.js",
+        "hermes_cli/web_dist/index.html",
+        "ui-tui/packages/hermes-ink/dist/index.js",
+    )
+    for relative in (*omitted, *retained):
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(relative, encoding="utf-8")
+
+    generation._copy_members(source, snapshot, first_party=True)
+
+    assert {
+        path.relative_to(snapshot).as_posix(): path.read_text(encoding="utf-8")
+        for path in snapshot.rglob("*") if path.is_file()
+    } == {relative: relative for relative in retained}
+
+
 def test_distinct_profile_parents_are_filtered_but_plugins_and_resources_survive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

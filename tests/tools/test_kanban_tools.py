@@ -1328,6 +1328,23 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         conn.close()
 
 
+@pytest.fixture
+def multi_board_env(tmp_path, monkeypatch):
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-orchestrator")
+    for name in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_BOARD",
+                 "HERMES_KANBAN_DB", "HERMES_KANBAN_HOME", "HERMES_KANBAN_WORKSPACES_ROOT"):
+        monkeypatch.delenv(name, raising=False)
+    kb.init_db(board="alt")
+    return home
+
+
 def test_orchestrator_repairs_generated_subtree_through_tools(multi_board_env):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc

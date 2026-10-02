@@ -288,11 +288,21 @@ def test_session_prune_dry_run_still_works_unnamed_while_multiplexing(client, se
     assert seams["db"] == [None]
 
 
-def test_credential_pool_delete_runs_in_the_named_profiles_home(client, homes, seams):
-    resp = client.delete("/api/credentials/pool/anthropic/0?profile=worker_beta")
+def test_credential_pool_delete_runs_in_the_named_profiles_home(client, homes):
+    root_auth = homes["launch"] / "auth.json"
+    named_auth = homes["worker_beta"] / "auth.json"
+    for path, key in ((root_auth, "shared-key"), (named_auth, "private-key")):
+        path.write_text(json.dumps({"version": 1, "credential_pool": {"deepseek": [{
+            "id": "manual-key", "label": key, "auth_type": "api_key",
+            "priority": 0, "source": "manual", "access_token": key,
+        }]}}), encoding="utf-8")
+    root_before = root_auth.read_bytes()
+
+    resp = client.delete("/api/credentials/pool/deepseek/1?profile=worker_beta")
 
     assert resp.status_code == 200, resp.text
-    assert seams["pool_home"] == [str(homes["worker_beta"])]
+    assert json.loads(named_auth.read_text())["credential_pool"]["deepseek"] == []
+    assert root_auth.read_bytes() == root_before
 
 
 # --- activation: the wiring the 400 branch depends on -------------------------------

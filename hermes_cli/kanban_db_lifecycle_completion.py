@@ -1060,6 +1060,23 @@ def edit_completed_task_result(
     return True
 
 
+def set_priority(
+    conn: sqlite3.Connection, task_id: str, priority: int, *, board: Optional[str] = None,
+) -> bool:
+    """Reorder a card without revising its goal or disturbing its claim."""
+    priority = int(priority)
+    with _kb.write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET priority = ?, version = COALESCE(version, 1) + 1 WHERE id = ?",
+            (priority, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _kb._append_event(conn, task_id, "reprioritized", {"priority": priority})
+    _kb.notify_task_updated(conn, task_id, ["priority"], board=board)
+    return True
+
+
 def edit_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, priority: Optional[int] = None,
@@ -1080,7 +1097,7 @@ def edit_task(
                 **{key: value for key, value in (("title", title), ("body", body)) if value is not None},
             )
         if priority is not None:
-            _kb.set_priority(conn, task_id, priority)
+            set_priority(conn, task_id, priority, board=board)
         if result is not None:
             edit_completed_task_result(conn, task_id, result=result, summary=summary, metadata=metadata)
             _kb.notify_task_updated(

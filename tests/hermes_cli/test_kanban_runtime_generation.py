@@ -31,7 +31,8 @@ def _install_memory_loaders(source):
         "plugins/memory/__init__.py", "plugins/memory/config_schema.py",
         "agent/memory_provider.py", "agent/secret_scope.py",
         "hermes_cli/env_loader.py", "hermes_cli/_early_recovery.py",
-        "hermes_cli/managed_scope.py", "hermes_constants.py", "utils.py",
+        "hermes_cli/managed_scope.py", "hermes_cli/stale_modules.py",
+        "hermes_constants.py", "utils.py", "hermes_yaml.py",
     ):
         destination = source / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -40,7 +41,7 @@ def _install_memory_loaders(source):
     # Only profile config I/O is synthetic; plugin discovery, imports, schemas,
     # resources and dotenv all execute their production implementations.
     _write(source / "hermes_cli" / "config.py", """
-import yaml
+import hermes_yaml as yaml
 from hermes_constants import get_hermes_home
 def load_config():
     path = get_hermes_home() / 'config.yaml'
@@ -48,12 +49,11 @@ def load_config():
 def cfg_get(config, section, key):
     return config.get(section, {}).get(key)
 """)
-    for name in ("yaml", "dotenv"):
+    for name in ("ruamel.yaml", "dotenv"):
         spec = importlib.util.find_spec(name)
-        shutil.copytree(
-            Path(spec.origin).parent, source.parent / "site-packages" / name,
-            dirs_exist_ok=True,
-        )
+        destination = source.parent / "site-packages" / name.replace(".", "/")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(Path(spec.origin).parent, destination, dirs_exist_ok=True)
 
 
 def _write_memory_provider(plugin, label):
@@ -115,7 +115,7 @@ def installation(tmp_path, monkeypatch, runtime_storage):
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(REPOSITORY / "providers" / name, destination)
     _write(source / "hermes_cli" / "__init__.py", '__version__ = "fixture"\n')
-    _write(source / "hermes_constants.py", "import os\nfrom pathlib import Path\ndef get_hermes_home(): return Path(os.environ['HERMES_HOME'])\n")
+    shutil.copy2(REPOSITORY / "hermes_constants.py", source / "hermes_constants.py")
     _write(source / "early.py", "VALUE = 'old'\n")
     _write(source / "late.py", "VALUE = 'old'\n")
     _write(dependencies / "startup_sdk.py", "VALUE = 'old'\n")
@@ -803,7 +803,7 @@ def test_reused_generation_cannot_be_deleted_while_another_worker_is_live(instal
             child.wait()
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_runtime_storage_uses_persistent_user_cache(tmp_path, monkeypatch):
     home = tmp_path / "home"
     monkeypatch.setattr(Path, "home", lambda: home)

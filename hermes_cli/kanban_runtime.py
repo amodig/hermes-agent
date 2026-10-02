@@ -191,6 +191,7 @@ def _git_sha(root: Path) -> str:
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=3,
         )
     except (OSError, subprocess.SubprocessError, TypeError):

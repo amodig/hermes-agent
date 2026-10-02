@@ -13,14 +13,13 @@ def test_completed_decomposition_survives_retriage(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     with kbc.connect_closing() as conn:
-        prerequisite = kb.create_task(conn, title="prerequisite", tenant="business-a")
-        root = kb.create_task(conn, title="root", triage=True, tenant="business-a", parents=[prerequisite])
-        downstream = kb.create_task(conn, title="downstream", parents=[root], tenant="business-a")
+        root = kb.create_task(conn, title="root", triage=True, tenant="business-a")
         specs = [{"title": "work", "assignee": "default"}]
         first = decompose_triage_task(conn, root, root_assignee="default", children=specs)
         assert first and kb.get_task(conn, first[0]).tenant == "business-a"
-        assert conn.execute("SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?", (prerequisite, root)).fetchone()
-        assert conn.execute("SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?", (root, downstream)).fetchone()
+        prerequisite = kb.create_task(conn, title="prerequisite", tenant="business-a")
+        downstream = kb.create_task(conn, title="downstream", parents=[root], tenant="business-a")
+        kb.link_tasks(conn, prerequisite, root)
         # Retention must not erase the identity of a completed fan-out.
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='done' WHERE id=?", (root,))
@@ -31,6 +30,8 @@ def test_completed_decomposition_survives_retriage(tmp_path, monkeypatch):
         before = list(conn.execute("SELECT id FROM tasks ORDER BY id"))
         assert decompose_triage_task(conn, root, root_assignee="default", children=specs) is None
         assert list(conn.execute("SELECT id FROM tasks ORDER BY id")) == before
+        assert prerequisite in kb.parent_ids(conn, root)
+        assert root in kb.parent_ids(conn, downstream)
         assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='decomposed'", (root,)).fetchone()[0] == 1
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 

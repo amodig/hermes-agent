@@ -191,7 +191,7 @@ class TestRoutedForeignHomeScope:
         ``bind_home=False`` — no home override, because the passthrough POLICY
         belongs to the dispatcher. The profile_home stamp must still make scoped
         misses fail closed, or the dispatcher's env leaks into B's worker env."""
-        from hermes_cli.kanban_db_dispatch import _worker_profile_scope
+        from hermes_cli.kanban_worker_runtime import _worker_profile_scope
 
         foreign = tmp_path / "profiles" / "assignee"
         foreign.mkdir(parents=True)
@@ -227,7 +227,7 @@ class TestScopeSetupRecovery:
         assert ss.current_secret_scope() is None
 
     def test_worker_profile_scope_setup_failure_restores_override(self, monkeypatch, tmp_path):
-        from hermes_cli.kanban_db_dispatch import _worker_profile_scope
+        from hermes_cli.kanban_worker_runtime import _worker_profile_scope
         from hermes_constants import get_hermes_home_override
 
         foreign = tmp_path / "profiles" / "assignee"

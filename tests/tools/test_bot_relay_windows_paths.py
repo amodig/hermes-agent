@@ -51,6 +51,9 @@ def test_local_delivery_resolves_sibling_hermes(tmp_path, monkeypatch):
     sibling.touch()
     sibling.chmod(0o755)
     monkeypatch.setattr("sys.executable", str(bin_dir / "python"))
+    # Keep this checkout's own published install launcher out of the resolution
+    # when probing the sibling rung (#124868).
+    monkeypatch.setattr(bot_relay, "__file__", str(tmp_path / "nowhere" / "bot_relay.py"))
 
     argv = bot_relay.local_delivery_command("ops", "query.json")
     assert argv[0] == str(sibling)

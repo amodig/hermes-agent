@@ -139,11 +139,7 @@ def test_worker_captures_assigned_profile_plugins_before_child_imports(
     (source / "providers").mkdir()
     for name in ("__init__.py", "base.py"):
         shutil.copy2(repository / "providers" / name, source / "providers" / name)
-    (source / "hermes_constants.py").write_text(
-        "import os\nfrom pathlib import Path\n"
-        "def get_hermes_home(): return Path(os.environ['HERMES_HOME'])\n",
-        encoding="utf-8",
-    )
+    shutil.copy2(repository / "hermes_constants.py", source / "hermes_constants.py")
     for home, label in ((dispatcher_home, "dispatcher"), (worker_home, "assigned")):
         plugin = home / "plugins" / "model-providers" / "profile-fixture"
         plugin.mkdir(parents=True)
@@ -408,6 +404,7 @@ def test_managed_gateway_worker_spawn_fails_closed_without_scope(
     worker_setup, monkeypatch, forbid_worker_spawn,
 ):
     workspace, task = worker_setup
+    monkeypatch.setenv("INVOCATION_ID", "managed-gateway-test")
     monkeypatch.setattr("tools.process_registry._is_supervised_gateway_process", lambda: True)
     monkeypatch.setattr("tools.process_registry._systemd_run_user_scope_available", lambda: False)
     with pytest.raises(RuntimeError, match="restart-safe systemd scope"):
@@ -419,6 +416,7 @@ def test_managed_gateway_scope_builder_fails_closed_if_binary_disappears(
     worker_setup, monkeypatch, forbid_worker_spawn,
 ):
     workspace, task = worker_setup
+    monkeypatch.setenv("INVOCATION_ID", "managed-gateway-test")
     monkeypatch.setattr("tools.process_registry._is_supervised_gateway_process", lambda: True)
     monkeypatch.setattr("tools.process_registry._systemd_run_user_scope_available", lambda: True)
     monkeypatch.setattr("shutil.which", lambda _name: None)

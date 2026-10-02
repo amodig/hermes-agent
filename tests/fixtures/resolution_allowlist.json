@@ -230,7 +230,7 @@
     "kind": "bare_which"
   },
   {
-    "path": "hermes_cli/kanban_db_dispatch.py",
+    "path": "hermes_cli/kanban_worker_runtime.py",
     "symbol": "_resolve_hermes_argv",
     "kind": "bare_which"
   },

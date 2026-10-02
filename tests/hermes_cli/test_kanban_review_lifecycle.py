@@ -493,17 +493,10 @@ def _backdate_comments(conn, tid, seconds=60):
         )
 
 
-def test_active_pr_guard_lifts_for_profile_handed_the_card_after_the_pr(
+def test_active_pr_guard_requires_authorization_after_profile_handoff(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A ready card whose PR is open spawns the profile it was handed to.
-
-    #111910: ``active_pr`` exists to stop the implementer from opening a
-    duplicate PR; it must not stop the closer/recovery profile an operator
-    assigned AFTER the PR comment — that handoff is why the PR must be worked.
-    The un-reassigned implementer stays guarded; a newer PR comment posted
-    after the handoff (the closer's own run) guards again.
-    """
+    """A new assignee must explicitly continue the recorded PR, not replace it."""
     import hermes_cli.config as cfgmod
     import hermes_cli.profiles as profmod
 
@@ -522,6 +515,13 @@ def test_active_pr_guard_lifts_for_profile_handed_the_card_after_the_pr(
         assert kb.assign_task(conn, closer_id, "closer") is True
 
         assert kbd.check_respawn_guard(conn, dev_id) == "active_pr"
+        assert kbd.check_respawn_guard(conn, closer_id) == "active_pr"
+        assert kb.update_task(
+            conn, closer_id, expected_version=kb.get_task(conn, closer_id).version,
+            reason="operator authorizes the closer to finish the existing PR",
+            transition="continue_existing_pr",
+            authorized_pr_urls=["https://github.com/example/repo/pull/44"],
+        )
         assert kbd.check_respawn_guard(conn, closer_id) is None
 
         res = kbd.dispatch_once(conn, dry_run=True)
@@ -532,19 +532,18 @@ def test_active_pr_guard_lifts_for_profile_handed_the_card_after_the_pr(
             conn, closer_id, author="closer",
             body="Pushed to https://github.com/example/repo/pull/44",
         )
+        assert kbd.check_respawn_guard(conn, closer_id) is None
+        kb.add_comment(
+            conn, closer_id, author="closer",
+            body="Opened https://github.com/example/repo/pull/45",
+        )
         assert kbd.check_respawn_guard(conn, closer_id) == "active_pr"
 
 
-def test_active_pr_guard_holds_through_same_profile_reassign_and_unassign(
+def test_active_pr_guard_holds_through_reassign_and_unassign(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only a handoff to a DIFFERENT profile lifts ``active_pr``.
-
-    A no-op ``assign dev -> dev`` (CLI, dashboard PATCH, ``reassign --reclaim``)
-    and an unassign both record an ``assigned`` event but change no owner; if
-    they counted as handoffs the implementer would be re-spawned against its own
-    PR — the duplicate-work protection #111910 says must survive.
-    """
+    """Neither operator assignment nor dispatcher auto-assignment authorizes PR work."""
     import hermes_cli.config as cfgmod
     import hermes_cli.profiles as profmod
 
@@ -568,17 +567,14 @@ def test_active_pr_guard_holds_through_same_profile_reassign_and_unassign(
         assert dict(res.respawn_guarded).get(tid) == "active_pr"
         assert tid not in [s[0] for s in res.spawned]
 
-        # A real handoff after all of that still lifts the guard.
         assert kb.assign_task(conn, tid, "closer") is True
-        assert kbd.check_respawn_guard(conn, tid) is None
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
 
 
-def test_active_pr_guard_lifts_for_implementer_after_changes_requested(
+def test_active_pr_guard_requires_authorization_after_changes_requested(
     kanban_home: Path,
 ) -> None:
-    """Reviewer CHANGES_REQUESTED routes the card back to ``ready`` for the
-    implementer to fix the SAME PR; ``active_pr`` must not hold it (#111910).
-    ``recent_success`` is untouched by the handoff exemption."""
+    """A review rejection routes work back without authorizing PR continuation."""
     pr_comment = "Opened https://github.com/example/repo/pull/44 for review."
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="changes requested", assignee="dev")
@@ -595,6 +591,13 @@ def test_active_pr_guard_lifts_for_implementer_after_changes_requested(
         )
         assert (ok, implementer) == (True, "dev")
         assert kb.get_task(conn, tid).status == "ready"
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+        assert kb.update_task(
+            conn, tid, expected_version=kb.get_task(conn, tid).version,
+            reason="operator authorizes fixes to the existing PR",
+            transition="continue_existing_pr",
+            authorized_pr_urls=["https://github.com/example/repo/pull/44"],
+        )
         assert kbd.check_respawn_guard(conn, tid) is None
 
         done_id = kb.create_task(conn, title="recent success", assignee="dev")

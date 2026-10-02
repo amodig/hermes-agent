@@ -386,6 +386,9 @@ def test_write_pool_never_merges_cooldown_onto_reauthed_entry(classic_env):
 def test_dashboard_pool_manages_shared_root_from_named_profile(tmp_path, monkeypatch):
     """Adding/listing/removing shared keys must never target the launch profile."""
     import asyncio
+    import agent.secret_scope as secret_scope
+    from fastapi import HTTPException
+    from tui_gateway import launch_profile_policy
     from hermes_cli.web_models import CredentialPoolAdd
     from hermes_cli.web_routers import ops
 
@@ -399,19 +402,44 @@ def test_dashboard_pool_manages_shared_root_from_named_profile(tmp_path, monkeyp
         "deepseek": [_pool_entry(label="private", access_token="private-key")],
     }))
     original = profile_auth.read_bytes()
+    shared_auth = shared_home / "auth.json"
+    _write(shared_auth, _make_auth_store(pool={
+        "deepseek": [_pool_entry(label="old-shared", access_token="old-shared-key")],
+    }))
+    was_active = secret_scope.is_multiplex_active()
+    monkeypatch.setattr(launch_profile_policy, "_snapshot", None)
 
     async def exercise():
+        # An omitted delete admitted on a single-profile host uses the same
+        # shared root as omitted list/add, even when launched from coder.
+        assert not secret_scope.is_multiplex_active()
+        await ops.remove_credential_pool_entry("deepseek", 1)
+        assert json.loads(shared_auth.read_text())["credential_pool"]["deepseek"] == []
+        assert profile_auth.read_bytes() == original
         await ops.add_credential_pool_entry(CredentialPoolAdd(
             provider="deepseek", api_key="shared-key", label="shared",
         ))
         result = await ops.list_credential_pool()
         assert [(p["provider"], [e["label"] for e in p["entries"]])
                 for p in result["providers"]] == [("deepseek", ["shared"])]
-        shared_auth = shared_home / "auth.json"
         stored = json.loads(shared_auth.read_text())["credential_pool"]["deepseek"]
         assert [e["access_token"] for e in stored] == ["shared-key"]
-        await ops.remove_credential_pool_entry("deepseek", 1)
+        private = await ops.list_credential_pool(profile="coder")
+        assert [(p["provider"], [e["label"] for e in p["entries"]])
+                for p in private["providers"]] == [("deepseek", ["private"])]
+        # Serving the other home activated the real multiplex guard.
+        before = shared_auth.read_bytes()
+        with pytest.raises(HTTPException) as refused:
+            await ops.remove_credential_pool_entry("deepseek", 1)
+        assert refused.value.status_code == 400
+        assert shared_auth.read_bytes() == before
+        assert profile_auth.read_bytes() == original
+        await ops.remove_credential_pool_entry("deepseek", 1, profile="default")
         assert json.loads(shared_auth.read_text())["credential_pool"]["deepseek"] == []
 
-    asyncio.run(exercise())
+    secret_scope.set_multiplex_active(False)
+    try:
+        asyncio.run(exercise())
+    finally:
+        secret_scope.set_multiplex_active(was_active)
     assert profile_auth.read_bytes() == original

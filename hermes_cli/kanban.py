@@ -1103,11 +1103,14 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             if not done:
                 # complete_task returns bare False for a dependency refusal too;
                 # name the open parents instead of claiming the id is unknown.
-                blockers = kb.unsatisfied_parents(conn, tid)
+                blockers = kb.evaluate_dependencies(conn, tid)["blockers"]
                 if blockers:
-                    detail = ", ".join(f"{pid} ({status})" for pid, status in blockers)
-                    fail_msg[tid] = (f"cannot complete {tid}: unsatisfied parent dependencies: {detail}; "
-                                     f"complete the parents first, or `hermes kanban unlink <parent> {tid}`.")
+                    detail = ", ".join(
+                        f"{item['parent_id']} ({parent.status if parent else item['code']}): {item['message']}"
+                        for item in blockers
+                        for parent in [kb.get_task(conn, item["parent_id"])]
+                    )
+                    fail_msg[tid] = f"cannot complete {tid}: unsatisfied parent dependencies: {detail}"
             return done
 
         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
