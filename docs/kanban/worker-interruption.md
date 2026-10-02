@@ -125,9 +125,15 @@ these.
 ## Budget placement
 
 Workers are launched with `systemd-run --user --scope --slice-inherit`, so a
-worker keeps its own transient cgroup while remaining a **sibling of the gateway
-service inside the gateway's slice**. A worker is therefore bounded by the
-slice's budget and every ancestor of it, not by the gateway service's own
-`MemoryMax`; an OOM inside a worker cannot take the gateway down. If the host's
-systemd is too old to know `--slice-inherit`, the availability probe fails and
-the restart-safe launch refuses rather than silently escaping the budget.
+worker keeps its own cgroup while remaining a sibling of the gateway service
+inside the gateway's slice. A worker is therefore bounded by the slice's budget
+and every ancestor of it, not by the gateway service's own `MemoryMax`; an OOM
+inside a worker cannot take the gateway down.
+
+That flag needs systemd ≥ 248, and the capability is probed on its own rather than
+folded into the "can we make a scope at all" probe, so an older host keeps its
+managed scope: a worker still gets its own cgroup with its own `MemoryMax` (the
+isolation that keeps an OOM from killing the gateway), it just lands in the
+default slice and the shared-budget property cannot be honoured there. That gap is
+reported by the resource verifier's placement check rather than silently
+accepted.

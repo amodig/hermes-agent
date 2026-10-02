@@ -2808,14 +2808,14 @@ def test_model_not_found_notice_absent_when_fallback_chain_configured(monkeypatc
     assert "No fallback chain is configured" not in text
 
 
-def test_legacy_systemd_keeps_isolation_and_refuses_the_slice_bound_route(monkeypatch):
+def test_legacy_systemd_keeps_a_managed_scope_without_slice_inheritance(monkeypatch):
     """One invariant for the capability split.
 
-    ``--slice-inherit`` needs systemd >= 248. On a host without it, ordinary
-    background executors must keep their isolating legacy scope — otherwise a
-    memory-heavy job can again get the whole gateway cgroup OOM-killed — while the
-    restart-safe route, whose contract is "stay inside the shared slice", must
-    refuse instead of silently landing in ``app.slice``.
+    ``--slice-inherit`` needs systemd >= 248. On a host without it, supervisors must
+    keep launching children in a MANAGED scope — own cgroup, own MemoryMax, so an
+    OOM in one cannot take the gateway cgroup down — because refusing would take
+    worker launches down entirely. What such a host cannot honour is the shared
+    slice budget, which the resource verifier's placement check reports.
     """
     import tools.process_registry as pr
 
@@ -2829,8 +2829,12 @@ def test_legacy_systemd_keeps_isolation_and_refuses_the_slice_bound_route(monkey
     assert legacy[0] == "/usr/bin/systemd-run", "generic executors keep their scope"
     assert "--slice-inherit" not in legacy
     assert any(part.startswith("MemoryMax=") for part in legacy), "isolation properties survive"
-    with pytest.raises(RuntimeError, match="slice-inherit"):
-        pr.restart_safe_gateway_child_argv(["/bin/true"], unit_suffix="legacy")
+    restart_safe = pr.restart_safe_gateway_child_argv(["/bin/true"], unit_suffix="legacy")
+    assert restart_safe[0] == "/usr/bin/systemd-run", (
+        "the restart-safe route must still launch a managed scope; refusing takes "
+        "worker launches down on hosts without the flag"
+    )
+    assert "--slice-inherit" not in restart_safe
 
     monkeypatch.setattr(pr, "_SLICE_INHERIT_SUPPORTED", True)
     assert "--slice-inherit" in pr._build_systemd_scope_argv(["/bin/true"], unit_suffix="modern")

@@ -166,7 +166,9 @@ def _slice_inherit_supported() -> bool:
 
             binary = shutil.which("systemd-run")
             if binary:
-                result = subprocess.run([binary, "--help"], capture_output=True, timeout=3)
+                result = subprocess.run(
+                    [binary, "--help"], capture_output=True, stdin=subprocess.DEVNULL, timeout=3,
+                )
                 supported = b"--slice-inherit" in (result.stdout or b"")
         except Exception as exc:
             logger.debug("systemd-run --slice-inherit capability probe failed: %s", exc)
@@ -285,14 +287,19 @@ def restart_safe_gateway_child_argv(
             "systemd-run --user --scope is unavailable"
         )
     if not _slice_inherit_supported():
-        # This route exists to keep a child inside the SHARED slice budget as well
-        # as out of the service cgroup. Legacy scopes isolate but land in
-        # ``app.slice``, so refusing is the only honest answer; ordinary
-        # background executors still get that legacy scope.
-        raise RuntimeError(
-            "cannot create restart-safe systemd scope for gateway child: this "
-            "systemd-run does not support --slice-inherit, so the scope cannot "
-            "stay inside the caller's slice"
+        # The scope still isolates the child — own cgroup, own MemoryMax — which is
+        # what keeps an OOM in it from taking the gateway down. What this systemd
+        # cannot do is keep that scope inside the CALLER's slice, so the shared
+        # worker budget cannot be honoured here. Refusing instead would take worker
+        # launches down entirely on such hosts, which the existing contract test
+        # (and the project) treats as a regression, so degrade to the managed
+        # legacy scope and let the resource verifier's placement check report the
+        # gap to the operator.
+        logger.warning(
+            "systemd-run here does not support --slice-inherit: the %s scope will "
+            "land in the default slice, so the shared worker budget cannot be "
+            "honoured on this host (worker isolation is unaffected)",
+            f"hermes-worker-{unit_suffix}",
         )
     scoped = _build_systemd_scope_argv(command, unit_suffix=unit_suffix)
     if scoped == command:
