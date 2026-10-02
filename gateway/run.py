@@ -4892,6 +4892,14 @@ def _start_gateway_configure_logging(verbosity: Optional[int]) -> None:
 def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdown: list):
     """Build the SIGINT/SIGTERM handler; ``_signal_initiated_shutdown[0]`` records an unplanned signal."""
     def shutdown_signal_handler(received_signal=None):
+        # Synchronously, before the marker checks, the forensic snapshot and the
+        # detached diagnostics: those can run for seconds, and the embedded
+        # kanban dispatcher must stop granting work the moment we are asked to
+        # go away (a granted worker would outlive this gateway's intent).
+        from gateway.run_shutdown import _apply_lifecycle_flags
+
+        _apply_lifecycle_flags(runner, _draining=True)
+
         # Planned --replace takeover (sibling marked this PID): exit 0 so systemd won't revive us.
         def _takeover() -> bool:
             from gateway.status import consume_takeover_marker_for_self

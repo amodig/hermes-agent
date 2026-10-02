@@ -313,9 +313,9 @@ def notify_task_updated(
 # DispatchResult counters whose non-zero value means the tick did something.
 _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "crashed", "stale",
-    "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
-    "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
-    "skipped_nonspawnable",
+    "timed_out", "auto_blocked", "rate_limited", "interrupted", "cancelled",
+    "auto_assigned_default", "respawn_guarded", "skipped_per_profile_capped",
+    "skipped_unassigned", "skipped_nonspawnable",
 )
 
 
@@ -1109,7 +1109,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
     profile             TEXT,
     step_key            TEXT,
     status              TEXT NOT NULL,
-    -- status: running | done | blocked | crashed | timed_out | failed | released
+    -- status: running | done | blocked | interrupted | crashed | timed_out | failed | released
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
@@ -1323,6 +1323,7 @@ def _host_prefix() -> str:
 
 
 # --- Task creation / mutation ---
+
 
 def _validate_model_override(model: Optional[str], provider: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     """Strip both; a provider without a model is rejected (a bare ``--provider``
@@ -2476,6 +2477,9 @@ _RUN_OUTCOME_TERMINAL_STATUS = {
     "validation_requested": "validation",
     "changes_requested": "changes_requested",
     "blocked": "blocked",
+    # A run ended by host re-instantiation leaves the card sticky-blocked for the
+    # operator, so a goal loop must see it as blocked, not as a retryable failure.
+    "interrupted": "blocked",
     "dependency_wait": "blocked",
 }
 

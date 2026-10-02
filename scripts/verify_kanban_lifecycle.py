@@ -377,7 +377,9 @@ try:
         # The native launcher reaches worker_bootstrap_after_constructor before
         # any model request.  Keep its normal argv and cancel from the grant
         # fence after checking the durable claim, without granting the child.
-        def instrumented_default_spawn(task, workspace, *, board=None, defer_grant=False):
+        def instrumented_default_spawn(
+            task, workspace, *, board=None, defer_grant=False, should_stop=None,
+        ):
             if not defer_grant:
                 raise RuntimeError("materialization probe requires the native deferred grant")
             if Path(os.environ["HERMES_HOME"]).resolve() != gateway_profile:
@@ -397,6 +399,7 @@ try:
                 try:
                     launch = native_default_spawn(
                         task, workspace, board=board, defer_grant=True,
+                        should_stop=should_stop,
                     )
                 except Exception as exc:
                     proof["worker_bootstrap"] = False

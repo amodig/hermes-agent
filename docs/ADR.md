@@ -75,3 +75,73 @@ Consequences:
 - Regression coverage exercises the real production path
   (`set_hermes_home_override()`) rather than only the env-var path, and
   includes a dedicated relative-import leak test.
+
+
+## 2026-10-01: Distinguish a replaced host from a dead worker, and grant nothing while draining
+
+Status: Accepted
+
+Context:
+A `running` Kanban card whose worker is gone had no distinguishable causes. An
+ordinary worker crash counted against the wrong failure limit, because the
+dispatcher's configured `kanban.failure_limit` reached the reclaim phase but was
+dropped before crash accounting, so every crash used the built-in default. After
+a reboot or container restart, a recorded worker PID may be gone or reused by an
+unrelated process, and nothing recorded which host instantiation had owned the
+claim. Separately, a gateway that was already draining kept launching workers
+through the shutdown window, and `systemd-run --user --scope` placed workers in
+`app.slice`, outside the gateway slice whose budget the operator was reading.
+
+Decision:
+Record the host instantiation epoch (`<boot_id>:<pid1_start>`) on each new run as
+additive metadata beside the sealed runtime identity, never backfilling history.
+Before every other reclaim path, pause a locally owned `running` card only on a
+positive epoch verdict (differing valid boot UUID, or differing valid PID 1
+start ticks within the same valid boot); missing, malformed or incomparable
+components are unknown, never "changed". The pause is one compare-and-swap that
+closes the run as `interrupted` and emits the same sticky `blocked` event an
+explicit operator block uses, with reason `host_restarted`, refusing NULL or
+foreign run claims. It charges and resets nothing, never probes or signals the
+stale PID, and creates no successor card; `unblock_task` stays the only resume.
+
+Thread the configured `failure_limit` through to crash accounting (per-task
+`max_retries` still wins; systemic, protocol-violation and quota-wall policies
+keep their precedence). Set the drain flag synchronously at signal/stop entry and
+poll a `should_stop` predicate at every long launch step — before preparation,
+after preparation and before the claim, during bootstrap waits, and immediately
+before the grant. A cancelled launch charges no failure; a cancellation after the
+claim cancels the ungranted worker and records a sticky `gateway_stopping` pause
+on that exact run; a cancellation after the grant cancels nothing, so a granted
+worker survives a gateway restart. Accept the user-manager race, where scope
+creation fails before the gateway's own signal, only on the positive evidence of
+`systemctl --user is-system-running` reporting `stopping`, evaluated at the native
+scope/bootstrap failure site so that only the failure it was sampled beside is
+converted — dispatcher handlers exempt nothing, keeping runtime-identity,
+workspace and database failures charged. Report a launch refusal with its real
+phase instead of always `runtime_identity`, and isolate post-grant bookkeeping so
+a failed hook or PID write cannot cancel a worker that already holds its grant.
+
+Add `--slice-inherit` to the shared scope argv so a worker keeps its own cgroup
+while staying inside the caller's slice, and expose interruptions separately from
+crashes in dispatcher tick telemetry. The flag is a capability separate from "can
+we create a scope at all": a host whose systemd predates it keeps the managed
+legacy scope (own cgroup, own `MemoryMax`, so an OOM in a worker still cannot kill
+the gateway) instead of losing worker launches, and the unhonourable
+shared-budget property is reported by the resource verifier's placement check
+rather than silently accepted.
+
+Consequences:
+- A host interruption is an operator decision: the card waits in the blocked lane
+  until `hermes kanban unblock`, with implementation/review phase, candidate,
+  graph, goal revision and model pins preserved.
+- Receipts written before host epochs existed keep their previous reclaim
+  behavior and are never exempted from accounting on missing provenance.
+- Ordinary crashes now respect the operator's configured limit; the incident's
+  historical third failure would have tripped either the default or the
+  configured limit, so this fix is not a claim about what caused that block.
+- Workers no longer escape the gateway's ancestor budget. A host budget, slice,
+  drop-in, routing or profile value does not change, and systemd without the flag
+  keeps the restart-safe route unavailable rather than unmanaged.
+- True reboot and user-manager-shutdown-contention acceptance still needs a
+  disposable systemd host; the evidence gathered on `loota` covers a real
+  user-service restart, slice membership, and injected-epoch behavior.

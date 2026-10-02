@@ -2806,3 +2806,43 @@ def test_model_not_found_notice_absent_when_fallback_chain_configured(monkeypatc
     text = _format_async(evt)
     assert text.count("SUBAGENT MODEL REJECTED") == 1
     assert "No fallback chain is configured" not in text
+
+
+def test_legacy_systemd_keeps_a_managed_scope_without_slice_inheritance(monkeypatch):
+    """One invariant for the capability split.
+
+    ``--slice-inherit`` needs systemd >= 248. On a host without it, supervisors must
+    keep launching children in a MANAGED scope — own cgroup, own MemoryMax, so an
+    OOM in one cannot take the gateway cgroup down — because refusing would take
+    worker launches down entirely. What such a host cannot honour is the shared
+    slice budget, which the resource verifier's placement check reports.
+    """
+    import tools.process_registry as pr
+
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/systemd-run")
+    monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", True)
+    monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: True)
+    monkeypatch.setenv("INVOCATION_ID", "fixture")
+
+    monkeypatch.setattr(pr, "_SLICE_INHERIT_SUPPORTED", False)
+    legacy = pr._build_systemd_scope_argv(["/bin/true"], unit_suffix="legacy")
+    assert legacy[0] == "/usr/bin/systemd-run", "generic executors keep their scope"
+    assert "--slice-inherit" not in legacy
+    assert any(part.startswith("MemoryMax=") for part in legacy), "isolation properties survive"
+    restart_safe = pr.restart_safe_gateway_child_argv(["/bin/true"], unit_suffix="legacy")
+    assert restart_safe[0] == "/usr/bin/systemd-run", (
+        "the restart-safe route must still launch a managed scope; refusing takes "
+        "worker launches down on hosts without the flag"
+    )
+    assert "--slice-inherit" not in restart_safe
+
+    monkeypatch.setattr(pr, "_SLICE_INHERIT_SUPPORTED", True)
+    assert "--slice-inherit" in pr._build_systemd_scope_argv(["/bin/true"], unit_suffix="modern")
+    assert "--slice-inherit" in pr.restart_safe_gateway_child_argv(
+        ["/bin/true"], unit_suffix="modern",
+    )
+    # The scope-availability probe must not depend on the newer flag, or a legacy
+    # host would report "no scopes at all" and lose isolation for everything.
+    assert "--slice-inherit" not in pr._systemd_scope_argv(
+        "/usr/bin/systemd-run", "probe", "/bin/true", slice_inherit=False,
+    )

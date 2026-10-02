@@ -10,7 +10,9 @@ in ``kanban_watchers_common``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -37,6 +39,14 @@ _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
 _GC_INTERVAL_SECONDS = 3600.0
 _HEALTH_WINDOW = 6
+# Guards first construction of a runner's grant lock. Two threads can otherwise
+# both observe a missing handle and install different locks, which would let the
+# stop transition slip between the final check and the grant.
+_GRANT_LOCK_INIT = threading.Lock()
+# A grant is a bounded pipe write to an already-verdicted worker, so waiting for
+# the boundary is normally microseconds. The timeout only exists so a wedged
+# grant can never stall shutdown.
+_GRANT_GUARD_TIMEOUT_SECONDS = 2.0
 
 
 class GatewayKanbanWatchersMixin:
@@ -44,6 +54,102 @@ class GatewayKanbanWatchersMixin:
 
     def _owns_kanban_dispatcher_lock(self) -> bool:
         return getattr(self, "_kanban_dispatcher_lock_handle", None) is not None
+
+    def _kanban_drain_engaged(self) -> bool:
+        """Whether a DELIBERATE drain is engaged, as opposed to a stopping gateway.
+
+        Health telemetry uses this: a drain leaves queued work pending on purpose,
+        so the stuck-queue counters and their alerts must not accumulate. A
+        gateway that is merely stopping (``_running`` false) is deliberately NOT
+        included — the watcher loop exits on its next check, so one partial tick
+        cannot reach the alert window, and keying this off ``_running`` would
+        change the per-tick probe accounting mid-iteration.
+        """
+        return bool(
+            getattr(self, "_draining", False)
+            or getattr(self, "_external_drain_active", False)
+        )
+
+    def _kanban_shutdown_requested(self) -> bool:
+        """True once this gateway must stop granting new Kanban work.
+
+        Covers the one-way shutdown drain (``_draining``), the stopping gateway
+        (``not _running``), and the REVERSIBLE external drain
+        (``_external_drain_active``, engaged by ``.drain_request.json``). The
+        external drain sets only its own flag while ``draining`` is advertised, so
+        omitting it would let the dispatcher keep claiming and granting workers
+        through the quiesce window — the same rule the cron dispatch gate applies
+        (``can_dispatch = not (runner._draining or
+        runner._external_drain_active)``).
+
+        ``getattr``-guarded: shutdown-path tests build bare runners.
+        """
+        if getattr(self, "_draining", False) or getattr(self, "_external_drain_active", False):
+            return True
+        return not bool(getattr(self, "_running", True))
+
+    def _kanban_grant_lock(self) -> "threading.Lock":
+        """Lock serializing the stop transition against a worker grant.
+
+        The dispatcher's launch runs in a worker thread while the drain/stop flags
+        are set from the event loop or from a signal handler, so "read the flag,
+        then grant" is not atomic by itself: a drain landing between the two is
+        invisible to a grant that has already decided, and because a completed
+        grant is final by contract that worker then outlives the drain.
+
+        Holding this lock across the stop re-check and the grant makes the
+        boundary deterministic instead: the drain takes effect either BEFORE the
+        decision (the launch is cancelled) or AFTER the grant (that worker is
+        already final and survives). Flag reads outside the guarded region still
+        need no lock.
+        """
+        lock = getattr(self, "_kanban_grant_lock_handle", None)
+        if lock is None:
+            # Double-checked: the dispatch thread and the shutdown path can reach
+            # this on their first call at the same moment, and two different locks
+            # would let the stop transition slip past the boundary.
+            with _GRANT_LOCK_INIT:
+                lock = getattr(self, "_kanban_grant_lock_handle", None)
+                if lock is None:
+                    lock = threading.Lock()
+                    self._kanban_grant_lock_handle = lock
+        return lock
+
+    def _kanban_transition(self, **flags: bool) -> None:
+        """Set drain/stop flags under the grant lock so they cannot race a grant.
+
+        The timeout exists only so a wedged grant cannot stall shutdown: it set a
+        flag because the gateway is going away, which must always succeed.
+        """
+        lock = self._kanban_grant_lock()
+        acquired = lock.acquire(timeout=_GRANT_GUARD_TIMEOUT_SECONDS)
+        if not acquired:
+            logger.warning(
+                "kanban dispatcher: grant boundary busy for %.1fs; applying %s anyway",
+                _GRANT_GUARD_TIMEOUT_SECONDS, ", ".join(sorted(flags)),
+            )
+        try:
+            for name, value in flags.items():
+                setattr(self, name, value)
+        finally:
+            if acquired:
+                lock.release()
+
+    @contextlib.contextmanager
+    def _kanban_grant_guard(self):
+        """Hold the grant boundary across the stop re-check and the grant itself."""
+        lock = self._kanban_grant_lock()
+        acquired = lock.acquire(timeout=_GRANT_GUARD_TIMEOUT_SECONDS)
+        if not acquired:
+            logger.warning(
+                "kanban dispatcher: grant boundary busy for %.1fs; granting without it",
+                _GRANT_GUARD_TIMEOUT_SECONDS,
+            )
+        try:
+            yield
+        finally:
+            if acquired:
+                lock.release()
 
     def _release_kanban_dispatcher_lock(self) -> None:
         """Clear notifier-visible ownership before releasing the OS lock."""
@@ -247,7 +353,14 @@ class GatewayKanbanWatchersMixin:
         _load_config, _kb, kanban_cfg = boot
         settings = _resolve_dispatcher_settings(kanban_cfg, _kb)
         interval = settings.interval
-        dispatcher = _KanbanDispatcher(_kb, settings)
+        # The in-flight tick must see a drain/stop the moment it starts (the
+        # signal handler sets ``_draining`` before any diagnostics), so read the
+        # live flags instead of sampling them once at boot.
+        dispatcher = _KanbanDispatcher(
+            _kb, settings,
+            should_stop=self._kanban_shutdown_requested,
+            grant_guard=self._kanban_grant_guard,
+        )
 
         # Initial delay so adapters are wired before workers spawn (matches the notifier).
         await asyncio.sleep(5)
@@ -293,20 +406,27 @@ class GatewayKanbanWatchersMixin:
                         await _to_thread_process_service(dispatcher.auto_decompose_tick, _ad_per_tick)
                     results = await _to_thread_process_service(dispatcher.tick_once)
                     any_spawned = _log_spawn_results(results)
-                    pending_ids = await _to_thread_process_service(dispatcher.spawnable_ids)
-                    # Guard holds stay visible even when another card spawned:
-                    # the operator question is "why is THIS card queued?", not
-                    # "is the board idle?".
-                    holds = guarded_holds(results)
-                    guarded_ticks = guarded_ticks + 1 if holds else 0
-                    if holds:
-                        guard_holds = holds
-                    # The stuck signal counts only pending work the guard does
-                    # not already explain, so a guard hold cannot masquerade as
-                    # a profile/PATH failure.
-                    held_ids = {label for label, _reason in holds}
-                    unexplained = [task_id for task_id in pending_ids if task_id not in held_ids]
-                    bad_ticks = bad_ticks + 1 if unexplained and not any_spawned else 0
+                    if self._kanban_drain_engaged():
+                        # A deliberate drain is not a stuck queue: dispatch is
+                        # disabled on purpose, so the pending-work and guard
+                        # counters (and their alerts) must not accumulate.
+                        bad_ticks = 0
+                        guarded_ticks = 0
+                    else:
+                        pending_ids = await _to_thread_process_service(dispatcher.spawnable_ids)
+                        # Guard holds stay visible even when another card spawned:
+                        # the operator question is "why is THIS card queued?", not
+                        # "is the board idle?".
+                        holds = guarded_holds(results)
+                        guarded_ticks = guarded_ticks + 1 if holds else 0
+                        if holds:
+                            guard_holds = holds
+                        # The stuck signal counts only pending work the guard does
+                        # not already explain, so a guard hold cannot masquerade as
+                        # a profile/PATH failure.
+                        held_ids = {label for label, _reason in holds}
+                        unexplained = [task_id for task_id in pending_ids if task_id not in held_ids]
+                        bad_ticks = bad_ticks + 1 if unexplained and not any_spawned else 0
                 now = int(time.time())
                 if guarded_ticks >= _HEALTH_WINDOW and now - last_guard_warn_at >= 300:
                     logger.warning(

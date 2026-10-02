@@ -154,7 +154,8 @@ def test_review_cli_round_trip_preserves_handoff(
         assert task.assignee == "reviewer"
         handoff = kb.latest_run(conn, task_id)
         assert handoff is not None
-        assert handoff.metadata == {"tests_run": 3}
+        # Handoff metadata must survive; the run also carries additive provenance.
+        assert handoff.metadata["tests_run"] == 3
         review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
         assert review is not None
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
