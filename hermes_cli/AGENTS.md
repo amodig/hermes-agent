@@ -172,8 +172,13 @@ it guards. `plan → snapshot → apply → restart-per-kind → verify → repo
   `update_completion.py` runs new-code PM preparation with site initialization disabled, then
   selected-Python builds, maintenance, scans/restarts and verification. Git/current/ZIP share
   this owner; never reload or purge modules to continue in the old interpreter. The parent keeps
-  the lock, waits, and accepts only a correlated terminal result. `cmd_update` still finalizes
-  early failures and missing/killed-child outcomes; PM refusal data survives the handoff.
+  the command's update claim, waits, and accepts only a correlated terminal result.
+  The installation mutation lock belongs to individual source/build writes or the
+  PM mutation worker, never a completion parent waiting on that worker. Configured
+  feature repair, plugin migration and maintenance orchestration run outside it;
+  the pending completion marker fences runtime capture between mutation phases.
+  `cmd_update` still finalizes early failures and missing/killed-child outcomes;
+  PM refusal data survives the handoff.
   See `website/docs/developer-guide/source-update-completion.md`. A begun-but-unwritten receipt is a bug.
 - **Nothing runs pulled code in the pre-pull interpreter.** This tree finishes updates through
   `update_completion.run_completion` / `_update_takeover.py`.

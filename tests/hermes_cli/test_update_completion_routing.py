@@ -93,3 +93,77 @@ def test_completion_child_can_lock_installation_after_parent_handoff(tmp_path, m
     monkeypatch.setattr(update_cmd, "run_completion", complete)
     with installation_mutation_lock(tmp_path) as release:
         update_cmd._complete_source_update(request, release_installation=release)
+
+
+def test_completion_allows_pm_workers_but_excludes_concurrent_build_mutations(tmp_path, monkeypatch):
+    """A configured-feature repair must finish, without unlocking frontend writes."""
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    import pm
+    from hermes_cli import main_install_repair, memory_provider_migration, source_build
+    from hermes_cli import source_stamp, update_completion, venv_sync
+
+    for name in ("HOME", "USERPROFILE", "XDG_CACHE_HOME", "LOCALAPPDATA"):
+        monkeypatch.setenv(name, str(tmp_path))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "completion-lock-test"\nversion = "0"\n'
+        '[project.optional-dependencies]\nmcp = []\n', encoding="utf-8")
+    (tmp_path / "ui-tui").mkdir()
+    (tmp_path / "ui-tui/package.json").write_text("{}", encoding="utf-8")
+    pending = venv_sync.arm_completion(tmp_path)
+    repository = Path(__file__).resolve().parents[2]
+
+    def worker(name, *, locked):
+        assert pending.exists(), "runtime capture must remain fenced until completion"
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", "-c",
+             "import sys\nfrom pathlib import Path\n"
+             "sys.path.insert(0, sys.argv[1])\n"
+             "from hermes_cli.kanban_runtime_generation import installation_mutation_lock\n"
+             "try:\n"
+             "    with installation_mutation_lock(sys.argv[2], blocking=False):\n"
+             "        assert sys.argv[3] == 'free', 'installation mutation was not excluded'\n"
+             "        (Path(sys.argv[2]) / sys.argv[4]).write_text('published')\n"
+             "except BlockingIOError:\n"
+             "    assert sys.argv[3] == 'locked', 'waiting parent holds the PM worker lock'\n",
+             str(repository), str(tmp_path), "locked" if locked else "free", name],
+            cwd=tmp_path, env=dict(os.environ), capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    monkeypatch.setattr(main_install_repair, "_configured_features_missing_deps",
+                        lambda: [("MCP servers", "install MCP", "mcp")])
+    monkeypatch.setattr(pm, "sync_venv", lambda *a, **kw: worker("repaired", locked=False))
+    monkeypatch.setattr(source_build, "source_build_env", lambda **kw: {})
+    monkeypatch.setattr(source_build, "prepare_source_dependencies",
+                        lambda *a, **kw: worker("concurrent-node-writer", locked=True))
+
+    def build(*args, **kwargs):
+        assert (tmp_path / "repaired").read_text() == "published"
+        worker("concurrent-build-writer", locked=True)
+
+    monkeypatch.setattr(source_build, "build_source_tui", build)
+    monkeypatch.setattr(memory_provider_migration, "migrate_all_homes",
+                        lambda: worker("migrated", locked=False))
+    monkeypatch.setattr(update_cmd, "_sweep_bytecode_after_update",
+                        lambda branch: worker("concurrent-bytecode-writer", locked=True))
+    monkeypatch.setattr(venv_sync, "publish_launchers",
+                        lambda root: worker("concurrent-launcher-writer", locked=True))
+    monkeypatch.setattr(update_cmd_maint, "_run_post_update_maintenance",
+                        lambda **kw: worker("maintained", locked=False) is None)
+    monkeypatch.setattr(source_stamp, "write_source_stamp",
+                        lambda root: worker("concurrent-stamp-writer", locked=True))
+
+    update_completion._complete_selected({
+        "source": str(tmp_path), "branch": "main", "sibling_snapshots": {}, "plan": None,
+        "desktop": False, "assume_yes": True, "gateway_mode": False,
+        "snapshot_id": None, "pre_update_version": None, "no_gateway_restart": True,
+    })
+    assert not pending.exists()
+    assert (tmp_path / "migrated").read_text() == "published"
+    assert (tmp_path / "maintained").read_text() == "published"
+    assert not list(tmp_path.glob("concurrent-*-writer"))

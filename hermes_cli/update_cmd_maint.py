@@ -934,12 +934,18 @@ def _print_post_update_notices_and_self_heals() -> None:
     Windows bin launchers, cua-driver refresh) that run after the summary."""
     from hermes_cli.update_cmd import _m, _print_curator_first_run_notice, _print_curator_recent_run_notice
     from hermes_cli import _launchers
+    from hermes_cli.kanban_runtime_generation import installation_mutation_lock
+
+    def _expose_cli() -> None:
+        with installation_mutation_lock(_m().PROJECT_ROOT):
+            _launchers.expose_cli(_m().PROJECT_ROOT)
 
     def _migrate_windows_bin_path() -> None:
         # Windows launchers into the managed bin dir: in-checkout launchers were swept by the
         # autostash (--include-untracked) and updates never run install.ps1. No-op on POSIX.
         from hermes_cli._install_repair import migrate_windows_bin_path
-        migrate_windows_bin_path(_m().PROJECT_ROOT)
+        with installation_mutation_lock(_m().PROJECT_ROOT):
+            migrate_windows_bin_path(_m().PROJECT_ROOT)
 
     for message, step in (
         # v23 FTS layout is opt-in (existing indexes untouched); surface the command here.
@@ -947,7 +953,7 @@ def _print_post_update_notices_and_self_heals() -> None:
         ('Curator first-run notice failed: %s', _print_curator_first_run_notice),
         ('Curator recent-run notice failed: %s', _print_curator_recent_run_notice),
         ('FHS PATH guard check failed: %s', _ensure_fhs_path_guard),
-        ('CLI launcher exposure failed: %s', lambda: _launchers.expose_cli(_m().PROJECT_ROOT)),
+        ('CLI launcher exposure failed: %s', _expose_cli),
         ('Windows bin launcher migration failed: %s', _migrate_windows_bin_path),
         ('cua-driver refresh failed: %s', _refresh_cua_driver_after_update),
         ('Default PM tool install failed: %s', _install_default_tools_after_update),
@@ -974,6 +980,10 @@ def _run_post_update_maintenance(
     Ancillary repairs and notices are best-effort; an unsafe runtime withholds success.
     """
     from hermes_cli.update_cmd import _check_and_apply_config_migration, _m
+    from hermes_cli.kanban_runtime_generation import installation_mutation_lock
+
+    # Maintenance also provisions PM tools; lock only direct installation writes,
+    # never the orchestration that waits for those workers.
     # macOS TCC: Desktop bundles are re-signed each update, so old grants can go stale
     # (toggle ON, yet macOS re-prompts with no Allow button). Tell users how to re-grant.
     # With the post-#73681 identifier-pinned DR, new grants survive rebuilds — but a grant made to a pre-fix
@@ -994,7 +1004,8 @@ def _run_post_update_maintenance(
     try:
         # See #95596.
         from hermes_cli.macos_tcc_anchor import ensure_tcc_anchor
-        ensure_tcc_anchor()
+        with installation_mutation_lock(_m().PROJECT_ROOT):
+            ensure_tcc_anchor()
     except Exception:
         logger.debug("macOS TCC anchor refresh skipped", exc_info=True)
 
@@ -1007,8 +1018,9 @@ def _run_post_update_maintenance(
     try:
         from hermes_cli.gitlock import fetch_full_commit_graph
         from hermes_cli.update_cmd import _no_prompt_git_kwargs
-        if fetch_full_commit_graph(Path(_m().PROJECT_ROOT), **_no_prompt_git_kwargs()):
-            print("  ✓ Fetched release history (commits only) for version identity")
+        with installation_mutation_lock(_m().PROJECT_ROOT):
+            if fetch_full_commit_graph(Path(_m().PROJECT_ROOT), **_no_prompt_git_kwargs()):
+                print("  ✓ Fetched release history (commits only) for version identity")
     except (OSError, subprocess.SubprocessError) as exc:
         detail = (getattr(exc, "stderr", None) or str(exc)).strip().splitlines()[-1:] or [type(exc).__name__]
         print(f"  ⚠ Could not refresh release history ({detail[0]}); the version label may be stale or unknown until the next update")

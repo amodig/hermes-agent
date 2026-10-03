@@ -43,7 +43,6 @@ def complete_source_checkout(
     success here exactly as it does at the end of an update.
     """
     from hermes_cli.update_lock import UpdateLock, describe_holder
-    from hermes_cli.kanban_runtime_generation import installation_mutation_lock
 
     root = Path(root)
     # This tail is the last mutating step of an install or update, and its product
@@ -62,13 +61,12 @@ def complete_source_checkout(
             "wait for it to exit, then relaunch Hermes"
         )
     try:
-        with installation_mutation_lock(root):
-            return _complete_locked(
-                root, desktop=desktop, assume_yes=assume_yes, gateway_mode=gateway_mode,
-                pre_update_snapshot_id=pre_update_snapshot_id,
-                pre_update_version=pre_update_version,
-                completion_message=completion_message, announce=announce,
-            )
+        return _complete_locked(
+            root, desktop=desktop, assume_yes=assume_yes, gateway_mode=gateway_mode,
+            pre_update_snapshot_id=pre_update_snapshot_id,
+            pre_update_version=pre_update_version,
+            completion_message=completion_message, announce=announce,
+        )
     finally:
         lock.release()
 
@@ -85,6 +83,7 @@ def _complete_locked(
     announce: str | None,
 ) -> bool:
     """The completion body; callers hold the update lock already."""
+    from hermes_cli.kanban_runtime_generation import installation_mutation_lock
     from hermes_cli.source_build import build_update_products
     from hermes_cli.update_cmd_maint import _run_post_update_maintenance
     from hermes_cli.venv_sync import publish_launchers
@@ -97,7 +96,10 @@ def _complete_locked(
         expose_pm_git(root)
     except Exception as exc:  # noqa: BLE001 — git-less steps below still complete
         print(f"⚠ Could not provide git for the source completion: {exc}", file=sys.stderr)
-    publish_launchers(root)
+    with installation_mutation_lock(root):
+        publish_launchers(root)
+    # Builders and maintenance may request dependency mutations from PM workers.
+    # Only direct installation writes hold this process's installation lock.
     build_update_products(root, desktop=desktop)
     if announce:
         print(announce)
@@ -113,7 +115,8 @@ def _complete_locked(
         from hermes_cli.source_stamp import write_source_stamp
 
         try:
-            write_source_stamp(root)
+            with installation_mutation_lock(root):
+                write_source_stamp(root)
         except (OSError, ValueError) as exc:
             print(f"⚠ Source update completed, but the install stamp could not be written: {exc}",
                   file=sys.stderr)

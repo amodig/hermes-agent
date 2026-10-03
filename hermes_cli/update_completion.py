@@ -183,19 +183,20 @@ def _complete_selected(request: dict) -> None:
     from hermes_cli.kanban_runtime_generation import installation_mutation_lock
     from hermes_cli.update_receipt import record_stage
 
-    # Release before restarting gateways: their startup may need the same lock.
+    # Each mutation phase owns its lock; completion can wait on PM workers
+    # that acquire the same installation lock themselves.
     with installation_mutation_lock(root):
         update_cmd._sweep_bytecode_after_update(request["branch"])
-        # Launchers, products and post-build maintenance share the install path.
-        complete = complete_source_checkout(
-            root, desktop=request["desktop"], assume_yes=request["assume_yes"],
-            gateway_mode=request["gateway_mode"], pre_update_snapshot_id=request["snapshot_id"],
-            pre_update_version=request["pre_update_version"],
-            completion_message=request.get("completion_message"),
-            announce=None if request.get("completion_message") else "\n✓ Code updated!")
-        record_stage("build", "success" if complete else "failed")
-        if complete:
-            from hermes_cli.venv_sync import clear_completion
+    complete = complete_source_checkout(
+        root, desktop=request["desktop"], assume_yes=request["assume_yes"],
+        gateway_mode=request["gateway_mode"], pre_update_snapshot_id=request["snapshot_id"],
+        pre_update_version=request["pre_update_version"],
+        completion_message=request.get("completion_message"),
+        announce=None if request.get("completion_message") else "\n✓ Code updated!")
+    record_stage("build", "success" if complete else "failed")
+    if complete:
+        from hermes_cli.venv_sync import clear_completion
+        with installation_mutation_lock(root):
             clear_completion(root)
     # systemctl's KillMode=mixed fallback can kill this whole cgroup. Publish the
     # gateway watcher's status BEFORE that operation, and demote on later failure.

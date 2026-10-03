@@ -53,12 +53,22 @@ and is demoted on later failure. Verification publishes the final receipt.
 
 Each mutation process acquires the installation lock itself. The parent releases
 its source lock before waiting for the PM/completion children; the PM worker holds
-it during dependency publication, and the selected interpreter holds it through
-the shared `source_completion.complete_source_checkout` tail. A successful tail
-clears the pending marker under the lock. The lock is released before fleet
-restart so new gateways cannot deadlock against the updater waiting for them.
-Automatic startup repair and lazy dependency requests refuse a busy installation
-without waiting; lock contention does not consume a recovery retry.
+it during dependency publication. Completion retains the command's update claim,
+but never wraps the whole tail in the installation lock: configured-feature repair
+and memory-provider migration can dispatch PM workers that need that same lock.
+`source_build.build_update_products` locks frontend dependency/build writes, not
+the Python dependency repair before them or plugin migration afterward. This also
+protects historical takeover and direct builder callers.
+
+The selected interpreter separately locks bytecode cleanup, launcher publication,
+the maintenance tail's direct installation writes (interpreter anchor, Git history,
+launcher self-heals), and the final source stamp. Maintenance orchestration and PM
+tool provisioning stay outside those scopes. A successful tail clears the pending
+marker under the lock; it remains armed across unlocked phases so runtime capture
+cannot publish an incomplete installation. Fleet restart runs unlocked so new
+gateways cannot deadlock against the updater waiting for them. Automatic startup
+repair and lazy dependency requests refuse a busy installation without waiting;
+lock contention does not consume a recovery retry.
 
 Interrupted Git-pull recovery takes its checkout-local restore claim before
 trying the installation mutation lock. Concurrent launches wait for that restore
@@ -115,3 +125,8 @@ return. Focused existing tests cover dirty ZIP checks/grafts, snapshots, fleet
 reconciliation, supervisor timing and historical imports. Native service restart
 and Windows/macOS acceptance remain separate required lanes; no live user service
 or user state is touched by this implementation's test runs.
+
+`tests/hermes_cli/test_update_completion_routing.py` also exercises completion's
+lock boundary with real child-process lock attempts: dependency repair, plugin
+migration and maintenance can acquire the installation lock, while concurrent
+bytecode, launcher, frontend and stamp writers are excluded.
