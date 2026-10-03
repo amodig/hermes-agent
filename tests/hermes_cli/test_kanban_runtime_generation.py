@@ -962,3 +962,5 @@ print(distribution('unseeded-sdk').locate_file('../share/fixture.txt').read_text
     output, error = child.communicate(timeout=60)
     assert child.returncode == 0, error
     assert output.strip() == "old installed resource"
+
+

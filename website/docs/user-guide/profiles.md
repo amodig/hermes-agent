@@ -404,6 +404,11 @@ Profiles use the `HERMES_HOME` environment variable. When you run `coder chat`, 
 
 This is separate from terminal working directory. Tool execution starts from `terminal.cwd` (or the launch directory when `cwd: "."` on the local backend), not automatically from `HERMES_HOME`.
 
+Provider credential pools follow the same profile boundary: a named profile may
+borrow the root pool when it has no provider-specific pool of its own. Once its
+own credential is seeded, the live pool immediately stops selecting borrowed
+root credentials; subsequent loads keep using the profile-owned pool.
+
 On host installs, tool subprocesses keep your real OS-user `HOME` by default so
 existing CLI credentials under `~` keep working across profiles. Profile data is
 isolated by `HERMES_HOME`, not by changing `HOME`. Container backends still use

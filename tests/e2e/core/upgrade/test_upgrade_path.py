@@ -129,16 +129,13 @@ def _upgrade_prerequisites() -> None:
 
 
 IMPORT_PROBE = r"""
-import importlib, subprocess, sys, tomllib
+import importlib, sys, tomllib
 from pathlib import Path
-root, base = Path(sys.argv[1]), sys.argv[2]
+root = Path(sys.argv[1])
 cfg = tomllib.load(open(root / "pyproject.toml", "rb"))
 tops = [p for p in cfg["tool"]["setuptools"]["packages"]["find"]["include"] if "*" not in p]
-added = subprocess.run(["git", "-C", str(root), "diff", "--name-only", "--diff-filter=A", base, "HEAD", "--",
-                        *[f"{t}/*.py" for t in tops]], capture_output=True, text=True).stdout.split()
-added = [a[:-3].replace("/", ".") for a in added if "/tests/" not in a and not a.endswith("__init__.py")][:3]
 bad = []
-for name in tops + ["hermes_cli.main", "run_agent", "hermes_state"] + added:
+for name in tops + ["hermes_cli.main", "run_agent", "hermes_state"]:
     try:
         mod = importlib.import_module(name)
     except BaseException as exc:
@@ -469,9 +466,10 @@ def assert_healthy_at_head(leg: Leg, provider: FakeLLMServer, final: subprocess.
     assert _git("rev-parse", "HEAD", cwd=leg.install) == _refs().head, "update exited 0 but HEAD is not the target"
     assert not (leg.install / ".git" / "index.lock").exists(), "update left .git/index.lock behind"
     # The active interpreter must serve the pulled tree (stale editable finder, #119466):
-    # every top-level package and a HEAD-only module import from PM's selected interpreter.
+    # Top-level packages and core entrypoints import from PM's selected interpreter.
+    # The fresh-process suite covers all modules with optional-extra awareness.
     # PM snapshots the checkout into its workspace; compare imported source bytes.
-    cp = leg.run("-c", IMPORT_PROBE, str(leg.install), _refs().base, argv0=leg.python, cwd=leg.root)
+    cp = leg.run("-c", IMPORT_PROBE, str(leg.install), argv0=leg.python, cwd=leg.root)
     assert cp.returncode == 0, "the updated venv does not serve HEAD's tree:\n" + H.describe(cp)
     # The venv satisfies HEAD's declared dependency set (not just "the old release still imports"):
     # every core requirement in the pulled pyproject is installed at a satisfying version, and the

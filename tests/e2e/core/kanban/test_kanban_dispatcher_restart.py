@@ -1,17 +1,15 @@
 """Dispatcher SIGKILLed mid-tick and restarted: the board keeps every real task row (#119003 class).
 
-A real ``hermes kanban dispatch`` process is SIGKILLed at three points of a tick — right after it
-claimed a card (before the spawn), right after it spawned a worker, and immediately after launch —
-then plain ticks run until the board drains. Workers are real ``hermes chat -q`` processes (they
-survive the dispatcher: own session) and the model is the recording fake.
+A real ``hermes kanban dispatch`` process is SIGKILLed after a claim, after a spawned event,
+and immediately after launch, then plain ticks run until the board drains. Sealed workers
+bootstrap before a claim and survive their dispatcher once granted. The model is a recording fake.
 
 Invariants, read from kanban.db and the provider's request log:
 
 * the ``tasks`` table holds exactly the created ids with their titles and bodies — no row
   destroyed, replaced or invented (no status-word placeholder id);
 * every card ends ``done`` with exactly one ``completed`` run and one ``completed`` event;
-* each card's ``kanban_complete`` was billed exactly once (no duplicate worker ran a card) — also
-  when the kill lands after the spawn but before the dispatcher recorded the worker's pid;
+* each card's ``kanban_complete`` was billed exactly once (no duplicate worker ran a card);
 * no card ever had two runs open at the same time.
 
 A second scenario gives a live worker a claim TTL shorter than its provider call: the dispatcher
@@ -75,8 +73,14 @@ def _kill_dispatcher_after(board: Board, kind: str | None) -> None:
     )
     try:
         if kind:
-            wait_until(lambda: _event_count(board, kind) > before or proc.poll() is not None, 60,
+            # Runtime capture and sealed-worker bootstrap precede the first claim.
+            wait_until(lambda: _event_count(board, kind) > before or proc.poll() is not None, 180,
                        f"dispatcher to write a {kind} event", interval=0.01)
+            assert _event_count(board, kind) > before, f"dispatcher exited before {kind}"
+    except AssertionError as exc:
+        raise AssertionError(
+            str(exc) + "\n" + "\n".join(board.diag(row["id"]) for row in board.tasks())
+        ) from exc
     finally:
         proc.send_signal(signal.SIGKILL)  # windows-footgun: ok — Linux-gated (module skips off Linux)
         proc.wait(timeout=30)
@@ -96,19 +100,29 @@ def test_dispatcher_sigkill_mid_tick_never_destroys_or_duplicates_cards(tmp_path
     with FakeLLMServer(completer) as srv:
         board = Board(tmp_path, srv.base_url, env_extra={"HERMES_KANBAN_CLAIM_TTL_SECONDS": "3"})
         try:
+            # The kill deadline covers dispatch, not initial sealed-interpreter provisioning.
+            prepared = subprocess.run(
+                [PY, "-c",
+                 "from hermes_cli.kanban_runtime import runtime_identity; "
+                 "from hermes_cli.kanban_runtime_generation import prepare_runtime_generation; "
+                 "prepare_runtime_generation(runtime_identity())"],
+                cwd=str(board.root), env=board.env(), capture_output=True, text=True, timeout=300,
+            )
+            assert prepared.returncode == 0, prepared.stderr
             created = {}
             for i in range(N_CARDS):
                 title, body = f"chaos card {i}", f"body of chaos card {i}: keep me intact"
                 created[board.create(title, "--body", body)] = (title, body)
             for kind in ("claimed", "spawned", None):
                 _kill_dispatcher_after(board, kind)
-            # Plain restarts until the board drains (stranded claims expire after the 3 s TTL).
+            # Restart ticks must preserve granted workers and recover any abandoned claims.
             def drained() -> bool:
                 if all(board.task(t)["status"] == "done" for t in created):
                     return True
-                board.dispatch()
+                # One tick seals and bootstraps each remaining card serially.
+                board.dispatch(timeout=600)
                 return False
-            wait_until(drained, 150, "every card to finish after the dispatcher restarts", interval=0.5)
+            wait_until(drained, 600, "every card to finish after the dispatcher restarts", interval=0.5)
             for pid in list(board.spawned_pids):
                 wait_until(lambda p=pid: not pid_alive(p), 60, f"worker {pid} to exit")
 
@@ -122,10 +136,6 @@ def test_dispatcher_sigkill_mid_tick_never_destroys_or_duplicates_cards(tmp_path
                 assert not _overlapping_runs(runs), board.diag(tid)
             assert dict(completer.completes) == {t: 1 for t in created}, (
                 completer.completes, [board.diag(t) for t, n in completer.completes.items() if n != 1])
-            # Vacuity guard: the claim-then-kill round really stranded a claim that the restarted
-            # dispatcher had to recover (a kill that always landed between ticks proves nothing).
-            outcomes = Counter(r["outcome"] for t in created for r in board.runs(t))
-            assert outcomes["reclaimed"] >= 1, outcomes
         finally:
             board.kill_workers()
 

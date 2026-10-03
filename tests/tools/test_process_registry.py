@@ -3140,8 +3140,9 @@ def test_model_not_found_notice_absent_when_fallback_chain_configured(monkeypatc
 @pytest.mark.platforms("linux")
 @pytest.mark.parametrize("slice_inherit", [False, True])
 @pytest.mark.parametrize("required", [False, True])
+@pytest.mark.parametrize("caller_slice", [False, True])
 def test_systemd_scope_capabilities_preserve_isolation_on_legacy_hosts(
-    monkeypatch, slice_inherit, required,
+    monkeypatch, slice_inherit, required, caller_slice,
 ):
     """Lacking slice inheritance must not disable restart-safe worker scopes."""
     import tools.process_registry as pr
@@ -3158,15 +3159,16 @@ def test_systemd_scope_capabilities_preserve_isolation_on_legacy_hosts(
         if "--help" in argv:
             help_text = b"--scope --slice-inherit" if slice_inherit else b"--scope"
             return subprocess.CompletedProcess(argv, 0, stdout=help_text)
-        # Scope availability is independent of the newer flag.
-        assert "--scope" in argv and "--slice-inherit" not in argv
-        return subprocess.CompletedProcess(argv, 0)
+        assert "--scope" in argv
+        return subprocess.CompletedProcess(
+            argv, 1 if "--slice-inherit" in argv and not caller_slice else 0,
+        )
 
     monkeypatch.setattr(pr.subprocess, "run", systemd_run)
     command = ["/bin/sh", "-c", "exit 0"]
     ordinary = pr._build_systemd_scope_argv(command, unit_suffix="ordinary")
     assert "--scope" in ordinary
-    assert ("--slice-inherit" in ordinary) is slice_inherit
+    assert ("--slice-inherit" in ordinary) is (slice_inherit and caller_slice)
     assert any(part.startswith("MemoryMax=") for part in ordinary)
 
     dispatch = pr.restart_safe_gateway_child_argv(
@@ -3174,8 +3176,8 @@ def test_systemd_scope_capabilities_preserve_isolation_on_legacy_hosts(
     )
     assert dispatch.mode == "scoped"
     assert "--scope" in dispatch.argv
-    assert ("--slice-inherit" in dispatch.argv) is slice_inherit
+    assert ("--slice-inherit" in dispatch.argv) is (slice_inherit and caller_slice)
     assert any(part.startswith("MemoryMax=") for part in dispatch.argv)
 
     assert len([argv for argv in calls if "--help" in argv]) == 1
-    assert len([argv for argv in calls if "--scope" in argv]) == 1
+    assert len([argv for argv in calls if "--scope" in argv]) == 1 + int(slice_inherit)

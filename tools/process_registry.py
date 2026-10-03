@@ -244,12 +244,11 @@ def systemd_user_bus_env(base_env: Optional[Dict[str, str]] = None) -> Dict[str,
 
 
 def _slice_inherit_supported() -> bool:
-    """Whether this ``systemd-run`` knows ``--slice-inherit`` (systemd >= 248).
+    """Whether slice inheritance is usable from this process's systemd session.
 
-    Probed from ``--help`` (no user bus needed) and cached for the process
-    lifetime: it is a package capability, so it only changes across an upgrade and
-    the next gateway start re-probes. False is NOT a reason to skip isolation —
-    only a reason for the restart-safe route to refuse.
+    Knowing the flag is insufficient: containers may expose a user bus without
+    a manager-visible caller slice. Probe an empty scope before wrapping work.
+    Failure retains legacy scope isolation, without the shared slice budget.
     """
     global _SLICE_INHERIT_SUPPORTED
     if _SLICE_INHERIT_SUPPORTED is not None:
@@ -265,6 +264,14 @@ def _slice_inherit_supported() -> bool:
                     [*command, "--help"], capture_output=True, stdin=subprocess.DEVNULL, timeout=3,
                 )
                 supported = b"--slice-inherit" in (result.stdout or b"")
+                if supported:
+                    probe_unit = f"hermes-probe-inherit-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+                    result = subprocess.run(
+                        _systemd_scope_argv(command[0], probe_unit, "/bin/sh", "-c", "exit 0"),
+                        capture_output=True, stdin=subprocess.DEVNULL, timeout=3,
+                        env=systemd_user_bus_env(),
+                    )
+                    supported = result.returncode == 0
         except Exception as exc:
             logger.debug("systemd-run --slice-inherit capability probe failed: %s", exc)
     _SLICE_INHERIT_SUPPORTED = supported

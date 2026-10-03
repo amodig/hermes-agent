@@ -3135,4 +3135,8 @@ def load_pool(provider: str) -> CredentialPool:
     pool._borrowed_root_ids = borrowed_root_ids
     if changed:
         pool._persist(removed_ids=sorted(disk_ids - {entry.id for entry in entries}))
+    if borrowed_root_ids and _profile_owns_pool_provider(provider):
+        # Successful local seeding shadows root for this live pool, not just its next load.
+        pool._entries = [entry for entry in pool._entries if entry.id not in borrowed_root_ids]
+        pool._borrowed_root_ids = set()
     return pool

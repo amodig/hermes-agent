@@ -365,6 +365,24 @@ def _profile_home_paths(profile_home=None) -> set[Path]:
 def _is_sanctioned_plugin_root(path: Path, plugin_roots: set[Path]) -> bool:
     return any(path == root or path.is_relative_to(root) for root in plugin_roots)
 
+
+def _dependency_environment_roots(source: Path) -> tuple[Path, ...]:
+    """The PM-committed dependency tree for this install, when one is recorded.
+
+    A PM launcher boots the store Python with the selected environment's
+    site-packages on ``sys.path``; that environment lives under the dependency
+    home (the default profile root), so without this the profile-state filter
+    would drop every installed dependency from the sealed worker runtime.
+    """
+    from pm.environments import committed_venv, site_packages
+
+    environment = committed_venv(Path(source))
+    if environment is None:
+        return ()
+    environment = Path(environment).resolve()
+    return environment, site_packages(environment).resolve()
+
+
 def _is_interpreter_or_install_root(path: Path, source: Path, *, profile_home=None) -> bool:
     """Keep installation subtrees, without treating a nested profile as an install."""
     roots = {
@@ -372,6 +390,7 @@ def _is_interpreter_or_install_root(path: Path, source: Path, *, profile_home=No
         Path(sys.prefix).resolve(),
         Path(sys.base_prefix).resolve(),
         *(Path(sysconfig.get_path(key)).resolve() for key in ("purelib", "platlib")),
+        *_dependency_environment_roots(source),
     }
     target = os.environ.get("HERMES_LAZY_INSTALL_TARGET", "").strip()
     if target:

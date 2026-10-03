@@ -81,12 +81,6 @@ class Board:
             encoding="utf-8",
         )
         (self.hermes_home / ".env").write_text("OPENAI_API_KEY=sk-fake-e2e\n", encoding="utf-8")
-        # Workers run with cwd=<task workspace>; the wrapper pins THIS checkout on the path.
-        self.hermes_bin = self.root / "hermes-bin"
-        self.hermes_bin.write_text(
-            "#!/bin/sh\n"
-            f"PYTHONPATH={REPO} exec {PY} -m hermes_cli.main \"$@\"\n", encoding="utf-8")
-        self.hermes_bin.chmod(0o755)
 
     # env / processes -------------------------------------------------------
     def env(self) -> dict[str, str]:
@@ -95,7 +89,10 @@ class Board:
         env.pop("PYTEST_CURRENT_TEST", None)
         env.update({
             "HOME": str(self.home), "HERMES_HOME": str(self.hermes_home),
-            "HERMES_BIN": str(self.hermes_bin), "PYTHONPATH": str(REPO),
+            # The checkout's own launcher: the sealed dispatcher accepts only this installation's
+            # entrypoint for immutable workers (a fake wrapper is refused), and cwd-independent
+            # workers still run the sealed generation, never this file.
+            "HERMES_BIN": str(REPO / "hermes"), "PYTHONPATH": str(REPO),
             "NO_COLOR": "1", "TERM": "dumb",
             # Children keep pytest's PYTEST_VERSION, which arms the live-DB guard against the scratch
             # HOME's own state.db; the whole tree is under ``root`` (asserted below), so let workers
@@ -122,8 +119,8 @@ class Board:
     def create(self, title: str, *extra: str) -> str:
         return self.cli_json("create", title, "--assignee", "default", *extra)["id"]
 
-    def dispatch(self, *extra: str) -> dict:
-        res = self.cli_json("dispatch", *extra)
+    def dispatch(self, *extra: str, timeout: float = 90.0) -> dict:
+        res = self.cli_json("dispatch", *extra, timeout=timeout)
         for tid in [s["task_id"] for s in res.get("spawned", [])]:
             pid = self.task(tid)["worker_pid"]
             if pid:

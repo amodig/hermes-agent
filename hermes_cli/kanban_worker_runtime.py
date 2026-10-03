@@ -30,6 +30,15 @@ def _dispatcher():
 
     return kanban_db_dispatch
 
+
+def _kb():
+    # Late-bound facade access: the facade imports this module through
+    # ``kanban_db_dispatch``, so a module-level import here would make a
+    # worker-runtime-first import order read a partially initialized facade.
+    from hermes_cli import kanban_db
+
+    return kanban_db
+
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024
 DEFAULT_LOG_BACKUP_COUNT = 1
 
@@ -272,7 +281,7 @@ def _is_windows_batch_shim(path: str) -> bool:
 
 def _path_search_names(command: str) -> list[str]:
     """Return executable names to try for an unqualified command."""
-    if not _kb._IS_WINDOWS or os.path.splitext(command)[1]:
+    if not _kb()._IS_WINDOWS or os.path.splitext(command)[1]:
         return [command]
     raw = os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD"
     return [command + ext for ext in raw.split(";") if ext]
@@ -291,7 +300,7 @@ def _safe_which_no_cwd(command: str) -> Optional[str]:
         directory = os.path.expanduser(raw_dir)
         for name in _path_search_names(command):
             candidate = os.path.join(directory, name)
-            if os.path.isfile(candidate) and (_kb._IS_WINDOWS or os.access(candidate, os.X_OK)):
+            if os.path.isfile(candidate) and (_kb()._IS_WINDOWS or os.access(candidate, os.X_OK)):
                 return candidate
     return None
 
@@ -300,7 +309,7 @@ def _hermes_path_argv(path: str) -> list[str]:
     """argv for a resolved Hermes executable path. Windows batch shims
     (``.cmd``/``.bat``) are unsafe as argv[0] because the argument vector
     includes task-derived values; prefer the module form."""
-    if _kb._IS_WINDOWS and _is_windows_batch_shim(path):
+    if _kb()._IS_WINDOWS and _is_windows_batch_shim(path):
         return _module_hermes_argv()
     return [_absolute_hermes_path(path)]
 
@@ -326,7 +335,7 @@ def _resolve_hermes_argv() -> list[str]:
     if importlib.util.find_spec("hermes_cli") is not None:
         return _module_hermes_argv()
 
-    hermes_bin = _safe_which_no_cwd("hermes") if _kb._IS_WINDOWS else shutil.which("hermes")
+    hermes_bin = _safe_which_no_cwd("hermes") if _kb()._IS_WINDOWS else shutil.which("hermes")
     if hermes_bin:
         return _hermes_path_argv(hermes_bin)
     return _module_hermes_argv()
@@ -433,7 +442,7 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
             toolsets = sorted(_get_platform_tools(cfg, "cli"))
         return toolsets or None
     except Exception as exc:
-        _kb._log.debug(
+        _kb()._log.debug(
             "kanban worker: could not resolve CLI toolsets for HERMES_HOME=%r (%s)",
             hermes_home,
             exc,
@@ -464,7 +473,7 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
             release_or_close(db)
         _retagged_workspace_roots.add(workspaces_root_path)
     except Exception as exc:
-        _kb._log.debug("kanban worker: legacy session retag skipped (%s)", exc)
+        _kb()._log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
 def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
@@ -506,7 +515,7 @@ def _open_worker_log(task: Task, board: Optional[str]):
     rotated first. Anchored at the board root (not the shared kanban root) so
     `hermes kanban log` reads its own file and boards sharing task ids don't
     collide."""
-    log_dir = _kb.worker_logs_dir(board=board)
+    log_dir = _kb().worker_logs_dir(board=board)
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{task.id}.log"
     dispatcher = _dispatcher()
@@ -664,10 +673,10 @@ def _default_spawn(
         )
         if override is not None:
             env[var] = override
-    env["HERMES_KANBAN_DB"] = str(_kb.kanban_db_path(board=board))
-    env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(_kb.workspaces_root(board=board))
+    env["HERMES_KANBAN_DB"] = str(_kb().kanban_db_path(board=board))
+    env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(_kb().workspaces_root(board=board))
     _retag_legacy_worker_sessions(env["HERMES_KANBAN_WORKSPACES_ROOT"])
-    env["HERMES_KANBAN_BOARD"] = _kb._normalize_board_slug(board) or _kb.get_current_board()
+    env["HERMES_KANBAN_BOARD"] = _kb()._normalize_board_slug(board) or _kb().get_current_board()
     env["HERMES_PROFILE"] = profile_arg
     from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
     env.pop(DELEGATED_CHILD_ENV_MARKER, None)
@@ -691,7 +700,7 @@ def _default_spawn(
     assert_runtime_import_root(identity=expected_identity)
     preparation_id = uuid.uuid4().hex
     preparation_path = (
-        _kb.kanban_home() / "kanban" / "runtime-preparations"
+        _kb().kanban_home() / "kanban" / "runtime-preparations"
         / f"{task.id}-{preparation_id}.json"
     )
     env["HERMES_KANBAN_BOOTSTRAP_PATH"] = str(preparation_path)
@@ -772,7 +781,7 @@ def _default_spawn(
             stderr=subprocess.STDOUT,
             env=env,
             start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
+            creationflags=subprocess.CREATE_NO_WINDOW if _kb()._IS_WINDOWS else 0,
         )
         # A fake process in legacy unit tests has only ``pid``. Keep those
         # tests focused on environment construction without weakening real
@@ -885,7 +894,7 @@ def _default_spawn(
         # Classified here, where the scope route or bootstrap actually failed.
         _launch_failure_or_shutdown(exc, task.id)
 
-from hermes_cli import kanban_db as _kb
+
 def _pid_alive(pid: Optional[int]) -> bool:
     """Return True if ``pid`` is still running on this host.
 
