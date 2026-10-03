@@ -38,6 +38,12 @@ _MANIFEST = "generation.json"
 _OWNER = ".hermes-kanban-runtime-owner.json"
 _TREE_EXCLUDES = {".git", ".hg", ".svn", "__pycache__"}
 _SOURCE_EXCLUDES = {"venv", ".venv", ".pytest_cache", ".ruff_cache", ".mypy_cache"}
+# Frontend/tooling workspaces are not worker dependencies. Do not apply this
+# exclusion to plugin/skill-owned node_modules or captured Python import roots.
+_SOURCE_NODE_WORKSPACES = {
+    ".", "apps/bootstrap-installer", "apps/desktop", "apps/shared",
+    "ui-tui", "ui-tui/packages/hermes-ink", "web", "tests-js", "website",
+}
 
 
 def _runtime_storage_root() -> Path:
@@ -63,6 +69,8 @@ def installation_mutation_lock(module_root=None, *, blocking=True):
 
     The UI update marker is deliberately not reused: it is profile-local,
     read-then-write, and fails open. OS locks are released on process death.
+
+    Locks live in the shared user cache, never a profile's scratch TMPDIR.
     """
     if os.environ.get(_GENERATION_ENV):
         raise _error("immutable workers cannot mutate their installed runtime")
@@ -81,12 +89,12 @@ def installation_mutation_lock(module_root=None, *, blocking=True):
         raise BlockingIOError(errno.EWOULDBLOCK, "runtime installation is being mutated")
     with ExitStack() as stack:
         stack.callback(mutex.release)
+        lock_dir = _runtime_storage_root().parent / "installation-locks"
+        lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         for key in sorted(map(str, keys)):
             if key in held:
                 continue
             digest = hashlib.sha256(key.encode()).hexdigest()
-            lock_dir = Path(tempfile.gettempdir()) / "hermes-installation-locks"
-            lock_dir.mkdir(mode=0o700, exist_ok=True)
             handle = stack.enter_context((lock_dir / digest).open("a+b"))
             if os.name == "nt":
                 import msvcrt
@@ -157,6 +165,7 @@ def _members(root: Path, *, source=False, exclude=()):
                 f"{relative}/{name}" if relative else name, name, exclude,
             )
             and not (source and (name in _SOURCE_EXCLUDES or (base / name / "pyvenv.cfg").is_file()))
+            and not (source and name == "node_modules" and relative in _SOURCE_NODE_WORKSPACES)
         )
         yield relative + "/", base
         for name in sorted(files):
@@ -356,6 +365,24 @@ def _profile_home_paths(profile_home=None) -> set[Path]:
 def _is_sanctioned_plugin_root(path: Path, plugin_roots: set[Path]) -> bool:
     return any(path == root or path.is_relative_to(root) for root in plugin_roots)
 
+
+def _dependency_environment_roots(source: Path) -> tuple[Path, ...]:
+    """The PM-committed dependency tree for this install, when one is recorded.
+
+    A PM launcher boots the store Python with the selected environment's
+    site-packages on ``sys.path``; that environment lives under the dependency
+    home (the default profile root), so without this the profile-state filter
+    would drop every installed dependency from the sealed worker runtime.
+    """
+    from pm.environments import committed_venv, site_packages
+
+    environment = committed_venv(Path(source))
+    if environment is None:
+        return ()
+    environment = Path(environment).resolve()
+    return environment, site_packages(environment).resolve()
+
+
 def _is_interpreter_or_install_root(path: Path, source: Path, *, profile_home=None) -> bool:
     """Keep installation subtrees, without treating a nested profile as an install."""
     roots = {
@@ -363,6 +390,7 @@ def _is_interpreter_or_install_root(path: Path, source: Path, *, profile_home=No
         Path(sys.prefix).resolve(),
         Path(sys.base_prefix).resolve(),
         *(Path(sysconfig.get_path(key)).resolve() for key in ("purelib", "platlib")),
+        *_dependency_environment_roots(source),
     }
     target = os.environ.get("HERMES_LAZY_INSTALL_TARGET", "").strip()
     if target:
@@ -520,7 +548,7 @@ def cleanup_runtime_generation(root, *, force=False):
     if not force:
         from hermes_cli.kanban_runtime import process_start_time
         try:
-            owner = json.loads((root / _OWNER).read_text(encoding="utf-8"))
+            owner = json.loads((root / _OWNER).read_text(encoding="utf-8-sig"))
             pid = int(owner["pid"])
             started = process_start_time(pid)
             # Bootstrap initially has only stdlib available. Until it verifies
@@ -573,7 +601,7 @@ def _prune_runtime_content(current: Path, source: Path):
         if len(candidate.name) != 64 or any(char not in "0123456789abcdef" for char in candidate.name):
             continue
         try:
-            manifest = json.loads((candidate / _MANIFEST).read_text(encoding="utf-8"))
+            manifest = json.loads((candidate / _MANIFEST).read_text(encoding="utf-8-sig"))
             if manifest["identity"]["module_root"] != str(source):
                 continue
         except (OSError, ValueError, KeyError, TypeError):
@@ -614,12 +642,17 @@ def _installed_resources(roots, mappings):
 
 def prepare_runtime_generation(expected_identity, *, workspace=None, profile_home=None, project_plugins_enabled: bool | None = None):
     from hermes_cli.kanban_runtime import RuntimeIdentity, runtime_identity, same_code_identity, _RUNTIME_RESOURCE_ROOTS
+    from hermes_cli.venv_sync import completion_pending_path
     expected = expected_identity if isinstance(expected_identity, RuntimeIdentity) else RuntimeIdentity.from_value(expected_identity)
     source = Path(expected.module_root).resolve()
     with installation_mutation_lock(source):
-        for marker in (".update-incomplete", ".lazy-refresh-incomplete"):
-            if (source / marker).exists():
-                raise _error(f"runtime installation needs recovery: {marker}")
+        for marker in (
+            source / ".update-incomplete",
+            source / ".lazy-refresh-incomplete",
+            completion_pending_path(source),
+        ):
+            if marker.exists():
+                raise _error(f"runtime installation needs recovery: {marker.name}")
         current = runtime_identity(source)
         if not same_code_identity(expected, current):
             raise _error("source runtime changed before generation preparation")
@@ -775,7 +808,7 @@ def prepare_runtime_generation(expected_identity, *, workspace=None, profile_hom
             except BaseException:
                 _remove_runtime_tree(staging)
                 raise
-        manifest_json = (cache / _MANIFEST).read_text(encoding="utf-8")
+        manifest_json = (cache / _MANIFEST).read_text(encoding="utf-8-sig")
         manifest = json.loads(manifest_json)
         identity = RuntimeIdentity.from_value(manifest["identity"])
         if _bootstrap_digest(cache) != _validate_published_generation(cache, manifest_json):
@@ -829,13 +862,13 @@ def generation_runtime_path(path):
     if not raw:
         return Path(path)
     root = Path(raw).resolve()
-    manifest = json.loads((root / _MANIFEST).read_text(encoding="utf-8"))
+    manifest = json.loads((root / _MANIFEST).read_text(encoding="utf-8-sig"))
     return _mapped_path(Path(path), root, manifest["paths"])
 
 
 def generation_manifest(root=None, *, verify=False):
     root = Path(root or os.environ[_GENERATION_ENV]).resolve()
-    manifest = json.loads((root / _MANIFEST).read_text(encoding="utf-8"))
+    manifest = json.loads((root / _MANIFEST).read_text(encoding="utf-8-sig"))
     if verify and _generation_digest(root, manifest) != manifest["identity"]["generation"]:
         raise _error("runtime generation is incomplete or changed")
     return manifest
@@ -910,7 +943,7 @@ def _bootstrap():
     if not Path(sys.prefix).resolve().is_relative_to(root / "python"):
         raise RuntimeError("generation interpreter did not select its copied standard library")
     # No Hermes or third-party code has been imported by -I -S at this point.
-    manifest = json.loads((root / _MANIFEST).read_text(encoding="utf-8"))
+    manifest = json.loads((root / _MANIFEST).read_text(encoding="utf-8-sig"))
     if _generation_digest(root, manifest) != manifest["identity"]["generation"]:
         raise RuntimeError("runtime generation is incomplete or changed")
     sys.dont_write_bytecode = True

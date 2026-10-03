@@ -31,7 +31,8 @@ def _install_memory_loaders(source):
         "plugins/memory/__init__.py", "plugins/memory/config_schema.py",
         "agent/memory_provider.py", "agent/secret_scope.py",
         "hermes_cli/env_loader.py", "hermes_cli/_early_recovery.py",
-        "hermes_cli/managed_scope.py", "hermes_constants.py", "utils.py",
+        "hermes_cli/managed_scope.py", "hermes_cli/stale_modules.py",
+        "hermes_constants.py", "utils.py", "hermes_yaml.py",
     ):
         destination = source / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -40,7 +41,7 @@ def _install_memory_loaders(source):
     # Only profile config I/O is synthetic; plugin discovery, imports, schemas,
     # resources and dotenv all execute their production implementations.
     _write(source / "hermes_cli" / "config.py", """
-import yaml
+import hermes_yaml as yaml
 from hermes_constants import get_hermes_home
 def load_config():
     path = get_hermes_home() / 'config.yaml'
@@ -48,12 +49,11 @@ def load_config():
 def cfg_get(config, section, key):
     return config.get(section, {}).get(key)
 """)
-    for name in ("yaml", "dotenv"):
+    for name in ("ruamel.yaml", "dotenv"):
         spec = importlib.util.find_spec(name)
-        shutil.copytree(
-            Path(spec.origin).parent, source.parent / "site-packages" / name,
-            dirs_exist_ok=True,
-        )
+        destination = source.parent / "site-packages" / name.replace(".", "/")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(Path(spec.origin).parent, destination, dirs_exist_ok=True)
 
 
 def _write_memory_provider(plugin, label):
@@ -115,7 +115,7 @@ def installation(tmp_path, monkeypatch, runtime_storage):
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(REPOSITORY / "providers" / name, destination)
     _write(source / "hermes_cli" / "__init__.py", '__version__ = "fixture"\n')
-    _write(source / "hermes_constants.py", "import os\nfrom pathlib import Path\ndef get_hermes_home(): return Path(os.environ['HERMES_HOME'])\n")
+    shutil.copy2(REPOSITORY / "hermes_constants.py", source / "hermes_constants.py")
     _write(source / "early.py", "VALUE = 'old'\n")
     _write(source / "late.py", "VALUE = 'old'\n")
     _write(dependencies / "startup_sdk.py", "VALUE = 'old'\n")
@@ -803,7 +803,7 @@ def test_reused_generation_cannot_be_deleted_while_another_worker_is_live(instal
             child.wait()
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_runtime_storage_uses_persistent_user_cache(tmp_path, monkeypatch):
     home = tmp_path / "home"
     monkeypatch.setattr(Path, "home", lambda: home)
@@ -841,22 +841,28 @@ def test_generation_cleanup_is_confined_to_owned_worker_roots(runtime_storage, t
     assert live.is_dir()
 
 
-def test_generation_waits_for_source_and_dependency_transaction(installation):
+def test_generation_waits_for_source_and_dependency_transaction(installation, runtime_storage):
     source, _, _, _, _, _ = installation
     expected = runtime.runtime_identity(source)
+    writer_tmp = source.parent / "writer-scratch"
+    probe_tmp = source.parent / "probe-scratch"
+    writer_tmp.mkdir()
+    probe_tmp.mkdir()
     writer = subprocess.Popen(
         [sys.executable, "-c", """
 import sys
 from pathlib import Path
-from hermes_cli.kanban_runtime_generation import installation_mutation_lock
+from hermes_cli import kanban_runtime_generation as generation
+generation._runtime_storage_root = lambda: Path(sys.argv[2])
 root = Path(sys.argv[1])
-with installation_mutation_lock(root):
+with generation.installation_mutation_lock(root):
     (root / 'early.py').write_text("VALUE = 'new'\\n")
     print('half-written', flush=True)
     sys.stdin.readline()
     (root / 'late.py').write_text("VALUE = 'new'\\n")
-""", str(source)],
-        env={**os.environ, "PYTHONPATH": str(source), "HERMES_HOME": str(source / "other-profile")},
+""", str(source), str(runtime_storage)],
+        env={**os.environ, "PYTHONPATH": str(source), "HERMES_HOME": str(source / "other-profile"),
+             "TMPDIR": str(writer_tmp), "TEMP": str(writer_tmp), "TMP": str(writer_tmp)},
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     started = threading.Event()
@@ -868,14 +874,17 @@ with installation_mutation_lock(root):
         probe = subprocess.run(
             [sys.executable, "-c", """
 import sys
-from hermes_cli.kanban_runtime_generation import installation_mutation_lock
+from pathlib import Path
+from hermes_cli import kanban_runtime_generation as generation
+generation._runtime_storage_root = lambda: Path(sys.argv[2])
 try:
-    with installation_mutation_lock(sys.argv[1], blocking=False):
+    with generation.installation_mutation_lock(sys.argv[1], blocking=False):
         print('unexpected acquisition')
 except BlockingIOError:
     print('busy')
-""", str(source)],
-            env={**os.environ, "PYTHONPATH": str(source), "HERMES_HOME": str(source / "third-profile")},
+""", str(source), str(runtime_storage)],
+            env={**os.environ, "PYTHONPATH": str(source), "HERMES_HOME": str(source / "third-profile"),
+                 "TMPDIR": str(probe_tmp), "TEMP": str(probe_tmp), "TMP": str(probe_tmp)},
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10,
         )
         assert probe.returncode == 0, probe.stderr
@@ -915,6 +924,28 @@ def test_incomplete_installation_is_not_publishable(installation):
         prepare()
 
 
+def test_pending_source_completion_blocks_generation_reuse_until_cleared(
+    installation, monkeypatch,
+):
+    from hermes_cli.venv_sync import arm_completion, clear_completion
+    from pm import environments
+
+    source, _, _, _, _, prepare = installation
+    monkeypatch.setattr(environments, "installs_root", lambda: source.parent / "install-state")
+    # An existing content publication must not bypass an unfinished update tail.
+    prepare()
+    pending = arm_completion(source)
+    with pytest.raises(runtime.RuntimeIdentityError, match="source-completion-pending"):
+        prepare()
+    assert pending.is_file()
+
+    clear_completion(source)
+    prepared = prepare()
+    observed = _finish(_launch(prepared))
+    assert observed["late"] == "old"
+    assert observed["dynamic"] == "old"
+
+
 def test_installed_metadata_can_locate_data_outside_site_packages(installation, monkeypatch):
     source, dependencies, _, _, _, prepare = installation
     monkeypatch.setattr(sys, "prefix", str(dependencies.parent))
@@ -931,3 +962,5 @@ print(distribution('unseeded-sdk').locate_file('../share/fixture.txt').read_text
     output, error = child.communicate(timeout=60)
     assert child.returncode == 0, error
     assert output.strip() == "old installed resource"
+
+

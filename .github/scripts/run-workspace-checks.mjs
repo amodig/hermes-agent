@@ -133,6 +133,7 @@ async function main() {
   if (failed.length > 0) {
     for (const r of failed) console.error(`::error::${r.unit.pkg} :: ${r.unit.script} failed`)
     console.error(`::error::${failed.length} of ${results.length} checks failed`)
+    // Not process.exit(): it drops what stdout still buffers, which is the failing check's output.
     process.exitCode = 1
     return
   }

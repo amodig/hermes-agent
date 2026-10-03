@@ -1,7 +1,7 @@
 # Contributor email → GitHub login mappings
 
 This directory replaces appending entries to `AUTHOR_MAP` in
-`scripts/release.py`. The old dict caused constant merge conflicts when
+`scripts/releases/authors_legacy.py`. The old dict caused constant merge conflicts when
 several salvage PRs landed at once — every PR edited the same lines of the
 same file. Here, **each mapping is its own file**, and file additions never
 conflict.
@@ -16,7 +16,7 @@ python3 scripts/add_contributor.py <email> <github-login>
 echo "<github-login>" > contributors/emails/<email>
 ```
 
-- File **name** = the exact commit-author email (as shown by `git log --format='%ae'`).
+- File **name** = the canonical commit-author email (as shown by `git log --format='%aE'`, applying `.mailmap`). Reuse an existing mapping through `.mailmap` for case-only aliases; do not create case-colliding filenames.
 - File **content** = the GitHub login on the first non-comment line.
   Lines starting with `#` are comments (use them for the PR reference).
 
@@ -29,7 +29,7 @@ janedoe
 
 ## Rules
 
-- Do NOT add new entries to `AUTHOR_MAP` in `scripts/release.py`. That dict
+- Do NOT add new entries to `AUTHOR_MAP` in `scripts/releases/authors_legacy.py`. That dict
   is frozen legacy data; the release tooling merges it with this directory
   (directory entries win on duplicates).
 - GitHub noreply emails (`<id>+<login>@users.noreply.github.com` and

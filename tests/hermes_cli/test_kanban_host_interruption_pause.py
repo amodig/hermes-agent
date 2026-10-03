@@ -58,7 +58,7 @@ def _forbid_pid_use(monkeypatch: pytest.MonkeyPatch) -> None:
     def _probe(pid):
         raise AssertionError(f"the stale PID {pid} must never be probed")
 
-    def _terminate(pid, claim_lock, *, signal_fn=None):
+    def _terminate(pid, claim_lock, *, signal_fn=None, started_at=None):
         raise AssertionError(f"the stale PID {pid} must never be signalled")
 
     monkeypatch.setattr(kb, "_pid_alive", _probe)
@@ -90,7 +90,7 @@ def _reclaim(conn) -> kbd.DispatchResult:
 
 def _row(conn, tid: str):
     return conn.execute(
-        "SELECT status, consecutive_failures, claim_lock, worker_pid, block_kind, "
+        "SELECT status, consecutive_failures, claim_lock, worker_pid, worker_started_at, block_kind, "
         "       block_recurrences, model_override, provider_override, "
         "       reasoning_effort, branch_name, current_step_key "
         "FROM tasks WHERE id = ?", (tid,),
@@ -133,6 +133,7 @@ def test_positive_host_change_pauses_the_run_exactly_once(conn, monkeypatch):
     assert row["status"] == "blocked"
     assert row["consecutive_failures"] == 0, "a reboot must not charge a retry"
     assert row["claim_lock"] is None and row["worker_pid"] is None
+    assert row["worker_started_at"] is None
     run = _run_row(conn, run_id)
     assert (run["status"], run["outcome"]) == ("interrupted", "interrupted")
     assert run["ended_at"] is not None
@@ -180,6 +181,51 @@ def test_positive_host_change_pauses_the_run_exactly_once(conn, monkeypatch):
     assert _events(conn, tid, "block_loop_detected") == []
     assert kb.unblock_task(conn, tid) is True
     assert _row(conn, tid)["status"] == "ready"
+
+
+@pytest.mark.parametrize("terminal_before_restart,current_epoch", [
+    (True, NEW_EPOCH),
+    (False, NEW_EPOCH),
+    (False, ""),
+])
+def test_terminal_reaper_never_consults_a_previous_hosts_worker(
+    conn, monkeypatch, terminal_before_restart, current_epoch,
+):
+    tid = kb.create_task(conn, title="old host terminal worker", assignee="w")
+    run_id = _claim(conn, tid, monkeypatch=monkeypatch)
+    if terminal_before_restart:
+        assert kb.complete_task(conn, tid, result="done", expected_run_id=run_id)
+    monkeypatch.setattr(_kr, "current_host_epoch", lambda: NEW_EPOCH)
+    if not terminal_before_restart:
+        assert _reclaim(conn).interrupted == [tid]
+    conn.execute(
+        "UPDATE task_runs SET ended_at = ended_at - ? WHERE id = ?",
+        (kbd.TERMINAL_WORKER_REAP_GRACE_SECONDS, run_id),
+    )
+    conn.commit()
+    # Once interruption was proven, a later unreadable epoch cannot make the
+    # old PID safe again. Closed runs from before the reboot need the same fence.
+    monkeypatch.setattr(_kr, "current_host_epoch", lambda: current_epoch)
+    pid_uses = []
+
+    def probe(pid, *_args):
+        pid_uses.append(pid)
+        return True
+
+    def terminate(pid, *_args, **_kwargs):
+        pid_uses.append(pid)
+        return {"terminated": True}
+
+    monkeypatch.setattr(kb, "_pid_alive", probe)
+    monkeypatch.setattr(kbd, "_worker_alive", probe)
+    monkeypatch.setattr(kbd, "_terminate_reclaimed_worker", terminate)
+    assert _reclaim(conn).reaped_terminal_workers == []
+    assert pid_uses == []
+    retained = conn.execute(
+        "SELECT worker_pid, worker_started_at FROM task_runs WHERE id = ?", (run_id,),
+    ).fetchone()
+    assert tuple(retained) == (None, None)
+    assert _events(conn, tid, "terminal_worker_reaped") == []
 
 
 def test_provenance_rule_decides_between_a_pause_and_a_crash(conn, monkeypatch):

@@ -1,0 +1,2 @@
+soymarketing
+# GitHub commit-author identity: https://github.com/NousResearch/hermes-agent/commit/4131282513446447686a88132acb6280c3a67d71

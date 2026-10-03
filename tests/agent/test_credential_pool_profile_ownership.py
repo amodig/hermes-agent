@@ -114,7 +114,9 @@ def test_profile_owned_credentials_preserve_isolation_and_removal(
         "manual" if local_source == "manual" else "env:DEEPSEEK_API_KEY",
     ]
     local_id = local_rows[0]["id"]
-    pool.mark_exhausted_and_rotate(status_code=402, credential_id=local_id)
+    assert [entry.id for entry in pool.entries()] == [local_id]
+    assert pool.select().runtime_api_key == "sk-private"
+    assert pool.mark_exhausted_and_rotate(status_code=402, credential_id=local_id) is None
 
     private = load_pool("deepseek")
     assert [entry.id for entry in private.entries()] == [local_id]

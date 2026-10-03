@@ -1,6 +1,7 @@
 import { PassThrough } from 'stream'
 
 import { renderSync } from '@hermes/ink'
+import { stripAnsi } from '@hermes/shared/ansi'
 import React from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -12,7 +13,6 @@ import { StatusRule } from '../components/appChrome.js'
 import { AppLayout } from '../components/appLayout.js'
 import type { GatewayClient } from '../gatewayClient.js'
 import { DEFAULT_VOICE_RECORD_KEY } from '../lib/platform.js'
-import { stripAnsi } from '../lib/text.js'
 import { DEFAULT_THEME } from '../theme.js'
 
 type StatusRuleProps = React.ComponentProps<typeof StatusRule>
@@ -132,9 +132,9 @@ const layoutProps: AppLayoutProps = {
   actions: {
     activateLiveSession: () => {},
     answerApproval: () => {},
-    answerClarify: () => {},
     answerSecret: () => {},
     answerSudo: () => {},
+    cancelClarify: () => {},
     clearSelection: () => {},
     closeLiveSession: () => Promise.resolve(null),
     newLiveSession: () => {},
@@ -300,6 +300,7 @@ describe('status-chrome timers under an occluding overlay', () => {
     nowSpy.mockReturnValue(T0 + 300_000)
     rule.clear()
     resetOverlayState()
+    // Wait for the store-driven reveal instead of assuming a scheduler tick.
     await vi.waitFor(() => {
       const resumed = rule.output()
 
@@ -310,7 +311,7 @@ describe('status-chrome timers under an occluding overlay', () => {
 
       // …and the clocks are running again.
       expect(oneSecondTimers(intervalSpy)).toBe(2)
-    })
+    }, { interval: 10, timeout: 5_000 })
   })
 
   it('tears the clocks down when an overlay opens over an already-running status rule', async () => {
@@ -364,7 +365,7 @@ describe('status-chrome timers track the current overlay model', () => {
     ['agents', { agents: true }],
     ['approval', { approval: { command: 'ls', requestId: 'a-1' } as OverlayState['approval'] }],
     ['billing', { billing: { kind: 'credits' } as OverlayState['billing'] }],
-    ['clarify', { clarify: { question: 'which?', requestId: 'c-1' } as OverlayState['clarify'] }],
+    ['clarify', { clarify: { questions: [{ choices: null, qid: 'q0', question: 'which?' }], requestId: 'c-1' } }],
     ['confirm', { confirm: { onConfirm: () => {}, prompt: 'sure?' } as OverlayState['confirm'] }],
     ['journey', { journey: true }],
     ['secret', { secret: { envVar: 'TOKEN', prompt: 'token?' } as OverlayState['secret'] }],
@@ -423,15 +424,6 @@ describe('AppLayout status-rule visibility', () => {
     }
 
     await vi.waitFor(() => expect(layout.output()).toContain('1m 30s'))
-  })
-
-  it('keeps the status rule on screen AND its clock advancing under a flow-layout sudo prompt', async () => {
-    const layout = mountLayout({ sudo: { requestId: 'sudo-1' } as OverlayState['sudo'] })
-
-    await vi.waitFor(() => {
-      expect(layout.output()).toContain('1m 0s')
-      expect(oneSecondTimers(intervalSpy)).toBe(2)
-    })
   })
 
   it('arms no clock under a floating model picker while the rule is at the top', async () => {

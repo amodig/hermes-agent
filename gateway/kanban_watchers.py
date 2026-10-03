@@ -10,7 +10,6 @@ in ``kanban_watchers_common``.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import os
 import threading
 import time
@@ -43,10 +42,6 @@ _HEALTH_WINDOW = 6
 # both observe a missing handle and install different locks, which would let the
 # stop transition slip between the final check and the grant.
 _GRANT_LOCK_INIT = threading.Lock()
-# A grant is a bounded pipe write to an already-verdicted worker, so waiting for
-# the boundary is normally microseconds. The timeout only exists so a wedged
-# grant can never stall shutdown.
-_GRANT_GUARD_TIMEOUT_SECONDS = 2.0
 
 
 class GatewayKanbanWatchersMixin:
@@ -116,40 +111,18 @@ class GatewayKanbanWatchersMixin:
         return lock
 
     def _kanban_transition(self, **flags: bool) -> None:
-        """Set drain/stop flags under the grant lock so they cannot race a grant.
-
-        The timeout exists only so a wedged grant cannot stall shutdown: it set a
-        flag because the gateway is going away, which must always succeed.
-        """
-        lock = self._kanban_grant_lock()
-        acquired = lock.acquire(timeout=_GRANT_GUARD_TIMEOUT_SECONDS)
-        if not acquired:
-            logger.warning(
-                "kanban dispatcher: grant boundary busy for %.1fs; applying %s anyway",
-                _GRANT_GUARD_TIMEOUT_SECONDS, ", ".join(sorted(flags)),
-            )
-        try:
+        """Serialize drain/stop flags with the worker's bounded final pipe grant."""
+        with self._kanban_grant_lock():
             for name, value in flags.items():
                 setattr(self, name, value)
-        finally:
-            if acquired:
-                lock.release()
 
-    @contextlib.contextmanager
     def _kanban_grant_guard(self):
-        """Hold the grant boundary across the stop re-check and the grant itself."""
-        lock = self._kanban_grant_lock()
-        acquired = lock.acquire(timeout=_GRANT_GUARD_TIMEOUT_SECONDS)
-        if not acquired:
-            logger.warning(
-                "kanban dispatcher: grant boundary busy for %.1fs; granting without it",
-                _GRANT_GUARD_TIMEOUT_SECONDS,
-            )
-        try:
-            yield
-        finally:
-            if acquired:
-                lock.release()
+        """Hold the stop boundary; the native grant owns its pipe-write deadline.
+
+        Never bypass a busy boundary: that could grant after a drain or revoke a
+        worker whose grant already succeeded.
+        """
+        return self._kanban_grant_lock()
 
     def _release_kanban_dispatcher_lock(self) -> None:
         """Clear notifier-visible ownership before releasing the OS lock."""
@@ -176,6 +149,18 @@ class GatewayKanbanWatchersMixin:
         dispatcher respawned a crashed task). All SQLite work runs in a thread;
         one tick's failure never stops the next.
         """
+        try:
+            from hermes_cli.config import load_config as _load_config
+
+            cfg = _load_config()
+            kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        except Exception as exc:
+            logger.warning("kanban notifier: cannot load config (%s); continuing enabled", exc)
+            kanban_cfg = {}
+        if not kanban_cfg.get("notify_in_gateway", True):
+            logger.info("kanban notifier: disabled via config kanban.notify_in_gateway=false")
+            return
+
         from gateway.config import Platform as _Platform
         try:
             from hermes_cli import kanban_db as _kb
@@ -248,15 +233,21 @@ class GatewayKanbanWatchersMixin:
         reference only), and upload errors are logged, never raised.
         """
         raw_paths: list[str] = []
+        prose_paths: list[str] = []
         if isinstance(event_payload, dict):
             raw = event_payload.get("artifacts")
             if isinstance(raw, (list, tuple)):
                 raw_paths += [item for item in raw if isinstance(item, str)]
             summary = event_payload.get("summary")
             if isinstance(summary, str) and summary:
-                raw_paths += adapter.extract_local_files(summary)[0]
+                prose_paths += adapter.extract_local_files(summary)[0]
         if task is not None and getattr(task, "result", None):
-            raw_paths += adapter.extract_local_files(str(task.result))[0]
+            prose_paths += adapter.extract_local_files(str(task.result))[0]
+        # A staged copy and the scratch original it was copied from are the
+        # same deliverable; on a review handoff the original still exists, so
+        # prose mentions of it must not upload the file a second time.
+        staged_names = {os.path.basename(p) for p in raw_paths}
+        raw_paths += [p for p in prose_paths if os.path.basename(p) not in staged_names]
         candidates: list[str] = []
         for path in raw_paths:
             expanded = os.path.expanduser(path) if path else ""
@@ -378,6 +369,7 @@ class GatewayKanbanWatchersMixin:
         # the slot that reports a profile/PATH failure, and vice versa.
         last_guard_warn_at = 0
         last_stuck_warn_at = 0
+        results: Optional[list] = None
 
         logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
         while self._running:
@@ -435,12 +427,13 @@ class GatewayKanbanWatchersMixin:
                     )
                     last_guard_warn_at = now
                 if bad_ticks >= _HEALTH_WINDOW and now - last_stuck_warn_at >= 300:
+                    held = _kbd.describe_suppression(res for _slug, res in (results or []))
                     logger.warning(
                         "kanban dispatcher stuck: ready queue non-empty for "
-                        "%d consecutive ticks but 0 workers spawned. Check "
+                        "%d consecutive ticks but 0 workers spawned.%s Check "
                         "profile health (venv, PATH, credentials) and "
                         "`hermes kanban list --status ready`.",
-                        bad_ticks,
+                        bad_ticks, f" Last tick held back: {held}." if held else "",
                     )
                     last_stuck_warn_at = now
             except asyncio.CancelledError:
@@ -453,30 +446,3 @@ class GatewayKanbanWatchersMixin:
             await self._sleep_between_ticks(interval)
 
         self._release_kanban_dispatcher_lock()
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-from typing import Callable  # noqa: F401,E402
-from contextvars import Context  # noqa: F401,E402
-import logging  # noqa: F401,E402
-import re  # noqa: F401,E402
-import sqlite3  # noqa: F401,E402
-
-
-_PLUGIN_COMPAT_LAZY = {
-    't': ('agent.i18n', 't'),
-}
-
-
-def __getattr__(name):  # PEP 562 — lazy so no import cycles
-    target = _PLUGIN_COMPAT_LAZY.get(name)
-    if target is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    import importlib
-    from hermes_cli.plugin_compat import warn_once
-    warn_once(__name__, name, *target)
-    return getattr(importlib.import_module(target[0]), target[1])
-# ---- END PLUGIN-COMPAT ----

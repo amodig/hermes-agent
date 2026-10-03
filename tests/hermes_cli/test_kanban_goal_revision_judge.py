@@ -131,7 +131,6 @@ def test_plan_only_gate_then_authorization_revision_allows_completion(
             goal_mode=True,
         )
 
-    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
     first = json.loads(
         kt._handle_complete({
             "task_id": task_id,
@@ -203,7 +202,6 @@ def test_request_review_judge_reads_authorized_effective_revision(
             author="cto",
         )
 
-    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
     output = json.loads(
         kt._handle_request_review({
             "task_id": task_id,
@@ -531,7 +529,6 @@ def test_request_review_propagates_completion_contract_error(
 
     from tools import kanban_tools as kt
 
-    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
     output = json.loads(
         kt._handle_request_review({
             "task_id": task_id,
@@ -540,5 +537,6 @@ def test_request_review_propagates_completion_contract_error(
         })
     )
     assert "error" in output
-    assert "No task state changed" in output["error"]
-    assert "kanban_update" in output["error"]
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert kb.latest_run(conn, task_id) is None
