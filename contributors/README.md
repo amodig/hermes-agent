@@ -16,7 +16,7 @@ python3 scripts/add_contributor.py <email> <github-login>
 echo "<github-login>" > contributors/emails/<email>
 ```
 
-- File **name** = the exact commit-author email (as shown by `git log --format='%ae'`).
+- File **name** = the canonical commit-author email (as shown by `git log --format='%aE'`, applying `.mailmap`). Reuse an existing mapping through `.mailmap` for case-only aliases; do not create case-colliding filenames.
 - File **content** = the GitHub login on the first non-comment line.
   Lines starting with `#` are comments (use them for the PR reference).
 

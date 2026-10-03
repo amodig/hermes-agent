@@ -30,6 +30,13 @@ def update_tree(tmp_path, monkeypatch):
     monkeypatch.setenv('GIT_ALLOW_PROTOCOL', 'file')
     monkeypatch.delenv('HERMES_UPDATE_HANDOFF_PID', raising=False)
     monkeypatch.delenv('HERMES_UPDATE_REEXEC', raising=False)
+    # The runtime/installation-lock cache is deliberately profile-independent
+    # (shared across profiles, never HERMES_HOME), so conftest's home isolation
+    # does not cover it. On Windows it resolves inside %LOCALAPPDATA%\hermes —
+    # the real hermes home — so every cmd_update here must redirect it.
+    from hermes_cli import kanban_runtime_generation
+    monkeypatch.setattr(kanban_runtime_generation, '_runtime_storage_root',
+                        lambda: tmp_path / 'runtime-storage')
     origin = tmp_path / 'origin'
     origin.mkdir()
     git(origin, 'init', '-q', '-b', 'main')

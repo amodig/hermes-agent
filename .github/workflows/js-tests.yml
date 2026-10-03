@@ -8,7 +8,7 @@ jobs:
   check:
     name: JS & TS checks
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
       - name: Set up the locked JS build toolchain
@@ -62,22 +62,8 @@ jobs:
         with:
           command: npm ci
 
-      # Every check runs at the same time. The step fails only after all of
-      # them finish. There are two reasons this is not ``npm run --ws check``.
-      #
-      #   * ``--ws`` is serial and stops at the first workspace that fails. A
-      #     run then reports one failure, where the matrix this replaced
-      #     reported every failure together.
-      #   * The unit of work is a CHECK, and not a workspace. apps/desktop is
-      #     most of the payload, and its own ``check`` is a serial && chain.
-      #     A spread across workspaces alone leaves that chain as the long
-      #     pole. This expands the ``check:*`` sub-scripts of a package, so
-      #     its lint, ui, electron and plugin suites all run together. That
-      #     is the same selection rule the old matrix job used.
-      #
-      # Discovery is ``npm query .workspace``. A new package or a new
-      # ``check:*`` script needs no change here. An empty list is an error and
-      # not an empty run, because an empty run reports green after it checks
-      # nothing.
+      # Each check sizes its own worker pool from the available CPUs. Run checks
+      # serially on the fork's standard runner to avoid nested oversubscription.
+      # Fail only after all checks finish, unlike ``npm run --ws check``.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        run: node .github/scripts/run-workspace-checks.mjs --concurrency 1

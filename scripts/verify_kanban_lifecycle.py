@@ -427,6 +427,15 @@ try:
                     proof["diagnostics"].append(
                         f"native worker handshake raised {type(exc).__name__}: {str(exc)[:500]}",
                     )
+                    try:
+                        worker_log = kb.worker_logs_dir(board=board) / f"{task.id}.log"
+                        proof["diagnostics"].append(
+                            "worker log: " + worker_log.read_text(
+                                encoding="utf-8", errors="replace",
+                            )[-4000:],
+                        )
+                    except OSError:
+                        pass
                     raise
             finally:
                 generations.cleanup_runtime_generation = previous_cleanup

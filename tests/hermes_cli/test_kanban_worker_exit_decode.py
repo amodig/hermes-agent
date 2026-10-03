@@ -15,6 +15,7 @@ import sys
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_runtime_generation as generation
 from hermes_cli import kanban_worker_runtime as runtime
 
 
@@ -27,10 +28,16 @@ def _spawn_exit(code: int) -> subprocess.Popen:
 
 
 @pytest.mark.platforms("windows")
-def test_native_windows_reaper_and_decode(monkeypatch):
-    """Native Windows, nothing patched: ``_IS_WINDOWS`` selects the Popen-poll
-    reaper and the decode runs where ``os.WIFEXITED`` does not exist, so the
-    rate-limit sentinel exit is a requeue, not a crash."""
+def test_native_windows_reaper_and_decode(monkeypatch, tmp_path):
+    """Native Windows, reaper/decode path unpatched: ``_IS_WINDOWS`` selects the
+    Popen-poll reaper and the decode runs where ``os.WIFEXITED`` does not exist,
+    so the rate-limit sentinel exit is a requeue, not a crash. The reaper also
+    sweeps the profile-independent runtime cache (``%LOCALAPPDATA%\\hermes\\
+    kanban-runtime`` on Windows, i.e. the real hermes home), so that root is
+    redirected; nothing about the exit handling is patched."""
+    storage = tmp_path / "runtime-storage"
+    (storage / "workers").mkdir(parents=True)
+    monkeypatch.setattr(generation, "_runtime_storage_root", lambda: storage)
     monkeypatch.setattr(runtime, "_worker_processes", {})
     monkeypatch.setattr(runtime, "_recent_worker_exits", {})
     assert not hasattr(os, "WIFEXITED")
