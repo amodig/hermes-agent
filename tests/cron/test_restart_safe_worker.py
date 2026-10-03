@@ -1131,6 +1131,10 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
 
         # Replacing a managed gateway kills its old process tree. The active
         # cron owner must remain in its transient scope and keep the same PID.
+        # NOTE: this stops the HARNESS SUBPROCESS, it does not restart a systemd
+        # service. Real surviving-a-service-restart proof lives in
+        # tests/hermes_cli/test_kanban_gateway_restart_handoff.py::
+        # test_worker_survives_a_real_user_service_restart.
         parent.terminate()
         parent.wait(timeout=5)
         assert _pid_exists(worker_pid)

@@ -168,6 +168,25 @@ def _effective_watchdog_leash(runner: object) -> float:
     return effective_stop_watchdog_delay(runner, resolve_shutdown_watchdog_delay(effective_stop_drain_timeout(runner)))
 
 
+def _apply_lifecycle_flags(runner, **flags: bool) -> None:
+    """Apply drain/stop flags, through the Kanban grant boundary when present.
+
+    The boundary (``_kanban_transition``) is what stops the stop transition from
+    landing between the dispatcher's final stop check and its grant, so a real
+    runner must use it. This is a module-level function, and the boundary is
+    getattr-guarded, for the same reason ``_stop_hosted_room_worker`` is:
+    shutdown-path tests drive ``stop()`` against minimal hand-built stand-ins that
+    carry no mixin. The flag VALUES never depend on the boundary — only the
+    ordering guarantee does.
+    """
+    transition = getattr(runner, "_kanban_transition", None)
+    if callable(transition):
+        transition(**flags)
+        return
+    for name, value in flags.items():
+        setattr(runner, name, value)
+
+
 class GatewayShutdownMixin:
     """Stop/drain/restart, scale-to-zero and active-work accounting methods for GatewayRunner."""
 
@@ -704,7 +723,7 @@ class GatewayShutdownMixin:
         """Begin external drain: refuse NEW turns (in-flight ones are NOT interrupted). Idempotent."""
         if self._external_drain_active:
             return
-        self._external_drain_active = True
+        _apply_lifecycle_flags(self, _external_drain_active=True)
         logger.info(
             "External drain ENGAGED (.drain_request.json present) — refusing "
             "new turns; %d in-flight turn(s) will finish. Process stays up.", self._active_work_count(),
@@ -716,7 +735,7 @@ class GatewayShutdownMixin:
         """Cancel external drain: re-accept new turns. Idempotent; never resurrects a stopping gateway."""
         if not self._external_drain_active:
             return
-        self._external_drain_active = False
+        _apply_lifecycle_flags(self, _external_drain_active=False)
         if self._draining or not self._running:
             logger.info(
                 "External drain marker cleared during shutdown — not reverting "
@@ -1675,7 +1694,7 @@ class GatewayShutdownMixin:
         self._restart_via_service = via_service
         self._restart_task_started = True
         # Refuse new turns; keep ``_running`` True so the active turn can still deliver its final response.
-        self._draining = True
+        _apply_lifecycle_flags(self, _draining=True)
         # The restart's after-turn wait is a drain window too: pollers of GET /v1/runs/{id} must see
         # the boundary from the moment new turns are refused, not only once stop() begins (#115133).
         self._mark_api_runs_shutdown_requested()
@@ -1820,9 +1839,10 @@ class GatewayShutdownMixin:
         """Flag teardown, stop room worker/watchdog, notify sessions."""
         logger.info("Stopping gateway%s...", " for restart" if self._restart_requested else "")
         ctx.started_at = time.monotonic()
-        self._running = False
+        # One transition under the grant boundary: no launch may be handed out
+        # between "we are stopping" and the grant that follows a stop check.
+        _apply_lifecycle_flags(self, _running=False, _draining=True)
         self._clear_plugin_message_injector()
-        self._draining = True
         self._mark_api_runs_shutdown_requested()
         # getattr-guards: shutdown-path test doubles may lack the room worker / systemd watchdog.
         stop_room_worker = getattr(self, "_stop_hosted_room_worker", None)
@@ -2136,7 +2156,7 @@ class GatewayShutdownMixin:
             # Exit 75 + ``RestartForceExitStatus=75``: systemd replaces us without a racing helper.
             self._exit_code = GATEWAY_SERVICE_RESTART_EXIT_CODE
             self._exit_reason = self._exit_reason or "Gateway restart requested"
-        self._draining = False
+        _apply_lifecycle_flags(self, _draining=False)
         # Terminal gateway_state: "stopped", or "running" on an UNEXPECTED signal (docker restart,
         # OOM) — container_boot.py only auto-starts gateways last seen "running".
         if getattr(self, "_signal_initiated_shutdown", False) and not self._restart_requested:
@@ -2224,6 +2244,11 @@ class GatewayShutdownMixin:
     ) -> None:
         """Stop the gateway and disconnect all adapters."""
         from gateway.run import GatewayRunner
+        # Before anything can await: from here on this gateway grants no new
+        # kanban work, so a launch in flight cancels instead of being handed out.
+        # Taken under the grant boundary so the transition cannot land between the
+        # dispatcher's final stop check and its grant.
+        _apply_lifecycle_flags(self, _draining=True)
         # getattr-guard: shutdown-path tests build bare runners via object.__new__ that lack the
         # liveness-guard machinery.
         _stop_guards = getattr(self, "_stop_loop_liveness_guards", None)

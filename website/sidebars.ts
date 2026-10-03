@@ -112,6 +112,7 @@ const sidebars: SidebarsConfig = {
             'user-guide/features/kanban-tutorial',
             'user-guide/features/kanban-worker-lanes',
             'user-guide/features/kanban-multi-gateway',
+            'user-guide/features/worker-interruption',
             'user-guide/features/goals',
             'user-guide/features/heartbeat',
             'user-guide/features/loops',
@@ -793,6 +794,7 @@ const sidebars: SidebarsConfig = {
           label: 'Architecture',
           items: [
             'developer-guide/architecture',
+            'developer-guide/architecture-decisions',
             'developer-guide/codebase-ownership',
             'developer-guide/agent-loop',
             'developer-guide/prompt-assembly',

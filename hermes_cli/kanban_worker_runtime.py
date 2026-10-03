@@ -35,6 +35,47 @@ DEFAULT_LOG_BACKUP_COUNT = 1
 
 # Sealed-payload validation scales with installed dependency size in both phases.
 _BOOTSTRAP_PHASE_TIMEOUT_SECONDS = 60.0
+_GRANT_TIMEOUT_SECONDS = 1.0
+
+
+def _set_windows_pipe_nonblocking(fd: int) -> None:
+    """Python 3.11 lacks ``os.set_blocking`` support for Windows pipes."""
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    set_state = ctypes.WinDLL("kernel32", use_last_error=True).SetNamedPipeHandleState
+    set_state.argtypes = (
+        wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+    )
+    set_state.restype = wintypes.BOOL
+    mode = wintypes.DWORD(1)  # PIPE_NOWAIT
+    if not set_state(msvcrt.get_osfhandle(fd), ctypes.byref(mode), None, None):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _write_worker_grant(fd: int, frame: bytes) -> None:
+    """Bound final-grant IO on a nonblocking pipe while the stop/grant lock is held.
+
+    The child requires the terminating newline: a partial send followed by
+    cancellation/EOF cannot confer ownership. Once the complete frame is sent,
+    return immediately; no later cleanup failure may revoke that grant.
+    """
+    deadline = time.monotonic() + _GRANT_TIMEOUT_SECONDS
+    pending = memoryview(frame)
+    while pending:
+        try:
+            written = os.write(fd, pending)
+        except BlockingIOError:
+            written = 0
+        if written == len(pending):
+            return
+        pending = pending[written:]
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("worker bootstrap grant pipe timed out")
+        time.sleep(min(0.01, remaining))
 
 
 @dataclass(frozen=True)
@@ -47,6 +88,58 @@ class WorkerLaunch:
     grant: Optional[Callable[[int, Optional[str]], None]] = None
     cancel: Optional[Callable[[], None]] = None
     launcher_pid: Optional[int] = None
+
+
+class WorkerLaunchInterrupted(RuntimeError):
+    """A launch cancelled on purpose because the gateway is draining or stopping.
+
+    Deliberately NOT a ``RuntimeIdentityError`` and NOT an ordinary spawn
+    failure: nothing about the task, the runtime or the scope is wrong, so the
+    caller must neither charge a retry nor report identity corruption.
+    """
+
+
+def _stop_requested(should_stop: Optional[Callable[[], bool]]) -> bool:
+    """Whether a caller-supplied cancellation predicate now asks us to stop.
+
+    A broken predicate must never wedge dispatch, so it reads as "not yet" and
+    the ordinary failure paths still apply.
+    """
+    if should_stop is None:
+        return False
+    try:
+        return bool(should_stop())
+    except Exception:
+        return False
+
+
+def _check_not_stopping(should_stop: Optional[Callable[[], bool]], task_id: str) -> None:
+    """Abort a launch that would hand work to a gateway which is going away."""
+    if _stop_requested(should_stop):
+        raise WorkerLaunchInterrupted(
+            f"launch of {task_id} cancelled: gateway is draining or stopping"
+        )
+
+
+def _launch_failure_or_shutdown(exc: BaseException, task_id: str) -> None:
+    """Re-raise a launch failure, or classify it as an infrastructure shutdown.
+
+    Runs WHERE the launch failed, so the user-manager evidence is sampled next to
+    the failure instead of after it has propagated through unrelated handlers —
+    otherwise a caller could excuse the wrong exception just because a shutdown
+    started concurrently. Runtime-identity corruption is never shutdown evidence,
+    and neither is anything the user manager is not positively reporting as
+    ``stopping``; both re-raise unchanged.
+    """
+    from hermes_cli.kanban_runtime import RuntimeIdentityError
+
+    if isinstance(exc, (WorkerLaunchInterrupted, RuntimeIdentityError)):
+        raise exc
+    if _dispatcher()._user_manager_stopping():
+        raise WorkerLaunchInterrupted(
+            f"launch of {task_id} interrupted: the user manager is stopping ({exc})"
+        ) from exc
+    raise exc
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -504,8 +597,17 @@ def _default_spawn(
     *,
     board: Optional[str] = None,
     defer_grant: bool = False,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> WorkerLaunch | int:
-    """Start a worker and verify its identity before granting Kanban access."""
+    """Start a worker and verify its identity before granting Kanban access.
+
+    ``should_stop`` is polled at every long step (before preparation, after
+    runtime-generation preparation, before the scope is created, during the
+    bootstrap waits) so a gateway that starts draining mid-launch hands nothing
+    to a worker that would outlive it: :class:`WorkerLaunchInterrupted` unwinds
+    and the prepared worker is cancelled.
+    """
+    _check_not_stopping(should_stop, task.id)
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
@@ -651,6 +753,10 @@ def _default_spawn(
         _close_resources()
 
     try:
+        # After the expensive runtime-generation preparation and before any
+        # scope exists: a drain observed here costs one prepared generation and
+        # nothing else.
+        _check_not_stopping(should_stop, task.id)
         cmd = dispatcher._restart_safe_worker_argv(
             task, generation.command_prefix + cli_args,
             preparation_id=preparation_id if defer_grant else None,
@@ -680,9 +786,10 @@ def _default_spawn(
         deadline = time.monotonic() + _BOOTSTRAP_PHASE_TIMEOUT_SECONDS
         payload = None
         while time.monotonic() < deadline:
+            _check_not_stopping(should_stop, task.id)
             if preparation_path.is_file():
                 try:
-                    payload = json.loads(preparation_path.read_text(encoding="utf-8"))
+                    payload = json.loads(preparation_path.read_text(encoding="utf-8-sig"))
                 except (OSError, json.JSONDecodeError):
                     payload = None
                 if payload is not None:
@@ -713,9 +820,10 @@ def _default_spawn(
         post_deadline = time.monotonic() + _BOOTSTRAP_PHASE_TIMEOUT_SECONDS
         post_payload = None
         while time.monotonic() < post_deadline:
+            _check_not_stopping(should_stop, task.id)
             if preparation_path.is_file():
                 try:
-                    candidate = json.loads(preparation_path.read_text(encoding="utf-8"))
+                    candidate = json.loads(preparation_path.read_text(encoding="utf-8-sig"))
                 except (OSError, json.JSONDecodeError):
                     candidate = None
                 if isinstance(candidate, dict) and candidate.get("post_import") is True:
@@ -736,20 +844,26 @@ def _default_spawn(
         _worker_pid_aliases[proc.pid] = actual.pid
 
         sweep_runtime_generations()
+        grant_fd = proc.stdin.fileno()
+        if os.name == "nt" and sys.version_info < (3, 12):
+            _set_windows_pipe_nonblocking(grant_fd)
+        else:
+            os.set_blocking(grant_fd, False)
+        # Encode the potentially large identity before entering the grant lock.
+        grant_prefix = (json.dumps({
+            "grant": True,
+            "preparation_id": preparation_id,
+            "runtime_identity": actual.as_dict(),
+        }, sort_keys=True)[:-1] + ", ").encode("utf-8")
         def _grant(run_id: int, claim_lock: Optional[str]) -> None:
             if proc is None or proc.stdin is None:
                 raise RuntimeError("worker bootstrap pipe unavailable")
-            proc.stdin.write(json.dumps({
-                "grant": True,
-                "preparation_id": preparation_id,
-                "runtime_identity": actual.as_dict(),
-                "run_id": run_id,
-                "claim_lock": claim_lock,
-            }, sort_keys=True).encode("utf-8") + b"\n")
-            proc.stdin.flush()
-            proc.stdin.close()
-            with contextlib.suppress(OSError):
-                preparation_path.unlink()
+            suffix = json.dumps({"run_id": run_id, "claim_lock": claim_lock})[1:].encode("utf-8")
+            _write_worker_grant(grant_fd, grant_prefix + suffix + b"\n")
+            # The buffered import handshake was already flushed. Only close an
+            # empty, now-nonblocking pipe here; filesystem cleanup is child-owned.
+            with contextlib.suppress(Exception):
+                proc.stdin.close()
 
         if defer_grant:
             return WorkerLaunch(
@@ -766,9 +880,10 @@ def _default_spawn(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
-    except Exception:
+    except Exception as exc:
         _cancel()
-        raise
+        # Classified here, where the scope route or bootstrap actually failed.
+        _launch_failure_or_shutdown(exc, task.id)
 
 from hermes_cli import kanban_db as _kb
 def _pid_alive(pid: Optional[int]) -> bool:

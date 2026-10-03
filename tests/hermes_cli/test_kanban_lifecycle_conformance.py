@@ -1620,7 +1620,7 @@ class KanbanLifecycleConformance(MODULE.KanbanConformanceFixture):
         identity = runtime_identity(MODULE.RUNTIME_ROOT)
         order: list[str] = []
 
-        def fake_default_spawn(task, workspace, *, board=None, defer_grant=False):
+        def fake_default_spawn(task, workspace, *, board=None, defer_grant=False, should_stop=None):
             self.assertTrue(defer_grant)
 
             def grant(_run_id, _claim_lock):
@@ -2968,7 +2968,7 @@ assert recovery.recover_if_needed(project_root=root, argv=[]) is (sys.argv[3] ==
         identity = runtime_identity(MODULE.RUNTIME_ROOT)
         cancelled: list[bool] = []
 
-        def fake_default_spawn(task, workspace, *, board=None, defer_grant=False):
+        def fake_default_spawn(task, workspace, *, board=None, defer_grant=False, should_stop=None):
             self.assertTrue(defer_grant)
             self.assertTrue(kb.assign_task(self.conn, task.id, "replacement"))
             return kbd.WorkerLaunch(
@@ -3149,7 +3149,7 @@ assert recovery.recover_if_needed(project_root=root, argv=[]) is (sys.argv[3] ==
         identity = runtime_identity(MODULE.RUNTIME_ROOT)
         cancelled: list[bool] = []
 
-        def fake_default_spawn(task, workspace, *, board=None, defer_grant=False):
+        def fake_default_spawn(task, workspace, *, board=None, defer_grant=False, should_stop=None):
             self.assertTrue(defer_grant)
             # A brand-new, unauthorized PR appears after the pre-claim guard
             # passed and before the claim transaction opens.
@@ -3681,7 +3681,14 @@ class KanbanPhaseAwareHandoff(MODULE.KanbanConformanceFixture):
             self.assertEqual(state["task"].assignee, "reviewer")
             self.assertEqual(state["task"].candidate_run_id, run.current_run_id)
             self.assertIsNone(state["lifecycle"]["review_verdict"])
-            self.assertIsNone(state["run"].metadata)  # no implementation evidence stamped
+            # No implementation evidence stamped on the review run. The run does
+            # carry additive provenance (its host instantiation epoch), so assert
+            # on the evidence keys rather than on the whole metadata column.
+            self.assertEqual(
+                set(state["run"].metadata or {})
+                & set(self._implementation_metadata(base, head)),
+                set(),
+            )
             self.assertEqual([e.kind for e in state["events"]].count("review_requested"), 1)
             self.assertEqual([call[0] for call in judge.calls],
                              ["implementation", "review", "review"])

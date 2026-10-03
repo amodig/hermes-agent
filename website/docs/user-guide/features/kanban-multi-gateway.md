@@ -55,6 +55,11 @@ Arbitrary wrappers and other installations are rejected rather than executed
 outside the generation. Runtime generations are not an OS sandbox: task
 workspaces and operating-system libraries remain external.
 
+How a worker behaves when the gateway or the host goes away — gateway-restart
+survival, host-restart pauses, shutdown cancellation, failure accounting, and
+the shared slice budget — is documented in
+[worker interruption](worker-interruption.md).
+
 ## Configuration
 
 On the dispatch-owning gateway (typically the `default` profile), no change is

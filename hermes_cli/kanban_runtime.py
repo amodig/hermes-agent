@@ -7,6 +7,7 @@ actual worker claim against PID reuse.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -107,6 +108,24 @@ def _module_root(module_root: Optional[os.PathLike[str] | str] = None) -> Path:
     return Path(module_root or Path(__file__).resolve().parents[1]).resolve()
 
 
+def current_host_epoch() -> str:
+    """This host instantiation's identity (``"<boot_id>:<pid1_start>"``); "" when unreadable.
+
+    Recorded on new Kanban runs as additive provenance so a later dispatcher tick
+    can tell "my worker died" from "the host that owned this claim is gone" (#43).
+    Lives here, beside ``runtime_identity``, because it is provenance captured with
+    the identity rather than board behaviour; the gate that OWNS the epoch format
+    is ``gateway.drain_control``. Late import keeps this module importable without
+    the gateway package.
+    """
+    try:
+        from gateway.drain_control import current_instantiation_epoch
+
+        return str(current_instantiation_epoch() or "")
+    except Exception:
+        return ""
+
+
 def process_start_time(pid: Optional[int] = None) -> int:
     """Return a PID-reuse-resistant process start marker on every platform."""
     pid = int(pid or os.getpid())
@@ -145,7 +164,7 @@ def _git_sha(root: Path) -> str:
         if marker.is_dir():
             git_dir = marker
         else:
-            text = marker.read_text(encoding="utf-8").strip()
+            text = marker.read_text(encoding="utf-8-sig").strip()
             prefix, separator, value = text.partition(":")
             if prefix != "gitdir" or not separator:
                 raise OSError("invalid gitdir marker")
@@ -159,7 +178,7 @@ def _git_sha(root: Path) -> str:
             common_dir = git_dir
             commondir_file = git_dir / "commondir"
             if commondir_file.is_file():
-                common = Path(commondir_file.read_text(encoding="utf-8").strip())
+                common = Path(commondir_file.read_text(encoding="utf-8-sig").strip())
                 if not common.is_absolute():
                     common = (git_dir / common).resolve()
                 common_dir = common
@@ -202,7 +221,7 @@ def _git_sha(root: Path) -> str:
 
 def _version(root: Path) -> str:
     try:
-        text = (root / "hermes_cli" / "__init__.py").read_text(encoding="utf-8")
+        text = (root / "hermes_cli" / "__init__.py").read_text(encoding="utf-8-sig")
     except OSError:
         return "unknown"
     marker = '__version__ = "'
@@ -465,6 +484,8 @@ def _read_bootstrap_message() -> dict[str, Any]:
         grant_line = grant_queue.get(timeout=_BOOTSTRAP_TIMEOUT_SECONDS)
     except queue.Empty as exc:
         raise RuntimeIdentityError("worker bootstrap message timed out") from exc
+    if not grant_line or not grant_line.endswith("\n"):
+        raise RuntimeIdentityError("incomplete worker bootstrap message")
     try:
         message = json.loads(grant_line or "")
     except (json.JSONDecodeError, TypeError) as exc:
@@ -519,6 +540,8 @@ def worker_bootstrap_from_env() -> Optional[dict[str, Any]]:
         if message.get("claim_lock"):
             os.environ["HERMES_KANBAN_CLAIM_LOCK"] = str(message["claim_lock"])
         os.environ["HERMES_KANBAN_RUNTIME_GRANTED"] = "1"
+        with contextlib.suppress(OSError):
+            Path(path_raw).unlink()
         for key in _BOOTSTRAP_INPUT_ENV:
             os.environ.pop(key, None)
         return payload
@@ -577,6 +600,8 @@ def _finish_worker_bootstrap_grant(
     if grant.get("claim_lock"):
         os.environ["HERMES_KANBAN_CLAIM_LOCK"] = str(grant["claim_lock"])
     os.environ["HERMES_KANBAN_RUNTIME_GRANTED"] = "1"
+    with contextlib.suppress(OSError):
+        Path(os.environ["HERMES_KANBAN_BOOTSTRAP_PATH"]).unlink()
     for key in _BOOTSTRAP_INPUT_ENV:
         os.environ.pop(key, None)
 

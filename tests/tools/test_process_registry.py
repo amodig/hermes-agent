@@ -28,18 +28,13 @@ def registry():
 
 
 @pytest.fixture(autouse=True)
-def _reset_systemd_scope_cache():
-    """Reset the cached ``systemd-run --user --scope`` availability flag
-    before each test so a probe run on a real systemd host (where
-    ``INVOCATION_ID`` is set) doesn't leak into tests that mock
-    ``subprocess.Popen``. Tests that exercise the probe directly reset the
-    cache themselves."""
-    import tools.process_registry as _pr
+def _reset_systemd_scope_cache(monkeypatch):
+    """Keep ordinary tests off the host's systemd; probe tests opt in explicitly."""
+    import tools.process_registry as pr
 
-    original = _pr._SYSTEMD_SCOPE_AVAILABLE
-    _pr._SYSTEMD_SCOPE_AVAILABLE = False
-    yield
-    _pr._SYSTEMD_SCOPE_AVAILABLE = original
+    monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", False)
+    monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_PROBED_AT", time.monotonic())
+    monkeypatch.setattr(pr, "_SLICE_INHERIT_SUPPORTED", True)
 
 
 def _make_session(
@@ -3140,3 +3135,53 @@ def test_model_not_found_notice_absent_when_fallback_chain_configured(monkeypatc
     text = _format_async(evt)
     assert text.count("SUBAGENT MODEL REJECTED") == 1
     assert "No fallback chain is configured" not in text
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("slice_inherit", [False, True])
+@pytest.mark.parametrize("required", [False, True])
+def test_systemd_scope_capabilities_preserve_isolation_and_strict_budget(
+    monkeypatch, slice_inherit, required,
+):
+    """Old systemd keeps generic isolation, but cannot satisfy a strict slice budget."""
+    import tools.process_registry as pr
+
+    monkeypatch.setattr(shutil, "which", lambda _name, **_kwargs: "/usr/bin/systemd-run")
+    monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", None)
+    monkeypatch.setattr(pr, "_SLICE_INHERIT_SUPPORTED", None)
+    monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: True)
+    monkeypatch.setenv("INVOCATION_ID", "fixture")
+    calls = []
+
+    def systemd_run(argv, **_kwargs):
+        calls.append(argv)
+        if "--help" in argv:
+            help_text = b"--scope --slice-inherit" if slice_inherit else b"--scope"
+            return subprocess.CompletedProcess(argv, 0, stdout=help_text)
+        # Scope availability is independent of the newer flag.
+        assert "--scope" in argv and "--slice-inherit" not in argv
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(pr.subprocess, "run", systemd_run)
+    command = ["/bin/sh", "-c", "exit 0"]
+    ordinary = pr._build_systemd_scope_argv(command, unit_suffix="ordinary")
+    assert "--scope" in ordinary
+    assert ("--slice-inherit" in ordinary) is slice_inherit
+    assert any(part.startswith("MemoryMax=") for part in ordinary)
+
+    if required and not slice_inherit:
+        with pytest.raises(pr.RestartSafeScopeUnavailable, match="--slice-inherit"):
+            pr.restart_safe_gateway_child_argv(
+                command, unit_suffix="strict", require_restart_safe_scope=required,
+            )
+    else:
+        dispatch = pr.restart_safe_gateway_child_argv(
+            command, unit_suffix="worker", require_restart_safe_scope=required,
+        )
+        assert dispatch.mode == "scoped"
+        assert "--scope" in dispatch.argv
+        assert ("--slice-inherit" in dispatch.argv) is slice_inherit
+        assert any(part.startswith("MemoryMax=") for part in dispatch.argv)
+
+    assert len([argv for argv in calls if "--help" in argv]) == 1
+    assert len([argv for argv in calls if "--scope" in argv]) == 1

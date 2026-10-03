@@ -16,6 +16,7 @@ import contextlib
 import functools
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -36,6 +37,11 @@ DRAIN_REQUEST_MAX_AGE_SECONDS = 3600.0
 # ``requested_at`` so a keep-alive re-write that later expires logs again.
 _expiry_logged_for: Optional[str] = None
 
+# Canonical ``/proc/sys/kernel/random/boot_id`` shape (8-4-4-4-12 lowercase hex).
+_BOOT_ID_RE = re.compile(
+    r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z"
+)
+
 
 @functools.lru_cache(maxsize=1)
 def current_instantiation_epoch() -> str:
@@ -54,6 +60,52 @@ def current_instantiation_epoch() -> str:
         # LAST ')'. starttime is field 22 (1-indexed) = tail index 19.
         pid1_start = Path("/proc/1/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()[19]
     return f"{boot_id}:{pid1_start}" if (boot_id or pid1_start) else ""
+
+
+def _is_boot_id(value: str) -> bool:
+    """A canonical ``/proc/sys/kernel/random/boot_id`` value (8-4-4-4-12 hex).
+
+    The grouping is part of the check: a 32-hex string with hyphens in the wrong
+    places is malformed provenance, and malformed provenance must never prove a
+    host change.
+    """
+    return bool(_BOOT_ID_RE.match(value))
+
+
+def split_instantiation_epoch(value: Any) -> tuple[Optional[str], Optional[str]]:
+    """Validated ``(boot_id, pid1_start)`` components of an epoch string.
+
+    Either component is ``None`` when it is missing or malformed: a receipt
+    written before this contract, a non-Linux host, or a partially readable
+    ``/proc``. "Unknown" is never "changed".
+    """
+    boot_id, _, pid1_start = str(value or "").strip().partition(":")
+    return (
+        boot_id.lower() if _is_boot_id(boot_id) else None,
+        pid1_start if pid1_start.isdigit() and pid1_start else None,
+    )
+
+
+def instantiation_changed(recorded: Any, current: Any) -> bool:
+    """True ONLY when readable components positively prove a new instantiation.
+
+    A differing valid boot UUID proves a reboot; within the SAME valid boot,
+    differing valid PID 1 start ticks prove a new container instantiation
+    (``docker restart`` keeps the kernel boot id). Anything unreadable,
+    malformed or incomparable is unknown and must not pause a task, so receipts
+    that predate host epochs keep their existing reclaim behavior.
+    """
+    recorded_boot, recorded_pid1 = split_instantiation_epoch(recorded)
+    current_boot, current_pid1 = split_instantiation_epoch(current)
+    if recorded_boot is None or current_boot is None:
+        return False
+    if recorded_boot != current_boot:
+        return True
+    return (
+        recorded_pid1 is not None
+        and current_pid1 is not None
+        and recorded_pid1 != current_pid1
+    )
 
 
 def drain_request_path(home: Optional[Path] = None) -> Path:

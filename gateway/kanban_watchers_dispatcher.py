@@ -129,9 +129,16 @@ class _KanbanDispatcher:
 
     CORRUPT_BOARD_RETRY_AFTER_SECONDS = 300
 
-    def __init__(self, kb: Any, settings: _DispatcherSettings) -> None:
+    def __init__(self, kb: Any, settings: _DispatcherSettings, should_stop=None,
+                 grant_guard=None) -> None:
         self.kb = kb
         self.settings = settings
+        # Called on every tick so a drain/stop that starts mid-tick cancels the
+        # launches still in flight instead of granting them to a dying gateway.
+        self.should_stop = should_stop
+        # Held across the final stop re-check and the grant, so a drain cannot
+        # land between the decision and the grant (see the gateway mixin).
+        self.grant_guard = grant_guard
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
         _kbd()._freeze_runtime_identity()
 
@@ -187,7 +194,10 @@ class _KanbanDispatcher:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).
             conn = _kbc().connect(board=slug)
-            return _kbd().dispatch_once(conn, board=slug, **kwargs)
+            return _kbd().dispatch_once(
+                conn, board=slug, should_stop=self.should_stop,
+                grant_guard=self.grant_guard, **kwargs,
+            )
         except Exception as exc:
             if self.is_corrupt_board_db_error(exc):
                 self.disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
@@ -208,8 +218,20 @@ class _KanbanDispatcher:
                     conn.close()
 
     def tick_once(self) -> list[tuple[str, Optional[object]]]:
-        """Run one dispatch_once per board. Returns (slug, result) pairs."""
-        return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
+        """Run one dispatch_once per board. Returns (slug, result) pairs.
+
+        Stops enumerating boards the moment the caller asks us to stop: every
+        later board's tick would only prepare workers for a gateway that is
+        going away.
+        """
+        results: list[tuple[str, Optional[object]]] = []
+        for slug in self._board_slugs():
+            # ``_stop_requested`` reads a broken predicate as "keep going", so a
+            # faulty shutdown check can never wedge the dispatcher loop.
+            if _kbd()._stop_requested(self.should_stop):
+                break
+            results.append((slug, self.tick_once_for_board(slug)))
+        return results
 
     def spawnable_ids(self) -> list[str]:
         """Board-qualified ids of tasks on ANY board the dispatcher would spawn for.
@@ -340,19 +362,32 @@ def _default_profile_secret_scope():
 
 
 def _log_spawn_results(results: Optional[list]) -> bool:
-    """Log per-board spawn summaries; returns whether any board spawned."""
+    """Log per-board spawn summaries; returns whether any board spawned.
+
+    An interruption-only tick (a paused card, no spawn) still logs: that line is
+    the operator's only in-gateway signal that the dispatcher acted.
+    """
     any_spawned = False
     for slug, res in (results or []):
-        if res is not None and getattr(res, "spawned", None):
+        if res is None:
+            continue
+        spawned = getattr(res, "spawned", None)
+        interrupted = len(getattr(res, "interrupted", ()) or ())
+        cancelled = len(getattr(res, "cancelled", ()) or ())
+        if spawned:
             any_spawned = True
+        if not spawned and not interrupted and not cancelled:
             # Quiet by default: an idle gateway stays silent.
-            logger.info(
-                "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
-                "crashed=%d timed_out=%d promoted=%d auto_blocked=%d",
-                slug, len(res.spawned), res.reclaimed,
-                len(res.crashed) if hasattr(res.crashed, "__len__") else 0,
-                len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
-                res.promoted,
-                len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
-            )
+            continue
+        logger.info(
+            "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
+            "crashed=%d timed_out=%d interrupted=%d cancelled=%d promoted=%d auto_blocked=%d",
+            slug, len(spawned or ()), res.reclaimed,
+            len(res.crashed) if hasattr(res.crashed, "__len__") else 0,
+            len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
+            interrupted,
+            cancelled,
+            res.promoted,
+            len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
+        )
     return any_spawned

@@ -529,7 +529,7 @@ def cleanup_runtime_generation(root, *, force=False):
     if not force:
         from hermes_cli.kanban_runtime import process_start_time
         try:
-            owner = json.loads((root / _OWNER).read_text(encoding="utf-8"))
+            owner = json.loads((root / _OWNER).read_text(encoding="utf-8-sig"))
             pid = int(owner["pid"])
             started = process_start_time(pid)
             # Bootstrap initially has only stdlib available. Until it verifies
@@ -582,7 +582,7 @@ def _prune_runtime_content(current: Path, source: Path):
         if len(candidate.name) != 64 or any(char not in "0123456789abcdef" for char in candidate.name):
             continue
         try:
-            manifest = json.loads((candidate / _MANIFEST).read_text(encoding="utf-8"))
+            manifest = json.loads((candidate / _MANIFEST).read_text(encoding="utf-8-sig"))
             if manifest["identity"]["module_root"] != str(source):
                 continue
         except (OSError, ValueError, KeyError, TypeError):
@@ -789,7 +789,7 @@ def prepare_runtime_generation(expected_identity, *, workspace=None, profile_hom
             except BaseException:
                 _remove_runtime_tree(staging)
                 raise
-        manifest_json = (cache / _MANIFEST).read_text(encoding="utf-8")
+        manifest_json = (cache / _MANIFEST).read_text(encoding="utf-8-sig")
         manifest = json.loads(manifest_json)
         identity = RuntimeIdentity.from_value(manifest["identity"])
         if _bootstrap_digest(cache) != _validate_published_generation(cache, manifest_json):
@@ -843,13 +843,13 @@ def generation_runtime_path(path):
     if not raw:
         return Path(path)
     root = Path(raw).resolve()
-    manifest = json.loads((root / _MANIFEST).read_text(encoding="utf-8"))
+    manifest = json.loads((root / _MANIFEST).read_text(encoding="utf-8-sig"))
     return _mapped_path(Path(path), root, manifest["paths"])
 
 
 def generation_manifest(root=None, *, verify=False):
     root = Path(root or os.environ[_GENERATION_ENV]).resolve()
-    manifest = json.loads((root / _MANIFEST).read_text(encoding="utf-8"))
+    manifest = json.loads((root / _MANIFEST).read_text(encoding="utf-8-sig"))
     if verify and _generation_digest(root, manifest) != manifest["identity"]["generation"]:
         raise _error("runtime generation is incomplete or changed")
     return manifest
@@ -924,7 +924,7 @@ def _bootstrap():
     if not Path(sys.prefix).resolve().is_relative_to(root / "python"):
         raise RuntimeError("generation interpreter did not select its copied standard library")
     # No Hermes or third-party code has been imported by -I -S at this point.
-    manifest = json.loads((root / _MANIFEST).read_text(encoding="utf-8"))
+    manifest = json.loads((root / _MANIFEST).read_text(encoding="utf-8-sig"))
     if _generation_digest(root, manifest) != manifest["identity"]["generation"]:
         raise RuntimeError("runtime generation is incomplete or changed")
     sys.dont_write_bytecode = True
