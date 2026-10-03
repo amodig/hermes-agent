@@ -175,9 +175,8 @@ def _systemd_scope_argv(
     CALLER's slice instead of the default ``app.slice``: a worker gets its own
     cgroup (so an OOM in it cannot take the gateway down) while still counting
     against the shared ancestor budget. It is a separate capability from "can we
-    create a scope at all" (systemd >= 248) precisely so a host without it keeps
-    the isolating legacy scope for ordinary background executors, while the
-    restart-safe worker route, which must stay inside the slice, fails closed."""
+    create a scope at all" (systemd >= 248), so older hosts retain restart/OOM
+    isolation even when they cannot honour the shared slice budget."""
     slice_args = ["--slice-inherit"] if slice_inherit else []
     return [
         binary, "--user", "--scope", "--quiet", *slice_args,
@@ -455,9 +454,8 @@ def restart_safe_gateway_child_argv(
     degrades to a direct external subprocess with a once-per-process warning
     (cron, behind ``cron.require_restart_safe_scope``).
 
-    Required scopes also need ``--slice-inherit`` to preserve the shared slice
-    budget. Non-strict callers on older systemd retain a legacy scope with its
-    own memory limit, but warn that the ancestor budget cannot be honoured.
+    Older systemd without ``--slice-inherit`` retains a legacy scope with its
+    own memory limit, but warns that the shared slice budget cannot be honoured.
 
     ``outlives_parent=True`` (fire-and-forget kanban workers): any *other*
     systemd unit — a ``Type=oneshot`` dispatch timer, an operator's sequencer
@@ -495,13 +493,6 @@ def restart_safe_gateway_child_argv(
             "`sudo loginctl enable-linger <gateway-user>` and restart the gateway."
         )
     if not _slice_inherit_supported():
-        if require_restart_safe_scope:
-            raise RestartSafeScopeUnavailable(
-                "cannot create restart-safe systemd scope for gateway child: "
-                "systemd-run lacks --slice-inherit; upgrade systemd to keep "
-                "workers inside the shared slice budget"
-            )
-        # Non-strict callers retain the legacy scope's per-worker OOM isolation.
         logger.warning(
             "systemd-run here does not support --slice-inherit: the %s scope will "
             "land in the default slice, so the shared worker budget cannot be "

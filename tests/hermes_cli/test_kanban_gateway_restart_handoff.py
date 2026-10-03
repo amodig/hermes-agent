@@ -525,13 +525,15 @@ def test_oneshot_unit_dispatcher_scope_wraps_or_warns_never_dooms_silently(
 
 
 @pytest.mark.platforms("linux")
-def test_real_user_systemd_scope_preserves_worker_context(worker_setup, monkeypatch):
+@pytest.mark.parametrize("slice_inherit", [False, True])
+def test_real_user_systemd_scope_preserves_worker_context(worker_setup, monkeypatch, slice_inherit):
     from tools import process_registry
 
     if not process_registry._systemd_run_user_scope_available():
         pytest.skip("systemd-run --user --scope is unavailable on this host")
-    if not process_registry._slice_inherit_supported():
-        pytest.skip("systemd-run --slice-inherit is required for restart-safe workers")
+    if slice_inherit and not process_registry._slice_inherit_supported():
+        pytest.skip("systemd-run --slice-inherit is unavailable on this host")
+    monkeypatch.setattr(process_registry, "_slice_inherit_supported", lambda: slice_inherit)
     workspace, task = worker_setup
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
     monkeypatch.setenv("INVOCATION_ID", "managed-gateway-test")
@@ -662,7 +664,7 @@ def test_worker_survives_a_real_user_service_restart(tmp_path, monkeypatch):
     if not process_registry._systemd_run_user_scope_available():
         pytest.skip("systemd-run --user --scope is unavailable on this host")
     if not process_registry._slice_inherit_supported():
-        pytest.skip("systemd-run --slice-inherit is required for restart-safe workers")
+        pytest.skip("systemd-run --slice-inherit is required for shared-slice placement")
 
     base = tmp_path / "service-smoke"
     base.mkdir()

@@ -125,10 +125,10 @@ a failed hook or PID write cannot cancel a worker that already holds its grant.
 Add `--slice-inherit` to the shared scope argv so a worker keeps its own cgroup
 while staying inside the caller's slice, and expose interruptions separately from
 crashes and pre-claim cancellations in dispatcher telemetry. The flag is a
-capability separate from "can we create a scope at all": ordinary executors on
-older systemd keep their managed legacy scope (own cgroup, own `MemoryMax`).
-The restart-safe worker route refuses without the flag rather than silently
-escaping the shared slice budget.
+capability separate from "can we create a scope at all": older systemd keeps
+managed legacy scopes (own cgroup, own `MemoryMax`) for ordinary executors and
+restart-safe workers alike. A warning reports that shared slice placement
+cannot be honoured; required workers refuse only when no scope can be created.
 
 Consequences:
 - A host interruption is an operator decision: the card waits in the blocked lane

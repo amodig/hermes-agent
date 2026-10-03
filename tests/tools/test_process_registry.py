@@ -3140,10 +3140,10 @@ def test_model_not_found_notice_absent_when_fallback_chain_configured(monkeypatc
 @pytest.mark.platforms("linux")
 @pytest.mark.parametrize("slice_inherit", [False, True])
 @pytest.mark.parametrize("required", [False, True])
-def test_systemd_scope_capabilities_preserve_isolation_and_strict_budget(
+def test_systemd_scope_capabilities_preserve_isolation_on_legacy_hosts(
     monkeypatch, slice_inherit, required,
 ):
-    """Old systemd keeps generic isolation, but cannot satisfy a strict slice budget."""
+    """Lacking slice inheritance must not disable restart-safe worker scopes."""
     import tools.process_registry as pr
 
     monkeypatch.setattr(shutil, "which", lambda _name, **_kwargs: "/usr/bin/systemd-run")
@@ -3169,19 +3169,13 @@ def test_systemd_scope_capabilities_preserve_isolation_and_strict_budget(
     assert ("--slice-inherit" in ordinary) is slice_inherit
     assert any(part.startswith("MemoryMax=") for part in ordinary)
 
-    if required and not slice_inherit:
-        with pytest.raises(pr.RestartSafeScopeUnavailable, match="--slice-inherit"):
-            pr.restart_safe_gateway_child_argv(
-                command, unit_suffix="strict", require_restart_safe_scope=required,
-            )
-    else:
-        dispatch = pr.restart_safe_gateway_child_argv(
-            command, unit_suffix="worker", require_restart_safe_scope=required,
-        )
-        assert dispatch.mode == "scoped"
-        assert "--scope" in dispatch.argv
-        assert ("--slice-inherit" in dispatch.argv) is slice_inherit
-        assert any(part.startswith("MemoryMax=") for part in dispatch.argv)
+    dispatch = pr.restart_safe_gateway_child_argv(
+        command, unit_suffix="worker", require_restart_safe_scope=required,
+    )
+    assert dispatch.mode == "scoped"
+    assert "--scope" in dispatch.argv
+    assert ("--slice-inherit" in dispatch.argv) is slice_inherit
+    assert any(part.startswith("MemoryMax=") for part in dispatch.argv)
 
     assert len([argv for argv in calls if "--help" in argv]) == 1
     assert len([argv for argv in calls if "--scope" in argv]) == 1
