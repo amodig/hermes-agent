@@ -27,9 +27,13 @@ concurrency:
 
 jobs:
   test:
-    name: Run tests
+    name: Run tests (${{ matrix.slice }}/4)
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: [1, 2, 3, 4]
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -64,6 +68,13 @@ jobs:
         run: |
           "$HERMES_PYTHON" -c "import sqlite3, sys, hermes_state_wal as w; v = w.is_sqlite_wal_reset_vulnerable(); print(f'Python {sys.version.split()[0]}, SQLite {sqlite3.sqlite_version}, WAL-reset vulnerable: {v}'); sys.exit(1 if v else 0)"
 
+      - name: Select fixed slice before restoring timing data
+        # Every runner selects from the same checkout, not a duration cache
+        # that another matrix job may update before a queued job starts.
+        run: |
+          "$HERMES_PYTHON" scripts/run_tests_parallel.py --generate-slices 4 |
+            "$HERMES_PYTHON" -c 'import json, pathlib, sys; files = json.load(sys.stdin)["slice"][int(sys.argv[2]) - 1]["files"]; pathlib.Path(sys.argv[1]).write_text(files.replace(":", "\n") + "\n")' "$RUNNER_TEMP/test-slice-files.txt" "${{ matrix.slice }}"
+
       - name: Restore per-file duration cache
         # scripts/run_tests_parallel.py raises a file's timeout to
         # 3x its last healthy duration (_effective_file_timeout) so a
@@ -86,12 +97,14 @@ jobs:
         # with bounded parallelism. No xdist, no shared workers, no
         # module-level state leakage between files.
         #
-        # No --files: the runner discovers the suite itself. The discovered
-        # set is identical to the list the removed matrix job used to pass in.
+        # Native runner slices cover the same discovered suite without exceeding
+        # the hosted job's one-hour limit; each file still runs exactly once.
         run: |
-          scripts/run_tests.sh -j "$(nproc)"
+          scripts/run_tests.sh -j 2 --files-from "$RUNNER_TEMP/test-slice-files.txt"
         env:
-          HERMES_TEST_FILE_TIMEOUT: 600
+          # The sealed-runtime handoff file takes over 12 minutes serially;
+          # individual bootstrap/turn deadlines remain unchanged.
+          HERMES_TEST_FILE_TIMEOUT: 900
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
@@ -100,18 +113,23 @@ jobs:
       - name: Save per-file duration cache (main only)
         # Only green first-attempt durations are written by the runner, so
         # a hang on main cannot ratchet its own bound upward.
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && hashFiles('test_durations.json') != ''
+        if: matrix.slice == 1 && github.event_name == 'push' && github.ref == 'refs/heads/main' && hashFiles('test_durations.json') != ''
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: test_durations.json
           key: test-durations-${{ github.run_id }}
 
   e2e:
+    name: e2e (${{ matrix.slice }}/3)
     # Bound the real serve / gateway / MCP / SQLite process trees on the
     # fork's standard hosted runner.
     if: inputs.e2e
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: [1, 2, 3]
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -161,21 +179,15 @@ jobs:
           "$HERMES_PYTHON" -c "import sqlite3, hermes_state_wal as w; print('sqlite', sqlite3.sqlite_version); assert not w.is_sqlite_wal_reset_vulnerable()"
 
       - name: Run e2e tests
-        # One subprocess per file, in parallel: the core suites spawn real
-        # processes (serve, gateway, tui_gateway, MCP servers, SQLite writers)
-        # and must not share interpreter state.
+        # Each file owns a real process tree and isolated interpreter state.
         # tests/e2e/core/upgrade runs in its own job (e2e-upgrade) below.
         run: |
           mapfile -t files < <(find tests/e2e -name 'test_*.py' -not -path 'tests/e2e/core/upgrade/*' | sort)
-          scripts/run_tests.sh --include-integration "${files[@]}"
+          scripts/run_tests.sh --include-integration --slice "${{ matrix.slice }}/3" "${files[@]}"
         env:
-          # An e2e file is a process tree, not one CPU-bound pytest worker. With
-          # 32 files at once the hosted run starved live children before their
-          # ready frames (empty stderr, still alive) and hit 60–120s deadlines
-          # across unrelated SQLite, tenancy, provider and terminal suites.
-          # Bound the trees, not the child readiness/turn timeouts. At 4 the
-          # PTY turn and serve-SIGTERM deadlines still starved intermittently.
-          HERMES_TEST_WORKERS: "3"
+          # Run one process tree per hosted machine; native slices retain full
+          # coverage without CPU contention during sealed-worker bootstrap.
+          HERMES_TEST_WORKERS: "1"
           # Multi-process episodes (torture chamber, compaction kill -9,
           # gateway liveness, delivery exactly-once through a real gateway,
           # the cron virtual-clock soak) legitimately run past the 300 s default.

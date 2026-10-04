@@ -663,6 +663,10 @@ def test_worker_survives_a_real_user_service_restart(tmp_path, monkeypatch):
 
     if not process_registry._systemd_run_user_scope_available():
         pytest.skip("systemd-run --user --scope is unavailable on this host")
+    bus_env = process_registry.systemd_user_bus_env(os.environ)
+    for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+        if key in bus_env:
+            monkeypatch.setenv(key, bus_env[key])
     if not process_registry._slice_inherit_supported():
         pytest.skip("systemd-run --slice-inherit is required for shared-slice placement")
 
@@ -723,14 +727,15 @@ def test_worker_survives_a_real_user_service_restart(tmp_path, monkeypatch):
     worker_pid = None
     worker_start_time = None
     try:
-        subprocess.run(
+        launch = subprocess.run(
             # Same slice the CTO gateway occupies: the worker must stay inside
             # that shared budget, not escape to app.slice.
             ["systemd-run", "--user", "--unit", unit,
              "--slice=agents-controls.slice", "--collect",
              sys.executable, "-B", str(harness_py)],
-            check=True, capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=30,
         )
+        assert launch.returncode == 0, launch.stderr
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline and not (info.is_file() and started.is_file()):
             time.sleep(0.05)

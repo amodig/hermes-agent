@@ -37,6 +37,9 @@ importing Hermes. Its identity records both source provenance and the captured
 dependency content. Source-checkout captures omit `node_modules` in the repository
 root and first-party frontend/tooling workspaces; plugin- and skill-owned
 dependencies, bundled resources, and built frontend assets remain captured.
+Directory symlinks are materialized and cycles are rejected; on POSIX, ordinary
+directories avoid repeated ancestor resolution during these scans. Every worker
+still validates the full sealed payload before imports and at bootstrap handshakes.
 
 Managed updates, dependency installation, and recovery coordinate with generation
 preparation. Existing workers retain their captured runtime across updates and

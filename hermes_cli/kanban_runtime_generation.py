@@ -153,10 +153,14 @@ def _members(root: Path, *, source=False, exclude=()):
 
     for base, directories, files in os.walk(root, followlinks=True, onerror=unreadable):
         base = Path(base)
-        resolved = base.resolve()
-        ancestors = {parent.resolve() for parent in base.parents if parent.is_relative_to(root)}
-        if resolved in ancestors:
-            raise _error(f"cyclic runtime directory: {base}")
+        # Only a symlink can revisit an ancestor on POSIX. Re-resolving every
+        # ordinary directory's ancestors multiplies work in every payload scan.
+        # Keep the full check on Windows, where junctions need not be symlinks.
+        if os.name == "nt" or base.is_symlink():
+            resolved = base.resolve()
+            ancestors = {parent.resolve() for parent in base.parents if parent.is_relative_to(root)}
+            if resolved in ancestors:
+                raise _error(f"cyclic runtime directory: {base}")
         relative = base.relative_to(root).as_posix()
         directories[:] = sorted(
             name for name in directories

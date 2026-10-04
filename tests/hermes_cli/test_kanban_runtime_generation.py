@@ -228,6 +228,35 @@ def _finish(process):
     return json.loads(output.splitlines()[-1])
 
 
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("linked_root", [False, True])
+def test_runtime_walk_materializes_aliases_but_rejects_ancestor_cycles(tmp_path, linked_root):
+    source = tmp_path / "source"
+    source.mkdir()
+    external = tmp_path / "external"
+    payload = external / "nested" / "data.bin"
+    _write(payload, "captured resource")
+    for name in ("first", "second"):
+        (source / name).symlink_to(external, target_is_directory=True)
+    if linked_root:
+        alias = tmp_path / "source-alias"
+        alias.symlink_to(source, target_is_directory=True)
+        source = alias
+
+    destination = tmp_path / "sealed"
+    generation._copy_members(source, destination)
+    assert generation._payload_digest(destination) == generation._payload_digest(source)
+    for name in ("first", "second"):
+        copied = destination / name / "nested" / "data.bin"
+        assert copied.read_text() == "captured resource"
+        assert not (destination / name).is_symlink()
+        assert not copied.samefile(payload)
+
+    (external / "nested" / "back").symlink_to(source, target_is_directory=True)
+    with pytest.raises(runtime.RuntimeIdentityError, match="cyclic runtime directory"):
+        list(generation._members(source))
+
+
 def test_deployment_identity_ignores_install_artifacts_but_detects_runtime_changes(
     tmp_path, monkeypatch, runtime_storage,
 ):

@@ -16,6 +16,7 @@
 import { expect, type Page, test } from '@playwright/test'
 
 import {
+  appLogTail,
   coreAppEnv,
   createCoreSandbox,
   currentSessionId,
@@ -86,6 +87,12 @@ test('lineage: a branch child is its own titled row and switching never leaks tu
   writeProviderHome(sandbox.hermesHome, provider.url)
   const { app, page } = await launchCoreApp(coreAppEnv(sandbox))
   const ws = recordWebSockets(page)
+  const rpcFrames: { direction: string; payload: string }[] = []
+  page.on('websocket', socket => {
+    if (!socket.url().includes('/api/ws')) return
+    socket.on('framesent', frame => rpcFrames.push({ direction: 'sent', payload: String(frame.payload) }))
+    socket.on('framereceived', frame => rpcFrames.push({ direction: 'received', payload: String(frame.payload) }))
+  })
 
   const finished = (marker: string) =>
     expect
@@ -174,6 +181,22 @@ test('lineage: a branch child is its own titled row and switching never leaks tu
       await waitForInteractive(app, page)
       await expect.poll(() => sidebarRows(page).count(), { timeout: 30_000 }).toBe(2)
     })
+  } catch (error) {
+    await test
+      .info()
+      .attach('rpc-frames', {
+        body: JSON.stringify(rpcFrames),
+        contentType: 'application/json'
+      })
+      .catch(() => undefined)
+    await test
+      .info()
+      .attach('main-process-log', {
+        body: appLogTail(app),
+        contentType: 'text/plain'
+      })
+      .catch(() => undefined)
+    throw error
   } finally {
     await app.close().catch(() => undefined)
     await provider.close()
