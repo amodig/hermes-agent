@@ -142,8 +142,12 @@ inside the gateway's slice. A worker is therefore bounded by the slice's budget
 and every ancestor of it, not by the gateway service's own `MemoryMax`; an OOM
 inside a worker cannot take the gateway down.
 
-That flag needs systemd ≥ 248, and the capability is probed separately from
+On systemd ≥ 254, `--expand-environment=no` keeps dollar signs in worker
+command arguments literal instead of expanding them through systemd.
+
+The `--slice-inherit` flag needs systemd ≥ 248, and its capability is probed separately from
 "can we make a scope at all". Without it, workers retain their legacy managed
 scopes, restart survival and per-worker memory isolation. A warning reports
-that the shared slice budget cannot be honoured. Required workers still refuse
-to launch when no transient scope can be created.
+that the shared slice budget cannot be honoured. Workers that require
+restart-safe placement refuse to launch without `--slice-inherit` or a
+transient scope.

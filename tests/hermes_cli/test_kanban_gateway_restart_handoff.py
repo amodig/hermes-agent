@@ -591,9 +591,11 @@ conn.close()
 os._exit(0)
 """
     launch_env = {**os.environ, "PYTHONPATH": str(Path(kbd.__file__).resolve().parents[1])}
+    # This child also materializes the sealed interpreter; a cold copy can
+    # consume the old 30-second deadline before the dispatch being exercised.
     completed = subprocess.run(
         [sys.executable, "-c", script, str(base), str(generations._runtime_storage_root())],
-        env=launch_env, timeout=30,
+        env=launch_env, timeout=60,
     )
     assert completed.returncode == 0
     claimed = kb.get_task(conn, task_id)

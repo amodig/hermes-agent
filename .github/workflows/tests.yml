@@ -117,7 +117,9 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: test_durations.json
-          key: test-durations-${{ github.run_id }}
+          # Per-slice key: each slice's file keeps the restored entries for the other
+          # slice's files and refreshes its own, so the cache stays complete.
+          key: test-durations-${{ github.run_id }}-${{ matrix.slice }}
 
   e2e:
     name: e2e (${{ matrix.slice }}/3)
