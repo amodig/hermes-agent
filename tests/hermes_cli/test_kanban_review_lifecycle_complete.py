@@ -518,6 +518,22 @@ def test_interrupted_review_runs_retry_in_review_phase(
     assert event.payload.get("retry_status") == "review"
 
 
+@pytest.mark.parametrize("failure_limit", [1, 2])
+def test_dispatch_reports_stale_claim_breaker_trips(conn, failure_limit):
+    task_id, _review = _claimed_review(conn, "Reported stale reclaim")
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 1, task_id),
+        )
+
+    result = kbd.dispatch_once(conn, max_spawn=0, failure_limit=failure_limit)
+
+    assert result.reclaimed == 1
+    assert result.auto_blocked == ([task_id] if failure_limit == 1 else [])
+    assert kb.get_task(conn, task_id).status == ("blocked" if failure_limit == 1 else "review")
+
+
 def test_stale_reclaim_rolls_back_when_failure_accounting_fails(conn, monkeypatch):
     task_id, review = _claimed_review(conn, "Atomic stale reclaim", ttl_seconds=-1)
     with kb.write_txn(conn):

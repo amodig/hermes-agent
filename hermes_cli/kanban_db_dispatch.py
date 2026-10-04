@@ -146,7 +146,7 @@ class DispatchResult:
     Kept apart from ``interrupted`` so operator-recovery telemetry does not report
     a paused card for a launch that never started."""
     auto_blocked: list[str] = field(default_factory=list)
-    """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    """Task ids auto-blocked by worker-failure circuit breakers."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
@@ -2972,7 +2972,9 @@ def _run_reclaim_phase(
     # reused, so nothing after this may probe, defer on, or signal it.
     result.interrupted = pause_host_interrupted_runs(conn)
     result.reaped_terminal_workers = reap_terminal_workers(conn)
-    result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
+    result.reclaimed = _kb.release_stale_claims(
+        conn, failure_limit=failure_limit, auto_blocked=result.auto_blocked,
+    )
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)

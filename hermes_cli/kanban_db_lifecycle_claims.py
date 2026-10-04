@@ -336,8 +336,10 @@ def claim_review_task(
 
 def release_stale_claims(
     conn: sqlite3.Connection, *, signal_fn=None, failure_limit: Optional[int] = None,
+    auto_blocked: Optional[list[str]] = None,
 ) -> int:
     """Reclaim ``running`` tasks whose claim expired; returns the count reclaimed.
+    Append committed breaker trips to ``auto_blocked`` when supplied.
 
     A host-local worker that is still alive gets its claim *extended* instead
     (a slow model can sit longer than the TTL inside one tool-free call, so no
@@ -416,12 +418,14 @@ def release_stale_claims(
                 },
             )
             reclaimed += 1
-            _kb._record_task_failure(
+            tripped = _kb._record_task_failure(
                 conn, row["id"], f"stale_lock={row['claim_lock']}",
                 outcome="reclaimed", failure_limit=failure_limit,
                 release_claim=False, end_run=False,
                 event_payload_extra={"worker_pid": _kb._opt_int(row["worker_pid"]), "retry_status": retry_status},
             )
+        if tripped and auto_blocked is not None:
+            auto_blocked.append(row["id"])
         # Post-commit observer; every non-reclaim branch ``continue``d above.
         if _kb._kanban_observer_consumed("on_kanban_worker_stale_claim"):
             _kb._fire_kanban_lifecycle_hook(

@@ -119,6 +119,8 @@ Ordinary worker crashes are counted against the configured
 Expired-claim release, run closure and failure accounting commit atomically.
 Another claimant cannot acquire the card before the old run's breaker decision;
 an accounting failure rolls back the database reclaim.
+Stale-claim breaker trips also appear in the dispatch result's `auto_blocked`
+list, including `kanban dispatch --json` and dashboard responses.
 
 Three deliberate policies outrank the configured limit and are unchanged:
 
