@@ -1,5 +1,6 @@
 import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
+import { flushSync } from 'react-dom'
 import type { NavigateFunction } from 'react-router'
 
 import { NO_PROJECT_ID } from '@/app/chat/sidebar/projects/workspace-groups'
@@ -2918,7 +2919,8 @@ export function useSessionActions({
         // unconditionally). resumeSession reuses the runtime warm-cached above
         // (ensureSessionState/updateSessionState) instead of an extra resume RPC.
         if (parentStoredId !== null && selectedStoredSessionIdRef.current === parentStoredId) {
-          navigate(sessionRoute(routedSessionId), { replace: true })
+          // Resume must capture the committed branch route, not the parent's token.
+          flushSync(() => navigate(sessionRoute(routedSessionId), { replace: true }))
           await resumeSession(routedSessionId)
         } else {
           // Carry the exact owner onto the tile: its persisted ownerRoute is
