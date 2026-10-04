@@ -63,8 +63,9 @@ jobs:
           HERMES_E2E_MACHINE_ROOT: ${{ runner.temp }}\wm
           HERMES_E2E_PROFILES_ROOT: C:\Users
           HERMES_E2E_ARTIFACTS: ${{ runner.temp }}\win-update-e2e
-          # Each journey spawns a process tree; bound load on the standard runner.
-          HERMES_TEST_WORKERS: '2'
+          # A neighbour journey already installs two runtimes concurrently.
+          # Keep files serial so their PM/Node builds do not multiply that load.
+          HERMES_TEST_WORKERS: '1'
           HERMES_TEST_FILE_TIMEOUT: '2400'
           HERMES_TEST_FILE_RETRIES: '0'
           OPENROUTER_API_KEY: ''
