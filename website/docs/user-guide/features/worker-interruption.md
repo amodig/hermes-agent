@@ -92,6 +92,8 @@ any drain flag is set. That is accepted only on positive evidence: `systemctl
 --user is-system-running` reporting `stopping`. A timeout, a missing
 `systemctl`, an inaccessible bus, `degraded`, or arbitrary error text is not
 evidence, and a genuine launch failure still fails closed and counts normally.
+The probe decodes output as UTF-8 with replacement for invalid bytes; malformed
+output cannot become positive shutdown evidence.
 
 The evidence is evaluated at the native scope/bootstrap failure site and converts
 only the failure it was sampled beside. Dispatcher exception handlers exempt

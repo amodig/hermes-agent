@@ -1258,7 +1258,8 @@ def _user_manager_stopping() -> bool:
         from hermes_cli.gateway import _run_systemctl
 
         result = _run_systemctl(
-            ["is-system-running"], timeout=5, capture_output=True, text=True, check=False,
+            ["is-system-running"], timeout=5, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", check=False,
         )
     except Exception:
         return False
