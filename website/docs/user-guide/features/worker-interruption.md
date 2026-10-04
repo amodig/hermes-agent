@@ -116,6 +116,10 @@ Ordinary worker crashes are counted against the configured
 2. `kanban.failure_limit`;
 3. the built-in default.
 
+Expired-claim release, run closure and failure accounting commit atomically.
+Another claimant cannot acquire the card before the old run's breaker decision;
+an accounting failure rolls back the database reclaim.
+
 Three deliberate policies outrank the configured limit and are unchanged:
 
 - **systemic** — three or more identical error fingerprints in one tick trip

@@ -518,6 +518,29 @@ def test_interrupted_review_runs_retry_in_review_phase(
     assert event.payload.get("retry_status") == "review"
 
 
+def test_stale_reclaim_rolls_back_when_failure_accounting_fails(conn, monkeypatch):
+    task_id, review = _claimed_review(conn, "Atomic stale reclaim", ttl_seconds=-1)
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 1, task_id),
+        )
+    before = kb.get_task(conn, task_id)
+
+    def fail_accounting(*args, **kwargs):
+        raise RuntimeError("failure accounting unavailable")
+
+    monkeypatch.setattr(kb, "_record_task_failure", fail_accounting)
+    with pytest.raises(RuntimeError, match="failure accounting unavailable"):
+        kb.release_stale_claims(conn)
+
+    after = kb.get_task(conn, task_id)
+    assert after.status == "running"
+    assert after.claim_lock == before.claim_lock
+    assert after.current_run_id == review.current_run_id
+    assert kb.list_runs(conn, task_id=task_id)[-1].ended_at is None
+
+
 def test_review_retry_still_trips_the_failure_breaker(conn) -> None:
     task_id, _review = _claimed_review(conn, "Reviewer repeatedly fails")
     assert kbd._record_task_failure(
