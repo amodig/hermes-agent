@@ -287,6 +287,29 @@ def test_the_stop_transition_cannot_land_between_check_and_grant():
     assert runner._kanban_shutdown_requested() is False
 
     landed = threading.Event()
+    waiting = threading.Event()
+    timed_acquires = []
+    lock = threading.Lock()
+
+    class ObservedLock:
+        def acquire(self, *args, **kwargs):
+            if "timeout" in kwargs:
+                timed_acquires.append(kwargs["timeout"])
+            if lock.locked():
+                waiting.set()
+            return lock.acquire(*args, **kwargs)
+
+        def release(self):
+            lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self.release()
+
+    runner._kanban_grant_lock_handle = ObservedLock()
 
     def _drain():
         runner._kanban_transition(_draining=True)
@@ -295,13 +318,12 @@ def test_the_stop_transition_cannot_land_between_check_and_grant():
     with runner._kanban_grant_guard():
         thread = threading.Thread(target=_drain, daemon=True)
         thread.start()
-        assert not landed.wait(timeout=0.25), (
-            "the drain landed inside the grant boundary, so a grant could still "
-            "be handed out after the stop was decided"
-        )
+        assert waiting.wait(timeout=5.0), "the transition must reach the busy boundary"
+        assert not landed.is_set(), "the drain must wait for the in-flight grant"
 
     assert landed.wait(timeout=5.0), "the transition must complete once the grant is done"
     thread.join(timeout=5.0)
+    assert timed_acquires == [], "a delayed boundary must never time out and proceed unlocked"
     assert runner._kanban_shutdown_requested() is True
     # ...and a launch that starts now sees the stop immediately.
     assert runner._kanban_shutdown_requested() is True
@@ -359,3 +381,90 @@ def test_a_gateway_that_is_draining_or_stopped_grants_nothing(engage):
     runner._draining = False
     runner._external_drain_active = False
     assert runner._kanban_shutdown_requested() is False
+
+
+def test_native_grant_pipe_sends_one_complete_frame(monkeypatch):
+    import os
+    from hermes_cli import kanban_runtime as runtime
+    from hermes_cli import kanban_worker_runtime as worker
+
+    read_fd, write_fd = os.pipe()
+    if os.name == "nt":
+        worker._set_windows_pipe_nonblocking(write_fd)
+    else:
+        os.set_blocking(write_fd, False)
+    frame = b'{"grant": true, "run_id": 23}\n'
+    writes = []
+    native_write = os.write
+
+    def write_once(fd, data):
+        writes.append(bytes(data))
+        return native_write(fd, data)
+
+    monkeypatch.setattr(worker.os, "write", write_once)
+    try:
+        worker._write_worker_grant(write_fd, frame)
+    finally:
+        os.close(write_fd)
+    with os.fdopen(read_fd, "r") as reader:
+        monkeypatch.setattr(runtime.sys, "stdin", reader)
+        assert runtime._read_bootstrap_message() == {"grant": True, "run_id": 23}
+    assert writes == [frame], "a completed grant must not be resent"
+
+
+@pytest.mark.parametrize("write_error", [BlockingIOError, BrokenPipeError])
+def test_partial_native_grant_failure_cancels_only_the_ungranted_worker(
+    conn, switch, recorder, monkeypatch, write_error,
+):
+    import io
+    from dataclasses import replace
+    from hermes_cli import kanban_runtime as runtime
+    from hermes_cli import kanban_worker_runtime as worker
+
+    delivered = bytearray()
+    frame = b'{"grant": true, "run_id": 23}\n'
+
+    def partial_write(_fd, data):
+        if delivered:
+            raise write_error
+        delivered.extend(data[:-1])
+        return len(data) - 1
+
+    def blocked_grant(_run_id, _claim_lock):
+        with pytest.MonkeyPatch.context() as patch:
+            clock = iter((0.0, 0.0, worker._GRANT_TIMEOUT_SECONDS + 1))
+            patch.setattr(worker.os, "write", partial_write)
+            patch.setattr(worker.time, "monotonic", lambda: next(clock))
+            patch.setattr(worker.time, "sleep", lambda _seconds: None)
+            worker._write_worker_grant(-1, frame)
+
+    def spawn(*args, **kwargs):
+        return replace(recorder(*args, **kwargs), grant=blocked_grant)
+
+    monkeypatch.setattr(kbd, "_default_spawn", spawn)
+    tid = kb.create_task(conn, title="grant pipe full", assignee="w")
+    result = kbd.dispatch_once(conn, failure_limit=3, should_stop=switch)
+    assert result.spawned == [] and recorder.cancels == 1
+    row = _row(conn, tid)
+    assert (row["status"], row["consecutive_failures"]) == ("ready", 1)
+    # Even syntactically complete JSON is not a grant without the final newline.
+    assert bytes(delivered) == frame[:-1]
+    monkeypatch.setattr(runtime.sys, "stdin", io.StringIO(delivered.decode()))
+    with pytest.raises(RuntimeIdentityError, match="incomplete worker bootstrap message"):
+        runtime._read_bootstrap_message()
+
+
+@pytest.mark.platforms("windows")
+def test_windows_311_pipe_mode_supports_bounded_grants():
+    import os
+    from hermes_cli import kanban_worker_runtime as worker
+
+    read_fd, write_fd = os.pipe()
+    try:
+        worker._set_windows_pipe_nonblocking(write_fd)
+        frame = b'{"grant": true}\n'
+        worker._write_worker_grant(write_fd, frame)
+        assert os.read(read_fd, len(frame)) == frame
+    finally:
+        os.close(write_fd)
+        os.close(read_fd)

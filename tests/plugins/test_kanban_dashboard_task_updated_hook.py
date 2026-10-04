@@ -1,10 +1,8 @@
 """Dashboard mutation-boundary coverage for ``on_kanban_task_updated``.
 
-The dashboard plugin API's priority/title/body editors write task rows with
-direct SQL, bypassing every ``kanban_db`` mutator — the exact gap the RFC
-#58548 mutation-boundary review called out. These tests verify each
-direct-SQL write path (single-task PATCH and bulk POST) reports through
-``kanban_db.notify_task_updated`` with the right ``changed_fields``.
+Single-task PATCH and bulk POST must report priority edits through the
+domain mutation boundary, including ``on_kanban_task_updated`` with the
+correct ``changed_fields`` after commit.
 """
 
 from __future__ import annotations
@@ -85,6 +83,8 @@ def test_patch_priority_fires_task_updated(client, captured_updates):
     assert kw["task_id"] == tid
     assert kw["changed_fields"] == ["priority"]
     assert kw["board"]
+
+
 
 def test_bulk_priority_fires_task_updated_per_task(client, captured_updates):
     tid1 = _make_task("a")

@@ -110,11 +110,14 @@ def test_completion_records_and_enforces_exact_head(kanban_home, tmp_path):
         assert implementation_run is not None
         head = _commit(repo)
         with pytest.raises(kb.HandoffValidationError, match="head_sha is required"):
-            kb.complete_task(conn, parent, metadata={"base_sha": base})
+            kb.complete_task(
+                conn, parent, summary="implemented src/changed.py", metadata={"base_sha": base}
+            )
         assert kb.complete_task(
             conn,
             parent,
             expected_run_id=implementation_run.current_run_id,
+            summary="implemented src/changed.py",
             metadata={"base_sha": base, "head_sha": head},
         )
         handoff = kb.latest_handoff(conn, parent)
@@ -139,7 +142,8 @@ def test_review_claim_aborts_after_parent_head_moves(kanban_home, tmp_path):
         head = _commit(repo)
         assert kb.claim_task(conn, parent) is not None
         assert kb.complete_task(
-            conn, parent, metadata={"base_sha": base, "head_sha": head}
+            conn, parent, summary="implemented src/changed.py",
+            metadata={"base_sha": base, "head_sha": head}
         )
         with kb.write_txn(conn):
             conn.execute(
@@ -242,6 +246,7 @@ def test_legacy_handoff_requeues_and_recompletes_same_lane(kanban_home, tmp_path
         assert kb.complete_task(
             conn,
             parent,
+            summary="committed the legacy implementation",
             metadata={"base_sha": base, "head_sha": head},
             expected_run_id=run.current_run_id,
         )
@@ -254,6 +259,7 @@ def test_legacy_handoff_requeues_and_recompletes_same_lane(kanban_home, tmp_path
             reviewer,
             expected_run_id=review_run.current_run_id,
             verdict="APPROVE",
+            summary="review approved the committed implementation",
             metadata={"reviewed_head_sha": head},
         )
         assert kb.get_task(conn, tester).status == "ready"
@@ -315,7 +321,6 @@ def _rework_graph(conn, repo: Path, base: str, branch: str) -> tuple[str, str, s
         title="validation",
         assignee="tester",
         parents=[reviewer],
-        initial_status="blocked",
         lifecycle_contract={"kind": "validation", "candidate_task_id": implementation},
     )
     descendant = kb.create_task(
@@ -329,6 +334,7 @@ def _rework_graph(conn, repo: Path, base: str, branch: str) -> tuple[str, str, s
         conn,
         implementation,
         expected_run_id=implementation_run.current_run_id,
+        summary="implemented the candidate for review",
         metadata={"base_sha": base, "head_sha": first_head},
     )
     reviewer_run = kb.claim_review_task(conn, reviewer, claimer="reviewer:1")
@@ -338,6 +344,7 @@ def _rework_graph(conn, repo: Path, base: str, branch: str) -> tuple[str, str, s
         reviewer,
         expected_run_id=reviewer_run.current_run_id,
         verdict="REQUEST_CHANGES",
+        summary="review found changes required",
         metadata={"reviewed_head_sha": first_head},
     )
     kb.add_comment(conn, implementation, "operator", "rework is required")
@@ -369,6 +376,7 @@ def test_typed_same_card_rework_refuses_active_implementation(kanban_home, tmp_p
             conn,
             implementation,
             expected_run_id=implementation_run.current_run_id,
+            summary="implemented the candidate for review",
             metadata={"base_sha": base, "head_sha": head},
         )
         review_run = kb.claim_review_task(conn, implementation, claimer="reviewer:1")
@@ -427,6 +435,7 @@ def test_typed_same_card_rework_rejects_newer_review_handoff(kanban_home, tmp_pa
             conn,
             implementation,
             expected_run_id=first_run.current_run_id,
+            summary="implemented the first candidate",
             metadata={"base_sha": base, "head_sha": first_head},
         )
         review_run = kb.claim_review_task(conn, implementation, claimer="reviewer:1")
@@ -447,6 +456,7 @@ def test_typed_same_card_rework_rejects_newer_review_handoff(kanban_home, tmp_pa
             conn,
             implementation,
             expected_run_id=second_run.current_run_id,
+            summary="implemented the review fixes",
             metadata={"base_sha": base, "head_sha": second_head},
         )
         assert kb.get_task(conn, implementation).status == "review"
@@ -490,6 +500,7 @@ def test_typed_same_card_rework_rechecks_evidence_inside_transaction(
             conn,
             implementation,
             expected_run_id=first_run.current_run_id,
+            summary="implemented the first candidate",
             metadata={"base_sha": base, "head_sha": first_head},
         )
         review_run = kb.claim_review_task(conn, implementation, claimer="reviewer:1")
@@ -525,6 +536,7 @@ def test_typed_same_card_rework_rechecks_evidence_inside_transaction(
                     conn,
                     implementation,
                     expected_run_id=second_run.current_run_id,
+                    summary="implemented the review fixes",
                     metadata={"base_sha": base, "head_sha": second_head},
                 )
                 second_review = kb.claim_review_task(
@@ -598,6 +610,7 @@ def test_separate_reviewer_requires_explicit_approval(kanban_home, tmp_path):
             conn,
             implementation,
             expected_run_id=implementation_run.current_run_id,
+            summary="implemented the candidate for review",
             metadata={"base_sha": base, "head_sha": head},
         )
         reviewer_run = kb.claim_review_task(conn, reviewer, claimer="reviewer:1")
@@ -607,6 +620,7 @@ def test_separate_reviewer_requires_explicit_approval(kanban_home, tmp_path):
                 conn,
                 reviewer,
                 expected_run_id=reviewer_run.current_run_id,
+                summary="reviewed the candidate",
                 metadata={"reviewed_head_sha": head},
             )
         assert kb.get_task(conn, reviewer).current_run_id == reviewer_run.current_run_id
@@ -617,6 +631,7 @@ def test_separate_reviewer_requires_explicit_approval(kanban_home, tmp_path):
             reviewer,
             expected_run_id=reviewer_run.current_run_id,
             verdict="APPROVE",
+            summary="review approved the candidate",
             metadata={"reviewed_head_sha": head},
         )
         assert kb.get_task(conn, tester).status == "ready"
@@ -648,6 +663,7 @@ def test_rework_review_accepts_todo_tester_for_second_rejection(kanban_home, tmp
             implementation,
             expected_run_id=implementation_run.current_run_id,
             metadata={"base_sha": base, "head_sha": second_head},
+            summary="implemented the review fixes",
         )
         reviewer_run = kb.claim_review_task(conn, reviewer, claimer="reviewer:2")
         assert reviewer_run is not None
@@ -656,6 +672,7 @@ def test_rework_review_accepts_todo_tester_for_second_rejection(kanban_home, tmp
             reviewer,
             expected_run_id=reviewer_run.current_run_id,
             verdict="REQUEST_CHANGES",
+            summary="review found further changes required",
             metadata={"reviewed_head_sha": second_head},
         )
         versions = tuple(kb.get_task(conn, task_id).version for task_id in ids)
@@ -726,7 +743,7 @@ def test_rework_review_reuses_cards_and_requires_new_head_approval(
         implementation, reviewer, tester, descendant, first_head = _rework_graph(
             conn, repo, base, branch
         )
-        assert kb.get_task(conn, tester).status == "blocked"
+        assert kb.get_task(conn, tester).status == "todo"
 
         ids = (implementation, reviewer, tester)
         versions = tuple(kb.get_task(conn, task_id).version for task_id in ids)
@@ -791,6 +808,7 @@ def test_rework_review_reuses_cards_and_requires_new_head_approval(
             conn,
             implementation,
             expected_run_id=implementation_run.current_run_id,
+            summary="implemented the review fixes",
             metadata={"base_sha": base, "head_sha": second_head},
         )
         reviewer_run = kb.claim_review_task(conn, reviewer, claimer="reviewer:2")
@@ -801,6 +819,7 @@ def test_rework_review_reuses_cards_and_requires_new_head_approval(
                 reviewer,
                 expected_run_id=reviewer_run.current_run_id,
                 verdict="APPROVE",
+                summary="review approved the earlier candidate",
                 metadata={"head_sha": first_head},
             )
         assert kb.get_task(conn, tester).status == "todo"
@@ -810,6 +829,7 @@ def test_rework_review_reuses_cards_and_requires_new_head_approval(
             reviewer,
             expected_run_id=reviewer_run.current_run_id,
             verdict="APPROVE",
+            summary="review approved the repaired candidate",
             metadata={"reviewed_head_sha": second_head},
         )
         assert kb.get_task(conn, tester).status == "ready"

@@ -351,7 +351,7 @@ def test_review_changes_reapply_parent_gate(conn):
 
     # Move the task through review while its parent is temporarily terminal,
     # then make the parent non-terminal again before changes are requested.
-    assert kb.complete_task(conn, parent_id)
+    assert kb.complete_task(conn, parent_id, result="done")
     implementation = kb.claim_task(conn, task_id, claimer="builder:1")
     assert implementation is not None
     assert kb.request_review(
@@ -379,7 +379,7 @@ def test_review_changes_reapply_parent_gate(conn):
 
 def test_parent_reopen_blocks_request_review_until_parent_is_done(conn) -> None:
     parent_id = kb.create_task(conn, title="Parent", assignee="planner")
-    assert kb.complete_task(conn, parent_id)
+    assert kb.complete_task(conn, parent_id, result="done")
     task_id = kb.create_task(
         conn,
         title="Implementation with reopened parent",
@@ -399,7 +399,7 @@ def test_parent_reopen_blocks_request_review_until_parent_is_done(conn) -> None:
     still_running = kb.get_task(conn, task_id)
     assert still_running is not None
     assert still_running.status == "running"
-    assert kb.complete_task(conn, parent_id)
+    assert kb.complete_task(conn, parent_id, result="done")
     assert kb.request_review(
         conn,
         task_id,
@@ -516,6 +516,45 @@ def test_interrupted_review_runs_retry_in_review_phase(
     event = kb.list_events(conn, task_id=task_id)[-1]
     assert event.payload is not None
     assert event.payload.get("retry_status") == "review"
+
+
+@pytest.mark.parametrize("failure_limit", [1, 2])
+def test_dispatch_reports_stale_claim_breaker_trips(conn, failure_limit):
+    task_id, _review = _claimed_review(conn, "Reported stale reclaim")
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 1, task_id),
+        )
+
+    result = kbd.dispatch_once(conn, max_spawn=0, failure_limit=failure_limit)
+
+    assert result.reclaimed == 1
+    assert result.auto_blocked == ([task_id] if failure_limit == 1 else [])
+    assert kb.get_task(conn, task_id).status == ("blocked" if failure_limit == 1 else "review")
+
+
+def test_stale_reclaim_rolls_back_when_failure_accounting_fails(conn, monkeypatch):
+    task_id, review = _claimed_review(conn, "Atomic stale reclaim", ttl_seconds=-1)
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 1, task_id),
+        )
+    before = kb.get_task(conn, task_id)
+
+    def fail_accounting(*args, **kwargs):
+        raise RuntimeError("failure accounting unavailable")
+
+    monkeypatch.setattr(kb, "_record_task_failure", fail_accounting)
+    with pytest.raises(RuntimeError, match="failure accounting unavailable"):
+        kb.release_stale_claims(conn)
+
+    after = kb.get_task(conn, task_id)
+    assert after.status == "running"
+    assert after.claim_lock == before.claim_lock
+    assert after.current_run_id == review.current_run_id
+    assert kb.list_runs(conn, task_id=task_id)[-1].ended_at is None
 
 
 def test_review_retry_still_trips_the_failure_breaker(conn) -> None:
@@ -652,7 +691,7 @@ def test_blocked_same_card_review_accepts_verdict(conn, tmp_path: Path) -> None:
 
 def test_review_dependency_wait_reenters_review_after_parent_finishes(conn) -> None:
     parent_id = kb.create_task(conn, title="Parent", assignee="planner")
-    assert kb.complete_task(conn, parent_id)
+    assert kb.complete_task(conn, parent_id, result="done")
     task_id = kb.create_task(
         conn,
         title="Review after dependency refresh",
@@ -682,7 +721,7 @@ def test_review_dependency_wait_reenters_review_after_parent_finishes(conn) -> N
     waiting = kb.get_task(conn, task_id)
     assert waiting is not None
     assert waiting.status == "todo"
-    assert kb.complete_task(conn, parent_id)
+    assert kb.complete_task(conn, parent_id, result="done")
     resumed = kb.get_task(conn, task_id)
     assert resumed is not None
     assert resumed.status == "review"

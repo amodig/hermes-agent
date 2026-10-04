@@ -17,6 +17,7 @@ up with ``assignee=None``.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -137,27 +138,27 @@ def _profile_author() -> str:
     return _specify_author("decomposer")
 
 
-def _load_config() -> dict:
-    try:
-        from hermes_cli.config import load_config
-        return load_config() or {}
-    except Exception:
-        return {}
-
-
-def _resolve_profile_from_cfg(cfg: dict, key: str) -> str:
-    """``kanban.<key>`` if it names an existing profile, else the active
-    default profile — so a task is never stranded for lack of an owner.
+def _resolve_profile_from_cfg(cfg: dict, key: str, *, fallback: Optional[str] = None) -> str:
+    """``kanban.<key>`` if it names an existing profile, else ``fallback``
+    (the root task's own assignee) if that does, else the active default
+    profile — so a task is never stranded for lack of an owner.
     ``orchestrator_profile`` owns the root after fan-out; ``default_assignee``
-    catches children the decomposer can't route."""
+    catches children the decomposer can't route.
+
+    The root's assignee sits before the active profile because the decomposer
+    runs inside whatever profile hosts the dispatcher — an operator's
+    credential-less incognito profile, say — and that profile must never
+    silently become the owner of work the card was assigned away from (#114294).
+    """
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     explicit = (kanban_cfg.get(key) or "").strip()
-    if explicit:
-        try:
-            if profiles_mod.profile_exists(explicit):
-                return explicit
-        except Exception:
-            pass
+    for candidate in (explicit, (fallback or "").strip()):
+        if candidate:
+            try:
+                if profiles_mod.profile_exists(candidate):
+                    return candidate
+            except Exception:
+                pass
     try:
         return profiles_mod.get_active_profile_name() or "default"
     except Exception:
@@ -212,13 +213,17 @@ class _Routing:
     valid_names: set[str]
 
 
-def _load_routing() -> _Routing:
-    cfg = _load_config()
+def _load_routing(*, root_assignee: Optional[str] = None) -> _Routing:
+    from hermes_cli.config import load_config_readonly
+    try:
+        cfg = load_config_readonly()
+    except Exception:  # decompose_task promises ok=False, never a raise, on config trouble
+        cfg = {}
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     roster, valid_names = _build_roster()
     return _Routing(
-        orchestrator=_resolve_profile_from_cfg(cfg, "orchestrator_profile"),
-        default_assignee=_resolve_profile_from_cfg(cfg, "default_assignee"),
+        orchestrator=_resolve_profile_from_cfg(cfg, "orchestrator_profile", fallback=root_assignee),
+        default_assignee=_resolve_profile_from_cfg(cfg, "default_assignee", fallback=root_assignee),
         auto_promote=bool(kanban_cfg.get("auto_promote_children", True)),
         roster=roster,
         valid_names=valid_names,
@@ -380,7 +385,7 @@ def _apply_fanout(
         logger.exception("decompose: DB error on task %s", task_id)
         return DecomposeOutcome(task_id, False, f"DB error: {type(exc).__name__}")
     if child_ids is None:
-        return DecomposeOutcome(task_id, False, "task moved out of triage before decomposition")
+        return DecomposeOutcome(task_id, False, "task already decomposed or moved out of triage")
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children", fanout=True, child_ids=child_ids,
     )
@@ -426,7 +431,7 @@ def decompose_task(
     expected_goal_revision_id = context.get("goal_revision_id")
     expected_goal_revision_version = context.get("goal_revision_version")
 
-    routing = _load_routing()
+    routing = _load_routing(root_assignee=task.assignee)
     raw, reason = _call_aux(
         "decompose", task_id, aux_task="kanban_decomposer", system=_SYSTEM_PROMPT,
         user=_USER_TEMPLATE.format(
@@ -471,12 +476,3 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     with kbc.connect_closing() as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
     return [row.id for row in rows]
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-import json  # noqa: F401,E402
-import os  # noqa: F401,E402
-# ---- END PLUGIN-COMPAT ----

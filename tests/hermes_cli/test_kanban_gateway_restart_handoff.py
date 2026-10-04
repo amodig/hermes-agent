@@ -40,7 +40,7 @@ def worker_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_BIN", raising=False)
-    monkeypatch.setenv("INVOCATION_ID", "managed-gateway-test")
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr("tools.process_registry._is_supervised_gateway_process", lambda: False)
     source = tmp_path / "install"
@@ -147,11 +147,7 @@ def test_worker_captures_assigned_profile_plugins_before_child_imports(
     (source / "providers").mkdir()
     for name in ("__init__.py", "base.py"):
         shutil.copy2(repository / "providers" / name, source / "providers" / name)
-    (source / "hermes_constants.py").write_text(
-        "import os\nfrom pathlib import Path\n"
-        "def get_hermes_home(): return Path(os.environ['HERMES_HOME'])\n",
-        encoding="utf-8",
-    )
+    shutil.copy2(repository / "hermes_constants.py", source / "hermes_constants.py")
     for home, label in ((dispatcher_home, "dispatcher"), (worker_home, "assigned")):
         plugin = home / "plugins" / "model-providers" / "profile-fixture"
         plugin.mkdir(parents=True)
@@ -411,24 +407,27 @@ value = {
         _finish_launch(launch)
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_managed_gateway_worker_spawn_fails_closed_without_scope(
     worker_setup, monkeypatch, forbid_worker_spawn,
 ):
     workspace, task = worker_setup
+    monkeypatch.setenv("INVOCATION_ID", "managed-gateway-test")
     monkeypatch.setattr("tools.process_registry._is_supervised_gateway_process", lambda: True)
     monkeypatch.setattr("tools.process_registry._systemd_run_user_scope_available", lambda: False)
     with pytest.raises(RuntimeError, match="restart-safe systemd scope"):
         kbd._default_spawn(task, str(workspace))
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_managed_gateway_scope_builder_fails_closed_if_binary_disappears(
     worker_setup, monkeypatch, forbid_worker_spawn,
 ):
     workspace, task = worker_setup
+    monkeypatch.setenv("INVOCATION_ID", "managed-gateway-test")
     monkeypatch.setattr("tools.process_registry._is_supervised_gateway_process", lambda: True)
     monkeypatch.setattr("tools.process_registry._systemd_run_user_scope_available", lambda: True)
+    monkeypatch.setattr("tools.process_registry._slice_inherit_supported", lambda: True)
     monkeypatch.setattr("shutil.which", lambda _name: None)
     with pytest.raises(RuntimeError, match="restart-safe systemd scope"):
         kbd._default_spawn(task, str(workspace))
@@ -495,14 +494,49 @@ def test_explicit_current_install_entrypoint_is_sealed_and_custom_wrapper_is_ref
         kbd._default_spawn(task, str(workspace), defer_grant=True)
 
 
-@pytest.mark.linux_only
-def test_real_user_systemd_scope_preserves_worker_context(worker_setup, monkeypatch):
+@pytest.mark.platforms("linux")
+def test_oneshot_unit_dispatcher_scope_wraps_or_warns_never_dooms_silently(
+    worker_setup, monkeypatch, caplog,
+):
+    from tools import process_registry
+
+    _, task = worker_setup
+    command = [sys.executable, "-m", "hermes_cli.main"]
+    monkeypatch.setenv("INVOCATION_ID", "oneshot-dispatch-timer")
+    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: False)
+    monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: True)
+    monkeypatch.setattr(process_registry, "_slice_inherit_supported", lambda: True)
+    monkeypatch.setattr(
+        process_registry, "_build_systemd_scope_argv",
+        lambda cmd, unit_suffix: ["systemd-run", "--user", "--scope", "--unit", f"hermes-worker-{unit_suffix}", *cmd],
+    )
+    wrapped = kbd._restart_safe_worker_argv(task, command)
+    assert wrapped[:3] == ["systemd-run", "--user", "--scope"]
+    assert f"hermes-worker-kanban-{task.id}-run-{task.current_run_id}" in wrapped
+    monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
+    monkeypatch.setattr(process_registry, "_scope_degraded_warned", False)
+    with caplog.at_level("WARNING", logger=process_registry.logger.name):
+        assert kbd._restart_safe_worker_argv(task, command) == command
+    warned = [r.getMessage() for r in caplog.records if "KILLED when the unit exits" in r.getMessage()]
+    assert len(warned) == 1 and "KillMode=process" in warned[0]
+    assert process_registry.restart_safe_gateway_child_argv(
+        ["hermes", "cron"], unit_suffix="cron-job-1", require_restart_safe_scope=True,
+    ).mode == "in_process"
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("slice_inherit", [False, True])
+def test_real_user_systemd_scope_preserves_worker_context(worker_setup, monkeypatch, slice_inherit):
     from tools import process_registry
 
     if not process_registry._systemd_run_user_scope_available():
         pytest.skip("systemd-run --user --scope is unavailable on this host")
+    if slice_inherit and not process_registry._slice_inherit_supported():
+        pytest.skip("systemd-run --slice-inherit is unavailable on this host")
+    monkeypatch.setattr(process_registry, "_slice_inherit_supported", lambda: slice_inherit)
     workspace, task = worker_setup
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
+    monkeypatch.setenv("INVOCATION_ID", "managed-gateway-test")
     launch = kbd._default_spawn(task, str(workspace), defer_grant=True)
     try:
         launch.grant(task.current_run_id, task.claim_lock)
@@ -517,7 +551,7 @@ def test_real_user_systemd_scope_preserves_worker_context(worker_setup, monkeypa
         _finish_launch(launch)
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 @pytest.mark.live_system_guard_bypass  # cleanup signals our start-time-verified, reparented worker
 def test_worker_and_claim_survive_dispatcher_exit_and_shared_install_replacement(worker_setup, monkeypatch):
     workspace, _task = worker_setup
@@ -610,7 +644,7 @@ def _proc_cgroup(pid: int) -> str:
     raise AssertionError(f"PID {pid} has no unified cgroup")
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 @pytest.mark.live_system_guard_bypass  # cleanup signals our start-time-verified worker
 def test_worker_survives_a_real_user_service_restart(tmp_path, monkeypatch):
     """A REAL ``systemctl --user restart`` must not take the granted worker down.
@@ -629,6 +663,12 @@ def test_worker_survives_a_real_user_service_restart(tmp_path, monkeypatch):
 
     if not process_registry._systemd_run_user_scope_available():
         pytest.skip("systemd-run --user --scope is unavailable on this host")
+    bus_env = process_registry.systemd_user_bus_env(os.environ)
+    for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+        if key in bus_env:
+            monkeypatch.setenv(key, bus_env[key])
+    if not process_registry._slice_inherit_supported():
+        pytest.skip("systemd-run --slice-inherit is required for shared-slice placement")
 
     base = tmp_path / "service-smoke"
     base.mkdir()
@@ -658,12 +698,16 @@ def test_worker_survives_a_real_user_service_restart(tmp_path, monkeypatch):
     harness_py.write_text(
         "import json, os, pathlib, subprocess, sys, time\n"
         f"sys.path.insert(0, {str(Path(kbd.__file__).resolve().parents[1])!r})\n"
+        f"os.environ['HERMES_HOME'] = {str(base / 'home')!r}\n"
+        f"os.environ['HOME'] = {str(base)!r}\n"
         "os.environ.setdefault('INVOCATION_ID', 'issue43-smoke')\n"
         "from tools import process_registry\n"
         "process_registry._is_supervised_gateway_process = lambda: True\n"
-        f"argv = process_registry.restart_safe_gateway_child_argv(\n"
-        f"    [sys.executable, '-B', {str(worker_py)!r}], unit_suffix={suffix!r})\n"
-        "proc = subprocess.Popen(argv, start_new_session=True)\n"
+        "dispatch = process_registry.restart_safe_gateway_child_argv(\n"
+        f"    [sys.executable, '-B', {str(worker_py)!r}], unit_suffix={suffix!r},\n"
+        "    require_restart_safe_scope=True, outlives_parent=True)\n"
+        "proc = subprocess.Popen(dispatch.argv, start_new_session=True,\n"
+        "    env=process_registry.systemd_user_bus_env(os.environ))\n"
         "# ``systemd-run --scope`` moves the command into its scope asynchronously,\n"
         "# so read the cgroup only once it has settled, or we record the service's.\n"
         "cgroup = ''\n"
@@ -683,14 +727,15 @@ def test_worker_survives_a_real_user_service_restart(tmp_path, monkeypatch):
     worker_pid = None
     worker_start_time = None
     try:
-        subprocess.run(
+        launch = subprocess.run(
             # Same slice the CTO gateway occupies: the worker must stay inside
             # that shared budget, not escape to app.slice.
             ["systemd-run", "--user", "--unit", unit,
              "--slice=agents-controls.slice", "--collect",
              sys.executable, "-B", str(harness_py)],
-            check=True, capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=30,
         )
+        assert launch.returncode == 0, launch.stderr
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline and not (info.is_file() and started.is_file()):
             time.sleep(0.05)

@@ -57,7 +57,6 @@ class KanbanLifecycleUpgradeConformance(MODULE.KanbanConformanceFixture):
                 self.conn,
                 title="separate reviewer",
                 assignee="reviewer",
-                initial_status="blocked",
                 lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
             )
             kb.link_tasks(self.conn, implementation, reviewer, requirement="phase_finished")
@@ -65,7 +64,6 @@ class KanbanLifecycleUpgradeConformance(MODULE.KanbanConformanceFixture):
             self.conn,
             title="acceptance tester",
             assignee="tester",
-            initial_status="blocked",
             lifecycle_contract={"kind": "validation", "candidate_task_id": implementation},
         )
         if mode == "same_card":

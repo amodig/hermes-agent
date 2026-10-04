@@ -264,7 +264,6 @@ def test_import_scrubs_typed_handoff_paths_and_requeues_candidate(kanban_root, t
             conn,
             title="typed review",
             assignee="reviewer",
-            initial_status="blocked",
             lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
         )
         kb.link_tasks(conn, implementation, review, requirement="phase_finished")
@@ -485,15 +484,12 @@ def test_traversal_members_are_rejected(member):
 
 
 def test_extract_refuses_a_symlink_member(tmp_path):
-    payload = tmp_path / "payload"
-    payload.mkdir()
-    (payload / "real.txt").write_text("fine")
-    link = payload / "link"
-    link.symlink_to("/etc/passwd")
-
     archive = tmp_path / "evil.tar.gz"
     with tarfile.open(archive, "w:gz") as tf:
-        tf.add(payload, arcname="payload")
+        link = tarfile.TarInfo("payload/link")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "/etc/passwd"
+        tf.addfile(link)
 
     with pytest.raises(ValueError, match="Unsupported archive member"):
         safe_extract_targz(archive, tmp_path / "out")
