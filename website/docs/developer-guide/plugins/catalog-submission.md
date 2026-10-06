@@ -13,8 +13,8 @@ the complete guidelines for getting a plugin in and keeping it there.
 
 The canonical copy of the admission rules is
 [`plugin-catalog/README.md`](https://github.com/NousResearch/hermes-agent/blob/main/plugin-catalog/README.md)
-in the repository. The [rules section](#admission-rules) below mirrors it word
-for word, and a test fails the build if the two drift apart.
+in the repository. The [rules section](#admission-rules) below reproduces them
+for submitters.
 
 ## Before you submit
 
@@ -68,7 +68,6 @@ the gallery. There is no separate listing to maintain.
 
 ## Admission rules
 
-<!-- admission-rules:start (mirrored in website/docs/developer-guide/plugins/catalog-submission.md; tests/website/test_catalog_rules_mirror.py keeps them identical) -->
 1. **Human-merged gate.** Entries are added *only* via a PR to the
    `hermes-agent` repository, reviewed and merged by a maintainer. There is
    no self-serve registry, no automated ingestion.
@@ -163,7 +162,6 @@ the gallery. There is no separate listing to maintain.
 15. **No skins or forks of bundled plugins.** A change to a bundled plugin is a
    PR against `hermes-agent`, not a competing listing, and vendor-lookalike skins
    are not listed under Nous branding.
-<!-- admission-rules:end -->
 
 ## Updating your entry
 

@@ -113,8 +113,6 @@ _PY_RELEVANT_CONTRACT_FILES = {
     "apps/desktop/src/lib/desktop-slash-registry.json",
     # tests/tui_gateway/test_show_reasoning_display_gate.py (card-tool names vs the gateway lifecycle set)
     "apps/desktop/src/lib/tool-render-class.ts",
-    # tests/website/test_catalog_rules_mirror.py (docs page mirrors the canonical rules)
-    "plugin-catalog/README.md",
 }
 
 # Supply-chain scan: files that can execute code at install/import time.
