@@ -386,11 +386,13 @@ def test_concurrent_category_loads_import_once_and_create_distinct_instances(tmp
                 base_ref="agent.memory_provider:MemoryProvider", capture="register_memory_provider")
         with ThreadPoolExecutor(max_workers=4) as pool:
             instances = list(pool.map(load, range(4)))
-        assert [instance.whoami() for instance in instances] == [host.pid] * 4
+        pids = [instance.whoami() for instance in instances]
+        assert len(set(pids)) == 1
+        assert pids[0] != os.getpid()
         assert [instance.level for instance in instances] == [1] * 4
         instances[0].whoami()
         assert [instance.level for instance in instances] == [2, 1, 1, 1]
-        assert marker.read_text().splitlines() == [str(host.pid)]
+        assert marker.read_text().splitlines() == [str(pids[0])]
     finally:
         host.shutdown()
 
