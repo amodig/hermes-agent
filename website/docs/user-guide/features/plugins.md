@@ -820,13 +820,16 @@ What changes in `host` mode:
 - **Crashes stay contained.** A plugin that crashes or exits kills its host, not Hermes; the call in
   flight returns a tool error and Hermes restarts the host and reloads its plugins (bounded retries).
 - **Unload cancels plugin-owned background work.** Coroutines started with `ctx.spawn_task()`
-  are cancelled when that plugin unloads or reloads; other plugins keep their host process.
+  are cancelled when that plugin unloads, reloads, or fails registration; cleanup callbacks run
+  for failed registration too. Other plugins keep their host process.
 - **Deferred callbacks keep the owning profile.** Background callbacks bind current owner
   credentials even if multiplexing activates later; in-flight callbacks retain their caller's scope.
 - **Dashboard APIs refresh on reload.** Unloading a plugin evicts its cached API and module
   without resetting sibling plugins or restarting the host.
 - **Category imports run once per host.** Concurrent first loads share the imported module;
   each memory/context-engine/category load still creates a fresh provider instance.
+- **Retained provider proxies refresh once after a host crash.** Concurrent callers share one
+  replacement instance and one registration refresh rather than duplicating forwarded hooks.
 - **A few surfaces need in-process code** and fail that plugin with a clear reason instead of loading:
   gateway platform adapters (`register_platform`), approval transports, Telegram/platform handlers,
   model-provider profiles that build their own SDK client (`create_client`), streaming dashboard

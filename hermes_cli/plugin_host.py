@@ -217,6 +217,10 @@ class PluginHost:
         try:
             result = channel.call("load", params)
         except BaseException:
+            try:
+                channel.call("unload", {"plugin_key": plugin_key})
+            except Exception:
+                logger.warning("Failed to clean up rejected plugin '%s'", plugin_key, exc_info=True)
             self._contexts.pop(plugin_key, None)
             raise
         finally:
@@ -494,21 +498,23 @@ class _ObjectSlot:
         self.ref, self.generation = int(ref["__object__"]), int(ref.get("generation") or host._generation)
         self._finalizer: Optional[weakref.finalize] = None
         self._proxy: Optional[weakref.ref] = None
+        self._lock = threading.Lock()
 
     def track(self, proxy: Any) -> None:
         self._proxy = weakref.ref(proxy)
         self._finalizer = weakref.finalize(proxy, self._host._release, self.generation, self.ref)
 
     def live(self) -> tuple:
-        if (self.generation != self._host._generation or not self._host.alive) and self._reload is not None:
-            fresh = self._reload()
-            if self._finalizer is not None:
-                self._finalizer.detach()
-            self.ref, self.generation = int(fresh["__object__"]), int(fresh["generation"])
-            proxy = self._proxy() if self._proxy is not None else None
-            if proxy is not None:
-                self.track(proxy)
-        return self.ref, self.generation
+        with self._lock:
+            if (self.generation != self._host._generation or not self._host.alive) and self._reload is not None:
+                fresh = self._reload()
+                if self._finalizer is not None:
+                    self._finalizer.detach()
+                self.ref, self.generation = int(fresh["__object__"]), int(fresh["generation"])
+                proxy = self._proxy() if self._proxy is not None else None
+                if proxy is not None:
+                    self.track(proxy)
+            return self.ref, self.generation
 
 
 def _holds_live_handle(value: Any) -> bool:

@@ -105,6 +105,37 @@ def test_plugin_runs_out_of_process_with_ctx_round_trips_and_survives_host_crash
         manager._plugin_host().shutdown()
 
 
+@pytest.mark.platforms("any")
+def test_failed_registration_cancels_background_work_and_runs_cleanup(tmp_path, monkeypatch):
+    home = _home_with_plugins(tmp_path, monkeypatch, {"failedprobe": '''
+import asyncio, os
+from pathlib import Path
+
+async def register(ctx):
+    home = Path(os.environ["HERMES_HOME"])
+    async def background():
+        while not (home / "release").exists():
+            await asyncio.sleep(0.01)
+        (home / "unexpected-side-effect").touch()
+    ctx.spawn_task(background())
+    ctx.on_unload(lambda: (home / "cleaned").touch())
+    await asyncio.sleep(0.05)
+    raise ValueError("registration failed")
+'''})
+    manager = PluginManager()
+    try:
+        manager.discover_and_load()
+        assert "registration failed" in str(manager._plugins["failedprobe"].error)
+        assert (home / "cleaned").exists()
+        (home / "release").touch()
+        time.sleep(0.1)
+        assert not (home / "unexpected-side-effect").exists()
+        assert manager._plugin_host().alive
+    finally:
+        manager.unload()
+        manager._plugin_host().shutdown()
+
+
 @pytest.mark.platforms("any")  # the host is a child process: its env/home resolution is per-OS
 def test_isolation_host_keeps_every_user_import_path_out_of_process(tmp_path, monkeypatch):
     from hermes_cli.plugin_isolation_audit import audit_plugin_dir
@@ -454,6 +485,41 @@ def test_concurrent_category_loads_import_once_and_create_distinct_instances(tmp
         instances[0].whoami()
         assert [instance.level for instance in instances] == [2, 1, 1, 1]
         assert marker.read_text().splitlines() == [str(pids[0])]
+    finally:
+        host.shutdown()
+
+
+@pytest.mark.platforms("any")
+def test_concurrent_retained_provider_refresh_reuses_one_instance(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    home = _home_with_plugins(tmp_path, monkeypatch, {})
+    provider_dir = home / "plugins" / "memprobe"
+    provider_dir.mkdir(parents=True)
+    (provider_dir / "__init__.py").write_text(MEMORY_PLUGIN, encoding="utf-8")
+    host = plugins_mod.get_plugin_manager()._plugin_host()
+    reloads = []
+    def before_reload():
+        reloads.append(True)
+        time.sleep(0.1)  # let all first callers encounter the stale slot
+    try:
+        provider = host.load_instance(
+            provider_dir, module_name="_hermes_memory_memprobe",
+            base_ref="agent.memory_provider:MemoryProvider",
+            capture="register_memory_provider", before_reload=before_reload)
+        previous = host._proc
+        previous.kill()
+        previous.wait(timeout=10)
+        barrier = Barrier(4)
+        def use(index):
+            barrier.wait(timeout=10)
+            return provider.is_available()
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            assert list(pool.map(use, range(4))) == [True] * 4
+        assert reloads == [True]
+        assert [provider.whoami() for _ in range(4)] == [host.info["pid"]] * 4
+        assert provider.level == 4
     finally:
         host.shutdown()
 
