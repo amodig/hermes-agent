@@ -150,13 +150,14 @@ def test_managed_scope_pins_host_isolation_over_the_profiles_own_config(tmp_path
         managed_scope.invalidate_managed_cache()
 
 MODEL_PROVIDER_PLUGIN = '''
-import os
+import os, time
 from pathlib import Path
 from providers import register_provider
 from providers.base import ProviderProfile
 
 with (Path(os.environ["HERMES_HOME"]) / "hostmodel-imports.txt").open("a", encoding="utf-8") as marker:
     marker.write(str(os.getpid()) + "\\n")
+time.sleep(0.2)  # Keep concurrent first-use requests inside the import window.
 
 class HostModel(ProviderProfile):
     def build_extra_body(self, *, session_id=None, **context):
@@ -169,6 +170,8 @@ register_provider(HostModel(name="hostmodel", base_url="https://hostmodel.exampl
 @pytest.mark.platforms("any")  # the host is a child process: its env/home resolution is per-OS
 def test_model_provider_profile_data_is_local_and_overrides_run_in_the_host(tmp_path, monkeypatch):
     import providers
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
 
     home = _home_with_plugins(tmp_path, monkeypatch, {})
     plugin_dir = home / "plugins" / "model-providers" / "hostmodel"
@@ -186,7 +189,16 @@ def test_model_provider_profile_data_is_local_and_overrides_run_in_the_host(tmp_
         extraction_pids = marker.read_text(encoding="utf-8").splitlines()
         assert len(extraction_pids) == 1
         assert int(extraction_pids[0]) != os.getpid()
-        body = profile.build_extra_body(session_id="s1")
+        from hermes_cli.plugin_isolation import user_plugin_host
+        user_plugin_host().ensure_started()
+        barrier = Barrier(4)
+        def first_call(index):
+            barrier.wait(timeout=10)
+            return profile.build_extra_body(session_id=f"s{index}")
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            bodies = list(pool.map(first_call, range(1, 5)))
+        body = bodies[0]
+        assert bodies == [{"pid": body["pid"], "session_id": f"s{index}"} for index in range(1, 5)]
         assert body["session_id"] == "s1" and body["pid"] != os.getpid()
         assert marker.read_text(encoding="utf-8").splitlines() == [*extraction_pids, str(body["pid"])]
         assert profile.build_extra_body(session_id="s2") == {"session_id": "s2", "pid": body["pid"]}

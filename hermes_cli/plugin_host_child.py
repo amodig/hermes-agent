@@ -138,6 +138,7 @@ class HostRuntime:
         self.modules: Dict[str, str] = {}
         self.asgi_apps: Dict[str, Any] = {}
         self.profiles: Dict[str, Dict[str, Any]] = {}
+        self._profile_lock = threading.Lock()
         self.instance_modules: Dict[str, Any] = {}
         self.stopped = threading.Event()
         self.loop = asyncio.new_event_loop()
@@ -290,10 +291,12 @@ class HostRuntime:
     def op_profile_call(self, params: Dict[str, Any]) -> Any:
         """Run one overridden method (or callable field) of a model-provider profile, loading the
         plugin on first use in this host process. Addressed by name, so it survives host restarts."""
-        profiles = self.profiles.get(str(params["path"]))
-        if profiles is None:
-            profiles = self.profiles[str(params["path"])] = {
-                p.name: p for p in capture_profiles(str(params["path"]), str(params["module_name"]))}
+        # Capture replaces process-global registration; serialize misses across all paths.
+        with self._profile_lock:
+            profiles = self.profiles.get(str(params["path"]))
+            if profiles is None:
+                profiles = self.profiles[str(params["path"])] = {
+                    p.name: p for p in capture_profiles(str(params["path"]), str(params["module_name"]))}
         target = getattr(profiles[str(params["profile"])], str(params["attr"]))
         args, kwargs = self._decode_args(params)
         return encode(self._run(target(*args, **kwargs)))
