@@ -308,6 +308,10 @@ If you want this profile to work in a specific project by default, also set its 
 coder config set terminal.cwd /absolute/path/to/project
 ```
 
+`hermes -p coder memory status` reports memory configuration for `coder`.
+If its memory provider is missing, the plugin-directory hint points to
+`~/.hermes/profiles/coder/plugins/`, not the default profile's directory.
+
 ### From the dashboard
 
 The [web dashboard](features/web-dashboard.md#managing-multiple-profiles)

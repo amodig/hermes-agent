@@ -97,13 +97,15 @@ def test_kill_and_prune_release_reader_while_detached_descendant_holds_slave(
     pytest.importorskip("ptyprocess")
     registry = ProcessRegistry()
     stop, probe, alive, done = (tmp_path / name for name in ("stop", "probe", "alive", "done"))
-    # The child detaches without closing its inherited slave. A file handshake
-    # proves it survives master closure; cleanup asks it to exit without signals.
+    # Detach from the terminal and ignore shell hangup propagation, as a daemon
+    # would. The file handshake still detects termination by the cleanup path.
     child = f"""
 import os
+import signal
 from pathlib import Path
 import time
 os.setsid()
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
 print("DETACHED-READY", flush=True)
 deadline = time.monotonic() + 30
 try:

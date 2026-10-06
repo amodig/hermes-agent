@@ -82,14 +82,13 @@ jobs:
         # and laundered into a FLAKY retry. The scaler reads
         # test_durations.json from the checkout; without this restore the
         # file is absent on a fresh runner and the scaler is inert.
-        # Exact key never matches (run_id differs); restore-keys picks the
-        # most recent cache saved by a main push. PRs read, only main writes.
+        # Restore the most recent cache from this slice. PRs read; only main writes.
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: test_durations.json
-          key: test-durations-never-exact
+          key: test-durations-${{ matrix.slice }}-never-exact
           restore-keys: |
-            test-durations-
+            test-durations-${{ matrix.slice }}-
 
       - name: Run tests
         # Per-file isolation via scripts/run_tests.sh: each test file runs
@@ -117,9 +116,8 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: test_durations.json
-          # Per-slice key: each slice's file keeps the restored entries for the other
-          # slice's files and refreshes its own, so the cache stays complete.
-          key: test-durations-${{ github.run_id }}-${{ matrix.slice }}
+          # Each matrix job publishes and restores its own timing data.
+          key: test-durations-${{ matrix.slice }}-${{ github.run_id }}
 
   e2e:
     name: e2e (${{ matrix.slice }}/3)
