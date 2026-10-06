@@ -1770,14 +1770,26 @@ class ProcessRegistry(ProcessCheckpointMixin):
             responder = PtyQueryResponder(rows=30, cols=120)
 
         def ingest(text: str) -> None:
-            # A kill can leave this reader running while a detached descendant holds the
-            # slave open (_release_finished_handles defers the close to it). Keep draining,
-            # but leave the killed session's output as the kill reported it.
+            # A chunk read before a kill can reach ingestion after its output
+            # snapshot; keep the killed session's output as the kill reported it.
             self._ingest_output(session, text, unless_exited=True)
 
         try:
+            poller = None
+            if not _IS_WINDOWS:
+                import select
+
+                poller = select.poll()
+                poller.register(pty, select.POLLIN)
             while pty.isalive():
                 try:
+                    if poller is not None:
+                        if session._reader_finish_requested.is_set():
+                            break
+                        # ptyprocess.read uses read1: one read of ready bytes,
+                        # without prefetch. Never block on an inherited slave.
+                        if not poller.poll(200):
+                            continue
                     chunk = pty.read(4096)
                     if chunk:
                         # ptyprocess returns bytes; pywinpty returns str
@@ -1830,21 +1842,21 @@ class ProcessRegistry(ProcessCheckpointMixin):
         with self._lock:
             was_running = session.id in self._running
             if was_running:
+                # A late reader may arrive after pruning; only a tracked
+                # running session can create a finished entry.
                 session.exited_at = time.time()
                 # Keep the session tracked until its result is durable. A finite
                 # parent must not observe completion and exit during this write.
                 save_completed_result(session)
                 self._running.pop(session.id)
-            self._finished[session.id] = session
+                self._finished[session.id] = session
         # Release the retained Popen/PTY handles now: otherwise every
         # finished-but-unpruned session keeps its stdout pipe (or PTY master)
         # FD open until FINISHED_TTL_SECONDS elapses, and heavy background
-        # churn can exhaust the gateway's FD limit. On the reader-thread path
-        # the pipe is already at EOF; on the kill/reconcile paths the reader
-        # may still be draining — its next read raises on the closed stream
-        # and the loop exits, dropping at most the unread tail of a process
-        # that was just killed. poll()/wait()/read_log() serve from the
-        # buffered ``output_buffer``, never from the pipe.
+        # churn can exhaust the gateway's FD limit. A live POSIX PTY reader
+        # owns its close and is asked to stop; never close its buffered stream
+        # from another thread. poll()/wait()/read_log() serve from the buffered
+        # ``output_buffer``, never from the pipe.
         self._release_finished_handles(session)
         self._write_checkpoint()
         if was_running and session.notify_on_complete:
@@ -1892,16 +1904,14 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     with suppress(OSError, ValueError):  # a stdin flush can hit EPIPE
                         stream.close()
         if session._pty is not None:
-            # A live ptyprocess reader sits in a blocking read holding the PTY file
-            # object's buffer lock, and that read only ends once every holder of
-            # the slave side is gone. A descendant that setsid()s past the kill
-            # keeps it open, so close() here would block forever (under _lock on
-            # the prune path). The reader closes the PTY itself via
-            # _finish_reader once its read ends. pywinpty reads don't block, so
-            # Windows closes here as before.
+            # Only the reader may close a live POSIX PTY: close() takes the same
+            # buffer lock as read(). Request cancellation before deferring; the
+            # bounded poll wakes even if a detached descendant retains the slave.
+            # pywinpty reads don't block, so Windows closes here as before.
             reader = session._reader_thread
             if (not _IS_WINDOWS and reader is not None and reader.is_alive()
                     and reader is not threading.current_thread()):
+                session._reader_finish_requested.set()
                 return
             # ptyprocess/pywinpty close() is idempotent (``closed`` flag) and
             # closes the master fd exactly once; it raises only if the child

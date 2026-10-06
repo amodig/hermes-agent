@@ -446,16 +446,27 @@ def test_pty_reader_loop_reassembles_multibyte_char_split_across_chunks(registry
                 return self._chunks.pop(0)
             raise EOFError
 
+        def fileno(self):
+            return read_fd
+
         def wait(self):
             return 0
 
+    # Real readiness FD for the staged byte chunks; only this reader consumes
+    # the fake PTY, so a single ready byte covers each read.
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b"x")
     session = _make_session(sid="proc_pty_utf8")
     session._pty = _FakePty([b"caf\xc3", b"\xa9\n"])
     monkeypatch.setattr(registry, "_check_watch_patterns", lambda _s, _c: None)
     monkeypatch.setattr(registry, "_emit_output", lambda _s, _c: None)
     monkeypatch.setattr(registry, "_move_to_finished", lambda _s: None)
 
-    registry._pty_reader_loop(session)
+    try:
+        registry._pty_reader_loop(session)
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
 
     assert session.output_buffer == "café\n"
     assert "\ufffd" not in session.output_buffer

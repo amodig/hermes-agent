@@ -9,9 +9,9 @@ nested request in the caller's contextvars (profile home, secret scope, session)
 reader thread's bare context.
 
 Values cross as JSON. Callables and provider objects travel as references the other side turns
-back into proxies; dataclasses become :class:`Record` (dict + attribute access); anything else
-becomes an :class:`Opaque` placeholder naming its type, so a plugin that touches a live handle it
-cannot have fails with a readable error rather than a pickle surprise.
+back into proxies; dataclasses become :class:`Record` (dict + attribute access). The provider's
+``OMIT_TEMPERATURE`` sentinel has an explicit tag; other objects become :class:`Opaque`
+placeholders, never arbitrary object hydration.
 """
 
 from __future__ import annotations
@@ -27,6 +27,8 @@ import threading
 from concurrent.futures import Future
 from pathlib import PurePath
 from typing import Any, BinaryIO, Callable, Dict, Optional
+
+from providers.base import OMIT_TEMPERATURE
 
 logger = logging.getLogger("hermes_cli.plugins")
 
@@ -98,6 +100,8 @@ def encode(value: Any, refs: Optional[Callable[[Any], Optional[dict]]] = None, _
     """JSON-safe form of ``value``; ``refs`` may turn callables/objects into reference dicts."""
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    if value is OMIT_TEMPERATURE:
+        return {"__sentinel__": "OMIT_TEMPERATURE"}
     if _depth > 64:
         return {"__opaque__": type(value).__name__, "repr": "<too deep>"}
     if isinstance(value, enum.Enum):
@@ -138,6 +142,8 @@ def decode(value: Any, resolve: Optional[Callable[[dict], Any]] = None) -> Any:
         return [decode(v, resolve) for v in value]
     if not isinstance(value, dict):
         return value
+    if value == {"__sentinel__": "OMIT_TEMPERATURE"}:
+        return OMIT_TEMPERATURE
     if "__record__" in value:
         return Record(decode(value.get("fields") or {}, resolve))
     if "__bytes__" in value:

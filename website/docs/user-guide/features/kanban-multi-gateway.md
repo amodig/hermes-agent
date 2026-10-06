@@ -28,6 +28,13 @@ each gateway polls only subscriptions for profiles whose platform adapters it
 hosts. The atomic event claim prevents duplicate delivery across watcher
 processes.
 
+The embedded dispatcher visits each resolved database only once per dispatch,
+pending-work probe, or auto-decomposition pass. If `HERMES_KANBAN_DB` pins
+several enumerated board names to one database, work retains the canonical
+active board name rather than the first enumerated name. Without a database
+pin, distinct boards still dispatch independently; `kanban.max_spawn` remains
+per-board, and the auto-decomposition attempt budget is shared across boards.
+
 ## Worker runtime generations
 
 Before granting a worker claim, the dispatcher prepares an immutable generation

@@ -26,7 +26,7 @@ from hermes_cli.plugin_host_wire import PluginHostUnavailable, decode, signature
 logger = logging.getLogger(__name__)
 
 _EXTRACT_TIMEOUT_SECS = 60.0
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2  # re-extract profiles cached before the OMIT_TEMPERATURE wire tag
 
 
 def load_hosted_profiles(plugin_dir: Path, module_name: str) -> List[Any]:

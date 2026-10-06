@@ -151,8 +151,12 @@ def test_managed_scope_pins_host_isolation_over_the_profiles_own_config(tmp_path
 
 MODEL_PROVIDER_PLUGIN = '''
 import os
+from pathlib import Path
 from providers import register_provider
 from providers.base import ProviderProfile
+
+with (Path(os.environ["HERMES_HOME"]) / "hostmodel-imports.txt").open("a", encoding="utf-8") as marker:
+    marker.write(str(os.getpid()) + "\\n")
 
 class HostModel(ProviderProfile):
     def build_extra_body(self, *, session_id=None, **context):
@@ -178,12 +182,52 @@ def test_model_provider_profile_data_is_local_and_overrides_run_in_the_host(tmp_
         assert profile.base_url == "https://hostmodel.example/v1" and tuple(profile.env_vars) == ("HOSTMODEL_KEY",)
         assert list((home / "cache" / "plugin_host" / "model-providers").glob("hostmodel-*.json"))
         assert not any("hostmodel" in name for name in sys.modules)
+        marker = home / "hostmodel-imports.txt"
+        extraction_pids = marker.read_text(encoding="utf-8").splitlines()
+        assert len(extraction_pids) == 1
+        assert int(extraction_pids[0]) != os.getpid()
         body = profile.build_extra_body(session_id="s1")
         assert body["session_id"] == "s1" and body["pid"] != os.getpid()
+        assert marker.read_text(encoding="utf-8").splitlines() == [*extraction_pids, str(body["pid"])]
+        assert profile.build_extra_body(session_id="s2") == {"session_id": "s2", "pid": body["pid"]}
+        assert marker.read_text(encoding="utf-8").splitlines() == [*extraction_pids, str(body["pid"])]
     finally:
         host = getattr(plugins_mod.get_plugin_manager(), "_plugin_host_instance", None)
         if host is not None:
             host.shutdown()
+
+
+@pytest.mark.platforms("any")  # exercises the real credential-free extraction process and disk cache
+def test_hosted_profile_temperature_survives_extraction(tmp_path, monkeypatch):
+    from agent.transports.chat_completions import ChatCompletionsTransport
+    from hermes_cli.plugin_host_profiles import load_hosted_profiles
+    from providers.base import OMIT_TEMPERATURE
+
+    home = _home_with_plugins(tmp_path, monkeypatch, {})
+    plugin_dir = home / "plugins" / "model-providers" / "hosttemperature"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "__init__.py").write_text(
+        "from providers import register_provider\n"
+        "from providers.base import OMIT_TEMPERATURE, ProviderProfile\n"
+        "for name, temperature in [('omit', OMIT_TEMPERATURE), ('default', None), "
+        "('zero', 0.0), ('fixed', 0.65)]:\n"
+        "    register_provider(ProviderProfile(name=name, fixed_temperature=temperature))\n",
+        encoding="utf-8",
+    )
+    transport = ChatCompletionsTransport()
+    for _ in range(2):  # first load extracts; the second decodes the persisted payload
+        profiles = {p.name: p for p in load_hosted_profiles(plugin_dir, "_hermes_hosttemperature")}
+        assert profiles["omit"].fixed_temperature is OMIT_TEMPERATURE
+        for name, expected in (("omit", None), ("default", 0.4), ("zero", 0.0), ("fixed", 0.65)):
+            kwargs = transport.build_kwargs(
+                model="test-model", messages=[{"role": "user", "content": "Hi"}],
+                provider_profile=profiles[name], temperature=0.4,
+            )
+            if name == "omit":
+                assert "temperature" not in kwargs
+            else:
+                assert kwargs["temperature"] == expected
+            json.dumps(kwargs)  # no opaque sentinel may leak into the API request
 
 
 ASYNC_PLUGIN = '''

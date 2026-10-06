@@ -107,6 +107,16 @@ run, or charges a retry. That run belongs to a live, verified worker, so a faile
 hook or a failed PID write is logged and the spawn still counts rather than
 requeueing the card beside a worker that is already running.
 
+### Background terminal cleanup
+
+On POSIX, killing a PTY-backed background terminal cancels its output reader
+within the reader's 200 ms polling interval and lets that reader close the PTY
+master. A detached descendant retaining the slave cannot keep the reader or
+master alive, even after the finished session is pruned, and cleanup does not
+signal that detached process just to release the terminal. Kill/prune never
+wait for the reader while holding the registry lock. The kill's captured output
+and single completion remain unchanged; Windows teardown is unchanged.
+
 ## Failure accounting
 
 Ordinary worker crashes are counted against the configured

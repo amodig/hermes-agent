@@ -25,6 +25,13 @@ Steps 2 and 3 are **per profile home**: one process that serves several profiles
 
 **User plugins override bundled plugins of the same name** because `register_provider()` is last-writer-wins. Drop a `$HERMES_HOME/plugins/model-providers/gmi/` directory to replace the built-in GMI profile without touching the repo.
 
+With `plugins.isolation: host`, profile data is extracted in a credential-free child and cached
+under that profile's home. Extraction initializes only bundled providers before importing the
+target once, without an eager home scan. Overridden methods load the target once in the
+profile's long-lived plugin host on first use. `fixed_temperature=OMIT_TEMPERATURE` retains its
+sentinel identity across extraction and caching, so requests omit `temperature`; numeric
+overrides and `None` (use the caller's value) keep their usual behavior.
+
 ## Directory structure
 
 ```

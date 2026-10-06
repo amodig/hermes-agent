@@ -508,7 +508,7 @@ def capture_profiles(path: str, module_name: str) -> List[Any]:
     """Import a model-provider plugin and return the profiles it passes to ``register_provider``."""
     import providers
     from providers.base import ProviderProfile
-    providers.list_providers()  # bundled + known profiles register before the capture window
+    providers._discover_providers(bundled_only=True)  # never scan the target's home before capture
     captured: List[Any] = []
     original = providers.register_provider
     providers.register_provider = captured.append  # type: ignore[assignment]

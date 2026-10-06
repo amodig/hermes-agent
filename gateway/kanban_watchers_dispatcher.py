@@ -142,8 +142,27 @@ class _KanbanDispatcher:
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
         _kbd()._freeze_runtime_identity()
 
-    def _board_slugs(self) -> list:
-        return _board_slugs(self.kb)
+    def _board_slugs(self) -> list[str]:
+        """Visit each resolved DB once, keeping the pinned board's identity."""
+        from hermes_cli import kanban_db as _kb
+
+        with _kb.pin_first_board_resolution():
+            slugs = _board_slugs(self.kb)
+            if os.environ.get("HERMES_KANBAN_DB", "").strip():
+                # Enumeration starts with default, not necessarily the board
+                # whose DB the gateway pins. Use the canonical active slug.
+                slugs.insert(0, self.kb.get_current_board())
+            seen_db_paths: set[str] = set()
+            unique: list[str] = []
+            for slug in slugs:
+                try:
+                    resolved = str(self.kb.kanban_db_path(slug).expanduser().resolve())
+                except Exception:
+                    resolved = f"slug:{slug}"
+                if resolved not in seen_db_paths:
+                    seen_db_paths.add(resolved)
+                    unique.append(slug)
+            return unique
 
     def board_db_fingerprint(self, slug: str) -> tuple[str, int | None, int | None]:
         from hermes_cli import kanban_db as _kb
