@@ -178,7 +178,15 @@ def test_model_provider_profile_data_is_local_and_overrides_run_in_the_host(tmp_
     plugin_dir.mkdir(parents=True)
     (plugin_dir / "plugin.yaml").write_text("name: hostmodel\nkind: model-provider\n", encoding="utf-8")
     (plugin_dir / "__init__.py").write_text(MODEL_PROVIDER_PLUGIN, encoding="utf-8")
-    profile = providers.get_provider_profile("hostmodel")
+    providers._discover_providers(bundled_only=True)
+    barrier = Barrier(4)
+    def first_lookup(index):
+        barrier.wait(timeout=10)
+        return providers.get_provider_profile("hostmodel")
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        profiles = list(pool.map(first_lookup, range(4)))
+    assert all(isinstance(profile, providers.ProviderProfile) for profile in profiles)
+    profile = profiles[0]
     try:
         assert isinstance(profile, providers.ProviderProfile)
         # Discovery never started a host: data came from the cached, credential-free extraction.

@@ -18,6 +18,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
@@ -27,6 +28,8 @@ logger = logging.getLogger(__name__)
 
 _EXTRACT_TIMEOUT_SECS = 60.0
 _CACHE_VERSION = 2  # re-extract profiles cached before the OMIT_TEMPERATURE wire tag
+_EXTRACTION_LOCKS: Dict[Path, Any] = {}
+_EXTRACTION_LOCKS_GUARD = threading.Lock()
 
 
 def load_hosted_profiles(plugin_dir: Path, module_name: str) -> List[Any]:
@@ -59,21 +62,27 @@ def _cached_extraction(plugin_dir: Path, module_name: str) -> Dict[str, Any]:
     # Keyed by the full path too: a user and a project plugin may share a directory name.
     path_key = hashlib.sha256(str(plugin_dir.resolve()).encode("utf-8")).hexdigest()[:12]
     cache = get_hermes_home() / "cache" / "plugin_host" / "model-providers" / f"{plugin_dir.name}-{path_key}.json"
-    fingerprint = _fingerprint(plugin_dir)
-    try:
-        cached = json.loads(cache.read_text(encoding="utf-8-sig"))
-        if cached.get("fingerprint") == fingerprint and cached.get("module_name") == module_name:
-            return cached["payload"]
-    except (OSError, ValueError, KeyError):
-        pass
-    payload = _extract(plugin_dir, module_name)
-    if not payload.get("error"):
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cache.with_suffix(f".{os.getpid()}.tmp")
-        tmp.write_text(json.dumps({"fingerprint": fingerprint, "module_name": module_name,
-                                   "payload": payload}), encoding="utf-8")
-        os.replace(tmp, cache)
-    return payload
+    with _EXTRACTION_LOCKS_GUARD:
+        lock = _EXTRACTION_LOCKS.get(cache)
+        if lock is None:
+            lock = _EXTRACTION_LOCKS[cache] = threading.Lock()
+    # Recheck under the per-cache lock: another lookup may have already extracted it.
+    with lock:
+        fingerprint = _fingerprint(plugin_dir)
+        try:
+            cached = json.loads(cache.read_text(encoding="utf-8-sig"))
+            if cached.get("fingerprint") == fingerprint and cached.get("module_name") == module_name:
+                return cached["payload"]
+        except (OSError, ValueError, KeyError):
+            pass
+        payload = _extract(plugin_dir, module_name)
+        if not payload.get("error"):
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps({"fingerprint": fingerprint, "module_name": module_name,
+                                       "payload": payload}), encoding="utf-8")
+            os.replace(tmp, cache)
+        return payload
 
 
 def _extract(plugin_dir: Path, module_name: str) -> Dict[str, Any]:
