@@ -820,9 +820,11 @@ What changes in `host` mode:
 - **Crashes stay contained.** A plugin that crashes or exits kills its host, not Hermes; the call in
   flight returns a tool error and Hermes restarts the host and reloads its plugins (bounded retries).
 - **Unload cancels plugin-owned background work.** Coroutines started with `ctx.spawn_task()`
-  are cancelled when that plugin unloads, reloads, or fails registration; cleanup callbacks run
-  for failed registration too, retaining parent callback context until cleanup finishes. Other
-  plugins keep their host process.
+  are cancelled when that plugin unloads, reloads, fails registration, or exceeds
+  `plugins.load_timeout_seconds`; cleanup callbacks retain parent callback context until cleanup
+  finishes. Timed-out loads cannot register more callbacks or start new `ctx.spawn_task()` work.
+  Synchronous Python code already running cannot be forcibly stopped: its modules are evicted when
+  it returns, and the same plugin cannot load again until then. Other plugins keep their host process.
 - **Deferred callbacks keep the owning profile.** Background callbacks bind current owner
   credentials and terminal policy even if multiplexing activates later; in-flight callbacks
   retain their caller's scope.
@@ -832,6 +834,8 @@ What changes in `host` mode:
   each memory/context-engine/category load still creates a fresh provider instance.
 - **Retained provider proxies refresh once after a host crash.** Concurrent callers share one
   replacement instance and one registration refresh rather than duplicating forwarded hooks.
+- **Ordinary JSON dictionaries stay dictionaries.** Keys resembling internal wire tags, such as
+  `__bytes__`, are escaped recursively; actual bytes, records and references keep their semantics.
 - **A few surfaces need in-process code** and fail that plugin with a clear reason instead of loading:
   gateway platform adapters (`register_platform`), approval transports, Telegram/platform handlers,
   model-provider profiles that build their own SDK client (`create_client`), streaming dashboard

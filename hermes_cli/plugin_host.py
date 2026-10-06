@@ -64,6 +64,7 @@ class PluginHost:
         self._handles: Dict[int, Any] = {}
         self._handle_ids = itertools.count(1)
         self._loading: Optional[str] = None
+        self._pending_loads: set[str] = set()
         self._stopping = False
         self._deaths: list = []
         # Bumped per host process: a proxy made for an earlier process must not address this one
@@ -207,32 +208,47 @@ class PluginHost:
     def load(self, manifest: Any, ctx: Any, *, module_name: Optional[str], entrypoint: bool) -> str:
         """Import ``manifest``'s plugin in the host and replay its registrations onto ``ctx``."""
         from hermes_cli.plugins import PluginContext, manifest_key
-        channel = self.ensure_started()
+        from hermes_cli.plugins_loader import PluginLoadTimeout
         plugin_key = manifest_key(manifest)
-        self._contexts[plugin_key] = ctx
-        params = {
-            "plugin_key": plugin_key, "plugin_id": ctx.plugin_id, "name": manifest.name,
-            "path": manifest.path, "module_name": module_name, "entrypoint": entrypoint,
-            "profile_name": self._build_base_context().run(lambda: ctx.profile_name),
-            "manifest": {k: getattr(manifest, k, None) for k in (
-                "name", "version", "description", "author", "source", "path", "key", "kind",
-                "skill_namespace")},
-            "ctx_methods": sorted(n for n in dir(PluginContext) if not n.startswith("_")),
-        }
-        self._loading = plugin_key
+        with self._lock:
+            if plugin_key in self._pending_loads:
+                raise PluginLoadTimeout(f"previous load of '{plugin_key}' is still running in the plugin host")
+            self._pending_loads.add(plugin_key)
+            self._contexts[plugin_key] = ctx
+        # Enrol before the RPC, not after register() returns: deadline abandonment never raises
+        # inside this worker. Internal cleanup must also survive a race with ctx's abandonment guard.
+        cleanup = ctx._track("on_unload", "plugin_host", functools.partial(self._unload, plugin_key))
         try:
+            if ctx._load_abandoned:
+                raise PluginLoadTimeout("plugin host load was abandoned")
+            channel = self.ensure_started()
+            params = {
+                "plugin_key": plugin_key, "plugin_id": ctx.plugin_id, "name": manifest.name,
+                "path": manifest.path, "module_name": module_name, "entrypoint": entrypoint,
+                "deadline": getattr(ctx, "_load_deadline", None),
+                "profile_name": self._build_base_context().run(lambda: ctx.profile_name),
+                "manifest": {k: getattr(manifest, k, None) for k in (
+                    "name", "version", "description", "author", "source", "path", "key", "kind",
+                    "skill_namespace")},
+                "ctx_methods": sorted(n for n in dir(PluginContext) if not n.startswith("_")),
+            }
+            if ctx._load_abandoned:
+                raise PluginLoadTimeout("plugin host load was abandoned")
+            self._loading = plugin_key
             result = channel.call("load", params)
+            # Successful unloads still run child cleanup before disposing the proxy registrations.
+            ctx.on_unload(cleanup.dispose)
+            return str((result or {}).get("module") or module_name or "")
         except BaseException:
-            try:
-                channel.call("unload", {"plugin_key": plugin_key})
-            except Exception:
-                logger.warning("Failed to clean up rejected plugin '%s'", plugin_key, exc_info=True)
-            self._contexts.pop(plugin_key, None)
+            cleanup.dispose()
             raise
         finally:
-            self._loading = None
-        ctx.on_unload(functools.partial(self._unload, plugin_key))
-        return str((result or {}).get("module") or module_name or "")
+            if ctx._load_abandoned:
+                cleanup.dispose()
+            with self._lock:
+                self._pending_loads.discard(plugin_key)
+                if self._loading == plugin_key:
+                    self._loading = None
 
     def load_instance(self, plugin_dir: Path, *, module_name: str, base_ref: str, capture: str,
                       ctx: Any = None, before_reload: Optional[Callable[[], None]] = None) -> Any:
@@ -303,6 +319,9 @@ class PluginHost:
                                    "headers": [list(h) for h in headers], "body": encode(body)})
 
     def _unload(self, plugin_key: str) -> None:
+        ctx = self._contexts.get(plugin_key)
+        if ctx is not None:
+            ctx._abandon_load()
         try:
             channel = self._channel
             if channel is None or channel.closed_reason is not None:
@@ -310,8 +329,13 @@ class PluginHost:
             errors = (channel.call("unload", {"plugin_key": plugin_key}) or {}).get("errors") or []
             for error in errors:
                 logger.warning("Plugin '%s' on_unload callback failed in the plugin host: %s", plugin_key, error)
+        except Exception:
+            logger.warning("Failed to clean up plugin '%s' in the plugin host", plugin_key, exc_info=True)
         finally:
             self._contexts.pop(plugin_key, None)
+            for handle_id, handle in self._handles.copy().items():
+                if handle.plugin_key == plugin_key:
+                    self._handles.pop(handle_id, None)
 
     # -- parent -> host -----------------------------------------------------------------------------
     def _call(self, method: str, params: Dict[str, Any], *, generation: Optional[int] = None) -> Any:

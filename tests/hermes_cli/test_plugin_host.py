@@ -137,6 +137,183 @@ async def register(ctx):
 
 
 @pytest.mark.platforms("any")
+@pytest.mark.parametrize("stall", ["register", "async_register", "import"])
+def test_load_deadline_retires_child_work_without_stopping_siblings(tmp_path, monkeypatch, stall):
+    import threading
+
+    from hermes_cli import plugins_loader
+    from tools.registry import registry
+
+    home = _home_with_plugins(tmp_path, monkeypatch, {"deadlineobserver": '''
+import asyncio, json, os, sys
+
+def register(ctx):
+    async def inspect(args, **kw):
+        await asyncio.sleep(0)  # let any wrongly accepted late task reach its side effect
+        runtime = ctx._runtime
+        key = "deadlineprobe"
+        with runtime._lock:
+            retained = [name for name in (
+                "contexts", "loading", "modules", "plugin_paths", "background_tasks", "unload_callbacks"
+            ) if key in getattr(runtime, name)]
+            if key in runtime.owners.values():
+                retained.append("refs")
+        return json.dumps({"pid": os.getpid(), "retained": retained,
+            "imported": any(name == args["module"] or name.startswith(args["module"] + ".")
+                            for name in sys.modules.copy())})
+    ctx.register_tool(name="deadline_inspect", toolset="deadlineobserver",
+        schema={"name": "deadline_inspect", "description": "Inspect the child",
+                "parameters": {"type": "object", "properties": {}}},
+        handler=inspect, is_async=True)
+'''})
+    manager = PluginManager()
+    host = manager._plugin_host()
+    plugin_dir = home / "plugins" / "deadlineprobe"
+    plugin_dir.mkdir()
+    (plugin_dir / "__init__.py").write_text(f"STALL = {stall!r}\n" + '''
+import asyncio, os, time
+from pathlib import Path
+
+home = Path(os.environ["HERMES_HOME"])
+if STALL == "import":
+    (home / "stall-started").touch()
+    while not (home / "finish-register").exists():
+        time.sleep(0.01)
+
+async def background():
+    (home / "background-started").touch()
+    try:
+        while not (home / "release-background").exists():
+            await asyncio.sleep(0.01)
+        (home / "unexpected-background").touch()
+    finally:
+        (home / "background-stopped").touch()
+
+async def late_background():
+    (home / "unexpected-late-task").touch()
+
+def late(ctx):
+    for call in (
+        lambda: ctx.spawn_task(late_background()),
+        lambda: ctx.on_unload(lambda: (home / "unexpected-late-cleanup").touch()),
+        lambda: ctx.register_tool(name="deadline_late", toolset="deadlineprobe",
+            schema={"name": "deadline_late", "description": "Late registration",
+                    "parameters": {"type": "object", "properties": {}}},
+            handler=lambda args, **kw: "late"),
+    ):
+        try:
+            call()
+        except RuntimeError:
+            pass
+    (home / "late-attempted").touch()
+
+async def async_register(ctx):
+    try:
+        while not (home / "finish-register").exists():
+            await asyncio.sleep(0.01)
+    finally:
+        late(ctx)  # also exercise code running as cancellation unwinds an async register()
+
+def register(ctx):
+    if STALL == "import":
+        (home / "unexpected-register").touch()
+        return
+    ctx.on_unload(lambda: ctx.dispatch_tool("deadline_cleanup", {}))
+    ctx.spawn_task(background())
+    (home / "stall-started").touch()
+    if STALL == "async_register":
+        return async_register(ctx)
+    while not (home / "finish-register").exists():
+        time.sleep(0.01)
+    late(ctx)
+''', encoding="utf-8")
+    manifest = plugins_mod.PluginManifest(name="deadlineprobe", source="user", path=str(plugin_dir))
+    cleaned = []
+    registry.register(
+        name="deadline_cleanup", toolset="deadlineobserver",
+        schema={"name": "deadline_cleanup", "description": "Cleanup",
+                "parameters": {"type": "object", "properties": {}}},
+        scope=manager.scope_key, handler=lambda args, **kw: cleaned.append(True) or "cleaned")
+    load_done = threading.Event()
+
+    def load():
+        try:
+            manager._load_plugin(manifest)
+        finally:
+            load_done.set()
+
+    loader = threading.Thread(target=load, daemon=True)
+
+    def await_marker(name):
+        deadline = time.monotonic() + 5
+        while not (home / name).exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert (home / name).exists(), name
+
+    try:
+        # Warm the real child and its sibling before applying the small configured load budget.
+        manager._load_plugin(plugins_mod.PluginManifest(
+            name="deadlineobserver", source="user", path=str(home / "plugins" / "deadlineobserver")))
+        assert manager._plugins["deadlineobserver"].error is None
+        pid = host.pid
+        (home / "config.yaml").write_text(yaml.safe_dump({"plugins": {
+            "enabled": ["deadlineobserver", "deadlineprobe"], "isolation": "host",
+            "load_timeout_seconds": 0.5,
+        }}), encoding="utf-8")
+        loader.start()
+        await_marker("stall-started")
+        assert load_done.wait(5), "deadline cleanup waited on stalled import/register()"
+        assert "timed out" in str(manager._plugins["deadlineprobe"].error)
+        assert not manager._plugins["deadlineprobe"].enabled
+        if stall != "import":
+            assert cleaned == [True]  # cleanup could still call back through the parent context
+            await_marker("background-stopped")
+        if stall != "async_register":
+            manager._load_plugin(manifest)
+            assert "previous load" in str(manager._plugins["deadlineprobe"].error)
+        assert host.alive and host.pid == pid
+        module_name = manager._policy_module_name(manifest)
+        assert json.loads(registry.dispatch(
+            "deadline_inspect", {"module": module_name}, scope=manager.scope_key))["pid"] == pid
+        (home / "finish-register").touch()
+        (home / "release-background").touch()
+        for worker in plugins_loader._ABANDONED_LOADERS:
+            if worker.name == "plugin-load:deadlineprobe":
+                worker.join(5)
+                assert not worker.is_alive()
+        if stall != "import":
+            await_marker("late-attempted")
+        state = json.loads(registry.dispatch(
+            "deadline_inspect", {"module": module_name}, scope=manager.scope_key))
+        assert state == {"pid": pid, "retained": [], "imported": False}
+        assert "deadlineprobe" not in host._contexts
+        assert not any(handle.plugin_key == "deadlineprobe" for handle in host._handles.values())
+        assert "deadlineprobe" not in manager._ownership_ledger
+        assert "deadline_late" not in manager._plugin_tool_names
+        assert not list(home.glob("unexpected-*"))
+        # Once the retired worker is gone, a fresh attempt at that same key is usable.
+        (plugin_dir / "__init__.py").write_text('''
+def register(ctx):
+    ctx.register_tool(name="deadline_late", toolset="deadlineprobe",
+        schema={"name": "deadline_late", "description": "Fresh registration",
+                "parameters": {"type": "object", "properties": {}}},
+        handler=lambda args, **kw: "reloaded")
+''', encoding="utf-8")
+        manager._load_plugin(manifest)
+        assert manager._plugins["deadlineprobe"].error is None
+        assert registry.dispatch("deadline_late", {}, scope=manager.scope_key) == "reloaded"
+        assert host.alive and host.pid == pid
+    finally:
+        (home / "finish-register").touch()
+        (home / "release-background").touch()
+        if loader.ident is not None:
+            loader.join(5)
+        manager.unload()
+        registry.deregister("deadline_cleanup", scope=manager.scope_key)
+        host.shutdown()
+
+
+@pytest.mark.platforms("any")
 def test_unload_callback_can_dispatch_back_to_parent(tmp_path, monkeypatch):
     from tools.registry import registry
     _home_with_plugins(tmp_path, monkeypatch, {"cleanupprobe": '''

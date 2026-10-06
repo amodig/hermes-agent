@@ -14,6 +14,7 @@ plugin lands in the host log instead of corrupting the wire.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import importlib
 import importlib.metadata
@@ -24,6 +25,7 @@ import logging
 import os
 import sys
 import threading
+import time
 import types
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -36,6 +38,8 @@ from hermes_cli.plugin_host_wire import (
 logger = logging.getLogger("hermes_cli.plugin_host_child")
 
 _ENTRY_POINTS_GROUP = "hermes_agent.plugins"
+_CLEANUP_CONTEXT: contextvars.ContextVar[Optional["RemotePluginContext"]] = contextvars.ContextVar(
+    "plugin_host_cleanup_context", default=None)
 
 
 class RemoteRegistration:
@@ -59,19 +63,19 @@ class RemoteRegistration:
 class RemoteFacade:
     """``ctx.state`` / ``ctx.llm`` / ...: every method call runs on the Hermes-side facade."""
 
-    def __init__(self, runtime: "HostRuntime", plugin_key: str, name: str):
-        self._runtime, self._plugin_key, self._name = runtime, plugin_key, name
+    def __init__(self, runtime: "HostRuntime", ctx: "RemotePluginContext", name: str):
+        self._runtime, self._ctx, self._name = runtime, ctx, name
         self._methods: Dict[str, bool] = {}  # method name -> is a coroutine function in Hermes
 
     def __getattr__(self, attr: str) -> Any:
         if attr.startswith("_"):
             raise AttributeError(attr)
         if attr not in self._methods:
-            value = self._runtime.facade_call(self._plugin_key, self._name, attr, _probe=True)
+            value = self._runtime.facade_call(self._ctx, self._name, attr, _probe=True)
             if not (isinstance(value, dict) and value.get("__method__")):
                 return value  # a plain attribute (``ctx.state.data_dir``): read fresh every time
             self._methods[attr] = bool(value.get("async"))
-        call = functools.partial(self._runtime.facade_call, self._plugin_key, self._name, attr)
+        call = functools.partial(self._runtime.facade_call, self._ctx, self._name, attr)
         if not self._methods[attr]:
             return call
 
@@ -93,6 +97,17 @@ class RemotePluginContext:
         self.manifest = types.SimpleNamespace(**(info.get("manifest") or {}))
         self.plugin_id = info.get("plugin_id") or plugin_key
         self.profile_name = info.get("profile_name")
+        self._active = True
+        self._cleaning = False
+        self._deadline = info.get("deadline")
+
+    def _check_active(self, *, cleanup: bool = False) -> None:
+        if cleanup and self._cleaning and _CLEANUP_CONTEXT.get() is self:
+            return
+        if not self._active:
+            raise RuntimeError(f"Plugin '{self.plugin_id}' has been unloaded")
+        if self._deadline is not None and time.monotonic() >= self._deadline:
+            raise RuntimeError(f"Plugin '{self.plugin_id}' load timed out")
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
@@ -112,18 +127,20 @@ class RemotePluginContext:
                 return None
             return skipped
         if name in HOST_REMOTE_FACADES:
-            return self._facades.setdefault(name, RemoteFacade(self._runtime, self._plugin_key, name))
+            return self._facades.setdefault(name, RemoteFacade(self._runtime, self, name))
         if name not in self._methods:
             raise AttributeError(f"'PluginContext' object has no attribute {name!r}")
-        return functools.partial(self._runtime.ctx_call, self._plugin_key, name)
+        return functools.partial(self._runtime.ctx_call, self, name)
 
     def on_unload(self, callback: Callable[[], Any]) -> None:
         if not callable(callback):
             raise TypeError("on_unload() callback must be callable")
-        self._runtime.unload_callbacks.setdefault(self._plugin_key, []).append(callback)
+        with self._runtime._lock:
+            self._check_active()
+            self._runtime.unload_callbacks.setdefault(self._plugin_key, []).append(callback)
 
     def spawn_task(self, coro: Any, *, name: Optional[str] = None) -> Any:
-        return self._runtime.spawn(self._plugin_key, coro, name=name)
+        return self._runtime.spawn(self, coro, name=name)
 
 
 class HostRuntime:
@@ -133,11 +150,13 @@ class HostRuntime:
         self.refs: Dict[int, Any] = {}
         self.owners: Dict[int, str] = {}
         self._ids = itertools.count(1)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.unload_callbacks: Dict[str, List[Callable[[], Any]]] = {}
         self.background_tasks: Dict[str, set] = {}
         self.modules: Dict[str, str] = {}
         self.plugin_paths: Dict[str, Path] = {}
+        self.contexts: Dict[str, RemotePluginContext] = {}
+        self.loading: set[str] = set()
         self.asgi_apps: Dict[Path, Dict[str, tuple[Any, types.ModuleType]]] = {}
         self.profiles: Dict[str, Dict[str, Any]] = {}
         # ponytail: serialize cold imports; shard only after capture stops replacing global registration.
@@ -198,27 +217,36 @@ class HostRuntime:
         return Opaque("callable" if "__callable__" in ref else "object")
 
     # -- outgoing ---------------------------------------------------------------------------------
-    def _send_call(self, method: str, plugin_key: str, payload: Dict[str, Any], *, allow_objects: bool) -> Any:
-        refs = functools.partial(self.ref_for, plugin_key, allow_objects=allow_objects)
-        payload = {**payload, "plugin": plugin_key,
-                   "args": encode(list(payload.pop("args", ())), refs),
-                   "kwargs": encode(dict(payload.pop("kwargs", {})), refs)}
+    def _send_call(self, method: str, ctx: RemotePluginContext, payload: Dict[str, Any], *, allow_objects: bool) -> Any:
+        # Check and encode together so unload cannot sweep refs and then have a late call add more.
+        with self._lock:
+            ctx._check_active(cleanup=True)
+            refs = functools.partial(self.ref_for, ctx._plugin_key, allow_objects=allow_objects)
+            payload = {**payload, "plugin": ctx._plugin_key,
+                       "args": encode(list(payload.pop("args", ())), refs),
+                       "kwargs": encode(dict(payload.pop("kwargs", {})), refs)}
         return decode(self.channel.call(method, payload), self.resolve_from_parent)
 
-    def ctx_call(self, plugin_key: str, method: str, *args: Any, **kwargs: Any) -> Any:
+    def ctx_call(self, ctx: RemotePluginContext, method: str, *args: Any, **kwargs: Any) -> Any:
         from hermes_cli.plugin_isolation import HOST_OBJECT_BASES
-        return self._send_call("ctx", plugin_key, {"method": method, "args": args, "kwargs": kwargs},
+        return self._send_call("ctx", ctx, {"method": method, "args": args, "kwargs": kwargs},
                                allow_objects=method in HOST_OBJECT_BASES)
 
-    def facade_call(self, plugin_key: str, facade: str, method: str, *args: Any, _probe: bool = False,
+    def facade_call(self, ctx: RemotePluginContext, facade: str, method: str, *args: Any, _probe: bool = False,
                     **kwargs: Any) -> Any:
-        return self._send_call("facade", plugin_key, {"facade": facade, "method": method, "probe": _probe,
-                                                      "args": args, "kwargs": kwargs}, allow_objects=False)
+        return self._send_call("facade", ctx, {"facade": facade, "method": method, "probe": _probe,
+                                              "args": args, "kwargs": kwargs}, allow_objects=False)
 
-    def spawn(self, plugin_key: str, coro: Any, *, name: Optional[str] = None) -> Any:
+    def spawn(self, ctx: RemotePluginContext, coro: Any, *, name: Optional[str] = None) -> Any:
         if not inspect.iscoroutine(coro):
             raise TypeError("spawn_task() requires a coroutine object")
+        plugin_key = ctx._plugin_key
         with self._lock:
+            try:
+                ctx._check_active()
+            except RuntimeError:
+                coro.close()
+                raise
             future = asyncio.run_coroutine_threadsafe(_on_behalf_of(coro, serving_request()), self.loop)
             self.background_tasks.setdefault(plugin_key, set()).add(future)
         def forget(done):
@@ -256,18 +284,38 @@ class HostRuntime:
 
     def op_load(self, params: Dict[str, Any]) -> Dict[str, Any]:
         plugin_key = str(params["plugin_key"])
-        with self._import_lock:
-            target = _import_plugin(params)
-            if params.get("path"):
-                self.plugin_paths[plugin_key] = Path(str(params["path"])).resolve()
-        register = target if callable(target) and not isinstance(target, types.ModuleType) \
-            else getattr(target, "register", None)
-        if not callable(register):
-            raise AttributeError(f"Plugin '{params.get('name')}' has no register() function")
-        module_name = getattr(target, "__name__", None) or getattr(register, "__module__", None)
-        self.modules[plugin_key] = str(module_name or "")
-        self._run(register(RemotePluginContext(self, plugin_key, params)))
-        return {"module": module_name}
+        ctx = RemotePluginContext(self, plugin_key, params)
+        with self._lock:
+            # A deadline's unload RPC can overtake this request's worker. Do not resurrect it.
+            ctx._check_active()
+            self.contexts[plugin_key] = ctx
+            self.loading.add(plugin_key)
+        try:
+            with self._import_lock:
+                target = _import_plugin(params)
+                if params.get("path"):
+                    self.plugin_paths[plugin_key] = Path(str(params["path"])).resolve()
+            register = target if callable(target) and not isinstance(target, types.ModuleType) \
+                else getattr(target, "register", None)
+            module_name = getattr(target, "__name__", None) or getattr(register, "__module__", None)
+            self.modules[plugin_key] = str(module_name or "")
+            ctx._check_active()
+            if not callable(register):
+                raise AttributeError(f"Plugin '{params.get('name')}' has no register() function")
+            result = register(ctx)
+            if inspect.iscoroutine(result):
+                self.spawn(ctx, result).result()
+            else:
+                self._run(result)
+            with self._lock:
+                ctx._check_active()
+                ctx._deadline = None
+            return {"module": module_name}
+        finally:
+            with self._lock:
+                self.loading.discard(plugin_key)
+            if not ctx._active:
+                self.op_unload(params)  # finish module eviction deferred while import/register ran
 
     def op_load_instance(self, params: Dict[str, Any]) -> Any:
         """Category plugins (memory provider, context engine, cron scheduler): import the directory,
@@ -288,6 +336,8 @@ class HostRuntime:
         if callable(register):
             ctx = _CapturingContext(self, plugin_key, params, capture, base, captured,
                                     forward=bool(params.get("forward")))
+            with self._lock:
+                self.contexts[plugin_key] = ctx
             try:
                 self._run(register(ctx))
             except Exception as exc:
@@ -418,18 +468,33 @@ class HostRuntime:
         plugin_key = str(params["plugin_key"])
         errors = []
         with self._lock:
+            ctx = self.contexts.pop(plugin_key, None)
+            if ctx is not None:
+                ctx._active = False
+            loading = plugin_key in self.loading
             tasks = self.background_tasks.pop(plugin_key, ())
+            callbacks = self.unload_callbacks.pop(plugin_key, [])
+            if ctx is not None:
+                ctx._cleaning = True
         for task in tasks:
             task.cancel()
-        for callback in reversed(self.unload_callbacks.pop(plugin_key, [])):
-            try:
-                self._run(callback())
-            except Exception as exc:
-                errors.append(f"{type(exc).__name__}: {exc}")
+        token = _CLEANUP_CONTEXT.set(ctx)
+        try:
+            for callback in reversed(callbacks):
+                try:
+                    self._run(callback())
+                except Exception as exc:
+                    errors.append(f"{type(exc).__name__}: {exc}")
+        finally:
+            _CLEANUP_CONTEXT.reset(token)
+            if ctx is not None:
+                ctx._cleaning = False
         with self._lock:
             for ref in [r for r, owner in self.owners.items() if owner == plugin_key]:
                 self.refs.pop(ref, None)
                 self.owners.pop(ref, None)
+        if loading:
+            return {"errors": errors}  # never wait on a stalled import; op_load finishes eviction
         with self._import_lock:
             plugin_dir = self.plugin_paths.pop(plugin_key, None)
             if plugin_dir is not None:

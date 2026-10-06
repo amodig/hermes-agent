@@ -11,7 +11,8 @@ reader thread's bare context.
 Values cross as JSON. Callables and provider objects travel as references the other side turns
 back into proxies; dataclasses become :class:`Record` (dict + attribute access). The provider's
 ``OMIT_TEMPERATURE`` sentinel has an explicit tag; other objects become :class:`Opaque`
-placeholders, never arbitrary object hydration.
+placeholders, never arbitrary object hydration. Ordinary dictionaries with reserved tag keys
+are escaped in a ``__dict__`` envelope so their contents remain data.
 """
 
 from __future__ import annotations
@@ -33,6 +34,11 @@ from providers.base import OMIT_TEMPERATURE
 logger = logging.getLogger("hermes_cli.plugins")
 
 PROTOCOL_VERSION = 1
+
+_VALUE_TAGS = frozenset({
+    "__dict__", "__bytes__", "__record__", "__opaque__",
+    "__callable__", "__object__", "__handle__", "__sentinel__",
+})
 
 
 class PluginHostError(RuntimeError):
@@ -97,7 +103,7 @@ class Opaque:
 
 
 def encode(value: Any, refs: Optional[Callable[[Any], Optional[dict]]] = None, _depth: int = 0) -> Any:
-    """JSON-safe form of ``value``; ``refs`` may turn callables/objects into reference dicts."""
+    """JSON-safe form of ``value``; ``refs`` returns already-encoded reference dicts, left unchanged."""
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if value is OMIT_TEMPERATURE:
@@ -111,7 +117,8 @@ def encode(value: Any, refs: Optional[Callable[[Any], Optional[dict]]] = None, _
     if isinstance(value, (bytes, bytearray)):
         return {"__bytes__": base64.b64encode(bytes(value)).decode("ascii")}
     if isinstance(value, dict):
-        return {str(k): encode(v, refs, _depth + 1) for k, v in value.items()}
+        fields = {str(k): encode(v, refs, _depth + 1) for k, v in value.items()}
+        return {"__dict__": fields} if not _VALUE_TAGS.isdisjoint(fields) else fields
     if isinstance(value, (list, tuple, set, frozenset)):
         return [encode(v, refs, _depth + 1) for v in value]
     if isinstance(value, Opaque):
@@ -142,6 +149,8 @@ def decode(value: Any, resolve: Optional[Callable[[dict], Any]] = None) -> Any:
         return [decode(v, resolve) for v in value]
     if not isinstance(value, dict):
         return value
+    if "__dict__" in value:
+        return {k: decode(v, resolve) for k, v in value["__dict__"].items()}
     if value == {"__sentinel__": "OMIT_TEMPERATURE"}:
         return OMIT_TEMPERATURE
     if "__record__" in value:

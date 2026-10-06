@@ -16,6 +16,7 @@ import logging
 import re
 import sys
 import threading
+import time
 import types
 from contextlib import contextmanager
 from functools import wraps
@@ -111,6 +112,7 @@ def run_with_load_deadline(plugin_key: str, ctx: "PluginContext", fn: Callable[[
     # Re-entrant load on our own deadline worker: run inline; the outer deadline covers it.
     outer_scope = _IN_PLUGIN_LOAD.get()
     if outer_scope is not None:
+        ctx._load_deadline = outer_scope[0]._load_deadline
         outer_scope.append(ctx)
         try:
             return fn()
@@ -137,6 +139,7 @@ def run_with_load_deadline(plugin_key: str, ctx: "PluginContext", fn: Callable[[
     worker = threading.Thread(
         target=contextvars.copy_context().run, args=(_worker,), name=f"plugin-load:{plugin_key}", daemon=True,
     )
+    ctx._load_deadline = time.monotonic() + timeout
     worker.start()
     worker.join(timeout)
     if worker.is_alive():
