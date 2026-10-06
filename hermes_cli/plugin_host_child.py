@@ -123,7 +123,7 @@ class RemotePluginContext:
         self._runtime.unload_callbacks.setdefault(self._plugin_key, []).append(callback)
 
     def spawn_task(self, coro: Any, *, name: Optional[str] = None) -> Any:
-        return self._runtime.spawn(coro, name=name)
+        return self._runtime.spawn(self._plugin_key, coro, name=name)
 
 
 class HostRuntime:
@@ -135,10 +135,12 @@ class HostRuntime:
         self._ids = itertools.count(1)
         self._lock = threading.Lock()
         self.unload_callbacks: Dict[str, List[Callable[[], Any]]] = {}
+        self.background_tasks: Dict[str, set] = {}
         self.modules: Dict[str, str] = {}
         self.asgi_apps: Dict[str, Any] = {}
         self.profiles: Dict[str, Dict[str, Any]] = {}
-        self._profile_lock = threading.Lock()
+        # ponytail: serialize cold imports; shard only after capture stops replacing global registration.
+        self._import_lock = threading.Lock()
         self.instance_modules: Dict[str, Any] = {}
         self.stopped = threading.Event()
         self.loop = asyncio.new_event_loop()
@@ -212,10 +214,21 @@ class HostRuntime:
         return self._send_call("facade", plugin_key, {"facade": facade, "method": method, "probe": _probe,
                                                       "args": args, "kwargs": kwargs}, allow_objects=False)
 
-    def spawn(self, coro: Any, *, name: Optional[str] = None) -> Any:
+    def spawn(self, plugin_key: str, coro: Any, *, name: Optional[str] = None) -> Any:
         if not inspect.iscoroutine(coro):
             raise TypeError("spawn_task() requires a coroutine object")
-        return asyncio.run_coroutine_threadsafe(_on_behalf_of(coro, serving_request()), self.loop)
+        with self._lock:
+            future = asyncio.run_coroutine_threadsafe(_on_behalf_of(coro, serving_request()), self.loop)
+            self.background_tasks.setdefault(plugin_key, set()).add(future)
+        def forget(done):
+            with self._lock:
+                tasks = self.background_tasks.get(plugin_key)
+                if tasks is not None:
+                    tasks.discard(done)
+                    if not tasks:
+                        self.background_tasks.pop(plugin_key, None)
+        future.add_done_callback(forget)
+        return future
 
     # -- incoming ---------------------------------------------------------------------------------
     def handle(self, method: str, params: Dict[str, Any], _origin: Optional[int]) -> Any:
@@ -242,7 +255,8 @@ class HostRuntime:
 
     def op_load(self, params: Dict[str, Any]) -> Dict[str, Any]:
         plugin_key = str(params["plugin_key"])
-        target = _import_plugin(params)
+        with self._import_lock:
+            target = _import_plugin(params)
         register = target if callable(target) and not isinstance(target, types.ModuleType) \
             else getattr(target, "register", None)
         if not callable(register):
@@ -259,9 +273,10 @@ class HostRuntime:
         plugin_key = str(params["plugin_key"])
         # Hermes asks for a fresh instance many times (agent cache, doctor, dashboard); like the
         # in-process loader, the module body runs once per host and only the instance is new.
-        module = self.instance_modules.get(str(params["path"]))
-        if module is None:
-            module = self.instance_modules[str(params["path"])] = _import_plugin(params)
+        with self._import_lock:
+            module = self.instance_modules.get(str(params["path"]))
+            if module is None:
+                module = self.instance_modules[str(params["path"])] = _import_plugin(params)
         self.modules[plugin_key] = module.__name__
         base = _import_base(str(params["base"]))
         capture = str(params["capture"])
@@ -292,7 +307,7 @@ class HostRuntime:
         """Run one overridden method (or callable field) of a model-provider profile, loading the
         plugin on first use in this host process. Addressed by name, so it survives host restarts."""
         # Capture replaces process-global registration; serialize misses across all paths.
-        with self._profile_lock:
+        with self._import_lock:
             profiles = self.profiles.get(str(params["path"]))
             if profiles is None:
                 profiles = self.profiles[str(params["path"])] = {
@@ -389,6 +404,10 @@ class HostRuntime:
     def op_unload(self, params: Dict[str, Any]) -> Dict[str, Any]:
         plugin_key = str(params["plugin_key"])
         errors = []
+        with self._lock:
+            tasks = self.background_tasks.pop(plugin_key, ())
+        for task in tasks:
+            task.cancel()
         for callback in reversed(self.unload_callbacks.pop(plugin_key, [])):
             try:
                 self._run(callback())
@@ -405,7 +424,7 @@ class HostRuntime:
         return {"errors": errors}
 
     def op_shutdown(self, _params: Dict[str, Any]) -> None:
-        for plugin_key in list(self.unload_callbacks):
+        for plugin_key in set(self.unload_callbacks) | set(self.background_tasks):
             self.op_unload({"plugin_key": plugin_key})
         self.stopped.set()
 

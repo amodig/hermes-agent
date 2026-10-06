@@ -291,6 +291,56 @@ def test_async_plugin_code_calls_back_in_the_callers_session(tmp_path, monkeypat
         manager._plugin_host().shutdown()
 
 
+@pytest.mark.platforms("any")
+@pytest.mark.parametrize("operation", ["unload", "reload"])
+def test_hosted_background_task_is_cancelled_without_stopping_host(tmp_path, monkeypatch, operation):
+    home = _home_with_plugins(tmp_path, monkeypatch, {"taskprobe": '''
+import asyncio, os
+from pathlib import Path
+
+def record(event):
+    with (Path(os.environ["HERMES_HOME"]) / "task-events").open("a") as handle:
+        handle.write(event + "\\n")
+
+async def background():
+    record("started")
+    try:
+        await asyncio.Event().wait()
+    finally:
+        record("stopped")
+
+def register(ctx):
+    ctx.spawn_task(background(), name="taskprobe-background")
+'''})
+    manager = PluginManager()
+    host = manager._plugin_host()
+    marker = home / "task-events"
+    def await_events(started, stopped):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            events = marker.read_text().splitlines() if marker.exists() else []
+            if events.count("started") == started and events.count("stopped") == stopped:
+                return
+            time.sleep(0.01)
+        pytest.fail(f"background lifecycle did not settle: {events}")
+    try:
+        manager.discover_and_load()
+        await_events(1, 0)
+        pid = host.pid
+        if operation == "reload":
+            manager.discover_and_load(force=True)
+            await_events(2, 1)
+        else:
+            manager.unload("taskprobe")
+            await_events(1, 1)
+        assert host.alive and host.pid == pid
+        manager.unload()
+        await_events(2, 2) if operation == "reload" else await_events(1, 1)
+    finally:
+        manager.unload()
+        host.shutdown()
+
+
 MEMORY_PLUGIN = '''
 import os
 from agent.memory_provider import MemoryProvider
@@ -309,6 +359,40 @@ class Probe(MemoryProvider):
 def register(ctx):
     ctx.register_memory_provider(Probe())
 '''
+
+
+@pytest.mark.platforms("any")
+def test_concurrent_category_loads_import_once_and_create_distinct_instances(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    home = _home_with_plugins(tmp_path, monkeypatch, {})
+    provider_dir = home / "plugins" / "memprobe"
+    provider_dir.mkdir(parents=True)
+    marker = home / "category-imports"
+    (provider_dir / "__init__.py").write_text(
+        "import os, time\nfrom pathlib import Path\n"
+        f"with Path({str(marker)!r}).open('a') as handle:\n"
+        "    handle.write(str(os.getpid()) + '\\n')\n"
+        "time.sleep(0.2)\n" + MEMORY_PLUGIN, encoding="utf-8")
+    host = plugins_mod.get_plugin_manager()._plugin_host()
+    try:
+        host.ensure_started()
+        barrier = Barrier(4)
+        def load(index):
+            barrier.wait(timeout=10)
+            return host.load_instance(
+                provider_dir, module_name="_hermes_memory_memprobe",
+                base_ref="agent.memory_provider:MemoryProvider", capture="register_memory_provider")
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            instances = list(pool.map(load, range(4)))
+        assert [instance.whoami() for instance in instances] == [host.pid] * 4
+        assert [instance.level for instance in instances] == [1] * 4
+        instances[0].whoami()
+        assert [instance.level for instance in instances] == [2, 1, 1, 1]
+        assert marker.read_text().splitlines() == [str(host.pid)]
+    finally:
+        host.shutdown()
 
 
 @pytest.mark.platforms("posix")  # SIGKILL
