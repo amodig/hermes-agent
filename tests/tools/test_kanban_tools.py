@@ -700,6 +700,38 @@ def test_reclaim_loses_to_a_worker_registering_mid_sweep(monkeypatch, worker_env
     assert (task.status, task.worker_pid) == ("running", _os.getpid())
 
 
+def test_update_attributes_goal_and_event_to_bound_profile(monkeypatch, worker_env, tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    served = tmp_path / ".hermes/profiles/served"
+    served.mkdir(parents=True)
+    token = set_hermes_home_override(served)
+    try:
+        with kbc.connect_closing() as conn:
+            task_id = kb.create_task(conn, title="original goal")
+            version = kb.get_task(conn, task_id).version
+        result = json.loads(kt._handle_update({
+            "task_id": task_id, "expected_version": version,
+            "title": "revised goal", "reason": "secondary profile turn",
+        }))
+        assert result["ok"], result
+        with kbc.connect_closing() as conn:
+            goal = kb.get_effective_goal(conn, task_id)
+            event = json.loads(conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? AND kind='goal_revised'",
+                (task_id,),
+            ).fetchone()[0])
+        assert goal["title"] == "revised goal"
+        assert goal["author"] == "served"
+        assert event["author"] == event["actor"] == "served"
+    finally:
+        reset_hermes_home_override(token)
+
+
 def test_comment_rejects_caller_supplied_author(worker_env):
     """Reject an undeclared author override before a worker can forge a comment."""
     from tools import kanban_tools as kt

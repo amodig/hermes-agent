@@ -16,6 +16,10 @@ so the controller inspects the existing card and current run; `notify` remains
 passive-only and `wake` remains wake-only. Review feedback never creates,
 unblocks, requeues, or otherwise mutates a task.
 
+In a multiplex gateway, task mutation events and goal revisions identify the
+profile serving the turn, not the gateway's launch profile. Worker mutations
+retain their verified task/run identity; callers cannot supply an author override.
+
 ## Single-dispatcher posture
 
 Only one gateway owns the kanban dispatcher. The owning gateway keeps

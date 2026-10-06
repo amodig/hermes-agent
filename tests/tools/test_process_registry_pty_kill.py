@@ -97,9 +97,11 @@ def test_kill_and_prune_release_reader_while_detached_descendant_holds_slave(
     pytest.importorskip("ptyprocess")
     registry = ProcessRegistry()
     stop, probe, alive, done = (tmp_path / name for name in ("stop", "probe", "alive", "done"))
+    error = tmp_path / "holder-error"
     # Detach from the terminal and ignore shell hangup propagation, as a daemon
     # would. The file handshake still detects termination by the cleanup path.
     child = f"""
+import fcntl
 import os
 import signal
 from pathlib import Path
@@ -111,9 +113,13 @@ deadline = time.monotonic() + 30
 try:
     while not Path({str(stop)!r}).exists() and time.monotonic() < deadline:
         if Path({str(probe)!r}).exists():
-            os.fstat(1)
+            # Inspect the retained descriptor, not the tty vnode BSD can revoke.
+            fcntl.fcntl(1, fcntl.F_GETFD)
             Path({str(alive)!r}).touch()
         time.sleep(0.02)
+except BaseException as exc:
+    Path({str(error)!r}).write_text(repr(exc))
+    raise
 finally:
     Path({str(done)!r}).touch()
 """
@@ -165,7 +171,9 @@ finally:
         assert event["completion_reason"] == "killed"
         assert event["output"] == result["output"]
         probe.touch()
-        assert _wait_for(alive.exists, 5), "cleanup signalled the detached slave holder"
+        assert _wait_for(alive.exists, 5), (
+            error.read_text() if error.exists() else "detached slave holder stopped responding"
+        )
         assert not done.exists(), "reader release depended on the detached child exiting"
     finally:
         release.set()

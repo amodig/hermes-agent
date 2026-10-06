@@ -1412,7 +1412,7 @@ def _handle_update(args: dict, **kw) -> str:
     kwargs = {
         "expected_version": expected_version,
         "reason": reason,
-        "author": os.environ.get("HERMES_PROFILE") or "orchestrator",
+        "author": _persisted_identity(),
     }
     for name in ("title", "body", "assignee", "model", "provider", "transition",
                  "authorized_pr_urls"):
@@ -1452,7 +1452,7 @@ def _handle_link(args: dict, **kw) -> str:
             expected_parent_version=_opt_int(args.get("expected_parent_version")),
             expected_child_version=_opt_int(args.get("expected_child_version")),
             reason=args.get("reason"),
-            author=os.environ.get("HERMES_PROFILE") or "orchestrator",
+            author=_persisted_identity(),
             expected_child_run_id=_worker_run_id(str(child_id)),
         )
         edge = conn.execute(
@@ -1491,7 +1491,7 @@ def _handle_unlink(args: dict, **kw) -> str:
             expected_parent_version=int(args.get("expected_parent_version")),
             expected_child_version=int(args.get("expected_child_version")),
             reason=reason,
-            author=os.environ.get("HERMES_PROFILE") or "orchestrator",
+            author=_persisted_identity(),
         )
         return _ok(
             parent_id=parent_id,
@@ -1514,7 +1514,7 @@ def _handle_archive(args: dict, **kw) -> str:
             task_id,
             expected_version=int(args.get("expected_version")),
             reason=reason,
-            author=os.environ.get("HERMES_PROFILE") or "orchestrator",
+            author=_persisted_identity(),
         )
         task = kb.get_task(conn, task_id)
         return _ok(
@@ -1538,7 +1538,7 @@ def _handle_requeue_handoff(args: dict, **kw) -> str:
             workspace_path=args.get("workspace_path"),
             patch_artifact=args.get("patch_artifact"),
             patch_sha256=args.get("patch_sha256"),
-            author=os.environ.get("HERMES_PROFILE") or "orchestrator",
+            author=_persisted_identity(),
         )
         task = kb.get_task(conn, task_id)
         return _ok(
@@ -1570,7 +1570,7 @@ def _handle_rework_review(args: dict, **kw) -> str:
             expected_reviewer_version=args.get("expected_reviewer_version"),
             expected_tester_version=args.get("expected_tester_version"),
             reason=reason,
-            author=os.environ.get("HERMES_PROFILE") or "orchestrator",
+            author=_persisted_identity(),
         )
     return _ok(**outcome)
 
