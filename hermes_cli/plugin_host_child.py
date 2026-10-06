@@ -137,7 +137,8 @@ class HostRuntime:
         self.unload_callbacks: Dict[str, List[Callable[[], Any]]] = {}
         self.background_tasks: Dict[str, set] = {}
         self.modules: Dict[str, str] = {}
-        self.asgi_apps: Dict[str, Any] = {}
+        self.plugin_paths: Dict[str, Path] = {}
+        self.asgi_apps: Dict[Path, Dict[str, tuple[Any, types.ModuleType]]] = {}
         self.profiles: Dict[str, Dict[str, Any]] = {}
         # ponytail: serialize cold imports; shard only after capture stops replacing global registration.
         self._import_lock = threading.Lock()
@@ -257,6 +258,8 @@ class HostRuntime:
         plugin_key = str(params["plugin_key"])
         with self._import_lock:
             target = _import_plugin(params)
+            if params.get("path"):
+                self.plugin_paths[plugin_key] = Path(str(params["path"])).resolve()
         register = target if callable(target) and not isinstance(target, types.ModuleType) \
             else getattr(target, "register", None)
         if not callable(register):
@@ -317,24 +320,34 @@ class HostRuntime:
         return encode(self._run(target(*args, **kwargs)))
 
     def op_asgi(self, params: Dict[str, Any]) -> Any:
-        """Serve one dashboard API request with the plugin's FastAPI ``router`` (loaded once)."""
-        api_path = Path(str(params["dashboard_dir"])) / str(params["api_file"])
-        app = self.asgi_apps.get(str(api_path))
-        if app is None:
-            from fastapi import FastAPI
-            module_name = f"hermes_dashboard_plugin_{params['plugin']}"
-            spec = importlib.util.spec_from_file_location(module_name, api_path)
-            if spec is None or spec.loader is None:
-                raise ImportError(f"cannot load dashboard api {api_path}")
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = module
-            spec.loader.exec_module(module)
-            router = getattr(module, "router", None)
-            if router is None:
-                raise AttributeError(f"dashboard api {api_path.name} has no 'router'")
-            app = FastAPI()
-            app.include_router(router)
-            self.asgi_apps[str(api_path)] = app
+        """Serve one dashboard API request with the plugin's FastAPI ``router`` (cached until unload)."""
+        dashboard_dir = Path(str(params["dashboard_dir"])).resolve()
+        api_path = dashboard_dir / str(params["api_file"])
+        with self._import_lock:
+            # The dashboard name need not equal the owner's manifest key; join them by plugin root.
+            apps = self.asgi_apps.setdefault(dashboard_dir.parent, {})
+            cached = apps.get(str(api_path))
+            if cached is None:
+                from fastapi import FastAPI
+                module_name = f"hermes_dashboard_plugin_{params['plugin']}"
+                spec = importlib.util.spec_from_file_location(module_name, api_path)
+                if spec is None or spec.loader is None:
+                    raise ImportError(f"cannot load dashboard api {api_path}")
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                try:
+                    # Updates can preserve source size and mtime, so never reuse timestamp-based bytecode.
+                    exec(compile(api_path.read_bytes(), str(api_path), "exec", dont_inherit=True), module.__dict__)
+                    router = getattr(module, "router", None)
+                    if router is None:
+                        raise AttributeError(f"dashboard api {api_path.name} has no 'router'")
+                    app = FastAPI()
+                    app.include_router(router)
+                except BaseException:
+                    sys.modules.pop(module_name, None)
+                    raise
+                cached = apps[str(api_path)] = (app, module)
+            app = cached[0]
 
         async def request() -> Dict[str, Any]:
             import httpx
@@ -417,10 +430,16 @@ class HostRuntime:
             for ref in [r for r, owner in self.owners.items() if owner == plugin_key]:
                 self.refs.pop(ref, None)
                 self.owners.pop(ref, None)
-        module_name = self.modules.pop(plugin_key, "")
-        if module_name:
-            for name in [m for m in sys.modules if m == module_name or m.startswith(module_name + ".")]:
-                sys.modules.pop(name, None)
+        with self._import_lock:
+            plugin_dir = self.plugin_paths.pop(plugin_key, None)
+            if plugin_dir is not None:
+                for _, module in self.asgi_apps.pop(plugin_dir, {}).values():
+                    if sys.modules.get(module.__name__) is module:
+                        sys.modules.pop(module.__name__, None)
+            module_name = self.modules.pop(plugin_key, "")
+            if module_name:
+                for name in [m for m in sys.modules if m == module_name or m.startswith(module_name + ".")]:
+                    sys.modules.pop(name, None)
         return {"errors": errors}
 
     def op_shutdown(self, _params: Dict[str, Any]) -> None:

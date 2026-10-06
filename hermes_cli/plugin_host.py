@@ -63,7 +63,6 @@ class PluginHost:
         self._contexts: Dict[str, Any] = {}
         self._handles: Dict[int, Any] = {}
         self._handle_ids = itertools.count(1)
-        self._base_context = self._build_base_context()
         self._loading: Optional[str] = None
         self._stopping = False
         self._deaths: list = []
@@ -91,9 +90,8 @@ class PluginHost:
         def bind() -> None:
             from hermes_constants import set_hermes_home_override
             set_hermes_home_override(self._home)
-            from agent.secret_scope import build_profile_secret_scope, is_multiplex_active, set_secret_scope
-            if is_multiplex_active():
-                set_secret_scope(build_profile_secret_scope(self._home), profile_home=str(self._home))
+            from agent.secret_scope import build_profile_secret_scope, set_secret_scope
+            set_secret_scope(build_profile_secret_scope(self._home), profile_home=str(self._home))
 
         context.run(bind)
         return context
@@ -104,7 +102,7 @@ class PluginHost:
 
     def _env(self) -> Dict[str, str]:
         from tools.environments.local import served_profile_child_env
-        env = self._base_context.run(served_profile_child_env, target_home=self._home, inherit_credentials=True)
+        env = self._build_base_context().run(served_profile_child_env, target_home=self._home, inherit_credentials=True)
         repo_root = str(Path(__file__).resolve().parents[1])
         env["PYTHONPATH"] = os.pathsep.join(p for p in (repo_root, env.get("PYTHONPATH", "")) if p)
         env.setdefault("HERMES_PLUGIN_HOST_LOG_LEVEL", "WARNING")
@@ -209,7 +207,7 @@ class PluginHost:
         params = {
             "plugin_key": plugin_key, "plugin_id": ctx.plugin_id, "name": manifest.name,
             "path": manifest.path, "module_name": module_name, "entrypoint": entrypoint,
-            "profile_name": self._base_context.copy().run(lambda: ctx.profile_name),
+            "profile_name": self._build_base_context().run(lambda: ctx.profile_name),
             "manifest": {k: getattr(manifest, k, None) for k in (
                 "name", "version", "description", "author", "source", "path", "key", "kind",
                 "skill_namespace")},
@@ -347,7 +345,8 @@ class PluginHost:
     def _context_for_origin(self, origin: Optional[int]) -> contextvars.Context:
         channel = self._channel
         caller = channel.context_of(origin) if channel is not None else None
-        return (caller or self._base_context).copy()
+        # Rebind per callback: multiplexing may activate, or secrets rotate, after host creation.
+        return caller.copy() if caller is not None else self._build_base_context()
 
     def _handle(self, method: str, params: Dict[str, Any], _origin: Optional[int]) -> Any:
         if method == "ctx":

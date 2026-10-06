@@ -341,6 +341,67 @@ def register(ctx):
         host.shutdown()
 
 
+@pytest.mark.platforms("any")
+def test_hosted_dashboard_reload_refreshes_api_without_resetting_sibling(tmp_path, monkeypatch):
+    home = _home_with_plugins(tmp_path, monkeypatch, {
+        name: "def register(ctx): pass\n" for name in ("reloadprobe", "siblingprobe")
+    })
+    api_source = '''
+import itertools, os, sys
+from fastapi import APIRouter
+
+router = APIRouter()
+requests = itertools.count(1)
+
+@router.get("/")
+def status():
+    return {"value": "before", "pid": os.getpid(), "requests": next(requests),
+            "reload_loaded": "hermes_dashboard_plugin_dashboard-reloadprobe" in sys.modules}
+'''
+    for name in ("reloadprobe", "siblingprobe"):
+        dashboard_dir = home / "plugins" / name / "dashboard"
+        dashboard_dir.mkdir()
+        (dashboard_dir / "api.py").write_text(api_source, encoding="utf-8")
+    manager = PluginManager()
+    host = manager._plugin_host()
+
+    def request(name):
+        # Dashboard manifests may use a name different from the path-derived plugin key.
+        dashboard_name = "dashboard-reloadprobe" if name == "reloadprobe" else name
+        result = host.asgi_request(
+            dashboard_name, str(home / "plugins" / name / "dashboard"), "api.py", "GET", "/", "", [], b"")
+        assert result["status"] == 200
+        return json.loads(result["body"])
+
+    try:
+        manager.discover_and_load()
+        assert manager._plugins["reloadprobe"].error is None
+        assert manager._plugins["siblingprobe"].error is None
+        manifest = manager._plugins["reloadprobe"].manifest
+        first = request("reloadprobe")
+        assert first["pid"] != os.getpid()
+        assert first == {"value": "before", "pid": first["pid"], "requests": 1, "reload_loaded": True}
+        sibling = request("siblingprobe")
+        assert sibling == first
+
+        api_file = home / "plugins" / "reloadprobe" / "dashboard" / "api.py"
+        original_stat = api_file.stat()
+        api_file.write_text(api_source.replace("before", "after!"), encoding="utf-8")
+        # An update with unchanged size/mtime must not resurrect the old .pyc.
+        os.utime(api_file, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        assert manager.unload("reloadprobe")
+        assert request("siblingprobe") == {**sibling, "requests": 2, "reload_loaded": False}
+
+        manager._load_plugin(manifest)
+        assert manager._plugins["reloadprobe"].error is None
+        assert request("reloadprobe") == {**first, "value": "after!"}
+        assert request("siblingprobe") == {**sibling, "requests": 3}
+        assert host.alive
+    finally:
+        manager.unload()
+        host.shutdown()
+
+
 MEMORY_PLUGIN = '''
 import os
 from agent.memory_provider import MemoryProvider
