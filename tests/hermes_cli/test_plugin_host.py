@@ -136,6 +136,34 @@ async def register(ctx):
         manager._plugin_host().shutdown()
 
 
+@pytest.mark.platforms("any")
+def test_unload_callback_can_dispatch_back_to_parent(tmp_path, monkeypatch):
+    from tools.registry import registry
+    _home_with_plugins(tmp_path, monkeypatch, {"cleanupprobe": '''
+def register(ctx):
+    ctx.on_unload(lambda: ctx.dispatch_tool("cleanup_target", {}))
+'''})
+    manager = PluginManager()
+    cleaned = []
+    def cleanup(args, **kwargs):
+        cleaned.append(True)
+        return "cleaned"
+    registry.register(
+        name="cleanup_target", toolset="cleanup",
+        schema={"name": "cleanup_target", "description": "Cleanup",
+                "parameters": {"type": "object", "properties": {}}},
+        scope=manager.scope_key, handler=cleanup)
+    try:
+        manager.discover_and_load()
+        assert manager._plugins["cleanupprobe"].error is None
+        manager.unload()
+        assert cleaned == [True]
+        assert manager._plugin_host().alive
+    finally:
+        registry.deregister("cleanup_target", scope=manager.scope_key)
+        manager._plugin_host().shutdown()
+
+
 @pytest.mark.platforms("any")  # the host is a child process: its env/home resolution is per-OS
 def test_isolation_host_keeps_every_user_import_path_out_of_process(tmp_path, monkeypatch):
     from hermes_cli.plugin_isolation_audit import audit_plugin_dir

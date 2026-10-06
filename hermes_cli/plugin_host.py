@@ -88,10 +88,16 @@ class PluginHost:
         context = contextvars.Context()
 
         def bind() -> None:
-            from hermes_constants import set_hermes_home_override
+            from hermes_constants import get_process_hermes_home, hermes_home_key, set_hermes_home_override
             set_hermes_home_override(self._home)
-            from agent.secret_scope import build_profile_secret_scope, set_secret_scope
+            from agent.secret_scope import build_profile_secret_scope, is_multiplex_active, set_secret_scope
             set_secret_scope(build_profile_secret_scope(self._home), profile_home=str(self._home))
+            launch = hermes_home_key(self._home) == hermes_home_key(get_process_hermes_home())
+            if not launch or is_multiplex_active():
+                from tools.terminal_scope import install_profile_terminal_scope
+                from tui_gateway.launch_profile_policy import launch_terminal_env
+                install_profile_terminal_scope(
+                    self._home, env_overlay=launch_terminal_env() if launch else None)
 
         context.run(bind)
         return context
@@ -297,13 +303,15 @@ class PluginHost:
                                    "headers": [list(h) for h in headers], "body": encode(body)})
 
     def _unload(self, plugin_key: str) -> None:
-        self._contexts.pop(plugin_key, None)
-        channel = self._channel
-        if channel is None or channel.closed_reason is not None:
-            return
-        errors = (channel.call("unload", {"plugin_key": plugin_key}) or {}).get("errors") or []
-        for error in errors:
-            logger.warning("Plugin '%s' on_unload callback failed in the plugin host: %s", plugin_key, error)
+        try:
+            channel = self._channel
+            if channel is None or channel.closed_reason is not None:
+                return
+            errors = (channel.call("unload", {"plugin_key": plugin_key}) or {}).get("errors") or []
+            for error in errors:
+                logger.warning("Plugin '%s' on_unload callback failed in the plugin host: %s", plugin_key, error)
+        finally:
+            self._contexts.pop(plugin_key, None)
 
     # -- parent -> host -----------------------------------------------------------------------------
     def _call(self, method: str, params: Dict[str, Any], *, generation: Optional[int] = None) -> Any:

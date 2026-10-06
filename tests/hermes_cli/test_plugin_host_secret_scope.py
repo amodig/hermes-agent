@@ -43,31 +43,40 @@ def test_deferred_callbacks_rebind_owner_secrets_after_activation(tmp_path, monk
     from hermes_constants import get_hermes_home, hermes_home_key, set_hermes_home_override
     from tools.approval_context import get_current_session_key, set_current_session_key
     from tools.registry import registry
+    from tools.terminal_scope import install_profile_terminal_scope, terminal_env
     from tui_gateway.launch_profile_policy import activate_multi_profile_hosting
 
-    home = tmp_path / ".hermes"
+    home = tmp_path / ".hermes" / "profiles" / "owner"
     plugin_dir = home / "plugins" / "scopeprobe"
     plugin_dir.mkdir(parents=True)
     (plugin_dir / "plugin.yaml").write_text("name: scopeprobe\nversion: '1.0'\n", encoding="utf-8")
     (plugin_dir / "__init__.py").write_text(_PLUGIN, encoding="utf-8")
     (home / "config.yaml").write_text(
-        "plugins:\n  isolation: host\n  enabled: [scopeprobe]\n", encoding="utf-8")
+        "plugins:\n  isolation: host\n  enabled: [scopeprobe]\n"
+        "terminal:\n  backend: docker\n  docker_image: owner-image\n", encoding="utf-8")
     (home / ".env").write_text("SCOPE_PROBE_KEY=owner\nSCOPE_REVOKED_KEY=revoked\n", encoding="utf-8")
-    secondary = home / "profiles" / "secondary"
+    secondary = tmp_path / ".hermes" / "profiles" / "secondary"
     secondary.mkdir(parents=True)
     (secondary / ".env").write_text("SCOPE_PROBE_KEY=secondary\n", encoding="utf-8")
+    (secondary / "config.yaml").write_text("terminal:\n  backend: local\n", encoding="utf-8")
     bundled = tmp_path / "bundled"
     bundled.mkdir()
     monkeypatch.setattr(plugins_mod, "get_bundled_plugins_dir", lambda: bundled)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     monkeypatch.setenv("SCOPE_PROBE_KEY", "launch-env")
     monkeypatch.setenv("SCOPE_ENV_ONLY_KEY", "must-not-leak")
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setenv("TERMINAL_SSH_HOST", "foreign-host")
+    monkeypatch.setenv("TERMINAL_DOCKER_IMAGE", "foreign-image")
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
     set_multiplex_active(False)
-    manager = plugins_mod.PluginManager()
+    def make_manager():
+        set_hermes_home_override(home)
+        return plugins_mod.PluginManager()
+    manager = contextvars.Context().run(make_manager)
     observations = Queue()
 
     def probe(args, **kwargs):
@@ -80,6 +89,9 @@ def test_deferred_callbacks_rebind_owner_secrets_after_activation(tmp_path, monk
                 "env_only": get_secret("SCOPE_ENV_ONLY_KEY"),
                 "session": get_session_env("HERMES_SESSION_ID", ""),
                 "approval": get_current_session_key(default=""),
+                "terminal": terminal_env("TERMINAL_ENV"),
+                "image": terminal_env("TERMINAL_DOCKER_IMAGE"),
+                "ssh_host": terminal_env("TERMINAL_SSH_HOST"),
             }
         except Exception as exc:
             result = {"error": f"{type(exc).__name__}: {exc}"}
@@ -94,6 +106,7 @@ def test_deferred_callbacks_rebind_owner_secrets_after_activation(tmp_path, monk
 
     def exercise():
         set_current_session_key("creator-approval")
+        set_hermes_home_override(home)
         with scoped_current_session_id("creator-session"):
             host = manager._plugin_host()
             try:
@@ -109,6 +122,7 @@ def test_deferred_callbacks_rebind_owner_secrets_after_activation(tmp_path, monk
                     "pid": host.info["pid"], "home": manager.scope_key, "scope_home": manager.scope_key,
                     "secret": "owner", "revoked": "revoked", "env_only": None,
                     "session": "", "approval": "",
+                    "terminal": "docker", "image": "owner-image", "ssh_host": "",
                 }
                 (home / "scope-release-0").touch()
                 assert observations.get(timeout=10) == expected
@@ -117,6 +131,7 @@ def test_deferred_callbacks_rebind_owner_secrets_after_activation(tmp_path, monk
                     secondary_home = hermes_home_key(secondary)
                     set_hermes_home_override(secondary_home)
                     set_secret_scope(build_profile_secret_scope(secondary), profile_home=secondary_home)
+                    install_profile_terminal_scope(secondary)
                     set_current_session_key("secondary-approval")
                     with scoped_current_session_id("secondary-session"):
                         # An in-flight call still uses its caller, not the host's fallback.
@@ -124,6 +139,7 @@ def test_deferred_callbacks_rebind_owner_secrets_after_activation(tmp_path, monk
                         assert json.loads(result) == {
                             **expected, "home": secondary_home, "scope_home": secondary_home,
                             "secret": "secondary", "revoked": None,
+                            "terminal": "local", "image": terminal_env("TERMINAL_DOCKER_IMAGE"),
                             "session": "secondary-session", "approval": "secondary-approval",
                         }
                         (home / ".env").write_text("SCOPE_PROBE_KEY=owner-rotated\n", encoding="utf-8")
