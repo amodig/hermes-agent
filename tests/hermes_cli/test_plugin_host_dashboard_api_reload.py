@@ -102,3 +102,61 @@ def test_api_only_dashboard_reloads_on_content_change_without_resetting_siblings
     # Final shutdown closes the live (post-reload) app and the sibling exactly once each.
     assert (home / "apireload-lifecycle").read_text().splitlines() == ["start", "stop", "start", "stop"]
     assert (home / "apisibling-lifecycle").read_text().splitlines() == ["start", "stop"]
+
+
+@pytest.mark.platforms("any")
+def test_dashboard_reload_drains_requests_without_blocking_siblings(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    import time
+
+    home = _home_with_plugins(tmp_path, monkeypatch, {})
+    held_source = API_SOURCE + '''
+import asyncio
+@router.get("/hold")
+async def hold():
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "holding-request").touch()
+    while not (home / "release-request").exists():
+        await asyncio.sleep(0.01)
+    assert ready, "lifespan resources closed during request"
+    return {"value": "before"}
+'''
+    for name in ("drain", "sibling"):
+        dashboard_dir = home / "plugins" / name / "dashboard"
+        dashboard_dir.mkdir(parents=True)
+        (dashboard_dir / "api.py").write_text(held_source, encoding="utf-8")
+    host = plugins_mod.get_plugin_manager()._plugin_host()
+    pool = ThreadPoolExecutor(max_workers=2)
+    replacement_started = threading.Event()
+
+    def request(name, path="/"):
+        if name == "drain" and path == "/":
+            replacement_started.set()
+        response = host.asgi_request(name, str(home / "plugins" / name / "dashboard"),
+                                     "api.py", "GET", path, "", [], b"")
+        assert response["status"] == 200
+        return json.loads(response["body"])
+
+    try:
+        held = pool.submit(request, "drain", "/hold")
+        deadline = time.monotonic() + 15
+        while not (home / "holding-request").exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert (home / "holding-request").exists()
+        (home / "plugins" / "drain" / "dashboard" / "api.py").write_text(
+            held_source.replace("before", "after!"), encoding="utf-8")
+        replacement = pool.submit(request, "drain")
+        assert replacement_started.wait(10)
+        with pytest.raises(TimeoutError):
+            replacement.result(timeout=0.5)
+        assert request("sibling")["value"] == "before"
+        assert (home / "drain-lifecycle").read_text().splitlines() == ["start"]
+        (home / "release-request").touch()
+        assert held.result(timeout=10) == {"value": "before"}
+        assert replacement.result(timeout=10)["value"] == "after!"
+        assert (home / "drain-lifecycle").read_text().splitlines() == ["start", "stop", "start"]
+    finally:
+        (home / "release-request").touch()
+        pool.shutdown(wait=True)
+        host.shutdown()

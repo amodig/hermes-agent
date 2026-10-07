@@ -34,6 +34,9 @@ extracted profile; rescanning changed bytes refreshes the host's profiles and pa
 even when file sizes and mtimes are unchanged. Package bodies and relative imports load from
 source rather than timestamp bytecode. Discovery and RPC capture share the exact profile
 instances already imported for that source generation, without publishing private captures.
+If a proxy needs to recapture its generation after the source has changed, it raises an
+explicit stale-generation error rather than pairing old fields with new method code.
+Rescan the provider to obtain the current profile.
 Concurrent first-use captures are serialized across plugin paths; method execution remains
 concurrent. `fixed_temperature=OMIT_TEMPERATURE` retains its
 sentinel identity across extraction and caching, so requests omit `temperature`; numeric

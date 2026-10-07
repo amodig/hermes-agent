@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 import types
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
@@ -40,6 +41,15 @@ if TYPE_CHECKING:
     from hermes_cli.plugins_ledger import PluginRegistration
 
 logger = logging.getLogger("hermes_cli.plugin_host_child")
+
+
+@dataclass
+class _DashboardApp:
+    app: Any
+    module: types.ModuleType
+    lifespan: Any
+    identity: str
+    active: int = 0
 
 _ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 _CLEANUP_CONTEXT: contextvars.ContextVar[Optional["RemotePluginContext"]] = contextvars.ContextVar(
@@ -177,12 +187,12 @@ class HostRuntime:
         self.plugin_paths: Dict[str, Path] = {}
         self.contexts: Dict[str, RemotePluginContext] = {}
         self.loading: set[str] = set()
-        # dashboard dir -> api path -> (app, module, entered lifespan, source content hash)
-        self.asgi_apps: Dict[Path, Dict[str, tuple[Any, types.ModuleType, Any, str]]] = {}
+        self.asgi_apps: Dict[Path, Dict[str, _DashboardApp]] = {}
         self.profiles: Dict[tuple, Dict[str, Any]] = {}
         from providers import _HOST_IMPORT_LOCK
         # Discovery inside a plugin import must join the same reentrant capture lock.
         self._import_lock = _HOST_IMPORT_LOCK
+        self._asgi_condition = threading.Condition(self._import_lock)
         self.imported_modules: Dict[Path, types.ModuleType] = {}
         self.stopped = threading.Event()
         self.loop = asyncio.new_event_loop()
@@ -410,7 +420,7 @@ class HostRuntime:
             if captured is None:
                 captured = self.profiles[key] = {
                     "fingerprint": fingerprint,
-                    "profiles": {p.name: p for p in capture_profiles(*key)},
+                    "profiles": {p.name: p for p in capture_profiles(*key, fingerprint=fingerprint)},
                 }
         target = getattr(captured["profiles"][str(params["profile"])], str(params["attr"]))
         args, kwargs = self._decode_args(params)
@@ -425,14 +435,17 @@ class HostRuntime:
         dashboard_dir = Path(str(params["dashboard_dir"])).resolve()
         api_path = dashboard_dir / str(params["api_file"])
         with self._import_lock:
-            # Content identity, not mtime/size: an update may preserve both, and a stale .pyc must
-            # never be reused. Read once and compile the same bytes, so hash and code cannot diverge.
-            source = api_path.read_bytes()
-            identity = hashlib.sha256(source).hexdigest()
-            # The dashboard name need not equal the owner's manifest key; join them by plugin root.
-            apps = self.asgi_apps.setdefault(dashboard_dir.parent, {})
-            cached = apps.get(str(api_path))
-            if cached is not None and cached[3] != identity:
+            while True:
+                # Compile exactly the bytes identified here, including metadata-preserving edits.
+                source = api_path.read_bytes()
+                identity = hashlib.sha256(source).hexdigest()
+                apps = self.asgi_apps.setdefault(dashboard_dir.parent, {})
+                cached = apps.get(str(api_path))
+                if cached is None or cached.identity == identity or not cached.active:
+                    break
+                # Release the shared import lock while old requests use their lifespan resources.
+                self._asgi_condition.wait()
+            if cached is not None and cached.identity != identity:
                 # The source changed under this path: retire just this app (siblings keep running)
                 # and enter the fresh one below. A shutdown error is logged, never fails the request.
                 apps.pop(str(api_path), None)
@@ -462,8 +475,9 @@ class HostRuntime:
                 except BaseException:
                     sys.modules.pop(module_name, None)
                     raise
-                cached = apps[str(api_path)] = (app, module, lifespan, identity)
-            app = cached[0]
+                cached = apps[str(api_path)] = _DashboardApp(app, module, lifespan, identity)
+            cached.active += 1
+            app = cached.app
 
         async def request() -> Dict[str, Any]:
             import httpx
@@ -476,13 +490,20 @@ class HostRuntime:
             return {"status": response.status_code, "headers": list(response.headers.multi_items()),
                     "body": response.content}
 
-        return encode(self._run(request()))
-
-    def _close_asgi_app(self, entry: tuple, errors: list) -> None:
-        """Exit one entered lifespan once and evict its module; caller holds the import/cache lock."""
-        _app, module, lifespan, _identity = entry
         try:
-            self._run(lifespan.__aexit__(None, None, None))
+            return encode(self._run(request()))
+        finally:
+            with self._asgi_condition:
+                cached.active -= 1
+                self._asgi_condition.notify_all()
+
+    def _close_asgi_app(self, entry: _DashboardApp, errors: list) -> None:
+        """Drain requests before exiting lifespan; caller holds the import/cache lock."""
+        while entry.active:
+            self._asgi_condition.wait()
+        module = entry.module
+        try:
+            self._run(entry.lifespan.__aexit__(None, None, None))
         except Exception as exc:
             errors.append(f"{type(exc).__name__}: {exc}")
         finally:
@@ -767,11 +788,11 @@ def _take_protocol_streams():
     return reader, writer
 
 
-def capture_profiles(path: str, module_name: str) -> List[Any]:
+def capture_profiles(path: str, module_name: str, *, fingerprint: Optional[str] = None) -> List[Any]:
     """Return this source generation's profiles, reusing any earlier host discovery import."""
     import providers
     from providers.base import ProviderProfile
-    captured = providers._load_host_profiles(Path(path), module_name)
+    captured = providers._load_host_profiles(Path(path), module_name, expected_fingerprint=fingerprint)
     for profile in captured:
         if type(profile).create_client is not ProviderProfile.create_client:
             raise PluginHostUnsupported(

@@ -402,7 +402,8 @@ def _user_module_name(plugin_dir: Path, home_key: str) -> str:
     return f"_hermes_user_provider_{digest}_{plugin_dir.name.replace('-', '_')}"
 
 
-def _load_host_profiles(plugin_dir: Path, module_name: str) -> list[ProviderProfile]:
+def _load_host_profiles(plugin_dir: Path, module_name: str, *,
+                        expected_fingerprint: str | None = None) -> list[ProviderProfile]:
     """Capture one source generation without publishing it into any live registry layer."""
     from hermes_cli.plugin_host_child import _import_plugin
     from hermes_cli.plugin_host_profiles import _fingerprint
@@ -410,6 +411,8 @@ def _load_host_profiles(plugin_dir: Path, module_name: str) -> list[ProviderProf
     plugin_dir = plugin_dir.resolve()
     with _HOST_IMPORT_LOCK:
         fingerprint = _fingerprint(plugin_dir)
+        if expected_fingerprint is not None and fingerprint != expected_fingerprint:
+            raise RuntimeError("Hosted provider profile generation is stale; rescan the provider before calling it")
         cached = _HOST_PROFILE_IMPORTS.get(plugin_dir)
         if cached is not None:
             previous, module, profiles = cached

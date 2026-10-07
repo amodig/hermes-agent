@@ -846,6 +846,8 @@ What changes in `host` mode:
   its first request and shutdown on plugin unload or host shutdown. Source-content changes
   replace the API and its lifespan even for API-only dashboards with no CLI/gateway manifest,
   without resetting sibling plugins or restarting the host.
+  Graceful API teardown drains in-flight requests before closing lifespan resources; waiting
+  releases the shared import lock, so sibling APIs keep serving requests.
 - **General and category loads share imports.** Concurrent first loads of one plugin directory
   share its module until unload; each category load still creates a fresh provider instance.
   A dual-kind general/memory plugin registers its hooks once, regardless of load order.

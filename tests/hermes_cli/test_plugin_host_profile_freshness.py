@@ -102,3 +102,35 @@ def test_live_host_recaptures_a_rewritten_profile_source(tmp_path, monkeypatch):
     # recapture on every concurrent first call would leave extra lines here.
     lines = (home / "freshness-imports.txt").read_text(encoding="utf-8").splitlines()
     assert sorted(line.split(":", 1)[1] for line in lines) == ["NEW_KEY", "NEW_KEY", "OLD_KEY", "OLD_KEY"]
+
+
+@pytest.mark.platforms("any")
+@pytest.mark.parametrize("restart", [False, True], ids=["delayed-first-call", "host-restart"])
+def test_stale_proxy_cannot_relabel_current_profile_source(tmp_path, monkeypatch, restart):
+    from tests.hermes_cli.test_plugin_host import _home_with_plugins
+
+    home = _home_with_plugins(tmp_path, monkeypatch, {})
+    plugin_dir = home / "plugins" / "model-providers" / "freshness"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "helper.py").write_text(_HELPER_V1, encoding="utf-8")
+    source = plugin_dir / "__init__.py"
+    source.write_text(_source("v1", "OLD_KEY", _FILLER), encoding="utf-8")
+    host = plugins_mod.get_plugin_manager()._plugin_host()
+    try:
+        old = load_hosted_profiles(plugin_dir, "_stale_freshness_provider")[0]
+        if restart:
+            assert old.ping() == {"code": "v1"}
+            host.shutdown()
+        source.write_text(_source("v2", "NEW_KEY", _ADDED_METHOD), encoding="utf-8")
+        with pytest.raises(RuntimeError, match="generation is stale"):
+            old.ping()
+        fresh = load_hosted_profiles(plugin_dir, "_stale_freshness_provider")[0]
+        assert tuple(fresh.env_vars) == ("NEW_KEY",)
+        assert fresh.ping() == {"code": "v2"}
+        with pytest.raises(RuntimeError, match="generation is stale"):
+            old.ping()
+        assert fresh.added() == {"code": "new"}
+        assert tuple(old.env_vars) == ("OLD_KEY",)
+        assert host.alive
+    finally:
+        host.shutdown()
