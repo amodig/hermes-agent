@@ -1061,6 +1061,7 @@ def register(ctx):
 @pytest.mark.platforms("any")
 def test_secondary_host_recovery_retains_owner_callback_scopes(tmp_path, monkeypatch):
     import threading
+    from pathlib import Path
 
     from hermes_cli.web_server_profiles import _config_profile_scope
     from agent.secret_scope import get_secret
@@ -1119,7 +1120,8 @@ def register(ctx):
         with _config_profile_scope("secondary"), install_and_reset_profile_terminal_scope(secondary):
             manager.discover_and_load()
             first = json.loads(registry.dispatch("profile_recovery_probe", {}, scope=manager.scope_key))
-        assert first == {"pid": host.info["pid"], "home": str(secondary.resolve()),
+        first["home"] = Path(first["home"])
+        assert first == {"pid": host.info["pid"], "home": secondary.resolve(),
                          "tag": "secondary", "secret": "secondary",
                          "parent": {"secret": "secondary", "cwd": str(secondary / "work")}}
         assert first["pid"] != os.getpid()
@@ -1128,6 +1130,7 @@ def register(ctx):
         assert finished.wait(15)
         with _config_profile_scope("secondary"):
             recovered = json.loads(registry.dispatch("profile_recovery_probe", {}, scope=manager.scope_key))
+        recovered["home"] = Path(recovered["home"])
         assert recovered == {**first, "pid": host.info["pid"]}
         assert recovered["pid"] not in {first["pid"], os.getpid()}
     finally:
