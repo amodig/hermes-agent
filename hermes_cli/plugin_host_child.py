@@ -481,14 +481,16 @@ class HostRuntime:
 
         async def request() -> Dict[str, Any]:
             import httpx
-            transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(transport=transport, base_url="http://plugin-host") as client:
-                response = await client.request(
-                    str(params["method"]), str(params["path"]), params=str(params.get("query") or ""),
+            transport = httpx.ASGITransport(app=app, root_path=str(params["root_path"]))
+            async with httpx.AsyncClient(transport=transport) as client:
+                async with client.stream(
+                    str(params["method"]), str(params["url"]),
                     headers=[tuple(h) for h in params.get("headers") or []],
-                    content=decode(params.get("body")) or b"")
-            return {"status": response.status_code, "headers": list(response.headers.multi_items()),
-                    "body": response.content}
+                    content=decode(params.get("body")) or b"") as response:
+                    # Keep the encoded representation paired with its Content-Encoding header.
+                    body = b"".join([chunk async for chunk in response.aiter_raw()])
+                    return {"status": response.status_code, "headers": list(response.headers.multi_items()),
+                            "body": body}
 
         try:
             return encode(self._run(request()))

@@ -848,6 +848,8 @@ What changes in `host` mode:
   without resetting sibling plugins or restarting the host.
   Graceful API teardown drains in-flight requests before closing lifespan resources; waiting
   releases the shared import lock, so sibling APIs keep serving requests.
+  Hosted requests preserve the external scheme, authority, query and mount root for generated
+  URLs; responses retain encoded bytes with their `Content-Encoding` header.
 - **General and category loads share imports.** Concurrent first loads of one plugin directory
   share its module until unload; each category load still creates a fresh provider instance.
   A dual-kind general/memory plugin registers its hooks once, regardless of load order.

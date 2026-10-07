@@ -809,17 +809,17 @@ def _mount_hosted_plugin_api(app, plugin: dict, api_file_name: str) -> None:
     scope still apply here first). Responses are buffered: streaming and websockets need in-process."""
     name = plugin["name"]
 
-    async def forward(request: Request, path: str = "") -> Response:
+    async def forward(request: Request) -> Response:
         # Resolve the plugin again in the REQUESTING profile (the route is mounted once, from the
         # launch profile): its own copy, gated by its own plugins.enabled, served by its own host.
         target = await asyncio.to_thread(_hosted_plugin_for_request, name)
         if target is None:
             return JSONResponse({"detail": f"plugin {name!r} is not enabled in this profile"}, status_code=404)
         host, dashboard_dir, api_file = target
+        root_path = f"{request.scope.get('root_path', '').rstrip('/')}/api/plugins/{name}"
         result = await asyncio.to_thread(
-            host.asgi_request, name, dashboard_dir, api_file, request.method, "/" + path,
-            request.url.query, [(k, v) for k, v in request.headers.items() if k.lower() != "host"],
-            await request.body())
+            host.asgi_request, name, dashboard_dir, api_file, request.method, str(request.url),
+            root_path, list(request.headers.items()), await request.body())
         response = Response(content=result["body"], status_code=int(result["status"]))
         for key, value in result["headers"]:  # a list, so repeated headers (Set-Cookie) all survive
             if key.lower() not in {"content-length", "transfer-encoding", "connection"}:

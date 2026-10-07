@@ -704,7 +704,8 @@ def status():
         # Dashboard manifests may use a name different from the path-derived plugin key.
         dashboard_name = "dashboard-reloadprobe" if name == "reloadprobe" else name
         result = host.asgi_request(
-            dashboard_name, str(home / "plugins" / name / "dashboard"), "api.py", "GET", "/", "", [], b"")
+            dashboard_name, str(home / "plugins" / name / "dashboard"), "api.py", "GET",
+            f"http://testserver/api/plugins/{dashboard_name}/", f"/api/plugins/{dashboard_name}", [], b"")
         assert result["status"] == 200
         return json.loads(result["body"])
 

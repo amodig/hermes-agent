@@ -340,12 +340,12 @@ class PluginHost:
                                            "attr": attr, "fingerprint": fingerprint,
                                            "args": encode(list(args)), "kwargs": encode(kwargs)})
 
-    def asgi_request(self, plugin_name: str, dashboard_dir: str, api_file: str, method: str, path: str,
-                     query: str, headers: list, body: bytes) -> Dict[str, Any]:
+    def asgi_request(self, plugin_name: str, dashboard_dir: str, api_file: str, method: str, url: str,
+                     root_path: str, headers: list, body: bytes) -> Dict[str, Any]:
         """One dashboard ``/api/plugins/<name>/`` request, served by the plugin's router in the host."""
         self.ensure_started()
         return self._call("asgi", {"plugin": plugin_name, "dashboard_dir": dashboard_dir, "api_file": api_file,
-                                   "method": method, "path": path, "query": query,
+                                   "method": method, "url": url, "root_path": root_path,
                                    "headers": [list(h) for h in headers], "body": encode(body)})
 
     def _cleanup_call(self, plugin_key: str, method: str, params: Dict[str, Any], *,

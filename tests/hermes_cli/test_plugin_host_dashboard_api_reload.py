@@ -62,7 +62,8 @@ def test_api_only_dashboard_reloads_on_content_change_without_resetting_siblings
 
     def request(name):
         result = host.asgi_request(name, str(home / "plugins" / name / "dashboard"), "api.py",
-                                   "GET", "/", "", [], b"")
+                                   "GET", f"http://testserver/api/plugins/{name}/",
+                                   f"/api/plugins/{name}", [], b"")
         assert result["status"] == 200, result
         return json.loads(result["body"])
 
@@ -134,7 +135,8 @@ async def hold():
         if name == "drain" and path == "/":
             replacement_started.set()
         response = host.asgi_request(name, str(home / "plugins" / name / "dashboard"),
-                                     "api.py", "GET", path, "", [], b"")
+                                     "api.py", "GET", f"http://testserver/api/plugins/{name}{path}",
+                                     f"/api/plugins/{name}", [], b"")
         assert response["status"] == 200
         return json.loads(response["body"])
 
@@ -159,4 +161,66 @@ async def hold():
     finally:
         (home / "release-request").touch()
         pool.shutdown(wait=True)
+        host.shutdown()
+
+
+@pytest.mark.platforms("any")
+@pytest.mark.parametrize("operation", ["url", "gzip"])
+def test_parent_dashboard_bridge_preserves_external_urls_and_encoded_bytes(tmp_path, monkeypatch, operation):
+    import asyncio
+    import gzip
+
+    import httpx
+    from fastapi import FastAPI
+    from hermes_cli.web_server_dashboard import _discover_dashboard_plugins, _mount_hosted_plugin_api
+
+    home = _home_with_plugins(tmp_path, monkeypatch, {"bridge": ""})
+    dashboard_dir = home / "plugins" / "bridge" / "dashboard"
+    dashboard_dir.mkdir()
+    (dashboard_dir / "manifest.json").write_text(json.dumps({"name": "bridge", "api": "api.py"}))
+    (dashboard_dir / "api.py").write_text('''
+import gzip, json
+from fastapi import APIRouter, Request
+from fastapi.responses import RedirectResponse, Response
+router = APIRouter()
+@router.get("/redirect")
+def redirect(request: Request):
+    return RedirectResponse(str(request.url_for("target", item="x")) + "?q=one%2Ftwo&q=3")
+@router.get("/target/{item}", name="target")
+def target(request: Request, item: str):
+    return {"url": str(request.url), "base": str(request.base_url)}
+@router.get("/gzip")
+def compressed(request: Request):
+    assert "gzip" in request.headers["accept-encoding"]
+    return Response(gzip.compress(json.dumps({"value": "compress me" * 100}).encode()),
+                    media_type="application/json", headers={"content-encoding": "gzip"})
+''')
+    app = FastAPI()
+    plugin = next(p for p in _discover_dashboard_plugins() if p["name"] == "bridge")
+    _mount_hosted_plugin_api(app, plugin, "api.py")
+    host = plugins_mod.get_plugin_manager()._plugin_host()
+    root = "https://example.test:9443/external/api/plugins/bridge"
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app, root_path="/external"),
+                                     base_url="https://example.test:9443") as client:
+            if operation == "url":
+                response = await client.get(root + "/redirect")
+                target = root + "/target/x?q=one%2Ftwo&q=3"
+                assert response.status_code == 307
+                assert response.headers["location"] == target
+                followed = await client.get(response.headers["location"])
+                assert followed.status_code == 200
+                assert followed.json() == {"url": target, "base": root + "/"}
+            else:
+                async with client.stream("GET", root + "/gzip", headers={"Accept-Encoding": "gzip"}) as response:
+                    raw = b"".join([chunk async for chunk in response.aiter_raw()])
+                    assert response.status_code == 200
+                    assert response.headers["content-encoding"] == "gzip"
+                    assert int(response.headers["content-length"]) == len(raw)
+                    assert json.loads(gzip.decompress(raw)) == {"value": "compress me" * 100}
+
+    try:
+        asyncio.run(exercise())
+    finally:
         host.shutdown()
