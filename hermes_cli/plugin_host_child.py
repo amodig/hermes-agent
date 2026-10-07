@@ -142,8 +142,19 @@ class RemotePluginContext:
             self._check_active()
             handle = PluginRegistration("on_unload", getattr(callback, "__name__", "callback"), callback,
                                         plugin_key=self._plugin_key)
-            self._runtime.unload_callbacks.setdefault(self._plugin_key, []).append(handle)
-            return handle
+
+        @functools.wraps(callback)
+        def release():
+            with self._runtime._lock:
+                if not handle.active:
+                    return None
+                handle._disposed = True
+            return handle.release()
+
+        # Keep dispose() local (including calls from the host loop), but let the parent's
+        # ordinary ledger choose when this callback runs among its other registrations.
+        self._runtime.ctx_call(self, "on_unload", release)
+        return handle
 
     def spawn_task(self, coro: Any, *, name: Optional[str] = None) -> Any:
         return self._runtime.spawn(self, coro, name=name)
@@ -157,14 +168,15 @@ class HostRuntime:
         self.owners: Dict[int, str] = {}
         self._ids = itertools.count(1)
         self._lock = threading.RLock()
+        # Category collectors have no parent cleanup ledger; general plugins enrol there instead.
         self.unload_callbacks: Dict[str, List[PluginRegistration]] = {}
         self.background_tasks: Dict[str, set] = {}
         self.modules: Dict[str, str] = {}
         self.plugin_paths: Dict[str, Path] = {}
         self.contexts: Dict[str, RemotePluginContext] = {}
         self.loading: set[str] = set()
-        self.asgi_apps: Dict[Path, Dict[str, tuple[Any, types.ModuleType]]] = {}
-        self.profiles: Dict[str, Dict[str, Any]] = {}
+        self.asgi_apps: Dict[Path, Dict[str, tuple[Any, types.ModuleType, Any]]] = {}
+        self.profiles: Dict[tuple, Dict[str, Any]] = {}
         # ponytail: serialize cold imports; shard only after capture stops replacing global registration.
         self._import_lock = threading.Lock()
         self.imported_modules: Dict[Path, types.ModuleType] = {}
@@ -172,7 +184,8 @@ class HostRuntime:
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self.loop.run_forever, name="plugin-host-loop", daemon=True).start()
         self.channel = Channel(reader, writer, self.handle, name="plugin-host",
-                               on_close=lambda _reason: self.stopped.set())
+                               on_close=lambda _reason: self.stopped.set(),
+                               context_for_origin=self._context_for_origin)
 
     # -- references -----------------------------------------------------------------------------
     def _remember(self, plugin_key: str, value: Any) -> int:
@@ -272,6 +285,11 @@ class HostRuntime:
         return asyncio.wrap_future(future, loop=loop) if loop is not None and loop is not self.loop else future
 
     # -- incoming ---------------------------------------------------------------------------------
+    def _context_for_origin(self, origin: Optional[int]) -> contextvars.Context:
+        # A nested parent->child call inherits only its still-pending child's provenance.
+        caller = self.channel.context_of(origin)
+        return caller.copy() if caller is not None else contextvars.Context()
+
     def handle(self, method: str, params: Dict[str, Any], _origin: Optional[int]) -> Any:
         handler = _HANDLERS.get(method)
         if handler is None:
@@ -335,7 +353,8 @@ class HostRuntime:
         finally:
             with self._lock:
                 self.loading.discard(plugin_key)
-            if not ctx._active:
+                unloaded = self.contexts.get(plugin_key) is not ctx
+            if unloaded:
                 self.op_unload(params)  # finish module eviction deferred while import/register ran
 
     def op_load_instance(self, params: Dict[str, Any]) -> Any:
@@ -377,13 +396,20 @@ class HostRuntime:
     def op_profile_call(self, params: Dict[str, Any]) -> Any:
         """Run one overridden method (or callable field) of a model-provider profile, loading the
         plugin on first use in this host process. Addressed by name, so it survives host restarts."""
-        # Capture replaces process-global registration; serialize misses across all paths.
+        # Capture replaces process-global registration; serialize misses across all paths. The source
+        # fingerprint makes a rewritten plugin recapture instead of serving its stale methods forever.
+        key = (str(params["path"]), str(params["module_name"]))
+        fingerprint = str(params["fingerprint"])
         with self._import_lock:
-            profiles = self.profiles.get(str(params["path"]))
-            if profiles is None:
-                profiles = self.profiles[str(params["path"])] = {
-                    p.name: p for p in capture_profiles(str(params["path"]), str(params["module_name"]))}
-        target = getattr(profiles[str(params["profile"])], str(params["attr"]))
+            captured = self.profiles.get(key)
+            if captured is not None and captured["fingerprint"] != fingerprint:
+                captured = None
+            if captured is None:
+                captured = self.profiles[key] = {
+                    "fingerprint": fingerprint,
+                    "profiles": {p.name: p for p in capture_profiles(*key)},
+                }
+        target = getattr(captured["profiles"][str(params["profile"])], str(params["attr"]))
         args, kwargs = self._decode_args(params)
         return encode(self._run(target(*args, **kwargs)))
 
@@ -411,10 +437,12 @@ class HostRuntime:
                         raise AttributeError(f"dashboard api {api_path.name} has no 'router'")
                     app = FastAPI()
                     app.include_router(router)
+                    lifespan = app.router.lifespan_context(app)
+                    self._run(lifespan.__aenter__())
                 except BaseException:
                     sys.modules.pop(module_name, None)
                     raise
-                cached = apps[str(api_path)] = (app, module)
+                cached = apps[str(api_path)] = (app, module, lifespan)
             app = cached[0]
 
         async def request() -> Dict[str, Any]:
@@ -430,13 +458,38 @@ class HostRuntime:
 
         return encode(self._run(request()))
 
+    def _close_asgi_apps(self, plugin_dir: Path, errors: list) -> None:
+        """Exit each entered lifespan once; caller holds the import/cache lock."""
+        for _, module, lifespan in self.asgi_apps.pop(plugin_dir, {}).values():
+            try:
+                self._run(lifespan.__aexit__(None, None, None))
+            except Exception as exc:
+                errors.append(f"{type(exc).__name__}: {exc}")
+            finally:
+                if sys.modules.get(module.__name__) is module:
+                    sys.modules.pop(module.__name__, None)
+
     def op_invoke(self, params: Dict[str, Any]) -> Any:
         ref = int(params["ref"])
-        fn = self.refs.get(ref)
-        if fn is None:
-            raise LookupError(f"plugin host callable {ref} was released")
-        args, kwargs = self._decode_args(params)
-        return self._encode_result(self.owners.get(ref, ""), self._run(fn(*args, **kwargs)))
+        with self._lock:
+            fn = self.refs.get(ref)
+            if fn is None:
+                raise LookupError(f"plugin host callable {ref} was released")
+            plugin_key = self.owners.get(ref, "")
+            ctx = self.contexts.get(plugin_key) if params.get("cleanup") else None
+            if ctx is not None:
+                ctx._active = False
+                ctx._cleaning = True
+        token = _CLEANUP_CONTEXT.set(ctx) if ctx is not None else None
+        try:
+            args, kwargs = self._decode_args(params)
+            result = self._run(fn(*args, **kwargs))
+            return None if params.get("cleanup") else self._encode_result(plugin_key, result)
+        finally:
+            if token is not None:
+                _CLEANUP_CONTEXT.reset(token)
+            if ctx is not None:
+                ctx._cleaning = False
 
     def op_obj_invoke(self, params: Dict[str, Any]) -> Any:
         ref = int(params["ref"])
@@ -494,8 +547,6 @@ class HostRuntime:
             callbacks = self.unload_callbacks.pop(plugin_key, [])
             if ctx is not None:
                 ctx._cleaning = True
-        for task in tasks:
-            self.loop.call_soon_threadsafe(task.cancel)
         token = _CLEANUP_CONTEXT.set(ctx)
         try:
             for handle in reversed(callbacks):
@@ -510,6 +561,8 @@ class HostRuntime:
             _CLEANUP_CONTEXT.reset(token)
             if ctx is not None:
                 ctx._cleaning = False
+        for task in tasks:
+            self.loop.call_soon_threadsafe(task.cancel)
         with self._lock:
             for ref in [r for r, owner in self.owners.items() if owner == plugin_key]:
                 self.refs.pop(ref, None)
@@ -526,17 +579,21 @@ class HostRuntime:
                     if path == plugin_dir:
                         self.plugin_paths.pop(owner)
                         self.modules.pop(owner, None)
-                for _, module in self.asgi_apps.pop(plugin_dir, {}).values():
-                    if sys.modules.get(module.__name__) is module:
-                        sys.modules.pop(module.__name__, None)
+                self._close_asgi_apps(plugin_dir, errors)
             if module_name:
                 for name in [m for m in sys.modules if m == module_name or m.startswith(module_name + ".")]:
                     sys.modules.pop(name, None)
         return {"errors": errors}
 
     def op_shutdown(self, _params: Dict[str, Any]) -> None:
-        for plugin_key in set(self.unload_callbacks) | set(self.background_tasks):
+        for plugin_key in set(self.contexts) | set(self.unload_callbacks) | set(self.background_tasks):
             self.op_unload({"plugin_key": plugin_key})
+        errors = []
+        with self._import_lock:
+            for plugin_dir in list(self.asgi_apps):
+                self._close_asgi_apps(plugin_dir, errors)
+        for error in errors:
+            logger.warning("Dashboard shutdown failed: %s", error)
         self.stopped.set()
 
 
@@ -559,6 +616,17 @@ class _CapturingContext(RemotePluginContext):
                  base: type, captured: List[Any], *, forward: bool):
         super().__init__(runtime, plugin_key, info)
         self._capture, self._base, self._captured, self._forward = capture, base, captured, forward
+
+    def on_unload(self, callback: Callable[[], Any]) -> PluginRegistration:
+        from hermes_cli.plugins_ledger import PluginRegistration
+        if not callable(callback):
+            raise TypeError("on_unload() callback must be callable")
+        with self._runtime._lock:
+            self._check_active()
+            handle = PluginRegistration("on_unload", getattr(callback, "__name__", "callback"), callback,
+                                        plugin_key=self._plugin_key)
+            self._runtime.unload_callbacks.setdefault(self._plugin_key, []).append(handle)
+            return handle
 
     def __getattr__(self, name: str) -> Any:
         if name == self._capture:
@@ -599,6 +667,11 @@ def _import_plugin(params: Dict[str, Any]) -> Any:
     if not init_file.exists():
         raise FileNotFoundError(f"No __init__.py in {plugin_dir}")
     module_name = str(params["module_name"])
+    # A re-import rebuilds the root below, so drop any previous incarnation's submodules with it;
+    # otherwise `from .provider import X` resolves against the stale module object in sys.modules.
+    # Callers serialize this with _import_lock (the one-shot extraction process is cold anyway).
+    for name in [m for m in sys.modules if m == module_name or m.startswith(module_name + ".")]:
+        sys.modules.pop(name, None)
     parts = module_name.split(".")[:-1]
     for i in range(1, len(parts) + 1):  # synthetic parent packages (hermes_plugins, _hermes_user_memory)
         parent = ".".join(parts[:i])
@@ -616,7 +689,9 @@ def _import_plugin(params: Dict[str, Any]) -> Any:
     module.__path__ = [str(plugin_dir)]  # type: ignore[attr-defined]
     sys.modules[module_name] = module
     try:
-        spec.loader.exec_module(module)
+        # A replaced plugin can keep its byte length and whole-second mtime, so its timestamp-checked
+        # pyc would be reused; compile the package body from source (submodules still use the loader).
+        exec(compile(init_file.read_bytes(), str(init_file), "exec", dont_inherit=True), module.__dict__)
     except BaseException:
         for name in [m for m in sys.modules if m == module_name or m.startswith(module_name + ".")]:
             sys.modules.pop(name, None)

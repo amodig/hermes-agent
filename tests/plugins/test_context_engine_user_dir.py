@@ -69,7 +69,7 @@ _COMMAND_ENGINE_SRC = dedent('''
             return messages
 
     def echo(raw_args):
-        return json.dumps({"args": raw_args, "pid": os.getpid(), "home": str(get_hermes_home())})
+        return json.dumps({"args": raw_args, "pid": os.getpid(), "home": os.path.normcase(str(get_hermes_home()))})
 
     async def echo_async(raw_args):
         return echo(raw_args)

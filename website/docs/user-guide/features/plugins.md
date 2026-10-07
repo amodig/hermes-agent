@@ -818,6 +818,8 @@ What changes in `host` mode:
   another profile's data from memory or patch Hermes internals. Under the multiplex gateway every
   profile gets one lazily constructed host shared by concurrent general and category loads,
   started with only that profile's environment and secrets.
+- **Manifest metadata stays available.** `ctx.manifest` carries all parsed manifest fields,
+  including declared capabilities, environment requirements and configuration schemas.
 - **Crashes stay contained.** A plugin that crashes or exits kills its host, not Hermes; the call in
   flight returns a tool error and Hermes restarts the host and reloads its plugins (bounded retries).
 - **Unload cancels plugin-owned background work.** Coroutines started with `ctx.spawn_task()`
@@ -833,12 +835,16 @@ What changes in `host` mode:
 - **Task and cleanup handles retain their contracts.** On the host's async loop,
   `ctx.spawn_task()` returns a named, awaitable task. `ctx.on_unload()` returns a
   registration whose `dispose()` runs cleanup once; disposed callbacks do not run again at unload.
+  Cleanup callbacks run in reverse acquisition order, interleaved with registration teardown,
+  including failed-load rollback. Tool failures during cleanup return sanitized errors without
+  rediscovering plugins.
   Finalized provider proxies release their hosted objects on the next RPC, including concurrent callers.
 - **Deferred callbacks keep the owning profile.** Background callbacks bind current owner
   credentials and terminal policy even if multiplexing activates later; in-flight callbacks
   retain their caller's scope.
-- **Dashboard APIs refresh on reload.** Unloading a plugin evicts its cached API and module
-  without resetting sibling plugins or restarting the host.
+- **Dashboard APIs retain their lifecycle.** The cached app runs router lifespan startup before
+  its first request and shutdown on plugin unload or host shutdown. Reload evicts its API and
+  module without resetting sibling plugins or restarting the host.
 - **General and category loads share imports.** Concurrent first loads of one plugin directory
   share its module until unload; each category load still creates a fresh provider instance.
   A dual-kind general/memory plugin registers its hooks once, regardless of load order.

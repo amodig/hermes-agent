@@ -356,29 +356,41 @@ def register(ctx):
 
 @pytest.mark.platforms("any")
 def test_load_deadline_retires_host_when_cleanup_callback_stalls(tmp_path, monkeypatch):
+    import threading
     from hermes_cli import plugin_host
 
     home = _home_with_plugins(tmp_path, monkeypatch, {"stalledcleanup": '''
-import time
+import os, time
+from pathlib import Path
 def register(ctx):
-    ctx.on_unload(lambda: time.sleep(4))
-    time.sleep(4)
+    ctx.on_unload(lambda: time.sleep(30))
+    (Path(os.environ["HERMES_HOME"]) / "cleanup-registered").touch()
+    time.sleep(30)
 '''})
-    manager = PluginManager()
+    manager = plugins_mod.get_plugin_manager()
     host = manager._plugin_host()
+    loader = threading.Thread(target=manager.discover_and_load, daemon=True)
     try:
         host.ensure_started()
         monkeypatch.setattr(plugin_host, "_SHUTDOWN_GRACE_SECS", 0.1)
         (home / "config.yaml").write_text(yaml.safe_dump({"plugins": {
-            "enabled": ["stalledcleanup"], "isolation": "host", "load_timeout_seconds": 0.5,
+            "enabled": ["stalledcleanup"], "isolation": "host", "load_timeout_seconds": 5,
         }}), encoding="utf-8")
         started = time.monotonic()
-        manager.discover_and_load()
-        assert time.monotonic() - started < 2
+        loader.start()
+        deadline = time.monotonic() + 15
+        while not (home / "cleanup-registered").exists() and loader.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert (home / "cleanup-registered").exists(), "load timed out before callback registration"
+        loader.join(10)
+        assert not loader.is_alive(), "deadline cleanup waited on stalled callback"
+        assert time.monotonic() - started < 15
         assert "timed out" in str(manager._plugins["stalledcleanup"].error)
         assert not host.alive
         assert "stalledcleanup" not in host._contexts
     finally:
+        if loader.ident is not None:
+            loader.join(10)
         host.shutdown()
 
 
@@ -653,13 +665,31 @@ def test_hosted_dashboard_reload_refreshes_api_without_resetting_sibling(tmp_pat
     })
     api_source = '''
 import itertools, os, sys
+from contextlib import asynccontextmanager
+from pathlib import Path
 from fastapi import APIRouter
 
-router = APIRouter()
+ready = False
+@asynccontextmanager
+async def lifespan(app):
+    global ready
+    marker = Path(os.environ["HERMES_HOME"]) / (Path(__file__).parent.parent.name + "-lifecycle")
+    with marker.open("a") as handle:
+        handle.write("start\\n")
+    ready = True
+    try:
+        yield
+    finally:
+        ready = False
+        with marker.open("a") as handle:
+            handle.write("stop\\n")
+
+router = APIRouter(lifespan=lifespan)
 requests = itertools.count(1)
 
 @router.get("/")
 def status():
+    assert ready, "dashboard startup has not run"
     return {"value": "before", "pid": os.getpid(), "requests": next(requests),
             "reload_loaded": "hermes_dashboard_plugin_dashboard-reloadprobe" in sys.modules}
 '''
@@ -696,12 +726,17 @@ def status():
         os.utime(api_file, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
         assert manager.unload("reloadprobe")
         assert request("siblingprobe") == {**sibling, "requests": 2, "reload_loaded": False}
+        assert (home / "reloadprobe-lifecycle").read_text().splitlines() == ["start", "stop"]
+        assert (home / "siblingprobe-lifecycle").read_text().splitlines() == ["start"]
 
         manager._load_plugin(manifest)
         assert manager._plugins["reloadprobe"].error is None
         assert request("reloadprobe") == {**first, "value": "after!"}
         assert request("siblingprobe") == {**sibling, "requests": 3}
         assert host.alive
+        host.shutdown()
+        assert (home / "reloadprobe-lifecycle").read_text().splitlines() == ["start", "stop", "start", "stop"]
+        assert (home / "siblingprobe-lifecycle").read_text().splitlines() == ["start", "stop"]
     finally:
         manager.unload()
         host.shutdown()

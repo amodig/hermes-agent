@@ -29,8 +29,10 @@ With `plugins.isolation: host`, profile data is extracted in a credential-free c
 under that profile's home. Concurrent gateway threads share one extraction per cache key;
 separate profile caches remain independent. Extraction initializes only bundled providers before importing the
 target once, without an eager home scan. Overridden methods load the target once in the
-profile's long-lived plugin host on first use. Concurrent first-use captures are serialized
-across plugin paths; method execution remains concurrent. `fixed_temperature=OMIT_TEMPERATURE` retains its
+profile's long-lived plugin host on first use. A source fingerprint travels with the extracted
+profile; rescanning changed sources refreshes the host's profiles and package modules before
+the new proxy's first call. Concurrent first-use captures are serialized across plugin paths;
+method execution remains concurrent. `fixed_temperature=OMIT_TEMPERATURE` retains its
 sentinel identity across extraction and caching, so requests omit `temperature`; numeric
 overrides and `None` (use the caller's value) keep their usual behavior.
 

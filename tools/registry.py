@@ -11,6 +11,7 @@ import importlib
 import inspect
 import json
 import logging
+import re
 import sys
 import threading
 import time
@@ -27,6 +28,26 @@ _MAX_TOOL_ERROR_CHARS = 2048
 _TOOL_ERROR_TRUNCATION_MARKER = "… [truncated]"
 # Logs keep more of the body than the model sees, but still a bounded amount.
 _MAX_LOGGED_ERROR_CHARS = 8192
+
+# Strip structural framing tokens without importing model_tools (which discovers plugins).
+_TOOL_ERROR_STRIP_RES = (
+    re.compile(r'</?(?:tool_call|function_call|result|response|output|input|system|assistant|user)>', re.IGNORECASE),
+    re.compile(r'^\s*```(?:json|xml|html|markdown)?\s*', re.MULTILINE),
+    re.compile(r'\s*```\s*$', re.MULTILINE),
+    re.compile(r'<!\[CDATA\[.*?\]\]>', re.DOTALL),
+)
+
+
+def _sanitize_tool_error(error_msg: str) -> str:
+    """Strip structural framing tokens from a tool error before the model sees it."""
+    if not error_msg:
+        return "[TOOL_ERROR] "
+    sanitized = error_msg
+    for pattern in _TOOL_ERROR_STRIP_RES:
+        sanitized = pattern.sub("", sanitized)
+    if len(sanitized) > _MAX_TOOL_ERROR_CHARS:
+        sanitized = sanitized[:_MAX_TOOL_ERROR_CHARS - 3] + "..."
+    return f"[TOOL_ERROR] {sanitized}"
 
 
 def _bound_error_text(text: str) -> str:
@@ -913,12 +934,7 @@ class ToolRegistry:
             logger.exception("Tool %s dispatch error: %s", name, _bound_error_text(str(e)))
             # Sanitize so framing tokens/CDATA/fences in exception text aren't structural noise.
             raw = f"Tool execution failed: {type(e).__name__}: {e}"
-            try:
-                from model_tools import _sanitize_tool_error
-                sanitized = _sanitize_tool_error(raw)
-            except Exception:
-                sanitized = raw  # defensive: never let the sanitizer block error propagation
-            return tool_error(sanitized)
+            return tool_error(_sanitize_tool_error(raw))
 
     # ---- Query helpers -----------------------------------------------
 

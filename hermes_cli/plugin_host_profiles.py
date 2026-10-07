@@ -5,7 +5,8 @@ so it must not start the plugin host (building the host's environment imports th
 Profile DATA therefore comes from a one-shot, credential-free extraction
 (``plugin_host_child --extract-profiles``), cached under the profile home by the plugin's file
 fingerprint. Overridden methods and callable fields run later in the profile's plugin host, addressed
-by (plugin dir, profile name, attribute) so they survive host restarts.
+by (plugin dir, profile name, attribute) plus that fingerprint — which recaptures a rewritten plugin
+instead of serving its stale methods — so they survive host restarts.
 """
 
 from __future__ import annotations
@@ -35,10 +36,10 @@ _EXTRACTION_LOCKS_GUARD = threading.Lock()
 def load_hosted_profiles(plugin_dir: Path, module_name: str) -> List[Any]:
     """ProviderProfile proxies for a model-provider plugin whose code runs in the plugin host."""
     from providers.base import ProviderProfile
-    payload = _cached_extraction(Path(plugin_dir), module_name)
+    fingerprint, payload = _cached_extraction(Path(plugin_dir), module_name)
     if payload.get("error"):
         raise PluginHostUnavailable(str(payload["error"]))
-    return [_profile_proxy(ProviderProfile, str(plugin_dir), module_name, entry)
+    return [_profile_proxy(ProviderProfile, str(plugin_dir), module_name, entry, fingerprint)
             for entry in payload.get("profiles") or []]
 
 
@@ -57,7 +58,8 @@ def _fingerprint(plugin_dir: Path) -> str:
     return digest.hexdigest()
 
 
-def _cached_extraction(plugin_dir: Path, module_name: str) -> Dict[str, Any]:
+def _cached_extraction(plugin_dir: Path, module_name: str) -> tuple[str, Dict[str, Any]]:
+    """The plugin's source fingerprint and its extraction payload, cached under that fingerprint."""
     from hermes_constants import get_hermes_home
     # Keyed by the full path too: a user and a project plugin may share a directory name.
     path_key = hashlib.sha256(str(plugin_dir.resolve()).encode("utf-8")).hexdigest()[:12]
@@ -72,7 +74,7 @@ def _cached_extraction(plugin_dir: Path, module_name: str) -> Dict[str, Any]:
         try:
             cached = json.loads(cache.read_text(encoding="utf-8-sig"))
             if cached.get("fingerprint") == fingerprint and cached.get("module_name") == module_name:
-                return cached["payload"]
+                return fingerprint, cached["payload"]
         except (OSError, ValueError, KeyError):
             pass
         payload = _extract(plugin_dir, module_name)
@@ -82,7 +84,7 @@ def _cached_extraction(plugin_dir: Path, module_name: str) -> Dict[str, Any]:
             tmp.write_text(json.dumps({"fingerprint": fingerprint, "module_name": module_name,
                                        "payload": payload}), encoding="utf-8")
             os.replace(tmp, cache)
-        return payload
+        return fingerprint, payload
 
 
 def _extract(plugin_dir: Path, module_name: str) -> Dict[str, Any]:
@@ -109,23 +111,25 @@ def _extract(plugin_dir: Path, module_name: str) -> Dict[str, Any]:
         return {"error": f"profile extraction exited {done.returncode}: {' | '.join(tail)}"}
 
 
-def _host_call(plugin_dir: str, module_name: str, profile: str, attr: str) -> Callable[..., Any]:
+def _host_call(plugin_dir: str, module_name: str, profile: str, attr: str,
+               fingerprint: str) -> Callable[..., Any]:
     def call(*args: Any, **kwargs: Any) -> Any:
         from hermes_cli.plugin_isolation import user_plugin_host
         host = user_plugin_host()
         if host is None:
             raise PluginHostUnavailable("plugins.isolation is no longer 'host'; restart Hermes")
-        return host.profile_call(plugin_dir, module_name, profile, attr, args, kwargs)
+        return host.profile_call(plugin_dir, module_name, profile, attr, args, kwargs, fingerprint)
     return call
 
 
-def _profile_proxy(base: type, plugin_dir: str, module_name: str, entry: Dict[str, Any]) -> Any:
+def _profile_proxy(base: type, plugin_dir: str, module_name: str, entry: Dict[str, Any],
+                   fingerprint: str) -> Any:
     name = str(entry["name"])
     namespace: Dict[str, Any] = {"__module__": __name__,
                                  "__repr__": lambda self_: f"<plugin-host profile {name!r}>"}
     fields = {key: decode(value) for key, value in (entry.get("fields") or {}).items()}
     for attr, meta in (entry.get("calls") or {}).items():
-        call = _host_call(plugin_dir, module_name, name, attr)
+        call = _host_call(plugin_dir, module_name, name, attr, fingerprint)
         if meta.get("async"):
             sync_call = call
 

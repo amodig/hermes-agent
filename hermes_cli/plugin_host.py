@@ -253,6 +253,7 @@ class PluginHost:
         cleanup = ctx._track("on_unload", "plugin_host", functools.partial(self._unload, plugin_key))
         try:
             if ctx._load_abandoned:
+                cleanup.dispose()  # The deadline may have swept the ledger before enrolment.
                 raise PluginLoadTimeout("plugin host load was abandoned")
             channel = self.ensure_started()
             params = {
@@ -260,24 +261,15 @@ class PluginHost:
                 "path": manifest.path, "module_name": module_name, "entrypoint": entrypoint,
                 "deadline": getattr(ctx, "_load_deadline", None),
                 "profile_name": self._build_base_context().run(lambda: ctx.profile_name),
-                "manifest": {k: getattr(manifest, k, None) for k in (
-                    "name", "version", "description", "author", "source", "path", "key", "kind",
-                    "skill_namespace")},
+                "manifest": dataclasses.asdict(manifest),
                 "ctx_methods": sorted(n for n in dir(PluginContext) if not n.startswith("_")),
             }
             if ctx._load_abandoned:
                 raise PluginLoadTimeout("plugin host load was abandoned")
             self._loading = plugin_key
             result = channel.call("load", params)
-            # Successful unloads still run child cleanup before disposing the proxy registrations.
-            ctx.on_unload(cleanup.dispose)
             return str((result or {}).get("module") or module_name or "")
-        except BaseException:
-            cleanup.dispose()
-            raise
         finally:
-            if ctx._load_abandoned:
-                cleanup.dispose()
             with self._lock:
                 self._pending_loads.discard(plugin_key)
                 if self._loading == plugin_key:
@@ -337,11 +329,16 @@ class PluginHost:
         return self._call("config_schema", {"path": str(path)})
 
     def profile_call(self, plugin_dir: str, module_name: str, profile: str, attr: str,
-                     args: tuple, kwargs: dict) -> Any:
-        """Run a model-provider profile's overridden method / callable field in the host."""
+                     args: tuple, kwargs: dict, fingerprint: str) -> Any:
+        """Run a model-provider profile's overridden method / callable field in the host.
+
+        ``fingerprint`` names the extracted source: the host recaptures the plugin when it differs
+        from the source it last captured, so a rewritten plugin never mixes new data with old code.
+        """
         self.ensure_started()
         return self._call("profile_call", {"path": plugin_dir, "module_name": module_name, "profile": profile,
-                                           "attr": attr, "args": encode(list(args)), "kwargs": encode(kwargs)})
+                                           "attr": attr, "fingerprint": fingerprint,
+                                           "args": encode(list(args)), "kwargs": encode(kwargs)})
 
     def asgi_request(self, plugin_name: str, dashboard_dir: str, api_file: str, method: str, path: str,
                      query: str, headers: list, body: bytes) -> Dict[str, Any]:
@@ -351,19 +348,19 @@ class PluginHost:
                                    "method": method, "path": path, "query": query,
                                    "headers": [list(h) for h in headers], "body": encode(body)})
 
-    def _unload(self, plugin_key: str) -> None:
+    def _cleanup_call(self, plugin_key: str, method: str, params: Dict[str, Any], *,
+                      generation: Optional[int] = None) -> Any:
         with self._lock:
+            if generation is not None and generation != self._generation:
+                raise PluginHostUnavailable("this callback belonged to a plugin host process that has exited")
             ctx = self._contexts.get(plugin_key)
             if ctx is not None:
                 ctx._abandon_load()
             proc, channel = self._proc, self._channel
+        if channel is None or channel.closed_reason is not None:
+            return None
         try:
-            if channel is None or channel.closed_reason is not None:
-                return
-            errors = (channel.call("unload", {"plugin_key": plugin_key},
-                                   timeout=_SHUTDOWN_GRACE_SECS) or {}).get("errors") or []
-            for error in errors:
-                logger.warning("Plugin '%s' on_unload callback failed in the plugin host: %s", plugin_key, error)
+            return channel.call(method, params, timeout=_SHUTDOWN_GRACE_SECS)
         except TimeoutError:
             logger.warning("Plugin '%s' cleanup timed out; retiring its host", plugin_key)
             # This is a failed host, not intentional shutdown. Kill the captured process so
@@ -374,6 +371,12 @@ class PluginHost:
                     proc.wait(timeout=_SHUTDOWN_GRACE_SECS)
             finally:
                 channel.close(f"plugin '{plugin_key}' cleanup timed out")
+
+    def _unload(self, plugin_key: str) -> None:
+        try:
+            errors = (self._cleanup_call(plugin_key, "unload", {"plugin_key": plugin_key}) or {}).get("errors") or []
+            for error in errors:
+                logger.warning("Plugin '%s' cleanup failed in the plugin host: %s", plugin_key, error)
         except Exception:
             logger.warning("Failed to clean up plugin '%s' in the plugin host", plugin_key, exc_info=True)
         finally:
@@ -404,9 +407,12 @@ class PluginHost:
             if generation == self._generation:
                 self._releases.append(ref)
 
-    def invoke(self, ref: int, args: tuple, kwargs: dict, *, generation: Optional[int] = None) -> Any:
-        return self._call("invoke", {"ref": ref, "args": encode(list(args)), "kwargs": encode(kwargs)},
-                          generation=generation)
+    def invoke(self, ref: int, args: tuple, kwargs: dict, *, generation: Optional[int] = None,
+               cleanup: Optional[str] = None) -> Any:
+        params = {"ref": ref, "args": encode(list(args)), "kwargs": encode(kwargs)}
+        if cleanup is not None:
+            return self._cleanup_call(cleanup, "invoke", {**params, "cleanup": True}, generation=generation)
+        return self._call("invoke", params, generation=generation)
 
     def obj_invoke(self, slot: "_ObjectSlot", method: str, args: tuple, kwargs: dict) -> Any:
         ref, generation = slot.live()
@@ -456,10 +462,12 @@ class PluginHost:
         ctx = self._plugin_ctx(params)
         method = str(params.get("method") or "")
         if (method.startswith("_") or method in HOST_UNSUPPORTED_CTX_METHODS
-                or method in HOST_SKIPPED_CTX_METHODS or method in {"on_unload", "spawn_task"}):
+                or method in HOST_SKIPPED_CTX_METHODS or method == "spawn_task"):
             raise PluginHostUnsupported(f"ctx.{method}() cannot be called across the plugin host")
         base = _import_ref(HOST_OBJECT_BASES[method]) if method in HOST_OBJECT_BASES else None
         resolve = functools.partial(self._resolve_ref, base=base)
+        if method == "on_unload":
+            resolve = functools.partial(self._callable_proxy, cleanup=str(params["plugin"]))
         args = decode(params.get("args") or [], resolve)
         kwargs = decode(params.get("kwargs") or {}, resolve)
         result = getattr(ctx, method)(*args, **kwargs)
@@ -506,16 +514,16 @@ class PluginHost:
             return self._object_proxy(ref, base)
         raise PluginHostUnsupported("registration handles are owned by the plugin host")
 
-    def _callable_proxy(self, ref: Dict[str, Any]) -> Callable[..., Any]:
+    def _callable_proxy(self, ref: Dict[str, Any], *, cleanup: Optional[str] = None) -> Callable[..., Any]:
         ref_id, generation = int(ref["__callable__"]), self._generation
 
         async def async_proxy(*args: Any, **kwargs: Any) -> Any:
             return await asyncio.to_thread(self.invoke, ref_id, args, kwargs, generation=generation)
 
         def sync_proxy(*args: Any, **kwargs: Any) -> Any:
-            return self.invoke(ref_id, args, kwargs, generation=generation)
+            return self.invoke(ref_id, args, kwargs, generation=generation, cleanup=cleanup)
 
-        proxy: Any = async_proxy if ref.get("async") else sync_proxy
+        proxy: Any = async_proxy if ref.get("async") and cleanup is None else sync_proxy
         signature = signature_from(ref.get("sig"))
         if signature is not None:
             proxy.__signature__ = signature  # type: ignore[attr-defined]
