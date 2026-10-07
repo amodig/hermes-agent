@@ -1214,37 +1214,39 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
                 return ("harness output:\n" + harness_log.read_text(errors="replace")
                         + "\nexternal-worker files:\n" + detail)
 
+            # Wait for the EXTERNAL WORKER's placement, not merely for the probe
+            # file: the durable row first carries the launcher's pid and is adopted
+            # by the worker afterwards, and ``systemd-run --scope`` moves that
+            # process into its scope asynchronously. Polling the real cgroup is what
+            # makes this independent of which of the two lands first.
             deadline = time.monotonic() + 120
             current = None
+            worker_pid = None
+            worker_cgroup = ""
             while time.monotonic() < deadline:
-                if started.exists() and current is not None and current.get("pid") != os.getpid():
-                    break
                 if parent.poll() is not None:
                     pytest.fail(
                         f"gateway fixture exited early with {parent.returncode};\n"
                         + _diagnostics()
                     )
                 current = executions.latest_execution(job["id"])
+                if started.exists() and current and current.get("pid"):
+                    candidate = int(current["pid"])
+                    try:
+                        group = fixture.cgroup_of(candidate)
+                    except FileNotFoundError:
+                        group = ""
+                    if group.startswith(boundary.workers_group + "/"):
+                        worker_pid, worker_cgroup = candidate, group
+                        break
                 time.sleep(0.05)
-            if not started.exists():
-                pytest.fail("the cron worker never started;\n" + _diagnostics())
-            assert current is not None
-            execution = current
-            worker_pid = int(current["pid"])
-            worker_start_time = process_start_time(worker_pid)
-            # ``systemd-run --scope`` moves the process into its scope
-            # asynchronously, so read the cgroup only once it has settled.
-            deadline = time.monotonic() + 20
-            worker_cgroup = ""
-            while time.monotonic() < deadline:
-                worker_cgroup = fixture.cgroup_of(worker_pid)
-                if worker_cgroup.startswith(boundary.workers_group + "/"):
-                    break
-                time.sleep(0.05)
-            assert worker_cgroup.startswith(boundary.workers_group + "/"), (
-                f"worker pid {worker_pid} is in {worker_cgroup}, not under "
-                f"{boundary.workers_group}; execution row={dict(execution)!r}"
+            assert worker_pid is not None, (
+                "the cron worker was never recorded inside "
+                f"{boundary.workers_group}; last row={dict(current) if current else None}\n"
+                + _diagnostics()
             )
+            execution = current
+            worker_start_time = process_start_time(worker_pid)
             assert not launched.exists(), "handoff returned before execution completed"
 
             # Replacing a managed gateway kills its own service tree. The active
