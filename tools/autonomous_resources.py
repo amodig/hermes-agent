@@ -133,7 +133,7 @@ def process_cgroup(proc, pid) -> str:
     Raises ``FileNotFoundError`` when the PID has exited: callers walking a
     live tree treat that as a short-lived descendant, not as a policy failure.
     """
-    for line in (Path(proc) / str(pid) / "cgroup").read_text(encoding="utf-8").splitlines():
+    for line in (Path(proc) / str(pid) / "cgroup").read_text(encoding="utf-8-sig").splitlines():
         if line.startswith("0::"):
             return line[3:]
     _fail(f"PID {pid}: unified cgroup missing")
@@ -162,7 +162,7 @@ def check_ancestors(root, group: str, expected: Mapping[str, object]) -> dict:
     rows: List[dict] = []
     while directory != root:
         try:
-            values = [(directory / key).read_text(encoding="utf-8").strip() for key in CGROUP_LIMITS]
+            values = [(directory / key).read_text(encoding="utf-8-sig").strip() for key in CGROUP_LIMITS]
         except OSError as exc:
             _fail(f"{group}: cgroup limits unreadable ({exc})")
         if not rows:
@@ -191,7 +191,7 @@ def check_ancestors(root, group: str, expected: Mapping[str, object]) -> dict:
 
 def _read_or_none(path: Path) -> Optional[str]:
     try:
-        return path.read_text(encoding="utf-8").strip()
+        return path.read_text(encoding="utf-8-sig").strip()
     except OSError:
         return None
 
@@ -223,7 +223,7 @@ def _cgroup_populated(directory: Path) -> Optional[bool]:
     observable afterwards.
     """
     try:
-        for line in (directory / "cgroup.events").read_text(encoding="utf-8").splitlines():
+        for line in (directory / "cgroup.events").read_text(encoding="utf-8-sig").splitlines():
             key, _, value = line.partition(" ")
             if key == "populated":
                 return value.strip() == "1" if value.strip() in ("0", "1") else None
