@@ -553,12 +553,13 @@ class PluginLoaderMixin:
         return manifest.source != "bundled" and isolation_mode() == ISOLATION_HOST
 
     def _plugin_host(self) -> Any:
-        """This manager's plugin host (one process per profile home), created on first use."""
-        host = getattr(self, "_plugin_host_instance", None)
-        if host is None:
-            from hermes_cli.plugin_host import PluginHost
-            host = self._plugin_host_instance = PluginHost(self)
-        return host
+        """Lazily create this manager's single host, shared by general and category loaders."""
+        with self._plugin_host_lock:
+            host = getattr(self, "_plugin_host_instance", None)
+            if host is None:
+                from hermes_cli.plugin_host import PluginHost
+                host = self._plugin_host_instance = PluginHost(self)
+            return host
 
     def _track_tool_override_policy(self, manifest: PluginManifest, module_name: str) -> None:
         """Install the plugin's tool-override policy in tools.registry as a ledger-owned lease."""

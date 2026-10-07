@@ -866,3 +866,157 @@ def test_hosted_memory_provider_stays_live_across_a_host_crash(tmp_path, monkeyp
         assert provider.whoami() not in {first_pid, os.getpid()}
     finally:
         host.shutdown()
+
+
+@pytest.mark.platforms("any")
+@pytest.mark.parametrize("outcome", ["recover", "budget_exhausted", "queued_shutdown", "worker_shutdown"])
+def test_cleanup_timeout_recovers_only_healthy_hosted_siblings(tmp_path, monkeypatch, outcome):
+    import threading
+
+    from hermes_cli import plugin_host, plugins_loader
+    from tools.registry import registry
+
+    home = _home_with_plugins(tmp_path, monkeypatch, {"retirementhealthy": '''
+import json, os
+from pathlib import Path
+
+SEEN = []
+
+def register(ctx):
+    with (Path(os.environ["HERMES_HOME"]) / "healthy-loads").open("a") as handle:
+        handle.write("registered\\n")
+    ctx.register_hook("post_tool_call", lambda tool_name=None, **kw: SEEN.append(tool_name))
+    ctx.register_tool(name="retirement_healthy", toolset="retirementhealthy",
+        schema={"name": "retirement_healthy", "description": "Healthy sibling",
+                "parameters": {"type": "object", "properties": {}}},
+        handler=lambda args, **kw: json.dumps({"pid": os.getpid(), "seen": SEEN}))
+'''})
+    manager = plugins_mod.get_plugin_manager()
+    host = manager._plugin_host()
+    recovery_started = threading.Event()
+    recovery_starting = threading.Event()
+    recovery_done = threading.Event()
+    release_recovery = threading.Event()
+    recoveries = []
+    restart = host._restart
+
+    def tracked_restart(*args):
+        recoveries.append(True)
+        recovery_started.set()
+        try:
+            if outcome == "queued_shutdown":
+                assert release_recovery.wait(15)
+            restart(*args)
+        finally:
+            recovery_done.set()
+
+    monkeypatch.setattr(host, "_restart", tracked_restart)
+    try:
+        manager.discover_and_load()
+        assert manager._plugins["retirementhealthy"].enabled
+        first = json.loads(registry.dispatch("retirement_healthy", {}, scope=manager.scope_key))
+        retired_proc = host._proc
+        assert retired_proc is not None and first["pid"] == host.info["pid"]
+        assert first["pid"] != os.getpid()
+        old_registrations = tuple(manager._ownership_ledger["retirementhealthy"])
+        ensure_started = host.ensure_started
+
+        def gated_start():
+            if outcome == "worker_shutdown" and threading.current_thread().name == "plugin-load:retirementhealthy":
+                # Shutdown wins after _restart's final check, but before its copied-context
+                # deadline worker reaches the real process-start lock.
+                recovery_starting.set()
+                assert release_recovery.wait(15)
+            return ensure_started()
+
+        monkeypatch.setattr(host, "ensure_started", gated_start)
+
+        plugin_dir = home / "plugins" / "retirementculprit"
+        plugin_dir.mkdir()
+        (plugin_dir / "__init__.py").write_text('''
+import os, threading
+from pathlib import Path
+
+def register(ctx):
+    home = Path(os.environ["HERMES_HOME"])
+    with (home / "culprit-loads").open("a") as handle:
+        handle.write("registered\\n")
+    def cleanup():
+        (home / "cleanup-started").touch()
+        threading.Event().wait()
+    ctx.on_unload(cleanup)
+    ctx.register_tool(name="retirement_culprit", toolset="retirementculprit",
+        schema={"name": "retirement_culprit", "description": "Must be removed",
+                "parameters": {"type": "object", "properties": {}}},
+        handler=lambda args, **kw: "stale")
+    threading.Event().wait()
+''', encoding="utf-8")
+        manifest = plugins_mod.PluginManifest(
+            name="retirementculprit", source="user", path=str(plugin_dir))
+        (home / "config.yaml").write_text(yaml.safe_dump({"plugins": {
+            "enabled": ["retirementhealthy", "retirementculprit"], "isolation": "host",
+            "load_timeout_seconds": 2,
+        }}), encoding="utf-8")
+        monkeypatch.setattr(plugin_host, "_SHUTDOWN_GRACE_SECS", 0.1)
+        if outcome == "budget_exhausted":
+            monkeypatch.setattr(plugin_host, "_RESTART_BUDGET", 0)
+
+        started = time.monotonic()
+        manager._load_plugin(manifest)
+        assert time.monotonic() - started < 5, "cleanup waited on the blocked child callback"
+        assert (home / "cleanup-started").exists()
+        assert retired_proc.poll() is not None
+        culprit = manager._plugins["retirementculprit"]
+        assert not culprit.enabled and "timed out" in str(culprit.error)
+        assert "retirementculprit" not in host._contexts
+        assert "retirementculprit" not in manager._ownership_ledger
+        assert "retirement_culprit" not in manager._plugin_tool_names
+        assert recovery_started.wait(10), "host retirement never scheduled sibling recovery"
+        if outcome in {"queued_shutdown", "worker_shutdown"}:
+            if outcome == "worker_shutdown":
+                assert recovery_starting.wait(10), "recovery never entered its deadline worker"
+            host.shutdown()
+            release_recovery.set()
+        assert recovery_done.wait(15), "sibling recovery did not finish"
+        for worker in tuple(plugins_loader._ABANDONED_LOADERS):
+            if worker.name == "plugin-load:retirementculprit":
+                worker.join(5)
+                assert not worker.is_alive(), "retired channel left the load worker blocked"
+        assert "retirementculprit" not in host._pending_loads
+        assert (home / "culprit-loads").read_text().splitlines() == ["registered"]
+        assert recoveries == [True]
+
+        if outcome == "recover":
+            assert manager._plugins["retirementhealthy"].enabled
+            assert manager._plugins["retirementhealthy"].error is None
+            assert all(not handle.active for handle in old_registrations)
+            manager.invoke_hook("post_tool_call", tool_name="after-retirement", args={}, result="ok")
+            healthy = json.loads(registry.dispatch("retirement_healthy", {}, scope=manager.scope_key))
+            assert healthy == {"pid": host.info["pid"], "seen": ["after-retirement"]}
+            assert healthy["pid"] not in {first["pid"], os.getpid()}
+            assert (home / "healthy-loads").read_text().splitlines() == ["registered", "registered"]
+        else:
+            assert not host.alive
+            assert (home / "healthy-loads").read_text().splitlines() == ["registered"]
+            if outcome == "budget_exhausted":
+                sibling = manager._plugins["retirementhealthy"]
+                assert not sibling.enabled and "restart budget" in str(sibling.error)
+                assert all(not handle.active for handle in old_registrations)
+                assert "retirementhealthy" not in host._contexts
+                assert "retirementhealthy" not in manager._ownership_ledger
+                assert "retirement_healthy" not in manager._plugin_tool_names
+            elif outcome == "worker_shutdown":
+                sibling = manager._plugins["retirementhealthy"]
+                assert not sibling.enabled and "cancelled by shutdown" in str(sibling.error)
+                assert "retirementhealthy" not in manager._ownership_ledger
+                assert "retirement_healthy" not in manager._plugin_tool_names
+                # Cancelling recovery does not make the host terminal: explicit revival remains
+                # supported for category proxies and other direct host consumers.
+                host.ensure_started()
+                assert host.alive
+    finally:
+        release_recovery.set()
+        if recovery_started.is_set():
+            recovery_done.wait(15)
+        manager.unload()
+        host.shutdown()

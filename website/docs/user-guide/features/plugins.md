@@ -816,7 +816,8 @@ What changes in `host` mode:
 
 - **No shared interpreter.** A plugin's module never enters the Hermes process, so it cannot read
   another profile's data from memory or patch Hermes internals. Under the multiplex gateway every
-  profile gets its own host, started with only that profile's environment and secrets.
+  profile gets one lazily constructed host shared by concurrent general and category loads,
+  started with only that profile's environment and secrets.
 - **Crashes stay contained.** A plugin that crashes or exits kills its host, not Hermes; the call in
   flight returns a tool error and Hermes restarts the host and reloads its plugins (bounded retries).
 - **Unload cancels plugin-owned background work.** Coroutines started with `ctx.spawn_task()`
@@ -825,8 +826,10 @@ What changes in `host` mode:
   finishes. Timed-out loads cannot register more callbacks or start new `ctx.spawn_task()` work.
   Synchronous Python code already running cannot be forcibly stopped: its modules are evicted when
   it returns, and the same plugin cannot load again until then. Cleanup gets a three-second grace;
-  a stalled unload callback retires the shared profile host rather than hanging discovery. Otherwise,
-  sibling plugins keep their host process.
+  a stalled unload callback retires the shared profile host rather than hanging discovery.
+  Unaffected enabled siblings reload into a replacement host; exhausted restart budgets remove
+  their dead registrations and disable them. Intentional shutdown cancels queued recovery.
+  Otherwise, sibling plugins keep their host process.
 - **Task and cleanup handles retain their contracts.** On the host's async loop,
   `ctx.spawn_task()` returns a named, awaitable task. `ctx.on_unload()` returns a
   registration whose `dispose()` runs cleanup once; disposed callbacks do not run again at unload.

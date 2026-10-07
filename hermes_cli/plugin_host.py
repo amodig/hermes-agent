@@ -15,6 +15,8 @@ run in the caller's context — same profile home, secret scope and session — 
 When the host dies every proxy raises :class:`PluginHostUnavailable`: tool calls return an error,
 hooks fail like any raising callback, and Hermes itself keeps running. A fresh host is then started
 and its plugins reloaded (bounded restarts; a plugin that killed the host while loading stays out).
+Timed-out cleanup also retires the host, but only unaffected enabled siblings are recovered. When
+the restart budget is exhausted, their dead registrations are removed and the plugins disabled.
 """
 
 from __future__ import annotations
@@ -66,6 +68,9 @@ class PluginHost:
         self._loading: Optional[str] = None
         self._pending_loads: set[str] = set()
         self._stopping = False
+        self._shutdown_epoch = 0
+        self._recovery_epoch: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+            "plugin_host_recovery_epoch", default=None)
         self._deaths: list = []
         # Bumped per host process: a proxy made for an earlier process must not address this one
         # (object ids restart at 1, so a stale id would silently land on a different object).
@@ -119,6 +124,9 @@ class PluginHost:
 
     def ensure_started(self) -> Channel:
         with self._lock:
+            recovery_epoch = self._recovery_epoch.get()
+            if recovery_epoch is not None and recovery_epoch != self._shutdown_epoch:
+                raise PluginHostUnavailable("plugin host recovery cancelled by shutdown")
             if self.alive:
                 return self._channel  # type: ignore[return-value]
             self._stopping = False
@@ -155,16 +163,22 @@ class PluginHost:
                 f"its plugins automatically" if code is not None else "the plugin host is not running")
 
     def _on_channel_close(self, generation: int, reason: str) -> None:
-        if self._stopping or generation != self._generation:
-            return  # a deliberate shutdown, or a late close from a host already replaced
-        culprit = self._loading
-        keys = [k for k in self._contexts.copy() if k != culprit and k in self._manager._plugins]
+        with self._lock:
+            if self._stopping or generation != self._generation:
+                return  # a deliberate shutdown, or a late close from a host already replaced
+            culprit = self._loading
+            # Closing the channel wakes load workers before this callback: _loading alone can
+            # already be cleared. An abandoned context must never be recovered as a sibling.
+            contexts = {k: ctx for k, ctx in self._contexts.copy().items()
+                        if k != culprit and k not in self._pending_loads
+                        and not ctx._load_abandoned and k in self._manager._plugins}
+            now = time.monotonic()
+            self._deaths = [t for t in self._deaths if now - t < _RESTART_WINDOW_SECS] + [now]
+            shutdown_epoch = self._shutdown_epoch
         logger.warning("Plugin host for %s exited (%s)%s", self._home, self._exit_reason(),
                        f" while loading plugin '{culprit}'" if culprit else "")
-        now = time.monotonic()
-        self._deaths = [t for t in self._deaths if now - t < _RESTART_WINDOW_SECS] + [now]
-        if keys:
-            threading.Thread(target=self._restart, args=(keys,), daemon=True,
+        if contexts:
+            threading.Thread(target=self._restart, args=(contexts, shutdown_epoch), daemon=True,
                              name="plugin-host-restart").start()
 
     def _restart_refused(self, what: str) -> bool:
@@ -174,21 +188,40 @@ class PluginHost:
                      self._home, len(self._deaths), _RESTART_WINDOW_SECS, what)
         return True
 
-    def _restart(self, keys: list) -> None:
-        if self._restart_refused("plugins: " + ", ".join(keys)):
-            return
-        time.sleep(0.5 * len(self._deaths))
+    def _restart(self, contexts: Dict[str, Any], shutdown_epoch: int) -> None:
+        from hermes_cli.plugins import LoadedPlugin
+        if len(self._deaths) <= _RESTART_BUDGET:
+            time.sleep(0.5 * len(self._deaths))
         manager = self._manager
-        for key in keys:
-            loaded = manager._plugins.get(key)
-            if loaded is None or not loaded.enabled:
-                continue
-            manager.unload(key)
-            manager._load_plugin(loaded.manifest)
+        for key, ctx in contexts.items():
+            # Wait for the failed load/unload's ledger rollback, and keep replacement atomic.
+            # A queued recovery must not undo a later unload, reload, or deliberate shutdown.
+            with manager._discovery_lock:
+                if self._stopping or shutdown_epoch != self._shutdown_epoch:
+                    return
+                loaded = manager._plugins.get(key)
+                if (self._contexts.get(key) is not ctx or loaded is None or not loaded.enabled):
+                    continue
+                refused = self._restart_refused(f"plugin: {key}")
+                manager.unload(key)
+                if self._stopping or shutdown_epoch != self._shutdown_epoch:
+                    return
+                if refused:
+                    manager._plugins[key] = LoadedPlugin(
+                        manifest=loaded.manifest, error="plugin host restart budget exhausted")
+                else:
+                    # run_with_load_deadline copies this context into its worker. Check the
+                    # shutdown epoch under ensure_started's lock, not only before spawning it.
+                    token = self._recovery_epoch.set(shutdown_epoch)
+                    try:
+                        manager._load_plugin(loaded.manifest)
+                    finally:
+                        self._recovery_epoch.reset(token)
 
     def shutdown(self) -> None:
-        self._stopping = True
         with self._lock:
+            self._stopping = True
+            self._shutdown_epoch += 1
             proc, channel = self._proc, self._channel
             self._proc = self._channel = None
         if channel is not None and channel.closed_reason is None:
@@ -319,11 +352,12 @@ class PluginHost:
                                    "headers": [list(h) for h in headers], "body": encode(body)})
 
     def _unload(self, plugin_key: str) -> None:
-        ctx = self._contexts.get(plugin_key)
-        if ctx is not None:
-            ctx._abandon_load()
+        with self._lock:
+            ctx = self._contexts.get(plugin_key)
+            if ctx is not None:
+                ctx._abandon_load()
+            proc, channel = self._proc, self._channel
         try:
-            channel = self._channel
             if channel is None or channel.closed_reason is not None:
                 return
             errors = (channel.call("unload", {"plugin_key": plugin_key},
@@ -332,7 +366,14 @@ class PluginHost:
                 logger.warning("Plugin '%s' on_unload callback failed in the plugin host: %s", plugin_key, error)
         except TimeoutError:
             logger.warning("Plugin '%s' cleanup timed out; retiring its host", plugin_key)
-            self.shutdown()
+            # This is a failed host, not intentional shutdown. Kill the captured process so
+            # channel-close recovery can reload siblings, even if the load worker is unwinding.
+            try:
+                if proc is not None:
+                    proc.kill()
+                    proc.wait(timeout=_SHUTDOWN_GRACE_SECS)
+            finally:
+                channel.close(f"plugin '{plugin_key}' cleanup timed out")
         except Exception:
             logger.warning("Failed to clean up plugin '%s' in the plugin host", plugin_key, exc_info=True)
         finally:
