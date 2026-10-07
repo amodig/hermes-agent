@@ -45,6 +45,7 @@ import time
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import ModuleType
 
 from providers.base import ProviderProfile
 
@@ -88,6 +89,10 @@ _HOME_LAYERS_LOCK = threading.Lock()
 # ``list_providers()``) would block on it while the scanning thread waits on that module's import lock.
 _REGISTRATION_TARGET: ContextVar[_HomeLayer | None] = ContextVar("_provider_registration_target", default=None)
 _BUNDLED_ONLY_DISCOVERY: ContextVar[bool] = ContextVar("_provider_bundled_only_discovery", default=False)
+# Only the hosted child uses these: discovery and profile RPCs share one source import.
+# Reentrant because a general plugin's import may itself discover providers.
+_HOST_IMPORT_LOCK = threading.RLock()
+_HOST_PROFILE_IMPORTS: dict[Path, tuple[str, ModuleType, list[ProviderProfile]]] = {}
 
 # Repo-root ``plugins/model-providers/`` — populated at discovery time.
 _BUNDLED_PLUGINS_DIR = (
@@ -139,7 +144,7 @@ def register_provider(profile: ProviderProfile) -> None:
         for alias in profile.aliases:
             _ALIASES[alias] = profile.name
         _PROVIDER_LIST_CACHE = None
-    if _discovered and not _discovering:  # post-discovery registration: mirror it immediately
+    if _discovered and not _discovering and not _BUNDLED_ONLY_DISCOVERY.get():
         _sync_auth_registry()
 
 
@@ -397,6 +402,37 @@ def _user_module_name(plugin_dir: Path, home_key: str) -> str:
     return f"_hermes_user_provider_{digest}_{plugin_dir.name.replace('-', '_')}"
 
 
+def _load_host_profiles(plugin_dir: Path, module_name: str) -> list[ProviderProfile]:
+    """Capture one source generation without publishing it into any live registry layer."""
+    from hermes_cli.plugin_host_child import _import_plugin
+    from hermes_cli.plugin_host_profiles import _fingerprint
+
+    plugin_dir = plugin_dir.resolve()
+    with _HOST_IMPORT_LOCK:
+        fingerprint = _fingerprint(plugin_dir)
+        cached = _HOST_PROFILE_IMPORTS.get(plugin_dir)
+        if cached is not None:
+            previous, module, profiles = cached
+            if previous == fingerprint and sys.modules.get(module.__name__) is module:
+                return profiles
+            # Discovery and RPC may use different names for the same source. Retire the
+            # original namespace's submodules as well when replacing that generation.
+            module_name = module.__name__
+        layer = _HomeLayer()
+        discovery_token = _BUNDLED_ONLY_DISCOVERY.set(True)
+        target_token = _REGISTRATION_TARGET.set(None)
+        try:
+            _discover_providers(bundled_only=True)
+            _REGISTRATION_TARGET.set(layer)
+            module = _import_plugin({"path": str(plugin_dir), "module_name": module_name})
+        finally:
+            _REGISTRATION_TARGET.reset(target_token)
+            _BUNDLED_ONLY_DISCOVERY.reset(discovery_token)
+        profiles = list(layer.registry.values())
+        _HOST_PROFILE_IMPORTS[plugin_dir] = (fingerprint, module, profiles)
+        return profiles
+
+
 def _import_plugin_dir(plugin_dir: Path, source: str, *, home_key: str = "") -> None:
     """Import a single plugin directory so it self-registers.
 
@@ -407,12 +443,14 @@ def _import_plugin_dir(plugin_dir: Path, source: str, *, home_key: str = "") -> 
     if not init_file.exists():
         return
     if source != "bundled":
-        from hermes_cli.plugin_isolation import ISOLATION_HOST, isolation_mode
-        if isolation_mode() == ISOLATION_HOST:  # the plugin's code runs in the plugin host
+        from hermes_cli.plugin_isolation import HOST_PROCESS_ENV, ISOLATION_HOST, isolation_mode
+        hosted_child = os.environ.get(HOST_PROCESS_ENV) == "1"
+        if hosted_child or isolation_mode() == ISOLATION_HOST:
             from hermes_cli.plugin_host_profiles import load_hosted_profiles
+            load = _load_host_profiles if hosted_child else load_hosted_profiles
             _current_source = source
             try:
-                for profile in load_hosted_profiles(plugin_dir, _user_module_name(plugin_dir, home_key)):
+                for profile in load(plugin_dir, _user_module_name(plugin_dir, home_key)):
                     register_provider(profile)
             except Exception as exc:
                 logger.warning("Failed to load user provider plugin %s in the plugin host: %s",

@@ -54,7 +54,9 @@ def _fingerprint(plugin_dir: Path) -> str:
         if not path.is_file() or "__pycache__" in path.parts or ".git" in path.parts:
             continue
         stat = path.stat()
-        digest.update(f"{path.relative_to(plugin_dir)}|{stat.st_size}|{stat.st_mtime_ns}".encode())
+        digest.update(f"{path.relative_to(plugin_dir)}|{stat.st_size}|".encode())
+        with path.open("rb") as source:
+            hashlib.file_digest(source, lambda: digest)
     return digest.hexdigest()
 
 

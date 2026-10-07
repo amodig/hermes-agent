@@ -843,8 +843,9 @@ What changes in `host` mode:
   credentials and terminal policy even if multiplexing activates later; in-flight callbacks
   retain their caller's scope.
 - **Dashboard APIs retain their lifecycle.** The cached app runs router lifespan startup before
-  its first request and shutdown on plugin unload or host shutdown. Reload evicts its API and
-  module without resetting sibling plugins or restarting the host.
+  its first request and shutdown on plugin unload or host shutdown. Source-content changes
+  replace the API and its lifespan even for API-only dashboards with no CLI/gateway manifest,
+  without resetting sibling plugins or restarting the host.
 - **General and category loads share imports.** Concurrent first loads of one plugin directory
   share its module until unload; each category load still creates a fresh provider instance.
   A dual-kind general/memory plugin registers its hooks once, regardless of load order.

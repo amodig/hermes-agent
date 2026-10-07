@@ -2,11 +2,9 @@
 
 A rewritten model-provider plugin used to stay on the host's first capture: a freshly extracted
 proxy carried the new fields while its methods still ran the old code, or raised AttributeError for
-a method it had just gained. The rewrite below is deliberately hostile: it keeps the ``__init__.py``
-byte length and the whole second its v1 ``.pyc`` was stamped from, and moves a relative helper
-module's clearly different bytes with it. A sibling file carries the directory fingerprint, so the
-rescan is triggered on any filesystem and freshness has to come from reading the source, never from
-a timestamp-validated bytecode cache or a stale ``sys.modules`` submodule.
+a method it had just gained. The rewrite below keeps every path, byte length and nanosecond mtime
+unchanged while replacing both the package body and a relative helper. Freshness must come from
+source bytes, not filesystem metadata, timestamp-validated bytecode or stale ``sys.modules``.
 """
 
 import os
@@ -21,7 +19,7 @@ from hermes_cli.plugin_host_profiles import load_hosted_profiles
 _ADDED_METHOD = "    def added(self):\n        return {'code': 'new'}\n"
 _FILLER = "# " + "x" * (len(_ADDED_METHOD) - 3) + "\n"
 _HELPER_V1 = 'MARK = "alpha"\n'
-_HELPER_V2 = 'MARK = "beta-alpha-longer"\n'
+_HELPER_V2 = 'MARK = "omega"\n'
 
 _PLUGIN = """import os, time
 from pathlib import Path
@@ -71,6 +69,7 @@ def test_live_host_recaptures_a_rewritten_profile_source(tmp_path, monkeypatch):
     second = 1_700_000_000  # fixed whole second: the v1 pyc's timestamp check must accept the v2 source
     source.write_bytes(v1.encode("utf-8"))  # bytes, so no platform newline translation skews sizes
     os.utime(source, ns=(second * 10**9 + 100_000_000,) * 2)
+    os.utime(helper, ns=(second * 10**9 + 100_000_000,) * 2)
 
     module_name = "_hermes_freshness_provider"
     host = plugins_mod.get_plugin_manager()._plugin_host()
@@ -81,11 +80,9 @@ def test_live_host_recaptures_a_rewritten_profile_source(tmp_path, monkeypatch):
         assert old.helper_mark() == "alpha"
 
         source.write_bytes(v2.encode("utf-8"))
-        os.utime(source, ns=(second * 10**9 + 900_000_000,) * 2)
-        # A sibling file carries the fingerprint, so the rescan does not depend on the filesystem
-        # resolving the sub-second mtime above — while the pyc's size/second check still validates.
-        manifest.write_text("name: freshness\n# rewritten\n", encoding="utf-8")
-        helper.write_text(_HELPER_V2, encoding="utf-8")  # relative submodule: clearly other bytes
+        os.utime(source, ns=(second * 10**9 + 100_000_000,) * 2)
+        helper.write_text(_HELPER_V2, encoding="utf-8")
+        os.utime(helper, ns=(second * 10**9 + 100_000_000,) * 2)
 
         fresh = {p.name: p for p in load_hosted_profiles(plugin_dir, module_name)}["freshness"]
         assert tuple(fresh.env_vars) == ("NEW_KEY",)  # a new extraction, not the cached v1 payload
@@ -97,7 +94,7 @@ def test_live_host_recaptures_a_rewritten_profile_source(tmp_path, monkeypatch):
 
         with ThreadPoolExecutor(max_workers=4) as pool:
             assert list(pool.map(call, range(4))) == [
-                ({"code": "v2"}, {"code": "new"}, "beta-alpha-longer")] * 4
+                ({"code": "v2"}, {"code": "new"}, "omega")] * 4
     finally:
         host.shutdown()
 

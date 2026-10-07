@@ -16,7 +16,9 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import functools
+import hashlib
 import importlib
+import importlib.machinery
 import importlib.metadata
 import importlib.util
 import inspect
@@ -175,10 +177,12 @@ class HostRuntime:
         self.plugin_paths: Dict[str, Path] = {}
         self.contexts: Dict[str, RemotePluginContext] = {}
         self.loading: set[str] = set()
-        self.asgi_apps: Dict[Path, Dict[str, tuple[Any, types.ModuleType, Any]]] = {}
+        # dashboard dir -> api path -> (app, module, entered lifespan, source content hash)
+        self.asgi_apps: Dict[Path, Dict[str, tuple[Any, types.ModuleType, Any, str]]] = {}
         self.profiles: Dict[tuple, Dict[str, Any]] = {}
-        # ponytail: serialize cold imports; shard only after capture stops replacing global registration.
-        self._import_lock = threading.Lock()
+        from providers import _HOST_IMPORT_LOCK
+        # Discovery inside a plugin import must join the same reentrant capture lock.
+        self._import_lock = _HOST_IMPORT_LOCK
         self.imported_modules: Dict[Path, types.ModuleType] = {}
         self.stopped = threading.Event()
         self.loop = asyncio.new_event_loop()
@@ -396,8 +400,7 @@ class HostRuntime:
     def op_profile_call(self, params: Dict[str, Any]) -> Any:
         """Run one overridden method (or callable field) of a model-provider profile, loading the
         plugin on first use in this host process. Addressed by name, so it survives host restarts."""
-        # Capture replaces process-global registration; serialize misses across all paths. The source
-        # fingerprint makes a rewritten plugin recapture instead of serving its stale methods forever.
+        # Serialize misses with discovery; the source fingerprint recaptures rewritten plugins.
         key = (str(params["path"]), str(params["module_name"]))
         fingerprint = str(params["fingerprint"])
         with self._import_lock:
@@ -414,13 +417,30 @@ class HostRuntime:
         return encode(self._run(target(*args, **kwargs)))
 
     def op_asgi(self, params: Dict[str, Any]) -> Any:
-        """Serve one dashboard API request with the plugin's FastAPI ``router`` (cached until unload)."""
+        """Serve one dashboard API request with the plugin's FastAPI ``router``.
+
+        The cached app is keyed by the api file's *content*, so an edit that rewrites
+        ``plugin_api.py`` — even preserving byte size and mtime — swaps in a fresh module,
+        lifespan and router instead of serving the old ones until the whole host exits."""
         dashboard_dir = Path(str(params["dashboard_dir"])).resolve()
         api_path = dashboard_dir / str(params["api_file"])
         with self._import_lock:
+            # Content identity, not mtime/size: an update may preserve both, and a stale .pyc must
+            # never be reused. Read once and compile the same bytes, so hash and code cannot diverge.
+            source = api_path.read_bytes()
+            identity = hashlib.sha256(source).hexdigest()
             # The dashboard name need not equal the owner's manifest key; join them by plugin root.
             apps = self.asgi_apps.setdefault(dashboard_dir.parent, {})
             cached = apps.get(str(api_path))
+            if cached is not None and cached[3] != identity:
+                # The source changed under this path: retire just this app (siblings keep running)
+                # and enter the fresh one below. A shutdown error is logged, never fails the request.
+                apps.pop(str(api_path), None)
+                errors: List[str] = []
+                self._close_asgi_app(cached, errors)
+                for error in errors:
+                    logger.warning("Dashboard reload shutdown failed: %s", error)
+                cached = None
             if cached is None:
                 from fastapi import FastAPI
                 module_name = f"hermes_dashboard_plugin_{params['plugin']}"
@@ -428,10 +448,10 @@ class HostRuntime:
                 if spec is None or spec.loader is None:
                     raise ImportError(f"cannot load dashboard api {api_path}")
                 module = importlib.util.module_from_spec(spec)
+                sys.modules.pop(module_name, None)  # retire whatever revision still owned this name
                 sys.modules[module_name] = module
                 try:
-                    # Updates can preserve source size and mtime, so never reuse timestamp-based bytecode.
-                    exec(compile(api_path.read_bytes(), str(api_path), "exec", dont_inherit=True), module.__dict__)
+                    exec(compile(source, str(api_path), "exec", dont_inherit=True), module.__dict__)
                     router = getattr(module, "router", None)
                     if router is None:
                         raise AttributeError(f"dashboard api {api_path.name} has no 'router'")
@@ -442,7 +462,7 @@ class HostRuntime:
                 except BaseException:
                     sys.modules.pop(module_name, None)
                     raise
-                cached = apps[str(api_path)] = (app, module, lifespan)
+                cached = apps[str(api_path)] = (app, module, lifespan, identity)
             app = cached[0]
 
         async def request() -> Dict[str, Any]:
@@ -458,16 +478,21 @@ class HostRuntime:
 
         return encode(self._run(request()))
 
+    def _close_asgi_app(self, entry: tuple, errors: list) -> None:
+        """Exit one entered lifespan once and evict its module; caller holds the import/cache lock."""
+        _app, module, lifespan, _identity = entry
+        try:
+            self._run(lifespan.__aexit__(None, None, None))
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+        finally:
+            if sys.modules.get(module.__name__) is module:
+                sys.modules.pop(module.__name__, None)
+
     def _close_asgi_apps(self, plugin_dir: Path, errors: list) -> None:
         """Exit each entered lifespan once; caller holds the import/cache lock."""
-        for _, module, lifespan in self.asgi_apps.pop(plugin_dir, {}).values():
-            try:
-                self._run(lifespan.__aexit__(None, None, None))
-            except Exception as exc:
-                errors.append(f"{type(exc).__name__}: {exc}")
-            finally:
-                if sys.modules.get(module.__name__) is module:
-                    sys.modules.pop(module.__name__, None)
+        for entry in self.asgi_apps.pop(plugin_dir, {}).values():
+            self._close_asgi_app(entry, errors)
 
     def op_invoke(self, params: Dict[str, Any]) -> Any:
         ref = int(params["ref"])
@@ -655,6 +680,31 @@ async def _on_behalf_of(awaitable: Any, origin: Optional[int]) -> Any:
     return await awaitable
 
 
+class _PluginSourceLoader(importlib.machinery.SourceFileLoader):
+    """Plugin generations are content-addressed; timestamp-validated bytecode is insufficient."""
+
+    def get_code(self, fullname):
+        path = self.get_filename(fullname)
+        return self.source_to_code(self.get_data(path), path)
+
+
+class _PluginSourceFinder:
+    def __init__(self):
+        self.namespaces: tuple[str, ...] = ()
+
+    def find_spec(self, fullname, path=None, target=None):
+        if not any(fullname.startswith(name + ".") for name in self.namespaces):
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
+        if spec is not None and isinstance(spec.loader, importlib.machinery.SourceFileLoader):
+            spec.loader = _PluginSourceLoader(fullname, spec.origin)
+            return spec
+        return None
+
+
+_PLUGIN_SOURCE_FINDER = _PluginSourceFinder()
+
+
 def _import_plugin(params: Dict[str, Any]) -> Any:
     """Import a directory plugin under the module name Hermes assigned, or resolve an entry point."""
     if params.get("entrypoint"):
@@ -667,6 +717,12 @@ def _import_plugin(params: Dict[str, Any]) -> Any:
     if not init_file.exists():
         raise FileNotFoundError(f"No __init__.py in {plugin_dir}")
     module_name = str(params["module_name"])
+    # Keep the namespace-scoped finder for helpers first imported later by a callback.
+    if module_name not in _PLUGIN_SOURCE_FINDER.namespaces:
+        # Readers include concurrent callbacks doing deferred imports.
+        _PLUGIN_SOURCE_FINDER.namespaces += (module_name,)
+    if _PLUGIN_SOURCE_FINDER not in sys.meta_path:
+        sys.meta_path.insert(0, _PLUGIN_SOURCE_FINDER)
     # A re-import rebuilds the root below, so drop any previous incarnation's submodules with it;
     # otherwise `from .provider import X` resolves against the stale module object in sys.modules.
     # Callers serialize this with _import_lock (the one-shot extraction process is cold anyway).
@@ -680,8 +736,9 @@ def _import_plugin(params: Dict[str, Any]) -> Any:
             ns_pkg.__path__ = []  # type: ignore[attr-defined]
             ns_pkg.__package__ = parent
             sys.modules[parent] = ns_pkg
-    spec = importlib.util.spec_from_file_location(module_name, init_file,
-                                                  submodule_search_locations=[str(plugin_dir)])
+    spec = importlib.util.spec_from_file_location(
+        module_name, init_file, loader=_PluginSourceLoader(module_name, str(init_file)),
+        submodule_search_locations=[str(plugin_dir)])
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot create module spec for {init_file}")
     module = importlib.util.module_from_spec(spec)
@@ -689,9 +746,7 @@ def _import_plugin(params: Dict[str, Any]) -> Any:
     module.__path__ = [str(plugin_dir)]  # type: ignore[attr-defined]
     sys.modules[module_name] = module
     try:
-        # A replaced plugin can keep its byte length and whole-second mtime, so its timestamp-checked
-        # pyc would be reused; compile the package body from source (submodules still use the loader).
-        exec(compile(init_file.read_bytes(), str(init_file), "exec", dont_inherit=True), module.__dict__)
+        spec.loader.exec_module(module)
     except BaseException:
         for name in [m for m in sys.modules if m == module_name or m.startswith(module_name + ".")]:
             sys.modules.pop(name, None)
@@ -713,17 +768,10 @@ def _take_protocol_streams():
 
 
 def capture_profiles(path: str, module_name: str) -> List[Any]:
-    """Import a model-provider plugin and return the profiles it passes to ``register_provider``."""
+    """Return this source generation's profiles, reusing any earlier host discovery import."""
     import providers
     from providers.base import ProviderProfile
-    providers._discover_providers(bundled_only=True)  # never scan the target's home before capture
-    captured: List[Any] = []
-    original = providers.register_provider
-    providers.register_provider = captured.append  # type: ignore[assignment]
-    try:
-        _import_plugin({"path": path, "module_name": module_name, "name": Path(path).name})
-    finally:
-        providers.register_provider = original  # type: ignore[assignment]
+    captured = providers._load_host_profiles(Path(path), module_name)
     for profile in captured:
         if type(profile).create_client is not ProviderProfile.create_client:
             raise PluginHostUnsupported(
