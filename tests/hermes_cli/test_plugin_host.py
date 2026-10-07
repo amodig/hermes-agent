@@ -1056,3 +1056,82 @@ def register(ctx):
             recovery_done.wait(15)
         manager.unload()
         host.shutdown()
+
+
+@pytest.mark.platforms("any")
+def test_secondary_host_recovery_retains_owner_callback_scopes(tmp_path, monkeypatch):
+    import threading
+
+    from hermes_cli.web_server_profiles import _config_profile_scope
+    from agent.secret_scope import get_secret
+    from tools.terminal_scope import install_and_reset_profile_terminal_scope, terminal_env
+    from tools.registry import registry
+
+    home = _home_with_plugins(tmp_path, monkeypatch, {}, isolation="in_process")
+    (home / ".env").write_text("RECOVERY_TOKEN=launch\n")
+    secondary = home / "profiles" / "secondary"
+    plugin_dir = secondary / "plugins" / "recovery"
+    plugin_dir.mkdir(parents=True)
+    (secondary / ".env").write_text("RECOVERY_TOKEN=secondary\n")
+    (secondary / "config.yaml").write_text(yaml.safe_dump({
+        "plugins": {"enabled": ["recovery"], "isolation": "host",
+                    "entries": {"recovery": {"tag": "secondary"}}},
+        "terminal": {"cwd": str(secondary / "work")},
+    }))
+    (plugin_dir / "plugin.yaml").write_text("name: recovery\n")
+    (plugin_dir / "__init__.py").write_text('''
+import json, os
+from agent.secret_scope import get_secret
+from hermes_cli.config import load_config
+from hermes_constants import get_hermes_home
+SEEN = {"pid": os.getpid(), "home": str(get_hermes_home()),
+        "tag": load_config()["plugins"]["entries"]["recovery"]["tag"],
+        "secret": get_secret("RECOVERY_TOKEN")}
+def register(ctx):
+    SEEN["parent"] = json.loads(ctx.dispatch_tool("profile_recovery_parent", {}))
+    ctx.register_tool(name="profile_recovery_probe", toolset="recovery",
+        schema={"name": "profile_recovery_probe", "parameters": {"type": "object", "properties": {}}},
+        handler=lambda args, **kw: json.dumps(SEEN))
+    ctx.register_tool(name="profile_recovery_crash", toolset="recovery",
+        schema={"name": "profile_recovery_crash", "parameters": {"type": "object", "properties": {}}},
+        handler=lambda args, **kw: os._exit(3))
+''')
+    with _config_profile_scope("secondary"):
+        manager = plugins_mod.get_plugin_manager()
+        registry.register(name="profile_recovery_parent", toolset="recovery",
+                          schema={"name": "profile_recovery_parent",
+                                  "parameters": {"type": "object", "properties": {}}},
+                          scope=manager.scope_key,
+                          handler=lambda args, **kw: json.dumps({
+                              "secret": get_secret("RECOVERY_TOKEN"), "cwd": terminal_env("TERMINAL_CWD")}))
+        host = manager._plugin_host()
+    finished = threading.Event()
+    restart = host._restart
+
+    def tracked_restart(*args):
+        try:
+            restart(*args)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(host, "_restart", tracked_restart)
+    try:
+        with _config_profile_scope("secondary"), install_and_reset_profile_terminal_scope(secondary):
+            manager.discover_and_load()
+            first = json.loads(registry.dispatch("profile_recovery_probe", {}, scope=manager.scope_key))
+        assert first == {"pid": host.info["pid"], "home": str(secondary.resolve()),
+                         "tag": "secondary", "secret": "secondary",
+                         "parent": {"secret": "secondary", "cwd": str(secondary / "work")}}
+        assert first["pid"] != os.getpid()
+        with _config_profile_scope("secondary"):
+            assert "plugin host" in registry.dispatch("profile_recovery_crash", {}, scope=manager.scope_key)
+        assert finished.wait(15)
+        with _config_profile_scope("secondary"):
+            recovered = json.loads(registry.dispatch("profile_recovery_probe", {}, scope=manager.scope_key))
+        assert recovered == {**first, "pid": host.info["pid"]}
+        assert recovered["pid"] not in {first["pid"], os.getpid()}
+    finally:
+        with _config_profile_scope("secondary"):
+            registry.deregister("profile_recovery_parent", scope=manager.scope_key)
+            manager.unload()
+            host.shutdown()

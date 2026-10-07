@@ -822,6 +822,8 @@ What changes in `host` mode:
   including declared capabilities, environment requirements and configuration schemas.
 - **Crashes stay contained.** A plugin that crashes or exits kills its host, not Hermes; the call in
   flight returns a tool error and Hermes restarts the host and reloads its plugins (bounded retries).
+  Recovery binds the owning profile's home, secrets and terminal policy, including parent
+  callbacks made while replacement plugins register.
 - **Unload cancels plugin-owned background work.** Coroutines started with `ctx.spawn_task()`
   are cancelled when that plugin unloads, reloads, fails registration, or exceeds
   `plugins.load_timeout_seconds`; cleanup callbacks retain parent callback context until cleanup

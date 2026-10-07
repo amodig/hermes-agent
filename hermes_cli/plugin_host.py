@@ -178,7 +178,8 @@ class PluginHost:
         logger.warning("Plugin host for %s exited (%s)%s", self._home, self._exit_reason(),
                        f" while loading plugin '{culprit}'" if culprit else "")
         if contexts:
-            threading.Thread(target=self._restart, args=(contexts, shutdown_epoch), daemon=True,
+            threading.Thread(target=self._build_base_context().run,
+                             args=(self._restart, contexts, shutdown_epoch), daemon=True,
                              name="plugin-host-restart").start()
 
     def _restart_refused(self, what: str) -> bool:
