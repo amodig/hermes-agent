@@ -516,8 +516,8 @@ def test_explicit_current_install_entrypoint_is_sealed_and_custom_wrapper_is_ref
 
 
 @pytest.mark.platforms("linux")
-def test_oneshot_unit_dispatcher_scope_wraps_or_warns_never_dooms_silently(
-    worker_setup, monkeypatch, caplog,
+def test_oneshot_unit_dispatcher_scope_wraps_and_refuses_without_one(
+    worker_setup, monkeypatch,
 ):
     from tools import process_registry
 
@@ -538,12 +538,12 @@ def test_oneshot_unit_dispatcher_scope_wraps_or_warns_never_dooms_silently(
     assert wrapped[:3] == ["systemd-run", "--user", "--scope"]
     assert "--slice=autonomous-workers.slice" in wrapped, wrapped
     assert f"hermes-worker-kanban-{task.id}-run-{task.current_run_id}" in wrapped
+    # Without a scope the launch is refused, not run unmanaged inside the unit:
+    # an unscoped autonomous child would escape both the native slot and the
+    # worker-scope evidence the boundary check reads.
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
-    monkeypatch.setattr(process_registry, "_scope_degraded_warned", False)
-    with caplog.at_level("WARNING", logger=process_registry.logger.name):
-        assert kbd._restart_safe_worker_argv(task, command) == command
-    warned = [r.getMessage() for r in caplog.records if "KILLED when the unit exits" in r.getMessage()]
-    assert len(warned) == 1 and "KillMode=process" in warned[0]
+    with pytest.raises(process_registry.AutonomousResourceUnavailable):
+        kbd._restart_safe_worker_argv(task, command)
     assert process_registry.restart_safe_gateway_child_argv(
         ["hermes", "cron"], unit_suffix="cron-job-1", require_restart_safe_scope=True,
     ).mode == "in_process"
@@ -923,20 +923,22 @@ def test_worker_survives_a_real_user_service_restart(tmp_path, monkeypatch):
 
 @pytest.mark.platforms("linux")
 @pytest.mark.live_system_guard_bypass  # creates a disposable transient worker slice
-def test_occupied_native_slot_refuses_dispatch_without_charging_retries(
-    worker_setup, tmp_path, monkeypatch,
-):
+def test_occupied_native_slot_refuses_dispatch_without_charging_retries(tmp_path, monkeypatch):
     """A permissive scheduling cap cannot admit a second autonomous worker.
 
-    Two DIFFERENT profile homes and boards ask for a worker while the single
-    native slot is genuinely occupied, with ``max_in_progress`` deliberately
-    permissive. The native slot is the admission authority, so both launches stay
-    ungranted, the cards keep their retry budget (the refusal is infrastructure),
-    and the scheduling knobs never enter the decision.
+    Two halves, each asserted where it is real. The ADMISSION half runs inside the
+    fixture aggregate, so the real validator decides with a genuinely placed
+    launcher and a genuinely held slot: two different profile homes both come back
+    ``busy`` with the slot diagnostic, and the same call is ADMITTED once the
+    holder is released. The BOOKKEEPING half drives ``dispatch_once`` with
+    ``max_in_progress`` deliberately permissive, keeping the real occupied-slot
+    verdict and replacing only the launcher-placement half (this pytest process is
+    not a gateway), and asserts the card keeps its retry budget.
     """
     from tests._fixtures import autonomous_slice as fixture
 
     fixture.require_user_bus()
+    runtime_root = str(Path(kbd.__file__).resolve().parents[1])
     homes = []
     for suffix in ("a", "b"):
         home = tmp_path / f"home-{suffix}"
@@ -947,13 +949,43 @@ def test_occupied_native_slot_refuses_dispatch_without_charging_retries(
 
     with fixture.disposable_boundary() as boundary:
         boundary.install(monkeypatch)
-        # Real validators: the whole point is the real decision, not a stub.
-        monkeypatch.setattr(
-            process_mod, "require_autonomous_boundary", REAL_REQUIRE_AUTONOMOUS_BOUNDARY,
+        probe = tmp_path / "admission_probe.py"
+        probe.write_text(
+            "import json, os, sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "from tools import autonomous_resources as ar, process_registry as pr\n"
+            "ar._LIVE_CONTRACT = ar._Contract(**%r)\n"
+            "out = {}\n"
+            "try:\n"
+            "    report = pr.require_autonomous_boundary()\n"
+            "    out['admission'] = 'admitted'\n"
+            "    out['launcher_cgroup'] = report['launcher_cgroup']\n"
+            "except ar.AutonomousWorkerBusy as exc:\n"
+            "    out['admission'] = 'busy'\n"
+            "    out['admission_error'] = str(exc)\n"
+            "except ar.AutonomousResourceUnavailable as exc:\n"
+            "    out['admission'] = 'drift'\n"
+            "    out['admission_error'] = str(exc)\n"
+            "print('__ADMISSION__' + json.dumps(out, sort_keys=True))\n"
+            % (boundary.contract_kwargs(),),
+            encoding="utf-8",
         )
-        monkeypatch.setattr(
-            autonomous_mod, "check_autonomous_worker", REAL_CHECK_AUTONOMOUS_WORKER,
-        )
+
+        def _admission():
+            completed = subprocess.run(
+                boundary.launcher_argv(
+                    [sys.executable, "-B", str(probe), runtime_root],
+                    unit_suffix="adm",
+                ),
+                capture_output=True, text=True, timeout=120, env=fixture.user_bus_env(),
+            )
+            assert completed.returncode == 0, completed.stderr
+            for line in completed.stdout.splitlines():
+                if line.startswith("__ADMISSION__"):
+                    return json.loads(line[len("__ADMISSION__"):])
+            raise AssertionError(
+                f"the admission probe produced no verdict: {completed.stdout!r} {completed.stderr!r}"
+            )
 
         holder = subprocess.Popen(
             ["systemd-run", "--user", "--scope", "--quiet", "--collect",
@@ -961,6 +993,7 @@ def test_occupied_native_slot_refuses_dispatch_without_charging_retries(
              "--unit", f"hermes-worker-{boundary.token}-holder.scope",
              "--", sys.executable, "-c", "import time; time.sleep(60)"],
             env=fixture.user_bus_env(), start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         try:
             deadline = time.monotonic() + 20
@@ -969,6 +1002,24 @@ def test_occupied_native_slot_refuses_dispatch_without_charging_retries(
                     break
                 time.sleep(0.05)
             assert autonomous_mod.check_autonomous_boundary(pid=None)["worker_slot_occupied"]
+
+            verdict = _admission()
+            assert verdict["admission"] == "busy", verdict
+            assert verdict["admission_error"].startswith(autonomous_mod.SLOT_DIAGNOSTIC), verdict
+
+            # The real occupied-slot verdict, with only the launcher half replaced
+            # because this process is not a gateway. The in-aggregate probe above
+            # covers that half against the real validator.
+            def _occupancy_boundary(**_kwargs):
+                report = autonomous_mod.check_autonomous_boundary(pid=None)
+                if report["worker_slot_occupied"]:
+                    raise autonomous_mod.AutonomousWorkerBusy(
+                        f"{autonomous_mod.SLOT_DIAGNOSTIC}: {report['workers']['cgroup']} "
+                        f"already holds {report['worker_scopes']}"
+                    )
+                return report
+
+            monkeypatch.setattr(process_mod, "require_autonomous_boundary", _occupancy_boundary)
 
             for home in homes:
                 monkeypatch.setenv("HERMES_HOME", str(home))
@@ -980,8 +1031,7 @@ def test_occupied_native_slot_refuses_dispatch_without_charging_retries(
                 kb._ensure_goal_revision_schema(conn)
                 task_id = kb.create_task(
                     conn, title=f"blocked by the slot {home.name}", assignee="coder",
-                    initial_status="blocked", workspace_kind="scratch",
-                    workspace_path=str(home),
+                    initial_status="blocked", workspace_kind="scratch", workspace_path=str(home),
                 )
                 promoted, reason = kb.promote_task(conn, task_id, actor="test")
                 assert promoted, reason
@@ -1003,18 +1053,68 @@ def test_occupied_native_slot_refuses_dispatch_without_charging_retries(
                     "ORDER BY id DESC LIMIT 1", (task_id,),
                 ).fetchone()
                 assert event is not None, "the refusal was not recorded"
-                assert json.loads(event["payload"]).get("infrastructure") is True
+                payload = json.loads(event["payload"])
+                assert payload.get("infrastructure") is True, payload
+                assert payload["error"].startswith(autonomous_mod.SLOT_DIAGNOSTIC), payload
                 conn.close()
         finally:
             holder.terminate()
             holder.wait(timeout=10)
 
-        # Once the whole scope has emptied, the same admission succeeds.
+        # The same admission is granted once the slot is free, which is what shows
+        # the refusal above came from the slot rather than from the fixture.
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             if not autonomous_mod.check_autonomous_boundary(pid=None)["worker_slot_occupied"]:
                 break
             time.sleep(0.05)
-        # The slot is free again; this test process itself can never be a launcher
-        # for the fixture aggregate, so only the occupancy half is asserted here.
-        assert not autonomous_mod.check_autonomous_boundary(pid=None)["worker_slot_occupied"]
+        freed = _admission()
+        assert freed["admission"] == "admitted", freed
+        assert freed["launcher_cgroup"].startswith(boundary.aggregate_group + "/"), freed
+
+
+@pytest.mark.platforms("linux")
+def test_losing_the_native_admission_race_is_infrastructure(monkeypatch):
+    """The loser of a native admission race must not spend the card's retry.
+
+    Two dispatchers can pass the capacity precheck before either scope activates;
+    systemd admits exactly one, and the loser's launcher exits before bootstrap --
+    which looks exactly like a crash. The manager's own state separates them: OUR
+    scope absent while the slot is held is a refused activation, our scope
+    populated is a real bootstrap failure, and an empty slice is a real failure.
+    """
+    from hermes_cli import kanban_worker_runtime as kwr
+    from tools import process_registry as process_registry_mod
+
+    scope = "hermes-worker-kanban-t_card-run-7.scope"
+
+    def _busy(**_kwargs):
+        raise autonomous_mod.AutonomousWorkerBusy("autonomous worker slot occupied: held")
+
+    monkeypatch.setattr(process_registry_mod, "require_autonomous_boundary", _busy)
+    with pytest.raises(autonomous_mod.AutonomousWorkerBusy):
+        kwr._raise_if_launch_refused(scope, 1)
+
+    def _held_by_another(**_kwargs):
+        return {
+            "worker_scopes": ["/fixture/hermes-worker-someone-else.scope"],
+            "worker_slot_occupied": True,
+        }
+
+    monkeypatch.setattr(process_registry_mod, "require_autonomous_boundary", _held_by_another)
+    with pytest.raises(autonomous_mod.AutonomousWorkerBusy):
+        kwr._raise_if_launch_refused(scope, 1)
+
+    def _our_scope_is_live(**_kwargs):
+        return {"worker_scopes": [f"/fixture/{scope}"], "worker_slot_occupied": True}
+
+    monkeypatch.setattr(process_registry_mod, "require_autonomous_boundary", _our_scope_is_live)
+    assert kwr._raise_if_launch_refused(scope, 1) is None, (
+        "a populated scope of ours means the bootstrap really failed"
+    )
+
+    def _slot_free(**_kwargs):
+        return {"worker_scopes": [], "worker_slot_occupied": False}
+
+    monkeypatch.setattr(process_registry_mod, "require_autonomous_boundary", _slot_free)
+    assert kwr._raise_if_launch_refused(scope, 1) is None

@@ -111,27 +111,29 @@ def test_restart_safe_gateway_child_fails_closed_when_required(monkeypatch):
 
 
 @pytest.mark.platforms("linux")
-def test_restart_safe_gateway_child_degrades_without_scope(monkeypatch, caplog):
-    """Managed gateway + no user bus degrades to a mode distinct from the
-    in-process passthrough, and warns once per process, not per dispatch."""
+@pytest.mark.parametrize("required", [False, True])
+def test_restart_safe_gateway_child_refuses_without_a_scope(monkeypatch, required):
+    """No user scope means no launch, whichever policy flag the caller passes.
+
+    A scope-less autonomous child would consume no ``ConcurrencyHardMax`` slot and
+    would not appear in the live worker scopes the boundary check reads, so the
+    next autonomous launch could start beside it. ``require_restart_safe_scope``
+    only selects which infrastructure error surfaces.
+    """
     import tools.process_registry as process_registry
 
     _stub_autonomous_boundary(monkeypatch, process_registry)
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
     monkeypatch.setenv("INVOCATION_ID", "managed-service")
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
-    monkeypatch.setattr(process_registry, "_scope_degraded_warned", False)
 
-    command = ["python", "worker.py"]
-    with caplog.at_level("WARNING", logger=process_registry.logger.name):
-        for _ in range(2):
-            dispatch = process_registry.restart_safe_gateway_child_argv(
-                command, unit_suffix="cron-job-1", require_restart_safe_scope=False
-            )
-    assert dispatch.mode == "degraded"
-    assert dispatch.argv == command
-    warnings = [r for r in caplog.records if "without restart-safe cgroup isolation" in r.getMessage()]
-    assert len(warnings) == 1
+    with pytest.raises(
+        process_registry.RestartSafeScopeUnavailable, match="restart-safe systemd scope",
+    ):
+        process_registry.restart_safe_gateway_child_argv(
+            ["python", "worker.py"], unit_suffix="cron-job-1",
+            require_restart_safe_scope=required,
+        )
 
 
 def test_restart_safe_gateway_child_is_unchanged_outside_managed_gateway(monkeypatch):
@@ -617,12 +619,12 @@ def test_launch_external_worker_stays_in_process_outside_managed_gateway(
 
 
 @pytest.mark.platforms("linux")
-def test_launch_external_worker_degrades_by_default_with_real_helper(
+def test_launch_external_worker_refuses_without_a_scope(
     tmp_path, monkeypatch,
 ):
-    """Managed gateway + no bus, through the real helper and real config
-    plumbing: the default still Popens the job externally with the #101940
-    handoff (never in-process)."""
+    """Managed gateway + no bus, through the real helper and real config plumbing:
+    the fire is refused BEFORE the handoff, so no payload, no ack and no Popen is
+    created from an uncertain attempt."""
     import cron.scheduler as scheduler
     import tools.process_registry as process_registry
 
@@ -635,13 +637,15 @@ def test_launch_external_worker_degrades_by_default_with_real_helper(
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
     spawned, payloads, handoff, _get = _stub_external_worker_launch(scheduler, monkeypatch)
 
-    assert scheduler._launch_external_cron_worker(job) is True
-    # Direct command, NOT a systemd-run wrapper — but still an external Popen.
-    assert "systemd-run" not in " ".join(spawned[0][0])
-    assert spawned[0][1]["start_new_session"] is True
-    assert payloads[0]["job"]["id"] == "job-1"
-    handoff.assert_called_once_with("exec-1")
+    with pytest.raises(
+        process_registry.RestartSafeScopeUnavailable, match="restart-safe systemd scope",
+    ):
+        scheduler._launch_external_cron_worker(job)
+    assert spawned == [], "a refused fire must not spawn anything"
+    assert payloads == [], "a refused fire must not write a payload"
+    handoff.assert_not_called()
     assert not (tmp_path / "cron/external-workers/exec-1.json").exists()
+    assert not (tmp_path / "cron/external-workers/exec-1.ready").exists()
 
 
 def test_launch_external_worker_pins_the_gateways_tree_on_pythonpath(
@@ -1227,9 +1231,20 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
             assert current is not None
             execution = current
             worker_pid = int(current["pid"])
-            worker_cgroup = fixture.cgroup_of(worker_pid)
             worker_start_time = process_start_time(worker_pid)
-            assert worker_cgroup.startswith(boundary.workers_group + "/"), worker_cgroup
+            # ``systemd-run --scope`` moves the process into its scope
+            # asynchronously, so read the cgroup only once it has settled.
+            deadline = time.monotonic() + 20
+            worker_cgroup = ""
+            while time.monotonic() < deadline:
+                worker_cgroup = fixture.cgroup_of(worker_pid)
+                if worker_cgroup.startswith(boundary.workers_group + "/"):
+                    break
+                time.sleep(0.05)
+            assert worker_cgroup.startswith(boundary.workers_group + "/"), (
+                f"worker pid {worker_pid} is in {worker_cgroup}, not under "
+                f"{boundary.workers_group}; execution row={dict(execution)!r}"
+            )
             assert not launched.exists(), "handoff returned before execution completed"
 
             # Replacing a managed gateway kills its own service tree. The active

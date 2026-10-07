@@ -209,25 +209,30 @@ def user_manager_root(group: str) -> str:
     _fail(f"{group}: no user-manager service in the cgroup path")
 
 
-def _cgroup_populated(directory: Path) -> bool:
-    """Whether *directory* still holds processes, directly or through descendants.
+def _cgroup_populated(directory: Path) -> Optional[bool]:
+    """Whether *directory* holds processes, directly or through descendants.
 
     ``cgroup.procs`` alone cannot answer this: a scope whose only processes sit in
     a nested child reports an empty ``cgroup.procs`` while it is still busy, and
     treating that as "empty" would hand the single slot to a second worker.
     ``cgroup.events`` reports ``populated`` for the whole subtree.
+
+    ``None`` means the question could not be answered at all. Callers must treat
+    that as a failure rather than as a free slot: reading "unknown" as "empty" is
+    exactly how a surviving worker is handed away, and a missing worker is not
+    observable afterwards.
     """
     try:
         for line in (directory / "cgroup.events").read_text().splitlines():
             key, _, value = line.partition(" ")
             if key == "populated":
-                return value.strip() == "1"
+                return value.strip() == "1" if value.strip() in ("0", "1") else None
     except OSError:
         pass
     try:
         return bool((directory / "cgroup.procs").read_text().split())
     except OSError:
-        return False
+        return None
 
 
 def live_worker_scope_cgroups(root, manager_group: str) -> List[str]:
@@ -246,7 +251,15 @@ def live_worker_scope_cgroups(root, manager_group: str) -> List[str]:
     directory = root / manager_group.lstrip("/")
     found: List[str] = []
     for candidate in sorted(directory.rglob(f"{WORKER_SCOPE_PREFIX}*{WORKER_SCOPE_SUFFIX}")):
-        if candidate.is_dir() and _cgroup_populated(candidate):
+        if not candidate.is_dir():
+            continue
+        populated = _cgroup_populated(candidate)
+        _require(
+            populated is not None,
+            f"{candidate}: population evidence is unreadable, so the worker slot "
+            "cannot be shown to be free",
+        )
+        if populated:
             found.append("/" + str(candidate.relative_to(root)))
     return found
 
@@ -303,8 +316,8 @@ class _Snapshot:
     oomd_active: bool = False
 
 
-def _show_units(names) -> Dict[str, Dict[str, str]]:
-    """Read *names*' properties from the user manager.
+def _show_units(names, *, system: bool = False) -> Dict[str, Dict[str, str]]:
+    """Read *names*' properties from the user manager, or the system one.
 
     An unknown unit is reported by systemd as ``LoadState=not-found`` with exit
     status 0, so it stays in the map and fails the loaded check like any other
@@ -315,7 +328,7 @@ def _show_units(names) -> Dict[str, Dict[str, str]]:
     for name in names:
         try:
             completed = subprocess.run(
-                ["systemctl", "--user", "show", name,
+                ["systemctl", *(("show",) if system else ("--user", "show")), name,
                  "--property=" + ",".join(UNIT_PROPERTIES)],
                 capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
             )
@@ -364,13 +377,49 @@ def _oomd_active() -> bool:
 
 
 def _ancestor_unit_names(manager_group: str) -> List[str]:
-    """Unit names on the path from the host root down to the user manager.
+    """UNIT NAMES on the path from the host root down to the user manager.
 
     Derived from the cgroup path rather than hardcoded, so a different UID or a
-    differently named manager is inspected as it actually is.
+    differently named manager is inspected as it actually is. Each ancestor
+    cgroup's owning unit is named by its last path component -- and the unit map is
+    keyed by unit name, so returning full cgroup paths here would silently miss
+    every ancestor when the OOM policy is looked up.
     """
     parts = Path(manager_group).parts
-    return ["/" + "/".join(parts[1:index + 1]) for index in range(1, len(parts))]
+    return [parts[index] for index in range(1, len(parts))]
+
+
+def _ancestor_units(names: List[str]) -> Dict[str, Dict[str, str]]:
+    """Properties of the units above the user manager, from BOTH managers.
+
+    ``user.slice`` and ``user-1000.slice`` are system units that the user manager
+    also answers for, and it resolves ``ManagedOOMMemoryPressure=auto`` to ``kill``
+    while the system manager reports the configured ``auto``. ``user@1000.service``
+    is not a user-manager unit at all, so the user manager answers ``not-found``.
+
+    A not-found view is therefore re-read from the system manager rather than being
+    treated as "this ancestor has no policy", and each entry records which manager
+    answered. Where the two disagree the more kill-prone reading is the one kept,
+    because a disagreement must not hide a shared OOM domain.
+    """
+    units = _show_units(names)
+    for name, properties in list(units.items()):
+        if properties.get("LoadState") != "not-found":
+            properties = {**properties, "AnsweredBy": "user"}
+            units[name] = properties
+            continue
+        try:
+            system_view = _show_units([name], system=True).get(name, {})
+        except AutonomousResourceUnavailable as exc:
+            # Unreadable is reported, not fatal: the ancestor memory limits are
+            # still enforced from the cgroup files, which is the primary contract.
+            units[name] = {**properties, "AnsweredBy": "user", "SystemView": f"unreadable ({exc})"}
+            continue
+        if system_view.get("LoadState") == "loaded":
+            units[name] = {**system_view, "AnsweredBy": "system"}
+        else:
+            units[name] = {**properties, "AnsweredBy": "user", "SystemView": "not-found"}
+    return units
 
 
 def _live_snapshot(contract: _Contract = _LIVE_CONTRACT) -> _Snapshot:
@@ -378,8 +427,7 @@ def _live_snapshot(contract: _Contract = _LIVE_CONTRACT) -> _Snapshot:
     units = _show_units(names)
     aggregate = units[contract.aggregate_unit].get("ControlGroup", "")
     if aggregate.startswith("/") and aggregate != "/":
-        for name in _ancestor_unit_names(user_manager_root(aggregate)):
-            units.setdefault(name, _show_units([name])[name])
+        units.update(_ancestor_units(_ancestor_unit_names(user_manager_root(aggregate))))
     return _Snapshot(units=units, oomd_active=_oomd_active())
 
 
@@ -462,13 +510,17 @@ def _require_shared_ancestors_clean(
             )
     kill_policy = []
     for row in shared:
-        # Each ancestor cgroup's own unit is named by its last path component.
+        # Each ancestor cgroup's owning unit is named by its last path component,
+        # which is how `_ancestor_units` keys the map.
         unit = snapshot.units.get(Path(row["cgroup"]).name)
         if unit is None:
             continue
         active = {key: unit.get(key) for key in OOM_POLICY_PROPERTIES if unit.get(key) == OOM_KILL}
         if active:
-            kill_policy.append({"cgroup": row["cgroup"], "properties": active})
+            kill_policy.append({
+                "cgroup": row["cgroup"], "properties": active,
+                "answered_by": unit.get("AnsweredBy"),
+            })
     if snapshot.oomd_active and kill_policy:
         _fail(
             f"systemd-oomd is active and a shared ancestor of {group} is a kill "

@@ -28,7 +28,7 @@ _IS_LINUX = platform.system() == "Linux"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, NamedTuple, Optional
+from typing import Any, Dict, List, Literal, NamedTuple, NoReturn, Optional
 
 from tools.autonomous_resources import (
     AUTONOMOUS_SLICE,
@@ -470,9 +470,6 @@ def require_autonomous_boundary(*, standalone_dispatch: bool = False) -> dict:
         ) from exc
 
 
-_scope_degraded_warned = False
-
-
 class RestartSafeScopeUnavailable(RuntimeError):
     """A ``require_restart_safe_scope=True`` child could not get its transient scope.
 
@@ -482,49 +479,30 @@ class RestartSafeScopeUnavailable(RuntimeError):
     """
 
 
-def _warn_scope_degraded_once(detail: str, *, consequence: str) -> None:
-    """Warn once per process: the condition is host-level and the probe verdict
-    is cached, so this would otherwise fire on every cron dispatch."""
-    global _scope_degraded_warned
-    if _scope_degraded_warned:
-        return
-    _scope_degraded_warned = True
-    logger.warning("%s; %s", detail, consequence)
-
-
-_CRON_DEGRADED_CONSEQUENCE = (
-    "cron children are dispatched as direct external subprocesses without restart-safe "
-    "cgroup isolation (killed if the gateway restarts mid-job). Set "
-    "cron.require_restart_safe_scope=true in config.yaml to fail closed instead."
-)
-_UNIT_DEGRADED_CONSEQUENCE = (
-    "workers are spawned unmanaged inside this systemd unit's cgroup and will be KILLED when the "
-    "unit exits (Type=oneshot dispatch timers lose every worker within a second). Give the unit's "
-    "user a session bus (`loginctl enable-linger <user>`) so workers get their own scope, or set "
-    "KillMode=process on the unit."
-)
-
-
 class GatewayChildDispatch(NamedTuple):
     """How a managed-gateway child is launched.
 
-    ``in_process``: not a managed systemd gateway, ``argv is command``, the caller
-    keeps its in-process path.  ``scoped``: ``argv`` is the systemd-run wrapper.
-    ``degraded``: no user scope could be created; ``argv`` is the direct command but
-    the caller MUST still launch it as an external subprocess — the distinct mode
-    exists so this case can never collapse into ``in_process`` and recreate the
-    restart interruption #101940 closed.
+    ``in_process``: the child is not autonomous work, ``argv is command``, the
+    caller keeps its in-process path.  ``scoped``: ``argv`` is the systemd-run
+    wrapper placing the child in the autonomous worker slice.
+
+    There is deliberately no third mode.  An autonomous child that cannot get its
+    scope would run inside the gateway's own cgroup: it would consume no
+    ``ConcurrencyHardMax`` slot, and it would not appear in the live worker scopes
+    the boundary check reads, so the next launch could start beside it.  Choosing
+    containment and ``--collect`` over restart-safety was never the trade being
+    made — the slot is.  Such a launch is refused instead (#101940).
     """
 
-    mode: Literal["in_process", "scoped", "degraded"]
+    mode: Literal["in_process", "scoped"]
     argv: List[str]
 
 
 def scoped_spawn_lost_user_bus(spawn_env: Dict[str, str]) -> bool:
     """After a ``systemd-run --user --scope`` wrapper exits before its child could start: True
     when the user bus is gone (:func:`systemd_user_bus_env` derives nothing), in which case the
-    cached True verdict is replaced so the next dispatch re-probes and degrades instead of
-    consuming another occurrence on the same dead wrapper (#110803).
+    cached True verdict is replaced so the next dispatch re-probes and refuses with the real
+    cause instead of consuming another occurrence on the same dead wrapper (#110803).
 
     *spawn_env* is the environment the wrapper was launched with: re-deriving from it (minus the
     bus address it carried) honours a configured ``XDG_RUNTIME_DIR`` exactly as the spawn did, so
@@ -565,13 +543,12 @@ def restart_safe_gateway_child_argv(
     there too (#113612).
 
     Hosts with no user systemd session (containers, LXCs without linger) cannot
-    create the scope; hard-failing there is a silent cron outage, so callers state
-    the policy: ``require_restart_safe_scope=True`` raises
-    :class:`RestartSafeScopeUnavailable` (kanban's long-lived workers), ``False``
-    degrades to a direct external subprocess with a once-per-process warning
-    (cron, behind ``cron.require_restart_safe_scope``). A degraded child stays
-    inside the autonomous aggregate the boundary check already proved, so it
-    loses restart-safety but never containment.
+    create the scope, and the launch is then REFUSED rather than run inside the
+    gateway's cgroup: without a scope the child consumes no ``ConcurrencyHardMax``
+    slot and does not appear in the live worker scopes, so a second autonomous
+    worker could start beside it. ``require_restart_safe_scope`` only selects which
+    infrastructure error the caller sees -- :class:`RestartSafeScopeUnavailable`
+    for the gateway path, :class:`AutonomousResourceUnavailable` otherwise.
     """
     if not _IS_LINUX:
         return GatewayChildDispatch("in_process", command)
@@ -584,22 +561,25 @@ def restart_safe_gateway_child_argv(
     # so the boundary is proven BEFORE any capability fallback can trigger.
     require_autonomous_boundary(standalone_dispatch=outlives_parent)
 
-    def _degrade(detail: str) -> GatewayChildDispatch:
+    def _refuse(detail: str) -> NoReturn:
+        """Refuse the launch: this child cannot be placed in the worker slice.
+
+        Both an unreachable user bus and a vanished ``systemd-run`` leave the child
+        with no scope, i.e. outside ``ConcurrencyHardMax`` and invisible to the
+        boundary check.  ``require_restart_safe_scope`` no longer selects a weaker
+        route -- it only decides which infrastructure error the caller sees.
+        """
         if supervised_gateway:
-            if require_restart_safe_scope:
-                # Stored as the cron execution's error and shown on the job row: name the remedy.
-                raise RestartSafeScopeUnavailable(
-                    f"cannot create restart-safe systemd scope for gateway child: {detail}"
-                )
-            _warn_scope_degraded_once(f"managed gateway: {detail}", consequence=_CRON_DEGRADED_CONSEQUENCE)
-        else:
-            _warn_scope_degraded_once(f"systemd unit dispatch: {detail}", consequence=_UNIT_DEGRADED_CONSEQUENCE)
-        return GatewayChildDispatch("degraded", command)
+            # Stored as the cron execution's error and shown on the job row: name the remedy.
+            raise RestartSafeScopeUnavailable(
+                f"cannot create restart-safe systemd scope for gateway child: {detail}"
+            )
+        raise AutonomousResourceUnavailable(
+            f"autonomous resource boundary unavailable: {detail}"
+        )
 
     if not _systemd_run_user_scope_available():
-        # The direct child stays inside the autonomous aggregate proven above: this
-        # loses restart-safety for this one child, never containment.
-        return _degrade(
+        _refuse(
             "systemd-run --user --scope is unavailable (usually no reachable user D-Bus session at "
             f"/run/user/{os.getuid()}/bus). On a system-level service install, run "  # windows-footgun: ok — behind the _IS_LINUX return above
             "`sudo loginctl enable-linger <gateway-user>` and restart the gateway."
@@ -608,7 +588,7 @@ def restart_safe_gateway_child_argv(
         command, unit_suffix=unit_suffix, slice_name=live_contract().workers_unit,
     )
     if scoped == command:
-        return _degrade("systemd-run disappeared after the availability probe")
+        _refuse("systemd-run disappeared after the availability probe")
     return GatewayChildDispatch("scoped", scoped)
 
 

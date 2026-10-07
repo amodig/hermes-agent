@@ -2656,6 +2656,21 @@ def _record_granted_spawn(
     return True
 
 
+def _require_autonomous_worker_capacity() -> None:
+    """Refuse the tick before any workspace or worktree work.
+
+    ``_default_spawn`` gates the launch too, but the dispatch path resolves and can
+    MATERIALIZE a worktree first, so a host that cannot place an autonomous worker
+    would still pay for that preparation -- and a preparation error would be charged
+    to the card before the hold was ever observed. Raising inside the caller's
+    existing try-block keeps the refusal classified as infrastructure.
+    """
+    from tools.process_registry import _IS_LINUX, require_autonomous_boundary
+
+    if _IS_LINUX:
+        require_autonomous_boundary(standalone_dispatch=True)
+
+
 def _grant_boundary(grant_guard) -> Any:
     """Context manager holding the caller's grant boundary; a no-op without one.
 
@@ -2761,6 +2776,7 @@ def _dispatch_lane_task(
             )
         try:
             _check_not_stopping(should_stop, task_id)
+            _require_autonomous_worker_capacity()
             if spawn_task.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(spawn_task, board=board)
             else:

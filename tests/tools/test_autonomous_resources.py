@@ -263,10 +263,75 @@ def test_finite_shared_ancestor_refuses(host, key):
 
 
 def test_oomd_kill_policy_on_a_shared_ancestor_refuses_only_while_oomd_is_active(host):
-    assert host.admit(None)["oomd_kill_candidates"]
+    candidates = host.admit(None)["oomd_kill_candidates"]
+    assert candidates, "a `kill` marking on an ancestor must be reported"
+    assert {entry["cgroup"] for entry in candidates} >= {
+        "/user.slice", "/user.slice/user-1000.slice",
+    }
     active = Host(host.proc.parent, oomd_active=True)
     with pytest.raises(ar.AutonomousResourceUnavailable, match="systemd-oomd is active"):
         ar._validate_boundary(active.snapshot(), pid=None)
+
+
+def test_ancestor_units_are_keyed_by_unit_name_not_cgroup_path():
+    """Regression: the OOM-policy lookup keys on the unit name.
+
+    Keying the ancestor map by cgroup path made every shared-ancestor lookup miss,
+    so an active OOM-kill policy above the aggregate was never reported or
+    rejected while the fixtures -- which key by unit name -- kept passing.
+    """
+    assert ar._ancestor_unit_names("/user.slice/user-1000.slice/user@1000.service") == [
+        "user.slice", "user-1000.slice", "user@1000.service",
+    ]
+
+
+def test_ancestor_units_read_the_system_manager_when_the_user_view_is_not_found(monkeypatch):
+    """``user@1000.service`` is a system unit; the user manager cannot answer for it."""
+    seen = []
+
+    def fake_show(names, *, system=False):
+        seen.append((tuple(names), system))
+        if system:
+            return {name: {
+                "LoadState": "loaded", "ManagedOOMMemoryPressure": "auto",
+                "ManagedOOMSwap": "kill",
+            } for name in names}
+        return {name: {
+            "LoadState": "not-found", "ManagedOOMMemoryPressure": "auto",
+            "ManagedOOMSwap": "auto",
+        } for name in names}
+
+    monkeypatch.setattr(ar, "_show_units", fake_show)
+    units = ar._ancestor_units(["user@1000.service"])
+    assert units["user@1000.service"]["AnsweredBy"] == "system"
+    assert units["user@1000.service"]["ManagedOOMSwap"] == "kill"
+    assert seen == [(("user@1000.service",), False), (("user@1000.service",), True)]
+
+
+def test_a_loaded_user_view_is_not_overridden_by_the_system_manager(monkeypatch):
+    """The managers disagree on `auto`; the view that can kill is the one kept."""
+    def fake_show(names, *, system=False):
+        assert not system, "a loaded user view must not trigger the system query"
+        return {name: {
+            "LoadState": "loaded", "ManagedOOMMemoryPressure": "kill",
+            "ManagedOOMSwap": "auto",
+        } for name in names}
+
+    monkeypatch.setattr(ar, "_show_units", fake_show)
+    units = ar._ancestor_units(["user.slice"])
+    assert units["user.slice"]["AnsweredBy"] == "user"
+    assert units["user.slice"]["ManagedOOMMemoryPressure"] == "kill"
+
+
+def test_an_unreadable_system_view_is_reported_not_fatal(monkeypatch):
+    def fake_show(names, *, system=False):
+        if system:
+            raise ar.AutonomousResourceUnavailable("no system bus here")
+        return {name: {"LoadState": "not-found"} for name in names}
+
+    monkeypatch.setattr(ar, "_show_units", fake_show)
+    units = ar._ancestor_units(["user@1000.service"])
+    assert "unreadable" in units["user@1000.service"]["SystemView"]
 
 
 def test_active_gateway_outside_the_aggregate_refuses(host):
@@ -306,6 +371,14 @@ def test_scope_with_only_a_nested_descendant_still_occupies_the_slot(host):
         host.admit(host.add_process(6000, AGGREGATE))
 
 
+def test_unreadable_population_evidence_refuses(host):
+    """Unknown is not empty: the slot must not be handed away on missing evidence."""
+    scope = host.root / f"{WORKERS}/hermes-worker-run-6.scope".lstrip("/")
+    scope.mkdir(parents=True)
+    with pytest.raises(ar.AutonomousResourceUnavailable, match="population evidence"):
+        host.admit(None)
+
+
 def test_collected_scope_without_processes_frees_the_slot(host):
     host.add_scope(f"{WORKERS}/hermes-worker-run-5.scope", None, populated=False)
     report = host.admit(host.add_process(6000, AGGREGATE))
@@ -332,13 +405,19 @@ def test_worker_verification_requires_its_own_scope_immediately_inside(host):
 
 
 @pytest.mark.parametrize(("group", "match"), [
+    # A scope directly in the workers slice that is not a worker scope at all.
+    (f"{WORKERS}/helper.service", "not in a hermes-worker"),
+    # A PID that never reached the workers slice.
     (f"{AGGREGATE}/launcher.scope", "not in a hermes-worker"),
-    (f"{WORKERS}/nested/hermes-worker-x.scope", "not directly inside"),
-    (f"{MANAGER}/agents-controls.slice/hermes-worker-x.scope", "not directly inside"),
+    # Nested deeper, or living in an interactive slice: caught by the misplaced
+    # rule that runs before placement, which is the rule that names the survivor.
+    (f"{WORKERS}/nested/hermes-worker-x.scope", "outside the autonomous worker slice"),
+    (f"{MANAGER}/agents-controls.slice/hermes-worker-x.scope", "outside the autonomous worker slice"),
 ])
 def test_worker_verification_refuses_any_other_placement(host, group, match):
-    if group.startswith(f"{WORKERS}/nested/"):
-        (host.root / group.lstrip("/")).mkdir(parents=True)
+    # Real population evidence: an unreadable scope is refused earlier, and these
+    # cases are about placement, not about missing evidence.
+    host.add_scope(group, 6500)
     pid = host.add_process(6500, group)
     with pytest.raises(ar.AutonomousResourceUnavailable, match=match):
         host.verify_worker(pid)
