@@ -38,9 +38,19 @@ def _make_runtime_fixture(root: Path) -> None:
     """Small real install: production bootstrap, dynamic imports, and resources."""
     package = root / "hermes_cli"
     package.mkdir(parents=True)
-    for name in ("kanban_runtime.py", "kanban_runtime_generation.py"):
+    for name in ("kanban_runtime.py", "kanban_runtime_generation.py", "plugin_isolation.py"):
         shutil.copy2(RUNTIME_ROOT / "hermes_cli" / name, package / name)
     (package / "__init__.py").write_text('__version__ = "fixture"\n', encoding="utf-8")
+    # Synthetic profiles use JSON configs; plugin isolation still reads the
+    # captured profile home rather than bypassing its production mode selection.
+    (package / "config.py").write_text(
+        "import json\n"
+        "from hermes_constants import get_hermes_home\n"
+        "def load_config_readonly():\n"
+        "    path = get_hermes_home() / 'config.yaml'\n"
+        "    return json.loads(path.read_text()) if path.is_file() else {}\n",
+        encoding="utf-8",
+    )
     (root / "fixture_early.py").write_text("value = 1\n", encoding="utf-8")
     (root / "fixture_lazy.py").write_text("value = 1\n", encoding="utf-8")
     dependency_root = root.parent / "site-packages"

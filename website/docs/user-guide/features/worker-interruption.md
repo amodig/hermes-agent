@@ -107,6 +107,16 @@ run, or charges a retry. That run belongs to a live, verified worker, so a faile
 hook or a failed PID write is logged and the spawn still counts rather than
 requeueing the card beside a worker that is already running.
 
+### Background terminal cleanup
+
+On POSIX, killing a PTY-backed background terminal cancels its output reader
+within the reader's 200 ms polling interval and lets that reader close the PTY
+master. A detached descendant retaining the slave cannot keep the reader or
+master alive, even after the finished session is pruned, and cleanup does not
+signal that detached process just to release the terminal. Kill/prune never
+wait for the reader while holding the registry lock. The kill's captured output
+and single completion remain unchanged; Windows teardown is unchanged.
+
 ## Failure accounting
 
 Ordinary worker crashes are counted against the configured
@@ -142,8 +152,12 @@ inside the gateway's slice. A worker is therefore bounded by the slice's budget
 and every ancestor of it, not by the gateway service's own `MemoryMax`; an OOM
 inside a worker cannot take the gateway down.
 
-That flag needs systemd ≥ 248, and the capability is probed separately from
+On systemd ≥ 254, `--expand-environment=no` keeps dollar signs in worker
+command arguments literal instead of expanding them through systemd.
+
+The `--slice-inherit` flag needs systemd ≥ 248, and its capability is probed separately from
 "can we make a scope at all". Without it, workers retain their legacy managed
 scopes, restart survival and per-worker memory isolation. A warning reports
-that the shared slice budget cannot be honoured. Required workers still refuse
-to launch when no transient scope can be created.
+that the shared slice budget cannot be honoured. Workers that require
+restart-safe placement refuse to launch without `--slice-inherit` or a
+transient scope.

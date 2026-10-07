@@ -7,7 +7,7 @@ import sys
 import shlex
 from pathlib import Path
 
-from hermes_constants import get_hermes_home
+from hermes_constants import display_hermes_home, get_hermes_home
 from hermes_cli.secret_prompt import masked_secret_prompt
 
 _CANCELLED = -1
@@ -154,6 +154,15 @@ def _find_provider(providers: list, provider_name: str):
     return next((p for p in providers if p[0] == provider_name), None)
 
 
+def _catalog_install_hint(provider_name: str):
+    """The install command for a catalog memory provider that resolves nowhere, else None."""
+    from plugins.memory import find_provider_dir
+    from hermes_cli.memory_provider_migration import catalog_install_hint
+    if not provider_name or find_provider_dir(provider_name) is not None:
+        return None
+    return catalog_install_hint(provider_name, category="memory")
+
+
 def _post_setup_hook(provider, config: dict) -> bool:
     """Normalize the ``memory`` block; True when the provider's ``post_setup`` took over (it owns
     config, connection test and activation), so the caller must stop."""
@@ -172,7 +181,11 @@ def cmd_setup_provider(provider_name: str) -> None:
     match = _find_provider(_get_available_providers(), provider_name)
     if not match:
         print(f"\n  Memory provider '{provider_name}' not found.")
-        print("  Run 'hermes memory setup' to see available providers.\n")
+        install = _catalog_install_hint(provider_name)
+        if install:
+            print(f"  It is a catalog plugin that is not installed. Install it with: {install}\n")
+        else:
+            print("  Run 'hermes memory setup' to see available providers.\n")
         return
     name, _, provider = match
 
@@ -249,7 +262,7 @@ def cmd_setup(args) -> None:
     providers = _get_available_providers()
     if not providers:
         print("\n  No memory provider plugins detected.")
-        print("  Install a plugin to ~/.hermes/plugins/ and try again.\n")
+        print(f"  Install a plugin to {display_hermes_home()}/plugins/ and try again.\n")
         return
 
     items = [(name, f"— {desc}") for name, desc, _ in providers]
@@ -408,11 +421,15 @@ def cmd_status(args) -> None:
                         if url and not is_set:
                             line += f"  → {url}"
                         print(line)
-                print("  Note: systemd/gateway services do not inherit ~/.hermes/.env —")
+                print(f"  Note: systemd/gateway services do not inherit {display_hermes_home()}/.env —")
                 print("        set any variables above in the service environment.")
         else:
             print("\n  Plugin:    NOT installed ✗")
-            print(f"  Install the '{provider_name}' memory plugin to ~/.hermes/plugins/")
+            install = _catalog_install_hint(provider_name)
+            if install:
+                print(f"  Install it with: {install}")
+            else:
+                print(f"  Install the '{provider_name}' memory plugin to {display_hermes_home()}/plugins/")
 
     if providers:
         print("\n  Installed plugins:")

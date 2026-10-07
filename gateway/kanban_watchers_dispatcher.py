@@ -142,11 +142,32 @@ class _KanbanDispatcher:
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
         _kbd()._freeze_runtime_identity()
 
-    def _board_slugs(self) -> list:
-        return _board_slugs(self.kb)
+    def _board_slugs(self) -> list[str]:
+        """Visit each resolved DB once, keeping the pinned board's identity."""
+        from hermes_cli import kanban_db as _kb
+
+        with _kb.pin_first_board_resolution():
+            slugs = _board_slugs(self.kb)
+            if os.environ.get("HERMES_KANBAN_DB", "").strip():
+                # Enumeration starts with default, not necessarily the board
+                # whose DB the gateway pins. Use the canonical active slug.
+                slugs.insert(0, self.kb.get_current_board())
+            seen_db_paths: set[str] = set()
+            unique: list[str] = []
+            for slug in slugs:
+                try:
+                    resolved = str(self.kb.kanban_db_path(slug).expanduser().resolve())
+                except Exception:
+                    resolved = f"slug:{slug}"
+                if resolved not in seen_db_paths:
+                    seen_db_paths.add(resolved)
+                    unique.append(slug)
+            return unique
 
     def board_db_fingerprint(self, slug: str) -> tuple[str, int | None, int | None]:
-        path = self.kb.kanban_db_path(slug)
+        from hermes_cli import kanban_db as _kb
+        with _kb.pin_first_board_resolution():
+            path = self.kb.kanban_db_path(slug)
         try:
             resolved = str(path.expanduser().resolve())
         except Exception:
@@ -193,11 +214,16 @@ class _KanbanDispatcher:
         try:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).
-            conn = _kbc().connect(board=slug)
-            return _kbd().dispatch_once(
-                conn, board=slug, should_stop=self.should_stop,
-                grant_guard=self.grant_guard, **kwargs,
-            )
+            # Pin-first: the tick is machine flow — on a box whose env pins
+            # HERMES_KANBAN_DB every enumerated slug must resolve to the pinned
+            # file, or the dispatcher reads per-slug DBs nobody writes.
+            from hermes_cli import kanban_db as _kb
+            with _kb.pin_first_board_resolution():
+                conn = _kbc().connect(board=slug)
+                return _kbd().dispatch_once(
+                    conn, board=slug, should_stop=self.should_stop,
+                    grant_guard=self.grant_guard, **kwargs,
+                )
         except Exception as exc:
             if self.is_corrupt_board_db_error(exc):
                 self.disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
@@ -244,17 +270,19 @@ class _KanbanDispatcher:
         """
         kbd = _kbd()
         found: list[str] = []
-        for slug in self._board_slugs():
-            conn = None
-            try:
-                conn = _kbc().connect(board=slug)
-                found += [f"{slug}/{task_id}" for task_id in kbd.spawnable_lane_ids(conn)]
-            except Exception:
-                continue
-            finally:
-                if conn is not None:
-                    with contextlib.suppress(Exception):
-                        conn.close()
+        from hermes_cli import kanban_db as _kb
+        with _kb.pin_first_board_resolution():
+            for slug in self._board_slugs():
+                conn = None
+                try:
+                    conn = _kbc().connect(board=slug)
+                    found += [f"{slug}/{task_id}" for task_id in kbd.spawnable_lane_ids(conn)]
+                except Exception:
+                    continue
+                finally:
+                    if conn is not None:
+                        with contextlib.suppress(Exception):
+                            conn.close()
         return found
 
     def ready_nonempty(self) -> bool:
@@ -274,15 +302,13 @@ class _KanbanDispatcher:
             return 0
         attempted = 0
         successes = 0
-        with _default_profile_secret_scope():
+        from hermes_cli import kanban_db as _kb
+        with _default_profile_secret_scope(), _kb.pin_first_board_resolution():
             for slug in self._board_slugs():
                 if attempted >= auto_decompose_per_tick:
                     break
-                # Pin the board via env for the call: the decomposer connects
-                # with no board kwarg (same pattern as the dashboard specify endpoint).
-                prev_env = os.environ.get("HERMES_KANBAN_BOARD")
-                try:
-                    os.environ["HERMES_KANBAN_BOARD"] = slug
+                # The decomposer connects without a board kwarg; scope only this tick.
+                with _kb.scoped_current_board(slug):
                     try:
                         triage_ids = _decomp.list_triage_ids()
                     except Exception as exc:
@@ -293,11 +319,6 @@ class _KanbanDispatcher:
                             break
                         attempted += 1
                         successes += self._decompose_one(_decomp, slug, tid)
-                finally:
-                    if prev_env is None:
-                        os.environ.pop("HERMES_KANBAN_BOARD", None)
-                    else:
-                        os.environ["HERMES_KANBAN_BOARD"] = prev_env
         return successes
 
     @staticmethod

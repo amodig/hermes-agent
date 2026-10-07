@@ -77,6 +77,38 @@ meaningful:
    their CI) — see the developer guide's *Dependency security policy*. A
    recent floor alone is not grounds to hold an entry.
 
+11. **Credentials stay with their owner.** A plugin reads the credentials it is
+   configured with: the env vars in `requires_env` and its own `config_schema`
+   secrets. Reading another tool's login (a vendor CLI's token file, a browser
+   profile) must be disclosed in the PR and is a trust-tier call for a
+   maintainer. Refreshing, rotating or writing another client's OAuth tokens, or
+   presenting itself as another vendor's client, is not admitted without an
+   explicit maintainer ruling; a read-only build is the usual way through.
+12. **Approvals and unattended runs are respected.** A plugin never routes around
+   Hermes's approval system: no auto-approving, no disabling guards, and no
+   spawning Hermes or shell children that inherit YOLO or non-interactive mode
+   to run commands nobody approved. Anything that waits for a person (a prompt,
+   an OAuth browser flow) fails cleanly or times out under cron, the messaging
+   gateway and other unattended runs instead of hanging the agent.
+13. **Risky behaviour is disclosed.** What a user would want to know before
+   installing goes in the PR description and the plugin's README: network calls
+   to third-party services, reads outside the plugin's own data, shell commands,
+   long-running background processes, stored credentials. Telemetry and usage
+   reporting are opt-in. Reviewers summarise these as disclosure lines on the
+   entry PR; undisclosed behaviour found in review is a request for changes.
+14. **Compatibility metadata is truthful.** `requires_hermes` is a SemVer floor
+   (`">=0.21.5"`), never a CalVer date, and never newer than the current release
+   (the loader skips the plugin otherwise). `version` matches the pinned code,
+   and Python dependencies resolve under Hermes's core constraints
+   (`hermes plugins validate --install-deps` is what CI runs).
+15. **No skins or forks of bundled plugins.** A change to a bundled plugin is a
+   PR against `hermes-agent`, not a competing listing, and vendor-lookalike skins
+   are not listed under Nous branding.
+
+The step-by-step submission guide, with the same rules and what reviewers check,
+lives at
+[Submitting to the plugin catalog](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins/catalog-submission).
+
 ## Entry schema
 
 ```yaml

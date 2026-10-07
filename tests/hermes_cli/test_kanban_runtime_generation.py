@@ -46,6 +46,7 @@ from hermes_constants import get_hermes_home
 def load_config():
     path = get_hermes_home() / 'config.yaml'
     return yaml.safe_load(path.read_text()) if path.is_file() else {}
+load_config_readonly = load_config
 def cfg_get(config, section, key):
     return config.get(section, {}).get(key)
 """)
@@ -106,7 +107,7 @@ def installation(tmp_path, monkeypatch, runtime_storage):
     plugins = tmp_path / "home" / "plugins"
     external = tmp_path / "external"
     native_probe = tmp_path / "native_probe.py"
-    for name in ("kanban_runtime.py", "kanban_runtime_generation.py"):
+    for name in ("kanban_runtime.py", "kanban_runtime_generation.py", "plugin_isolation.py"):
         destination = source / "hermes_cli" / name
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(REPOSITORY / "hermes_cli" / name, destination)
@@ -116,6 +117,13 @@ def installation(tmp_path, monkeypatch, runtime_storage):
         shutil.copy2(REPOSITORY / "providers" / name, destination)
     _write(source / "hermes_cli" / "__init__.py", '__version__ = "fixture"\n')
     shutil.copy2(REPOSITORY / "hermes_constants.py", source / "hermes_constants.py")
+    _write(source / "hermes_cli" / "config.py", """
+import json
+from hermes_constants import get_hermes_home
+def load_config_readonly():
+    path = get_hermes_home() / 'config.yaml'
+    return json.loads(path.read_text()) if path.is_file() else {}
+""")
     _write(source / "early.py", "VALUE = 'old'\n")
     _write(source / "late.py", "VALUE = 'old'\n")
     _write(dependencies / "startup_sdk.py", "VALUE = 'old'\n")

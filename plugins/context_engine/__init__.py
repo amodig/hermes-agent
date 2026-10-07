@@ -2,7 +2,8 @@
 ``$HERMES_HOME/plugins/<name>/`` (bundled wins on collision) → ``ContextEngine``. Separate from the
 general plugin system: ``context.engine`` in config.yaml names the active engine (default
 ``"compressor"``, the built-in ContextCompressor), so a user-installed engine needs no
-``plugins.enabled`` entry to be selectable."""
+``plugins.enabled`` entry to be selectable. In either isolation mode, engine slash commands
+use the owning profile's plugin command registry."""
 
 from __future__ import annotations
 
@@ -74,6 +75,24 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:  # noq
     name = engine_dir.name
     is_bundled = engine_dir.parent == _CONTEXT_ENGINE_PLUGINS_DIR
     module_name = f"plugins.context_engine.{name}" if is_bundled else f"{_USER_NAMESPACE}.{name}"
+    from hermes_cli.plugin_isolation import user_plugin_host
+    host = None if is_bundled else user_plugin_host()
+    if host is not None:
+        from hermes_cli.plugins import get_plugin_manager
+        manager = get_plugin_manager()
+        collector = _EngineCollector(engine_name=name, manager=manager)
+
+        def drop_commands() -> None:
+            # A retained engine may reload after another load registered the old host's commands.
+            # Use the engine owner, not this collector's registrations; leave other plugins alone.
+            with manager._discovery_lock:
+                for command, entry in list(manager._plugin_commands.items()):
+                    if entry.get("plugin") == f"context-engine:{name}":
+                        manager._restore_mapping(manager._plugin_commands, command, entry, None)
+
+        return host.load_instance(engine_dir, module_name=module_name, capture="register_context_engine",
+                                  base_ref="agent.context_engine:ContextEngine",
+                                  ctx=collector, before_reload=drop_commands)
     mod = _loader.load_plugin_module(
         module_name, engine_dir, parents=("plugins", "plugins.context_engine"), logger=logger,
         synthetic_namespace=None if is_bundled else _USER_NAMESPACE)
@@ -83,12 +102,13 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:  # noq
 
 
 class _EngineCollector(_loader.NoopPluginContext):
-    """Captures register_context_engine; forwards register_command to the global plugin command
-    registry so engine slash commands behave like plugin ones."""
+    """Captures register_context_engine; forwards register_command to the profile's plugin command
+    registry. Hosted callbacks bind the owning manager even if a later reload has another caller."""
 
-    def __init__(self, engine_name: str = ""):
+    def __init__(self, engine_name: str = "", *, manager=None):
         self.engine = None
         self._engine_name = engine_name or "context_engine"
+        self._manager = manager
 
     def register_context_engine(self, engine):
         self.engine = engine
@@ -109,7 +129,7 @@ class _EngineCollector(_loader.NoopPluginContext):
             pass
         try:
             from hermes_cli.plugins import get_plugin_manager
-            manager = get_plugin_manager()
+            manager = self._manager if self._manager is not None else get_plugin_manager()
             if clean in manager._plugin_commands:
                 logger.warning(conflict, self._engine_name, clean, "is already registered by a plugin.")
                 return

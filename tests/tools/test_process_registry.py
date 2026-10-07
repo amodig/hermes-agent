@@ -446,16 +446,27 @@ def test_pty_reader_loop_reassembles_multibyte_char_split_across_chunks(registry
                 return self._chunks.pop(0)
             raise EOFError
 
+        def fileno(self):
+            return read_fd
+
         def wait(self):
             return 0
 
+    # Real readiness FD for the staged byte chunks; only this reader consumes
+    # the fake PTY, so a single ready byte covers each read.
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b"x")
     session = _make_session(sid="proc_pty_utf8")
     session._pty = _FakePty([b"caf\xc3", b"\xa9\n"])
     monkeypatch.setattr(registry, "_check_watch_patterns", lambda _s, _c: None)
     monkeypatch.setattr(registry, "_emit_output", lambda _s, _c: None)
     monkeypatch.setattr(registry, "_move_to_finished", lambda _s: None)
 
-    registry._pty_reader_loop(session)
+    try:
+        registry._pty_reader_loop(session)
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
 
     assert session.output_buffer == "café\n"
     assert "\ufffd" not in session.output_buffer
@@ -2629,6 +2640,34 @@ class TestSystemdCgroupIsolation:
         assert not any(
             value.startswith("OOMPolicy=") for value in probe_argv if isinstance(value, str)
         ), probe_argv
+
+    @pytest.mark.platforms("linux")
+    @pytest.mark.parametrize("rejects_no_expand", [False, True], ids=["systemd>=254", "systemd<254"])
+    def test_scoped_command_is_not_expanded_by_systemd_run(self, monkeypatch, rejects_no_expand):
+        """systemd >= 254 rewrites ``$$``/``${X}`` in a --scope command unless given
+        ``--expand-environment=no``; older systemd-run rejects that option, and losing
+        it there must not cost the scope (#132385)."""
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", None)
+        monkeypatch.setattr(pr, "_SYSTEMD_RUN_NO_EXPAND", True)
+        probes = []
+
+        def fake_run(argv, **kwargs):
+            probes.append(argv)
+            if rejects_no_expand and "--expand-environment=no" in argv:
+                return subprocess.CompletedProcess(
+                    argv, 1, stderr=b"systemd-run: unrecognized option '--expand-environment=no'")
+            return subprocess.CompletedProcess(argv, 0, stderr=b"")
+
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        assert pr._systemd_run_user_scope_available() is True
+        spawn = pr._build_systemd_scope_argv(["bash", "-c", "echo $$"], unit_suffix="t")
+        assert ("--expand-environment=no" in spawn) is not rejects_no_expand
+        assert spawn[spawn.index("--") + 1:] == ["bash", "-c", "echo $$"]
+        assert len(probes) == (2 if rejects_no_expand else 1)
 
     @pytest.mark.platforms("linux")
     def test_successful_systemd_probe_revalidates_after_cache_ttl(self, monkeypatch):

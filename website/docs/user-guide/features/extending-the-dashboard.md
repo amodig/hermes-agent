@@ -913,7 +913,7 @@ The `sidebar` slot only renders when the active theme has `layoutVariant: cockpi
 
 **Plugin backend routes return 404.**
 1. Confirm the manifest has `"api": "plugin_api.py"` pointing to an existing file inside `dashboard/`.
-2. Restart `hermes dashboard` — plugin API routes are mounted once at startup, **not** on rescan.
+2. In-process APIs mount at startup, so restart `hermes dashboard`. With `plugins.isolation: host`, enabled user APIs are discovered on each request from that request's profile; install and enable the plugin there, including for `?profile=<name>`.
 3. Check that `plugin_api.py` exports a module-level `router = APIRouter()`. Other export names are not picked up.
 4. Tail `~/.hermes/logs/errors.log` for `Failed to load plugin <name> API routes` — import errors are logged there.
 
