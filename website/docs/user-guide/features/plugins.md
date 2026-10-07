@@ -830,6 +830,7 @@ What changes in `host` mode:
 - **Task and cleanup handles retain their contracts.** On the host's async loop,
   `ctx.spawn_task()` returns a named, awaitable task. `ctx.on_unload()` returns a
   registration whose `dispose()` runs cleanup once; disposed callbacks do not run again at unload.
+  Finalized provider proxies release their hosted objects on the next RPC, including concurrent callers.
 - **Deferred callbacks keep the owning profile.** Background callbacks bind current owner
   credentials and terminal policy even if multiplexing activates later; in-flight callbacks
   retain their caller's scope.

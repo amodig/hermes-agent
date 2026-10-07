@@ -57,7 +57,7 @@ class PluginHost:
     def __init__(self, manager: Any):
         self._manager = manager
         self._home = Path(manager.home_path)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._proc: Optional[subprocess.Popen] = None
         self._channel: Optional[Channel] = None
         self._contexts: Dict[str, Any] = {}
@@ -349,8 +349,9 @@ class PluginHost:
                 raise PluginHostUnavailable("not started")
             if generation is not None and generation != self._generation:
                 raise PluginHostUnavailable("this object belonged to a plugin host process that has exited")
-            if self._releases:
+            with self._lock:
                 released, self._releases = self._releases, []
+            if released:
                 channel.call("release", {"refs": released})
             return decode(channel.call(method, params), self._resolve_ref)
         except PluginHostUnavailable as exc:
@@ -358,8 +359,9 @@ class PluginHost:
 
     def _release(self, generation: int, ref: int) -> None:
         """Finalizer of an object proxy (any thread, GC time): queue only; sent with the next call."""
-        if generation == self._generation:
-            self._releases.append(ref)
+        with self._lock:
+            if generation == self._generation:
+                self._releases.append(ref)
 
     def invoke(self, ref: int, args: tuple, kwargs: dict, *, generation: Optional[int] = None) -> Any:
         return self._call("invoke", {"ref": ref, "args": encode(list(args)), "kwargs": encode(kwargs)},
