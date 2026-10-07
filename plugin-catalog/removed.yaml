@@ -3,4 +3,5 @@
 # matches an entry here (unless the caller explicitly bypasses the check).
 # Each entry: {name, repo, reason, date}. Removals land via reviewed PRs,
 # same as additions.
+
 removed: []
