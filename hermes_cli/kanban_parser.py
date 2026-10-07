@@ -363,6 +363,12 @@ _SPECS = [
     _cmd("block", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason (also appended as a comment)"),
+        _arg("--reason", dest="reason_option", help="Block reason (alternative to positional reason)"),
+        _arg("--quarantine-review", action="store_true",
+             help="Quarantine one unclaimed REVIEW with a current immutable-handoff refusal; "
+                  "requires --kind capability, a reason, and --expected-version. Creates no run."),
+        _arg("--expected-version", type=int,
+             help="Observed task version; required only with --quarantine-review"),
         _bulk_ids("block"),
         _arg("--kind", choices=sorted(kb.VALID_BLOCK_KINDS),
              help="Typed block reason. 'dependency' waits in todo (auto-promoted when "

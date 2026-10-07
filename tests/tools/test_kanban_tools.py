@@ -432,6 +432,138 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
+@pytest.mark.parametrize("review_mode", ["separate_card", "same_card"])
+def test_block_quarantine_tool_preserves_runs_and_rejects_stale_retry(
+    worker_env, monkeypatch, tmp_path, review_mode,
+):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tests.hermes_cli.test_kanban_cli import _quarantine_review_case
+    from tests.hermes_cli.test_kanban_handoff import _git
+    from tools import kanban_tools  # noqa: F401 — ensure registration
+    from tools.registry import registry
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+    kb.create_board("quarantine")
+    with kb.scoped_current_board("quarantine"), kbc.connect_closing() as conn:
+        repo, parent, review, head, moved_head = _quarantine_review_case(
+            conn, tmp_path, review_mode,
+        )
+        before = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (review,)).fetchone())
+        runs = list(conn.execute("SELECT * FROM task_runs"))
+        links = list(conn.execute("SELECT * FROM task_links"))
+        handoff = kb.latest_handoff(conn, parent)
+    entry = registry.get_entry("kanban_block")
+    assert entry is not None
+    args = {
+        "board": "quarantine", "task_id": review,
+        "quarantine_review": True, "expected_version": before["version"],
+        "kind": "capability",
+        "reason": "Immutable parent handoff is not startable; quarantine pending operator recovery",
+    }
+    result = json.loads(entry.handler(args))
+    assert result["ok"] is True
+    assert result["status"] == "blocked"
+    assert result["block_kind"] == "capability"
+    with kb.scoped_current_board("quarantine"), kbc.connect_closing() as conn:
+        after = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (review,)).fetchone())
+        assert after["version"] == before["version"] + 1
+        for field in before.keys() - {"status", "version", "block_kind", "block_recurrences"}:
+            assert after[field] == before[field], field
+        assert list(conn.execute("SELECT * FROM task_runs")) == runs
+        assert list(conn.execute("SELECT * FROM task_links")) == links
+        assert kb.latest_handoff(conn, parent) == handoff
+        event, = [event for event in kb.list_events(conn, review) if event.kind == "blocked"]
+        assert event.run_id is None
+        assert event.payload["kind"] == "capability"
+        assert event.payload["source_status"] == "review"
+        assert event.payload["handoff_error"]["expected_head_sha"] == head
+        assert event.payload["handoff_error"]["actual_head_sha"] == moved_head
+        quarantined = list(conn.iterdump())
+    assert _git(repo, "cat-file", "-t", head) == "commit"
+    assert _git(repo, "cat-file", "-t", moved_head) == "commit"
+    retry = json.loads(entry.handler(args))
+    assert "review quarantine refused" in retry["error"]
+    with kb.scoped_current_board("quarantine"), kbc.connect_closing() as conn:
+        assert list(conn.iterdump()) == quarantined
+
+
+@pytest.mark.parametrize(("overrides", "message"), [
+    ({"quarantine_review": "true"}, "must be a boolean"),
+    ({"quarantine_review": 1}, "must be a boolean"),
+    ({"quarantine_review": None}, "must be a boolean"),
+    ({"expected_version": None}, "expected_version"),
+    ({"expected_version": True}, "expected_version"),
+    ({"expected_version": 0}, "expected_version"),
+    ({"expected_version": "1"}, "expected_version"),
+    ({"expected_version": 1.0}, "expected_version"),
+    ({"kind": "needs_input"}, "capability"),
+    ({"reason": {"explanation": "not text"}}, "reason must be a string"),
+    ({"reason": " "}, "reason is required"),
+    ({"quarantine_review": False}, "requires quarantine_review"),
+    ({}, "review quarantine refused"),
+])
+def test_block_quarantine_tool_validates_without_mutation(
+    worker_env, monkeypatch, overrides, message,
+):
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools  # noqa: F401 — ensure registration
+    from tools.registry import registry
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+    with kbc.connect_closing() as conn:
+        before = list(conn.iterdump())
+    entry = registry.get_entry("kanban_block")
+    result = json.loads(entry.handler({
+        "task_id": worker_env, "quarantine_review": True, "expected_version": 1,
+        "kind": "capability", "reason": "operator recovery", **overrides,
+    }))
+    assert message in result["error"]
+    with kbc.connect_closing() as conn:
+        assert list(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize("context", ["own_run", "foreign_task", "unbound", "delegated", "goal_mode"])
+def test_block_quarantine_tool_preserves_authorization_gates(worker_env, monkeypatch, context):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+    from tools.registry import registry
+
+    tid = worker_env
+    with kbc.connect_closing() as conn:
+        if context == "foreign_task":
+            tid = kb.create_task(conn, title="foreign review")
+        if context == "goal_mode":
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET goal_mode = 1 WHERE id = ?", (tid,))
+        before = list(conn.iterdump())
+    if context == "unbound":
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+    if context == "delegated":
+        monkeypatch.setattr(
+            kt, "_delegation_ctx",
+            lambda predicate, default: predicate == "is_delegated_child_process_context",
+        )
+    entry = registry.get_entry("kanban_block")
+    result = json.loads(entry.handler({
+        "task_id": tid, "quarantine_review": True, "expected_version": 1,
+        "kind": "capability", "reason": "operator recovery",
+    }))
+    message = {
+        "own_run": "cannot use expected_run_id",
+        "foreign_task": "refusing to mutate",
+        "unbound": "cannot prove ownership",
+        "delegated": "not Kanban run owners",
+        "goal_mode": "goal_mode tasks can only block",
+    }[context]
+    assert message in result["error"]
+    with kbc.connect_closing() as conn:
+        assert list(conn.iterdump()) == before
+
+
 def test_schedule_parks_current_worker_with_reason(worker_env):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc

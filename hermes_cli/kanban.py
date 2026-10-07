@@ -1153,9 +1153,18 @@ def _commented(conn, reason: Optional[str], author, prefix: str, op):
 
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
+    reason_option = getattr(args, "reason_option", None)
+    if reason_option is not None:
+        if reason:
+            return _err("kanban block: use positional reason or --reason, not both", 2)
+        reason = reason_option.strip()
     kind = getattr(args, "kind", None)
+    quarantine_review = getattr(args, "quarantine_review", False)
+    expected_version = getattr(args, "expected_version", None)
     author = _profile_author()
     ids = _bulk_ids(args)
+    if quarantine_review and len(ids) != 1:
+        return _err("review quarantine requires exactly one task (no --ids)", 2)
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
         def ok_msg(tid):
@@ -1173,9 +1182,22 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 return f"{tid} → triage (unblock loop detected — {verdict}){suffix}"
             return f"Blocked {tid}{suffix}"
 
-        op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
-            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
+        def op(tid):
+            return kb.block_task(
+                conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid),
+                quarantine_review=quarantine_review, expected_version=expected_version,
+            )
+
+        # Fenced refusals must leave no comment or other durable mutation.
+        if not quarantine_review and expected_version is None:
+            op = _commented(conn, reason, author, "BLOCKED", op)
+        failure = (
+            "review quarantine refused: stale version, active claim, changed state, "
+            "or no current handoff refusal"
+        )
+        return _bulk_apply(
+            ids, op, ok_msg, lambda tid: failure if quarantine_review else f"cannot block {tid}",
+        )
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:

@@ -155,6 +155,8 @@ class DispatchResult:
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
     within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    handoff_refused: list[dict[str, Any]] = field(default_factory=list)
+    """Immutable handoff refusals with task identity and operator recovery guidance."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
@@ -177,6 +179,9 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             continue
         for _task_id, reason in res.respawn_guarded:
             counts[reason] = counts.get(reason, 0) + 1
+        for refusal in res.handoff_refused:
+            kind = refusal["kind"]
+            counts[kind] = counts.get(kind, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_locked:
@@ -2548,19 +2553,55 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _note_handoff_refusal(
+    task_id: str, version: int, error: dict[str, Any], result: "DispatchResult",
+    *, lane: str, board: Optional[str],
+) -> None:
+    if any(item["task_id"] == task_id for item in result.handoff_refused):
+        return
+    recovery = (
+        f"Inspect parent {error['parent_id']}'s immutable handoff. "
+        "Quarantine does not authorize a new candidate or release validation."
+    )
+    command = ""
+    if lane == "review":
+        recovery = "Quarantine this unclaimed review pending operator recovery. " + recovery
+        argv = ["hermes", "kanban"]
+        if board:
+            argv.extend(["--board", board])
+        argv.extend([
+            "block", task_id, "--quarantine-review", "--expected-version", str(version),
+            "--kind", "capability", "--reason",
+            "Immutable parent handoff is not startable; quarantine pending operator recovery",
+        ])
+        command = shlex.join(argv)
+    result.handoff_refused.append({
+        "task_id": task_id, **error, "recovery": recovery, "command": command,
+    })
+
+
 def _note_claim_hold(
     conn: sqlite3.Connection, task_id: str, result: "DispatchResult",
+    *, lane: str, board: Optional[str], expected_task=None,
 ) -> None:
-    """Surface a claim-time PR fence as a guard hold in ``DispatchResult``.
+    """Report a current handoff hold, never a historical refusal or a CAS winner.
 
-    The pre-claim guard can pass and a fresh unauthorized PR URL can then arrive
-    while a deferred worker is being prepared. ``claim_task`` re-checks inside its
-    own transaction, so that hold is observable from the ``claim_rejected`` event
-    it writes — which is also its durable record, so this only reports the hold
-    for the tick and appends nothing of its own. Ordinary CAS losers stay
-    ordinary losers.
+    Claims return only None on refusal. Recheck the unchanged, unclaimed lane;
+    a head restored before this read no longer has a reportable current hold.
     """
-    if _last_claim_rejected_reason(conn, task_id) == "active_pr":
+    current = _kb.get_task(conn, task_id)
+    if (current is None or current.status != lane or current.claim_lock is not None
+            or current.current_run_id is not None):
+        return
+    if expected_task is not None:
+        from hermes_cli.kanban_db_lifecycle_claims import _claim_snapshot_matches
+
+        if not _claim_snapshot_matches(conn, task_id, expected_task):
+            return
+    error = _kb._parent_handoff_start_error(conn, task_id, phase=lane)
+    if error is not None:
+        _note_handoff_refusal(task_id, current.version, error, result, lane=lane, board=board)
+    elif _last_claim_rejected_reason(conn, task_id) == "active_pr":
         result.respawn_guarded.append((task_id, "active_pr"))
 
 
@@ -2725,6 +2766,15 @@ def _dispatch_lane_task(
             with _kb.write_txn(conn):
                 _record_respawn_guard(conn, task_id, guard_reason)
         return False
+    handoff_error = _kb._parent_handoff_start_error(conn, task_id, phase=lane)
+    if handoff_error is not None:
+        _note_handoff_refusal(
+            task_id, row["version"], handoff_error, result, lane=lane, board=board,
+        )
+        if not dry_run:
+            with _kb.write_txn(conn):
+                _kb._record_parent_handoff_start_error(conn, task_id, handoff_error)
+        return False
 
     def _count_spawn(name: str) -> None:
         if per_profile_cap is not None and name:
@@ -2746,14 +2796,6 @@ def _dispatch_lane_task(
         if preflight is None:
             return False
         spawn_task = preflight
-        handoff_error = _kb._parent_handoff_start_error(
-            conn, task_id, phase=lane,
-        )
-        if handoff_error is not None:
-            _kb._record_parent_handoff_start_error(
-                conn, task_id, handoff_error,
-            )
-            return False
         if lane == "review":
             spawn_task = replace(
                 preflight,
@@ -2789,7 +2831,9 @@ def _dispatch_lane_task(
             if claimed is None:
                 if launch.cancel:
                     launch.cancel()
-                _note_claim_hold(conn, task_id, result)
+                _note_claim_hold(
+                    conn, task_id, result, lane=lane, board=board, expected_task=preflight,
+                )
                 return False
         except WorkerLaunchInterrupted as exc:
             if launch is not None and launch.cancel:
@@ -2826,7 +2870,7 @@ def _dispatch_lane_task(
         claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
         claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
         if claimed is None:
-            _note_claim_hold(conn, task_id, result)
+            _note_claim_hold(conn, task_id, result, lane=lane, board=board)
             return False
         try:
             if claimed.workspace_kind == "worktree":
@@ -3051,42 +3095,10 @@ def _tick_spawn_budget(
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, version FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
-
-
-def _any_spawnable_review(
-    conn: sqlite3.Connection,
-    review_rows: list[sqlite3.Row],
-    *,
-    per_profile_cap: Optional[int] = None,
-    per_profile_running: Optional[dict[str, int]] = None,
-) -> bool:
-    """Mirror review dispatch gates before reserving ready-lane capacity.
-
-    Unavailable profile metadata retains the historic fail-open behavior. A
-    review row that :func:`_dispatch_lane_task` would refuse this tick — its
-    assignee already at the per-profile cap, or respawn-guarded — cannot
-    consume the reservation, so it must not withhold capacity from an
-    otherwise ready task (one such row would pin ``ready_budget`` to 0).
-    """
-    if not review_rows:
-        return False
-    profile_exists = _profile_exists_fn()
-    running = per_profile_running or {}
-    for row in review_rows:
-        assignee = row["assignee"]
-        if not assignee:
-            continue
-        if profile_exists is not None and not profile_exists(assignee):
-            continue
-        if per_profile_cap is not None and running.get(assignee, 0) >= per_profile_cap:
-            continue
-        if check_respawn_guard(conn, row["id"], lane="review") is None:
-            return True
-    return False
 
 
 def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
@@ -3141,13 +3153,9 @@ def _dispatch_once_locked(
         return result
 
     ready_rows = _lane_rows(conn, "ready")
-    # Review rows are enumerated up front so the budget split can see whether
-    # review work exists at all.
-    review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
+    review_rows = iter(_lane_rows(conn, "review") if review_dispatch_enabled() else [])
     # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
     # skipped_unassigned — "busy, retry later" differs from "needs routing".
-    # Resolved BEFORE the review reservation so the reservation can see which
-    # review rows the lane loop would refuse this tick.
     per_profile_cap = max_in_progress_per_profile if (
         # Per-profile concurrency cap (#21582): when set, track how many workers each assignee already has
         # in flight, and refuse to spawn when this would push that assignee past the cap. Prevents fan-out
@@ -3157,23 +3165,19 @@ def _dispatch_once_locked(
         and max_in_progress_per_profile > 0
     ) else None
     per_profile_running: dict[str, int] = {}
-    if per_profile_cap is not None:
-        for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
-        ):
-            per_profile_running[prow["assignee"]] = int(prow["n"])
-    # Review-lane reservation: the ready loop runs first and would otherwise
-    # consume the ENTIRE shared budget, starving reviews under a sustained ready
-    # backlog. When spawnable review work exists and there is any budget, hold
-    # one slot back.
-    ready_budget = spawn_budget
-    if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(
-        conn, review_rows,
-        per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
-    ):
-        ready_budget = max(spawn_budget - 1, 0)
+
+    def refresh_profile_counts() -> None:
+        if per_profile_cap is not None:
+            per_profile_running.clear()
+            per_profile_running.update(
+                (prow["assignee"], int(prow["n"]))
+                for prow in conn.execute(
+                    "SELECT assignee, COUNT(*) AS n FROM tasks "
+                    "WHERE status = 'running' AND assignee IS NOT NULL GROUP BY assignee"
+                )
+            )
+
+    refresh_profile_counts()
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
@@ -3182,10 +3186,37 @@ def _dispatch_once_locked(
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
+    # Service one review before READY under a finite cap, not a speculative
+    # reservation. The iterator leaves every attempted row visited exactly once.
+    if spawn_budget is not None and spawn_budget > 0:
+        for row in review_rows:
+            if _stop_requested(should_stop) or spawned >= spawn_budget:
+                break
+            if not row["assignee"]:
+                result.skipped_unassigned.append(row["id"])
+                continue
+            served = _dispatch_lane_task(
+                conn, row, row["assignee"], result, lane="review", **lane_kwargs,
+            )
+            spawned += int(served)
+            if not dry_run:
+                # A different claimant may have won even when our attempt failed.
+                # Refresh before trying another row, not only before the READY pass.
+                may_spawn, remaining = _tick_spawn_budget(
+                    conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress,
+                    board=board,
+                )
+                if not may_spawn:
+                    spawn_budget = spawned
+                elif remaining is not None:
+                    spawn_budget = min(spawn_budget, spawned + remaining)
+                refresh_profile_counts()
+            if served:
+                break
     for row in ready_rows:
         if _stop_requested(should_stop):
             break
-        if ready_budget is not None and spawned >= ready_budget:
+        if spawn_budget is not None and spawned >= spawn_budget:
             break
         row_assignee = row["assignee"]
         if not row_assignee:
@@ -3201,10 +3232,8 @@ def _dispatch_once_locked(
         if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
             spawned += 1
 
-    # A review agent (sdlc-review) approves (→ done) or requests changes
-    # (→ ready/todo). Review spawns share max_spawn with ready tasks. The loop
-    # checks the FULL shared ``spawn_budget`` — the reservation above caps the
-    # ready lane, it grants no extra capacity here.
+    # READY gets the remaining slots before additional review work. With no cap,
+    # the initial review pass is unnecessary and READY retains its original order.
     for row in review_rows:
         if _stop_requested(should_stop):
             break

@@ -330,7 +330,7 @@ _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
     "timed_out", "auto_blocked", "rate_limited", "interrupted", "cancelled",
     "auto_assigned_default", "respawn_guarded", "skipped_per_profile_capped",
-    "skipped_unassigned", "skipped_nonspawnable",
+    "skipped_unassigned", "skipped_nonspawnable", "handoff_refused",
 )
 
 
@@ -3300,14 +3300,71 @@ _REVIEW_APPROVED_NOTE = "Review approved without additional evidence."
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    quarantine_review: bool = False, expected_version: Optional[int] = None,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``kind='dependency'`` with no unsatisfied parent
     becomes ``needs_input`` so it cannot respawn context-free. ``transient``
     still counts toward the loop breaker. An untyped, already-blocked card
     with no live run may be classified without changing its failure evidence.
-    True on any transition.
+    Explicit review quarantine fences an unclaimed, unstartable handoff by
+    version without ending or synthesizing a run. True on any transition.
     """
+    if not isinstance(quarantine_review, bool):
+        raise ValueError("quarantine_review must be a boolean")
+    if expected_version is not None and not quarantine_review:
+        raise ValueError("expected_version requires quarantine_review")
+    if quarantine_review:
+        if kind != "capability":
+            raise ValueError("review quarantine requires kind='capability'")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("review quarantine requires a nonempty reason")
+        if (
+            isinstance(expected_version, bool)
+            or not isinstance(expected_version, int)
+            or expected_version < 1
+        ):
+            raise ValueError("review quarantine requires expected_version >= 1")
+        if expected_run_id is not None:
+            raise ValueError("review quarantine cannot use expected_run_id")
+        with write_txn(conn):
+            row = conn.execute(
+                "SELECT block_kind, block_recurrences FROM tasks "
+                "WHERE id = ? AND status = 'review' AND version = ? "
+                "AND claim_lock IS NULL AND current_run_id IS NULL AND worker_pid IS NULL",
+                (task_id, expected_version),
+            ).fetchone()
+            if row is None:
+                return False
+            error = _parent_handoff_start_error(conn, task_id, phase="review")
+            if not error or error.get("kind") not in {
+                "handoff_head_moved", "handoff_unverifiable",
+            }:
+                return False
+            previous_recurrences = int(row["block_recurrences"] or 0)
+            previous_kind = normalize_block_kind(row["block_kind"])
+            if previous_kind is None and previous_recurrences > 0:
+                previous_kind = _latest_block_cause(conn, task_id)
+            _, _, set_sql, params, payload = _route_block(
+                kind, reason, "review",
+                prev_kind=previous_kind, prev_recurrences=previous_recurrences,
+            )
+            # Quarantine stays sticky even after repeated operator recovery attempts.
+            payload.pop("limit", None)
+            payload["handoff_error"] = error
+            changed = conn.execute(
+                f"UPDATE tasks SET status = 'blocked', version = version + 1, {set_sql} "
+                "WHERE id = ? AND status = 'review' AND version = ? "
+                "AND claim_lock IS NULL AND current_run_id IS NULL AND worker_pid IS NULL",
+                (*params, task_id, expected_version),
+            ).rowcount
+            if changed != 1:
+                return False
+            _record_parent_handoff_start_error(conn, task_id, error)
+            _append_event(conn, task_id, "blocked", payload, run_id=None)
+            blocked_task = get_task(conn, task_id)
+        _fire_task_hook("kanban_task_blocked", blocked_task, task_id, None, reason=reason)
+        return True
     normalized_kind = normalize_block_kind(kind, reason)
     if kind is not None and str(kind).strip() and normalized_kind is None:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")

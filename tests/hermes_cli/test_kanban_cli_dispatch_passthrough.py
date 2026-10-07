@@ -8,8 +8,10 @@ operator footgun that only manifests in long-running setups.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
+import shlex
 import tempfile
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -23,6 +25,7 @@ def isolated_kanban_home(monkeypatch):
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", test_home)
     for mod in list(sys.modules.keys()):
         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
             del sys.modules[mod]
@@ -96,3 +99,105 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
     )
 
 
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_dispatch_reports_real_handoff_heads_and_fenced_recovery(
+    isolated_kanban_home, monkeypatch, tmp_path, capsys, json_output,
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+    from tests.hermes_cli.test_kanban_handoff import _repo, _commit
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"max_in_progress": 1, "review_dispatch": True}},
+    )
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "ok")
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda name: True)
+    kb.init_db()
+    kb.create_board("recovery")
+    repo, base, branch = _repo(tmp_path)
+    with kbc.connect(board="recovery") as conn:
+        parent = kb.create_task(
+            conn, title="implementation", assignee="implementer",
+            workspace_kind="worktree", workspace_path=str(repo), branch_name=branch,
+            lifecycle_contract={
+                "kind": "code", "review_mode": "separate_card", "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        )
+        review = kb.create_task(
+            conn, title="review", assignee="reviewer", parents=[parent],
+            workspace_kind="worktree", workspace_path=str(repo), branch_name=branch,
+            lifecycle_contract={"kind": "review", "candidate_task_id": parent},
+        )
+        implementation = kb.claim_task(conn, parent)
+        assert implementation is not None
+        approved = _commit(repo)
+        assert kb.complete_task(
+            conn, parent, expected_run_id=implementation.current_run_id,
+            summary="implemented src/changed.py", metadata={"base_sha": base, "head_sha": approved},
+        )
+        moved = _commit(repo, "src/moved.py")
+        ready = kb.create_task(conn, title="ready work", assignee="implementer")
+        version = kb.get_task(conn, review).version
+        event_count = len(kb.list_events(conn, review))
+    args = argparse.Namespace(
+        dry_run=True, max=1, failure_limit=2, json=json_output, board=" ReCoVeRy ",
+    )
+    assert kb_cli._cmd_dispatch(args) == 0
+    output = capsys.readouterr().out
+    if json_output:
+        payload = json.loads(output)
+        assert [item["task_id"] for item in payload["spawned"]] == [ready]
+        assert len(payload["handoff_refused"]) == 1
+        refusal = payload["handoff_refused"][0]
+        assert refusal["task_id"] == review and refusal["parent_id"] == parent
+        assert refusal["expected_head_sha"] == approved
+        assert refusal["actual_head_sha"] == moved
+        command = shlex.split(refusal["command"])
+        assert command[:5] == ["hermes", "kanban", "--board", "recovery", "block"]
+        assert command[5] == review
+        assert "--quarantine-review" in command
+        assert command[command.index("--expected-version") + 1] == str(version)
+        assert command[command.index("--kind") + 1] == "capability"
+        assert "does not authorize a new candidate or release validation" in refusal["recovery"]
+    else:
+        for value in (review, parent, ready, approved, moved, "handoff_head_moved"):
+            assert value in output
+        assert "--board recovery block" in output and "--quarantine-review" in output
+        assert f"--expected-version {version}" in output
+        assert "does not authorize a new candidate or release validation" in output
+    with kbc.connect(board="recovery") as conn:
+        assert kb.get_task(conn, review).status == "review"
+        assert kb.get_task(conn, review).current_run_id is None
+        assert kb.get_task(conn, ready).status == "ready"
+        assert len(kb.list_events(conn, review)) == event_count
+
+
+@pytest.mark.parametrize("board", [None, "board with spaces; echo unsafe"])
+def test_handoff_recovery_command_quotes_arguments_and_deduplicates(
+    isolated_kanban_home, board,
+):
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    task_id = "task with 'quotes'"
+    error = {
+        "kind": "handoff_head_moved", "parent_id": "parent",
+        "expected_head_sha": "approved", "actual_head_sha": "moved", "reason": "branch moved",
+    }
+    result = kbd.DispatchResult()
+    for _ in range(2):
+        kbd._note_handoff_refusal(task_id, 7, error, result, lane="review", board=board)
+    assert len(result.handoff_refused) == 1
+    command = shlex.split(result.handoff_refused[0]["command"])
+    expected_prefix = ["hermes", "kanban"] + (["--board", board] if board else [])
+    assert command[:len(expected_prefix)] == expected_prefix
+    assert command[len(expected_prefix):len(expected_prefix)+3] == [
+        "block", task_id, "--quarantine-review",
+    ]
+    assert command[command.index("--expected-version") + 1] == "7"
+    assert "handoff_head_moved=1" in kbd.describe_suppression([None, result])

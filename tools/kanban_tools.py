@@ -904,6 +904,9 @@ def _handle_complete(args: dict, **kw) -> str:
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
     tid = _worker_guard("kanban_block", args)
+    quarantine_review = args.get("quarantine_review", False)
+    if quarantine_review is True:
+        _check(isinstance(args.get("reason"), str), "reason must be a string")
     reason = _redact(
         _require_text(args, "reason", "reason is required — explain what input you need"))
     kind = args.get("kind")
@@ -926,8 +929,14 @@ def _handle_block(args: dict, **kw) -> str:
                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
-        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
-        _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
+        ok = kb.block_task(
+            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid),
+            quarantine_review=quarantine_review, expected_version=args.get("expected_version"),
+        )
+        _check(ok, (
+            "review quarantine refused: stale version, active claim, changed state, "
+            "or no current handoff refusal"
+        ) if quarantine_review else f"could not block {tid} (unknown id or not in running/ready)")
         landed_kind = kb.get_task(conn, tid).block_kind
         extra: dict = {"block_kind": landed_kind}
         if kind == "dependency" and landed_kind != kind:

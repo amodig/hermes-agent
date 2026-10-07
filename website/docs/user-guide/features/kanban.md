@@ -542,6 +542,46 @@ worktree, and optional patch hash. The original completion, runs, comments,
 and edges remain; dependents stay gated until the same parent is recommitted
 and completed with an immutable head.
 
+### Unstartable review quarantine
+
+A `REVIEW` card whose recorded immutable head is no longer what the reviewer was
+handed — the branch/worktree moved, or the recorded workspace is missing or
+dirty — cannot start. The dispatcher reports the refusal and moves on, so an
+ineligible review never starves READY work. An explicit `reviewed_parent`
+handoff is verified against its own recorded workspace and branch — resolving
+that workspace's HEAD only when no branch was recorded — never the review card's
+assigned branch.
+
+`hermes kanban dispatch --dry-run --json` predicts the same refusal without
+writing anything: each `handoff_refused` entry carries `task_id`, the guard
+`kind` (`handoff_head_moved` or `handoff_unverifiable`), `parent_id`,
+`expected_head_sha`/`actual_head_sha` when known, `recovery` guidance, and
+`command` — the exact quarantine command for that card. `command` is empty for a
+READY validation refusal, which needs the named parent's handoff inspected
+rather than a review transition. The refusal path itself appends no event,
+creates no run, prepares no workspace, and spawns no worker; the rest of a
+dry-run tick still performs its existing reclaim/promotion bookkeeping. The
+human-readable output prints the same refusals.
+
+Quarantine the single unclaimed card by copying `command`, or:
+
+```bash
+hermes kanban --board <slug> block <id> --quarantine-review \
+  --expected-version <observed version> --kind capability \
+  --reason 'Immutable parent handoff is not startable; quarantine pending operator recovery'
+```
+
+The model-side equivalent is `kanban_block` with `quarantine_review: true`,
+`kind: "capability"`, the same `reason`, and the observed `expected_version`
+(plus the resolved board). It bumps `version` by one, keeps the card sticky
+`blocked` even past the usual re-block→triage loop breaker, and preserves the
+goal revision, candidate pointer, contracts, assignee/model pins, graph edges,
+workspaces, runs, evidence, and both Git commits. A stale `version`, an active
+claim or run, a changed state, or a now-valid handoff refuses (the error starts
+`review quarantine refused`) and mutates nothing. `kanban_unblock` later
+restores the review lane; it is not approval, and a still-moved candidate stays
+unclaimable and keeps its validator gated.
+
 ### Recommended handoff evidence
 
 `kanban_complete(summary=..., metadata={...})` is intentionally flexible:
