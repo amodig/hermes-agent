@@ -117,14 +117,14 @@ def register(ctx):
     try:
         manager.discover_and_load()
         assert manager._plugins["wireecho"].error is None
-        assert host.pid != os.getpid() and host.alive
+        assert host.info["pid"] != os.getpid() and host.alive
         provider = image_gen_registry.get_provider("wireecho")
         assert isinstance(provider, ImageGenProvider)
         payload = _dictionary_payload()
         attribute = {"__opaque__": "ordinary metadata", "status": 200}
         provider.attribute = attribute
         assert provider.generate("echo", payload=payload) == {
-            "pid": host.pid, "payload": payload, "attribute": attribute,
+            "pid": host.info["pid"], "payload": payload, "attribute": attribute,
         }
     finally:
         try:

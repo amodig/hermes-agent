@@ -132,7 +132,7 @@ def test_engine_commands_preserve_dispatch_schema_and_ownership(tmp_path, monkey
                 "plugin": "context-engine:ctx_commands", "args_hint": "<text>",
             }
             assert json.loads(resolve_plugin_command_result(handler("hello world"))) == {
-                "args": "hello world", "pid": expected_pid, "home": str(home),
+                "args": "hello world", "pid": expected_pid, "home": manager.scope_key,
             }
         assert manager._plugin_commands["engine-claimed"] is claimed
         assert "help" not in manager._plugin_commands
@@ -145,7 +145,7 @@ def test_engine_commands_preserve_dispatch_schema_and_ownership(tmp_path, monkey
         assert load_context_engine("ctx_commands") is not None
         reloaded = plugins_mod.get_plugin_command_handler("engine-echo")
         assert json.loads(reloaded("reloaded")) == {
-            "args": "reloaded", "pid": expected_pid, "home": str(home),
+            "args": "reloaded", "pid": expected_pid, "home": manager.scope_key,
         }
     finally:
         manager.unload()
@@ -200,7 +200,7 @@ def test_hosted_engine_reload_refreshes_only_its_profiles_owned_commands(tmp_pat
                 assert handlers[home] is not None
                 assert pids[home] != os.getpid()
                 assert json.loads(handlers[home]("initial")) == {
-                    "args": "initial", "pid": pids[home], "home": str(home),
+                    "args": "initial", "pid": pids[home], "home": manager.scope_key,
                 }
         assert pids[home_a] != pids[home_b]
         assert "_hermes_user_context_engine.ctx_commands" not in sys.modules
@@ -224,12 +224,12 @@ def test_hosted_engine_reload_refreshes_only_its_profiles_owned_commands(tmp_pat
                 assert handler is not None
                 assert (handler is handlers[home]) is (home == home_b)
                 assert json.loads(handler("after restart")) == {
-                    "args": "after restart", "pid": pids[home], "home": str(home),
+                    "args": "after restart", "pid": pids[home], "home": managers[home].scope_key,
                 }
                 async_handler = plugins_mod.get_plugin_command_handler("engine-async")
                 assert async_handler is not None
                 assert json.loads(resolve_plugin_command_result(async_handler("async"))) == {
-                    "args": "async", "pid": pids[home], "home": str(home),
+                    "args": "async", "pid": pids[home], "home": managers[home].scope_key,
                 }
                 assert ("engine-retired" in managers[home]._plugin_commands) is (home == home_b)
     finally:

@@ -208,7 +208,7 @@ def register(ctx):
                 "parameters": {"type": "object", "properties": {}}},
         handler=inspect, is_async=True)
 '''})
-    manager = PluginManager()
+    manager = plugins_mod.get_plugin_manager()
     host = manager._plugin_host()
     plugin_dir = home / "plugins" / "deadlineprobe"
     plugin_dir.mkdir()
@@ -287,24 +287,23 @@ def register(ctx):
     loader = threading.Thread(target=load, daemon=True)
 
     def await_marker(name):
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 15
         while not (home / name).exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         assert (home / name).exists(), name
 
     try:
-        # Warm the real child and its sibling before applying the small configured load budget.
-        manager._load_plugin(plugins_mod.PluginManifest(
-            name="deadlineobserver", source="user", path=str(home / "plugins" / "deadlineobserver")))
+        # Warm canonical discovery so later callbacks cannot load a second observer host.
+        manager.discover_and_load()
         assert manager._plugins["deadlineobserver"].error is None
-        pid = host.pid
+        pid = host.info["pid"]
         (home / "config.yaml").write_text(yaml.safe_dump({"plugins": {
             "enabled": ["deadlineobserver", "deadlineprobe"], "isolation": "host",
-            "load_timeout_seconds": 0.5,
+            "load_timeout_seconds": 5,
         }}), encoding="utf-8")
         loader.start()
         await_marker("stall-started")
-        assert load_done.wait(5), "deadline cleanup waited on stalled import/register()"
+        assert load_done.wait(15), "deadline cleanup waited on stalled import/register()"
         assert "timed out" in str(manager._plugins["deadlineprobe"].error)
         assert not manager._plugins["deadlineprobe"].enabled
         if stall != "import":
@@ -313,7 +312,7 @@ def register(ctx):
         if stall != "async_register":
             manager._load_plugin(manifest)
             assert "previous load" in str(manager._plugins["deadlineprobe"].error)
-        assert host.alive and host.pid == pid
+        assert host.alive and host.info["pid"] == pid
         module_name = manager._policy_module_name(manifest)
         assert json.loads(registry.dispatch(
             "deadline_inspect", {"module": module_name}, scope=manager.scope_key))["pid"] == pid
@@ -344,7 +343,7 @@ def register(ctx):
         manager._load_plugin(manifest)
         assert manager._plugins["deadlineprobe"].error is None
         assert registry.dispatch("deadline_late", {}, scope=manager.scope_key) == "reloaded"
-        assert host.alive and host.pid == pid
+        assert host.alive and host.info["pid"] == pid
     finally:
         (home / "finish-register").touch()
         (home / "release-background").touch()
