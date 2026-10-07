@@ -45,6 +45,7 @@ import time
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import ModuleType
 
 from providers.base import ProviderProfile
 
@@ -87,6 +88,11 @@ _HOME_LAYERS_LOCK = threading.Lock()
 # across the import itself — a thread mid-``import hermes_cli.auth`` (whose import calls
 # ``list_providers()``) would block on it while the scanning thread waits on that module's import lock.
 _REGISTRATION_TARGET: ContextVar[_HomeLayer | None] = ContextVar("_provider_registration_target", default=None)
+_BUNDLED_ONLY_DISCOVERY: ContextVar[bool] = ContextVar("_provider_bundled_only_discovery", default=False)
+# Only the hosted child uses these: discovery and profile RPCs share one source import.
+# Reentrant because a general plugin's import may itself discover providers.
+_HOST_IMPORT_LOCK = threading.RLock()
+_HOST_PROFILE_IMPORTS: dict[Path, tuple[str, ModuleType, list[ProviderProfile]]] = {}
 
 # Repo-root ``plugins/model-providers/`` — populated at discovery time.
 _BUNDLED_PLUGINS_DIR = (
@@ -138,7 +144,7 @@ def register_provider(profile: ProviderProfile) -> None:
         for alias in profile.aliases:
             _ALIASES[alias] = profile.name
         _PROVIDER_LIST_CACHE = None
-    if _discovered and not _discovering:  # post-discovery registration: mirror it immediately
+    if _discovered and not _discovering and not _BUNDLED_ONLY_DISCOVERY.get():
         _sync_auth_registry()
 
 
@@ -262,6 +268,10 @@ def _refresh_home_layer(layer: _HomeLayer, home: Path | None, key: str, *, force
     check picks it up. Checking on a short cadence keeps a newly installed plugin discoverable
     without making every model lookup perform two filesystem stats.
     """
+    # Bundled imports can re-enter lookups through config (e.g. router's base URL).
+    # Keep user modules outside the host's pre-capture initialization window.
+    if _BUNDLED_ONLY_DISCOVERY.get():
+        return False
     now = time.monotonic()
     if home is None or not (
         force
@@ -392,6 +402,40 @@ def _user_module_name(plugin_dir: Path, home_key: str) -> str:
     return f"_hermes_user_provider_{digest}_{plugin_dir.name.replace('-', '_')}"
 
 
+def _load_host_profiles(plugin_dir: Path, module_name: str, *,
+                        expected_fingerprint: str | None = None) -> list[ProviderProfile]:
+    """Capture one source generation without publishing it into any live registry layer."""
+    from hermes_cli.plugin_host_child import _import_plugin
+    from hermes_cli.plugin_host_profiles import _fingerprint
+
+    plugin_dir = plugin_dir.resolve()
+    with _HOST_IMPORT_LOCK:
+        fingerprint = _fingerprint(plugin_dir)
+        if expected_fingerprint is not None and fingerprint != expected_fingerprint:
+            raise RuntimeError("Hosted provider profile generation is stale; rescan the provider before calling it")
+        cached = _HOST_PROFILE_IMPORTS.get(plugin_dir)
+        if cached is not None:
+            previous, module, profiles = cached
+            if previous == fingerprint and sys.modules.get(module.__name__) is module:
+                return profiles
+            # Discovery and RPC may use different names for the same source. Retire the
+            # original namespace's submodules as well when replacing that generation.
+            module_name = module.__name__
+        layer = _HomeLayer()
+        discovery_token = _BUNDLED_ONLY_DISCOVERY.set(True)
+        target_token = _REGISTRATION_TARGET.set(None)
+        try:
+            _discover_providers(bundled_only=True)
+            _REGISTRATION_TARGET.set(layer)
+            module = _import_plugin({"path": str(plugin_dir), "module_name": module_name})
+        finally:
+            _REGISTRATION_TARGET.reset(target_token)
+            _BUNDLED_ONLY_DISCOVERY.reset(discovery_token)
+        profiles = list(layer.registry.values())
+        _HOST_PROFILE_IMPORTS[plugin_dir] = (fingerprint, module, profiles)
+        return profiles
+
+
 def _import_plugin_dir(plugin_dir: Path, source: str, *, home_key: str = "") -> None:
     """Import a single plugin directory so it self-registers.
 
@@ -401,6 +445,22 @@ def _import_plugin_dir(plugin_dir: Path, source: str, *, home_key: str = "") -> 
     init_file = plugin_dir / "__init__.py"
     if not init_file.exists():
         return
+    if source != "bundled":
+        from hermes_cli.plugin_isolation import HOST_PROCESS_ENV, ISOLATION_HOST, isolation_mode
+        hosted_child = os.environ.get(HOST_PROCESS_ENV) == "1"
+        if hosted_child or isolation_mode() == ISOLATION_HOST:
+            from hermes_cli.plugin_host_profiles import load_hosted_profiles
+            load = _load_host_profiles if hosted_child else load_hosted_profiles
+            _current_source = source
+            try:
+                for profile in load(plugin_dir, _user_module_name(plugin_dir, home_key)):
+                    register_provider(profile)
+            except Exception as exc:
+                logger.warning("Failed to load user provider plugin %s in the plugin host: %s",
+                               plugin_dir.name, exc)
+            finally:
+                _current_source = None
+            return
 
     # Give bundled plugins a stable import path (``plugins.model_providers.<name>``)
     # so relative imports within the plugin work. User plugins load via
@@ -501,6 +561,11 @@ def _discover_entry_point_providers() -> None:
                 "entry-point provider %r skipped: not enabled in config", ep.name
             )
             continue
+        from hermes_cli.plugin_isolation import in_process_import_refusal
+        refusal = in_process_import_refusal(f"pip-installed model-provider plugin {ep.name!r}")
+        if refusal:
+            logger.warning("%s", refusal)
+            continue
         try:
             loaded = ep.load()
         except Exception as exc:
@@ -555,7 +620,7 @@ def _requires_arguments(fn) -> bool:
     return False
 
 
-def _discover_providers() -> None:
+def _discover_providers(*, bundled_only: bool = False) -> None:
     """Populate the process-wide registry by importing every provider plugin.
 
     Order:
@@ -565,22 +630,28 @@ def _discover_providers() -> None:
     Each step imports its plugins, which call ``register_provider()`` at
     module-level. Later steps win on name collision. ``$HERMES_HOME`` plugins are
     per profile home and load through :func:`_home_layer` at lookup time.
+
+    ``bundled_only`` is for plugin-host capture: initialize shipped profiles without
+    entry-point imports, home scans from nested config lookups, or auth callbacks.
     """
     global _discovered, _discovering
     if _discovered:
         return
     _discovered = True
     _discovering = True
+    token = _BUNDLED_ONLY_DISCOVERY.set(bundled_only)
     try:
-        _run_discovery_steps()
+        _run_discovery_steps(bundled_only=bundled_only)
     finally:
         _discovering = False
+        _BUNDLED_ONLY_DISCOVERY.reset(token)
         # hermes_cli.auth may have been imported by a plugin during discovery and snapshotted a
         # partial profile list — hand it the complete one (no-op unless auth is already loaded).
-        _sync_auth_registry()
+        if not bundled_only:
+            _sync_auth_registry()
 
 
-def _run_discovery_steps() -> None:
+def _run_discovery_steps(*, bundled_only: bool = False) -> None:
     """The discovery passes, in precedence order (see :func:`_discover_providers`)."""
     # 0. Pip-installed plugins — entry points in the ``hermes_agent.plugins``
     #    group (the same group the general PluginManager uses). The manager
@@ -596,7 +667,8 @@ def _run_discovery_steps() -> None:
     #    third-party package from silently hijacking a first-party provider
     #    name (e.g. ``openrouter``) while still letting pip packages add
     #    genuinely new providers.
-    _discover_entry_point_providers()
+    if not bundled_only:
+        _discover_entry_point_providers()
 
     # 1. Bundled plugins — shipped with hermes-agent.
     if _BUNDLED_PLUGINS_DIR.is_dir():
@@ -604,6 +676,8 @@ def _run_discovery_steps() -> None:
             if not child.is_dir() or child.name.startswith(("_", ".")):
                 continue
             _import_plugin_dir(child, "bundled")
+    if bundled_only:
+        return
 
     # 2. Legacy single-file profiles at providers/<name>.py. Kept for
     #    back-compat — if someone drops a ``providers/foo.py`` into an

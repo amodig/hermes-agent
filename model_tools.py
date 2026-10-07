@@ -19,7 +19,7 @@ import time
 from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import CHECK_FN_CACHE_BYPASS, check_fn_cache_scope, discover_builtin_tools, registry, tool_error
-from tools.registry import _MAX_TOOL_ERROR_CHARS as _TOOL_ERROR_MAX_LEN
+from tools.registry import _sanitize_tool_error
 from toolsets import resolve_toolset, validate_toolset
 from tools.arg_coercion import coerce_tool_args
 from tools.todo_tool import TODO_LEGACY_ALIASES, TODO_SCHEMA
@@ -621,30 +621,6 @@ _LEGACY_TOOL_ALIASES = {
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
 
 
-# --- Tool error sanitization --------------------------------------------------
-# Defense-in-depth: strip role tags / CDATA / code fences from exception text the
-# model will read, and cap length (cap shared with tools/registry.py so text never
-# passes two different caps with two different markers).
-_TOOL_ERROR_STRIP_RES = (
-    re.compile(r'</?(?:tool_call|function_call|result|response|output|input|system|assistant|user)>', re.IGNORECASE),
-    re.compile(r'^\s*```(?:json|xml|html|markdown)?\s*', re.MULTILINE),
-    re.compile(r'\s*```\s*$', re.MULTILINE),
-    re.compile(r'<!\[CDATA\[.*?\]\]>', re.DOTALL),
-)
-
-
-def _sanitize_tool_error(error_msg: str) -> str:
-    """Strip structural framing tokens from a tool error before the model sees it."""
-    if not error_msg:
-        return "[TOOL_ERROR] "
-    sanitized = error_msg
-    for pattern in _TOOL_ERROR_STRIP_RES:
-        sanitized = pattern.sub("", sanitized)
-    if len(sanitized) > _TOOL_ERROR_MAX_LEN:
-        sanitized = sanitized[:_TOOL_ERROR_MAX_LEN - 3] + "..."
-    return f"[TOOL_ERROR] {sanitized}"
-
-
 @dataclass(frozen=True)
 class _CallIds:
     """Identity fields of one tool call, threaded through hooks and middleware."""
@@ -931,7 +907,7 @@ def handle_function_call(
         if "manage_connections" not in _select_tool_names(enabled_toolsets, disabled_toolsets, quiet_mode=True):
             return _emit(tool_error("Connectors are not available in this session."))
         if is_connector_name(function_name) and parse_connector_name(function_name) is None:
-            return _emit(tool_error("Malformed connector tool name; expected connectors__<connector>__<tool>."))
+            return _emit(tool_error("Malformed connector tool name; expected connectors__<connector>__{tool}."))
 
     original_args = dict(function_args)
     if not skip_tool_request_middleware:

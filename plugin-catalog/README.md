@@ -105,7 +105,7 @@ meaningful:
 15. **No skins or forks of bundled plugins.** A change to a bundled plugin is a
    PR against `hermes-agent`, not a competing listing, and vendor-lookalike skins
    are not listed under Nous branding.
-<!-- admission-rules:end -->
+
 
 The step-by-step submission guide, with the same rules and what reviewers check,
 lives at

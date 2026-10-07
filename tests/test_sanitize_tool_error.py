@@ -1,4 +1,4 @@
-"""Tests for `_sanitize_tool_error` in model_tools.
+"""Tests for `_sanitize_tool_error` in tools.registry.
 
 Ported from ironclaw#1639 — defense-in-depth on tool exception strings before
 they enter the model's `tool` message content. Note that `json.dumps()` in
@@ -9,7 +9,7 @@ cap pathological lengths.
 """
 from __future__ import annotations
 
-from model_tools import _sanitize_tool_error, _TOOL_ERROR_MAX_LEN
+from tools.registry import _sanitize_tool_error, _MAX_TOOL_ERROR_CHARS
 
 
 class TestRoleTagStripping:
@@ -56,11 +56,11 @@ class TestCodeFenceStripping:
 
 class TestTruncation:
     def test_caps_long_input(self):
-        long = "A" * (_TOOL_ERROR_MAX_LEN * 2)
+        long = "A" * (_MAX_TOOL_ERROR_CHARS * 2)
         out = _sanitize_tool_error(long)
         # Total length is prefix + truncated body
         body = out[len("[TOOL_ERROR] "):]
-        assert len(body) == _TOOL_ERROR_MAX_LEN
+        assert len(body) == _MAX_TOOL_ERROR_CHARS
         assert body.endswith("...")
 
 
@@ -92,15 +92,15 @@ class TestHandleFunctionCallIntegration:
         def boom(_args, **_kwargs):
             raise RuntimeError("<tool_call>injected</tool_call> boom")
 
-        all_tools = _registry.get_all_tool_names()
-        assert all_tools, "no tools registered — test environment broken"
-        target = all_tools[0]
-        original = _registry._tools[target].handler
-        _registry._tools[target].handler = boom
+        target = "sanitize_error_probe"
+        _registry.register(
+            name=target, toolset="sanitize_error_probe",
+            schema={"name": target, "parameters": {"type": "object", "properties": {}}},
+            handler=boom)
         try:
             result_str = handle_function_call(target, {})
         finally:
-            _registry._tools[target].handler = original
+            _registry.deregister(target)
 
         payload = json.loads(result_str)
         assert "error" in payload, payload

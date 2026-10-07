@@ -203,15 +203,19 @@ Hermes checks out the commit detached, verifies that `HEAD` exactly matches the
 requested SHA, and records the canonical source, installed revision, and pin
 status in the current profile. `hermes plugins update` refuses to move a pinned
 plugin; choose a new exact commit explicitly with
-`hermes plugins install <source> --force --ref <new-commit>`. The
+`hermes plugins install <source> --force --ref <new-commit>`. Like an
+update, a forced reinstall from the source the plugin was installed from
+replaces its code but keeps your files: untracked and git-ignored files stay in
+place, and edits to tracked files are copied to
+`~/.hermes/plugins-backup/<name>-<sha>/`. A reinstall from a different source
+starts clean; to reset a plugin completely, `hermes plugins remove` it first. The
 profile-local install metadata contains no config values, environment values,
 secrets, or capability grants.
 
-The same agent-plugin pin is available in Hermes Desktop: **Capabilities →
-Plugins → Install from Git** has a *Pin to commit* field that takes the full
-40-character SHA, and **Installed** shows a `pinned @ <sha8>` badge on pinned
-agent plugins. This does not guarantee a pinned standalone desktop-plugin
-install. `hermes plugins list` prints
+The same pin is available in Hermes Desktop: **Skills → Plugins → Install from
+Git** has a *Pin to commit* field that takes the full 40-character SHA, and the
+plugins list shows a `pinned @ <sha8>` badge on every pinned install so a team
+can confirm everyone is running the same commit. `hermes plugins list` prints
 the pin in its Source column (`git pinned@<sha8>`). Pins work for private
 repositories too, through the same stored credentials described below.
 
@@ -457,25 +461,6 @@ Ordinary Hermes application updates preserve user plugin directories, including
 wrapper files and external sidecar links. Explicit plugin updates or removals
 can change those files. See [Package management](../../reference/package-management.md)
 and the [plugin authoring guide](../../developer-guide/plugins/index.md#lazy-install-optional-python-dependencies).
-
-### Installed and Browse in Desktop
-
-Open **Capabilities → Plugins**. **Installed** reads the app's desktop-plugin
-registry and the selected profile's actual agent-plugin state, combining both
-halves in one row where appropriate. It is not a list of catalog entries
-assumed to be installed. **Browse** is a native catalog view, not an embedded
-website; it uses the same **Installed / Browse** tabs as Skills, with search
-at the top and the tab switch and actions on one row.
-
-Desktop and the public [Plugin Catalog](/plugins) consume the same CDN
-snapshot, [`/docs/api/plugins.json`](https://hermes-agent.nousresearch.com/docs/api/plugins.json).
-The public alias serves the same data as Desktop's fetch URL,
-`https://nousresearch.github.io/hermes-agent/docs/api/plugins.json`. The docs
-build generates it from `plugin-catalog/*.yaml` and cached star counts. The
-same publish also supplies the removed-entry list used by the installer.
-Browsing does not query GitHub live or fetch source repos;
-the installer retrieves code only as part of the separate install flow.
-
 ### One-click install links (Desktop)
 
 Hermes Desktop registers the `hermes://` URL scheme, so a website, README, or
@@ -486,22 +471,18 @@ hermes://plugin/install?catalog=NAME               # catalog entry, installs the
 hermes://plugin/install?repo=owner/repo            # any git repo
 hermes://plugin/install?repo=owner/repo&enable=1   # enable the agent plugin after install
 hermes://plugin/install?repo=owner/repo&force=1    # replace an existing install
+hermes://plugin/install?catalog=<name>             # reviewed catalog entry at its pinned commit
 ```
 
 The `catalog=<name>` form is what the **Open in Hermes Desktop** button on
 every [Plugin Catalog](./plugin-catalog.md) card uses. Desktop resolves the
-name against the live catalog (the same feed **Capabilities → Plugins → Browse**
-shows) and opens the same **reviewed catalog entry** dialog an in-app
+name against the live catalog (the same feed the **Capabilities → Plugins**
+picker shows) and opens the same **reviewed catalog entry** dialog an in-app
 pick does: the agent half installs at the catalog's pinned commit, never the
 branch tip. The link carries no repo URL, and a name that is not in the
 catalog shows an error toast and nothing else — it is never reinterpreted as a
 git path, so a link cannot smuggle an unreviewed repo behind a
 familiar-looking name.
-
-Use an updated Desktop build for catalog links and the Skills Hub's
-`hermes://skill/install?identifier=...` route. If the app is missing or too old,
-use the card's copyable `hermes plugins install <catalog-name>` command to
-retain catalog resolution.
 
 For a `repo=` link, clicking one opens Hermes and shows a **confirmation dialog** — the repo id,
 a "Before you install" note, and GitHub browse + clone links — then
@@ -811,6 +792,103 @@ Scanning is on by default; disable it in `config.yaml`:
 plugins:
   scan_on_install: false
 ```
+
+### Running plugins out of process (`plugins.isolation`)
+
+By default third-party Python plugins are imported into the Hermes process, as they always have been.
+Setting `plugins.isolation: host` moves them into a **plugin host**: one separate Python process per
+profile, started on demand, that imports the profile's user-installed plugins and talks to Hermes over a
+private pipe.
+
+```yaml
+plugins:
+  isolation: host        # default: in_process
+  host:
+    launcher: []         # optional argv prefix for the host, e.g. a sandbox runner
+```
+
+Plugins do not change. They receive the same `ctx` and register tools, hooks, slash commands, skills and
+provider objects (image/video generation, web search, browser, TTS/STT, memory, context engines,
+model-provider profiles) exactly as before; Hermes registers matching entries on its side that call into
+the host. Dashboard plugin APIs are served by the host too. Bundled plugins keep running in-process.
+
+What changes in `host` mode:
+
+- **No shared interpreter.** A plugin's module never enters the Hermes process, so it cannot read
+  another profile's data from memory or patch Hermes internals. Under the multiplex gateway every
+  profile gets one lazily constructed host shared by concurrent general and category loads,
+  started with only that profile's environment and secrets.
+- **Manifest metadata stays available.** `ctx.manifest` carries all parsed manifest fields,
+  including declared capabilities, environment requirements and configuration schemas.
+- **Crashes stay contained.** A plugin that crashes or exits kills its host, not Hermes; the call in
+  flight returns a tool error and Hermes restarts the host and reloads its plugins (bounded retries).
+  Recovery binds the owning profile's home, secrets and terminal policy, including parent
+  callbacks made while replacement plugins register.
+- **Unload cancels plugin-owned background work.** Coroutines started with `ctx.spawn_task()`
+  are cancelled when that plugin unloads, reloads, fails registration, or exceeds
+  `plugins.load_timeout_seconds`; cleanup callbacks retain parent callback context until cleanup
+  finishes. Timed-out loads cannot register more callbacks or start new `ctx.spawn_task()` work.
+  Synchronous Python code already running cannot be forcibly stopped: its modules are evicted when
+  it returns, and the same plugin cannot load again until then. Cleanup gets a three-second grace;
+  a stalled unload callback retires the shared profile host rather than hanging discovery.
+  Unaffected enabled siblings reload into a replacement host; exhausted restart budgets remove
+  their dead registrations and disable them. Intentional shutdown cancels queued recovery.
+  Otherwise, sibling plugins keep their host process.
+- **Task and cleanup handles retain their contracts.** On the host's async loop,
+  `ctx.spawn_task()` returns a named, awaitable task. `ctx.on_unload()` returns a
+  registration whose `dispose()` runs cleanup once; disposed callbacks do not run again at unload.
+  Cleanup callbacks run in reverse acquisition order, interleaved with registration teardown,
+  including failed-load rollback. Tool failures during cleanup return sanitized errors without
+  rediscovering plugins.
+  Finalized provider proxies release their hosted objects on the next RPC, including concurrent callers.
+- **Deferred callbacks keep the owning profile.** Background callbacks bind current owner
+  credentials and terminal policy even if multiplexing activates later; in-flight callbacks
+  retain their caller's scope.
+- **Dashboard APIs retain their lifecycle.** The cached app runs router lifespan startup before
+  its first request and shutdown on plugin unload or host shutdown. Source-content changes
+  replace the API and its lifespan even for API-only dashboards with no CLI/gateway manifest,
+  without resetting sibling plugins or restarting the host.
+  Graceful API teardown drains in-flight requests before closing lifespan resources; waiting
+  releases the shared import lock, so sibling APIs keep serving requests.
+  Hosted requests preserve the external scheme, authority, query and mount root for generated
+  URLs; responses retain encoded bytes with their `Content-Encoding` header.
+- **Hosted dashboard APIs are profile-local.** Paths and enablement come from the request's
+  profile, including plugin names absent at server startup; executable APIs never fall back
+  to another profile's copy. Static dashboard assets retain launch-home discovery.
+- **General and category loads share imports.** Concurrent first loads of one plugin directory
+  share its module until unload; each category load still creates a fresh provider instance.
+  A dual-kind general/memory plugin registers its hooks once, regardless of load order.
+- **Context-engine commands retain their owner.** Hosted sync and async slash commands use the
+  profile's command registry, preserve metadata and conflict checks, and refresh after a host
+  restart without removing another plugin's replacement command.
+- **Retained provider proxies refresh once after a host crash.** Concurrent callers share one
+  replacement instance and one registration refresh rather than duplicating forwarded hooks.
+- **Ordinary JSON dictionaries stay dictionaries.** Keys resembling internal wire tags, such as
+  `__bytes__`, are escaped recursively; actual bytes, records and references keep their semantics.
+- **A few surfaces need in-process code** and fail that plugin with a clear reason instead of loading:
+  gateway platform adapters (`register_platform`), approval transports, Telegram/platform handlers,
+  model-provider profiles that build their own SDK client (`create_client`), streaming dashboard
+  endpoints, and plugins that monkeypatch Hermes modules. Run those with `isolation: in_process`.
+
+**Locking it for a shared deployment.** `plugins.isolation` is ordinary profile config, so whoever can
+edit a profile's `config.yaml` can turn it off. When the profiles belong to people you are isolating from
+each other, pin it in the [managed scope](../managed-scope.md) instead; the managed value wins over every
+profile's own config and `hermes config set` refuses to change it:
+
+```yaml
+# /etc/hermes/config.yaml (root-owned, read by every profile on the machine)
+plugins:
+  isolation: host
+  host:
+    launcher: [...]      # pin the sandbox runner too, if you use one
+```
+
+Run the agents' terminal on an isolated backend (Docker, SSH, ...) as well, so the agent itself cannot
+reach the operator's files.
+
+`hermes plugins validate <dir>` and `hermes plugins show <name>` report whether a plugin runs in the host
+and, if not, why. Across the plugin catalog at the time of writing, 299 of 348 entries run in the host
+unchanged.
 
 ### Interactive UI
 

@@ -16,6 +16,10 @@ so the controller inspects the existing card and current run; `notify` remains
 passive-only and `wake` remains wake-only. Review feedback never creates,
 unblocks, requeues, or otherwise mutates a task.
 
+In a multiplex gateway, task mutation events and goal revisions identify the
+profile serving the turn, not the gateway's launch profile. Worker mutations
+retain their verified task/run identity; callers cannot supply an author override.
+
 ## Single-dispatcher posture
 
 Only one gateway owns the kanban dispatcher. The owning gateway keeps
@@ -27,6 +31,15 @@ race to spawn the same work. Notification delivery is profile-owned instead:
 each gateway polls only subscriptions for profiles whose platform adapters it
 hosts. The atomic event claim prevents duplicate delivery across watcher
 processes.
+
+The embedded dispatcher visits each resolved database only once per dispatch,
+pending-work probe, or auto-decomposition pass. If `HERMES_KANBAN_DB` pins
+several enumerated board names to one database, work retains the canonical
+active board name rather than the first enumerated name. Without a database
+pin, distinct boards still dispatch independently; `kanban.max_spawn` remains
+per-board, and the auto-decomposition attempt budget is shared across boards.
+Auto-decomposition selects each board only within the tick's execution context;
+concurrent CLI or gateway writes retain their own selected board.
 
 ## Worker runtime generations
 
