@@ -850,6 +850,9 @@ What changes in `host` mode:
   releases the shared import lock, so sibling APIs keep serving requests.
   Hosted requests preserve the external scheme, authority, query and mount root for generated
   URLs; responses retain encoded bytes with their `Content-Encoding` header.
+- **Hosted dashboard APIs are profile-local.** Paths and enablement come from the request's
+  profile, including plugin names absent at server startup; executable APIs never fall back
+  to another profile's copy. Static dashboard assets retain launch-home discovery.
 - **General and category loads share imports.** Concurrent first loads of one plugin directory
   share its module until unload; each category load still creates a fresh provider instance.
   A dual-kind general/memory plugin registers its hooks once, regardless of load order.

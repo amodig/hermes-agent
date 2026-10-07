@@ -4956,8 +4956,8 @@ class TestDashboardPluginManifestExtensions:
         original_scandir = web_server_dashboard.os.scandir
         original_exists = Path.exists
 
-        def search_dirs():
-            return [(denied_root, "user"), *original_search_dirs()]
+        def search_dirs(user_home=None):
+            return [(denied_root, "user"), *original_search_dirs(user_home)]
 
         def guarded_scandir(path):
             if Path(path) == denied_root:

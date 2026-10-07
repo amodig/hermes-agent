@@ -172,7 +172,7 @@ def test_parent_dashboard_bridge_preserves_external_urls_and_encoded_bytes(tmp_p
 
     import httpx
     from fastapi import FastAPI
-    from hermes_cli.web_server_dashboard import _discover_dashboard_plugins, _mount_hosted_plugin_api
+    from hermes_cli.web_server_dashboard import _mount_hosted_plugin_apis
 
     home = _home_with_plugins(tmp_path, monkeypatch, {"bridge": ""})
     dashboard_dir = home / "plugins" / "bridge" / "dashboard"
@@ -196,8 +196,7 @@ def compressed(request: Request):
                     media_type="application/json", headers={"content-encoding": "gzip"})
 ''')
     app = FastAPI()
-    plugin = next(p for p in _discover_dashboard_plugins() if p["name"] == "bridge")
-    _mount_hosted_plugin_api(app, plugin, "api.py")
+    _mount_hosted_plugin_apis(app)
     host = plugins_mod.get_plugin_manager()._plugin_host()
     root = "https://example.test:9443/external/api/plugins/bridge"
 
@@ -224,3 +223,53 @@ def compressed(request: Request):
         asyncio.run(exercise())
     finally:
         host.shutdown()
+
+
+@pytest.mark.platforms("any")
+@pytest.mark.parametrize("name", ["shared", "secondary-only", "launch-only"])
+def test_hosted_dashboard_routes_use_only_the_requesting_profile(tmp_path, monkeypatch, name):
+    import asyncio
+
+    import httpx
+    from fastapi import FastAPI
+    from hermes_cli import web_server, web_server_dashboard
+    from hermes_cli.web_server_profiles import _config_profile_scope
+
+    home = _home_with_plugins(tmp_path, monkeypatch, {"shared": "", "launch-only": ""})
+    secondary = home / "profiles" / "secondary"
+    secondary.mkdir(parents=True)
+    (secondary / "config.yaml").write_text(
+        "plugins:\n  isolation: host\n  enabled: [shared, secondary-only, launch-only]\n")
+    for owner, owner_home, names in (("launch", home, ["shared", "launch-only"]),
+                                      ("secondary", secondary, ["shared", "secondary-only"])):
+        for plugin_name in names:
+            dashboard_dir = owner_home / "plugins" / plugin_name / "dashboard"
+            dashboard_dir.mkdir(parents=True)
+            (dashboard_dir / "manifest.json").write_text(json.dumps({"name": plugin_name, "api": "api.py"}))
+            (dashboard_dir / "api.py").write_text(
+                "from fastapi import APIRouter\nrouter = APIRouter()\n"
+                f"@router.get('/')\ndef owner(): return {{'owner': {owner!r}}}\n")
+    app = FastAPI()
+    monkeypatch.setattr(web_server, "app", app)
+    monkeypatch.setattr(web_server, "_dashboard_plugins_cache", None)
+    web_server_dashboard._mount_plugin_api_routes()
+    with _config_profile_scope("secondary"):
+        secondary_host = plugins_mod.get_plugin_manager()._plugin_host()
+    launch_host = plugins_mod.get_plugin_manager()._plugin_host()
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+            response = await client.get(f"/api/plugins/{name}/?profile=secondary")
+            assert response.status_code == (404 if name == "launch-only" else 200)
+            if response.status_code == 200:
+                assert response.json() == {"owner": "secondary"}
+            launch = await client.get(f"/api/plugins/{name}/")
+            assert launch.status_code == (404 if name == "secondary-only" else 200)
+            if launch.status_code == 200:
+                assert launch.json() == {"owner": "launch"}
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        secondary_host.shutdown()
+        launch_host.shutdown()

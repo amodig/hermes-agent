@@ -462,7 +462,7 @@ def _safe_plugin_api_relpath(api_field: Any, *, dashboard_dir: Path) -> Optional
     return api_field
 
 
-def _dashboard_plugin_search_dirs() -> List[tuple]:
+def _dashboard_plugin_search_dirs(user_home: Optional[Path] = None) -> List[tuple]:
     """``(root, source)`` pairs to scan, in priority order (first name wins).
 
     User dashboard plugins are a dashboard-owned asset (like theme YAML): resolved from the
@@ -472,25 +472,19 @@ def _dashboard_plugin_search_dirs() -> List[tuple]:
     root is scanned too; profile-local plugins stay authoritative over same-named root ones.
     The project source is gated on shared truthy semantics (``1``/``true``/``yes``/``on``):
     a bare non-empty check let ``=0``/``=false`` silently enable it (GHSA-5qr3-c538-wm9j).
+    An explicit user_home selects only that profile's user plugins; hosted APIs do not
+    inherit executable code from the launch or default profile.
     """
     from hermes_cli.plugins import get_bundled_plugins_dir
     from hermes_constants import get_default_hermes_root
 
     bundled_root = get_bundled_plugins_dir()
-    # User dashboard plugins are a dashboard-owned asset (same category as theme YAML): resolve them from
-    # the process launch home so they don't vanish when a request is scoped to another profile via a
-    # context-local HERMES_HOME override (e.g. embedded /chat under --open-profile). #87197: when the
-    # process itself is profile-scoped (``--profile <name>`` sets ``HERMES_HOME=<root>/profiles/<name>``),
-    # the launch home is the profile directory, which has no ``plugins/`` — user plugins are installed in
-    # the hermes root (``~/.hermes/plugins``). Scan the default root as well (``get_default_hermes_root()``
-    # unwraps ``<root>/profiles/<name>`` → ``<root>`` and returns a custom ``HERMES_HOME`` unchanged when it
-    # *is* the root), mirroring how ``hermes_cli.plugins`` resolves plugin install locations. The
-    # ``seen_names`` dedupe below keeps profile-local plugins (if any) authoritative over same-named root
-    # plugins.
-    user_plugin_roots = [get_process_hermes_home() / "plugins"]
-    root_plugins = get_default_hermes_root() / "plugins"
-    if root_plugins.resolve(strict=False) != user_plugin_roots[0].resolve(strict=False):
-        user_plugin_roots.append(root_plugins)
+    # Assets retain launch-home/root discovery; hosted backends select their exact owning home.
+    user_plugin_roots = [(user_home if user_home is not None else get_process_hermes_home()) / "plugins"]
+    if user_home is None:
+        root_plugins = get_default_hermes_root() / "plugins"
+        if root_plugins.resolve(strict=False) != user_plugin_roots[0].resolve(strict=False):
+            user_plugin_roots.append(root_plugins)
     search_dirs = [(d, "user") for d in user_plugin_roots]
     search_dirs += [(bundled_root / "memory", "bundled"), (bundled_root, "bundled")]
     # GHSA-5qr3-c538-wm9j (#29156): the previous ``os.environ.get(...)`` check treated *any* non-empty
@@ -546,12 +540,12 @@ def _dashboard_plugin_entry(data: Dict[str, Any], name: str, dashboard_dir: Path
     }
 
 
-def _discover_dashboard_plugins() -> list:
+def _discover_dashboard_plugins(user_home: Optional[Path] = None) -> list:
     """Scan ``<plugins root>/*/dashboard/manifest.json`` across user, bundled and (opt-in)
     project plugin sources — same three sources as ``hermes_cli.plugins``."""
     plugins = []
     seen_names: set = set()
-    for plugins_root, source in _dashboard_plugin_search_dirs():
+    for plugins_root, source in _dashboard_plugin_search_dirs(user_home):
         try:
             if not plugins_root.is_dir():
                 continue
@@ -803,15 +797,12 @@ async def _plugin_route_secret_scope(profile: Optional[str] = None):
         yield
 
 
-def _mount_hosted_plugin_api(app, plugin: dict, api_file_name: str) -> None:
+def _mount_hosted_plugin_apis(app) -> None:
     """``plugins.isolation: host``: the plugin's router runs in the requesting profile's plugin host;
     this process only forwards each ``/api/plugins/<name>/`` request to it (auth and the profile
     scope still apply here first). Responses are buffered: streaming and websockets need in-process."""
-    name = plugin["name"]
-
-    async def forward(request: Request) -> Response:
-        # Resolve the plugin again in the REQUESTING profile (the route is mounted once, from the
-        # launch profile): its own copy, gated by its own plugins.enabled, served by its own host.
+    async def forward(request: Request, name: str) -> Response:
+        # Discovery, enablement and execution all belong to this request's bound profile.
         target = await asyncio.to_thread(_hosted_plugin_for_request, name)
         if target is None:
             return JSONResponse({"detail": f"plugin {name!r} is not enabled in this profile"}, status_code=404)
@@ -826,10 +817,10 @@ def _mount_hosted_plugin_api(app, plugin: dict, api_file_name: str) -> None:
                 response.headers.append(key, value)
         return response
 
-    app.add_api_route(f"/api/plugins/{name}/{{path:path}}", forward, include_in_schema=False,
+    app.add_api_route("/api/plugins/{name}/{path:path}", forward, include_in_schema=False,
                       methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
                       dependencies=[Depends(_plugin_route_secret_scope)])
-    _log.info("Mounted plugin API routes via the plugin host: /api/plugins/%s/", name)
+    _log.info("Mounted request-profile plugin API forwarding: /api/plugins/<name>/")
 
 
 def _hosted_plugin_for_request(name: str) -> Optional[tuple]:
@@ -837,7 +828,11 @@ def _hosted_plugin_for_request(name: str) -> Optional[tuple]:
     when that profile has no enabled user copy of it."""
     from hermes_cli.plugins import get_plugin_manager
     from hermes_cli.plugins_cmd import _get_disabled_set, _get_enabled_set
-    for plugin in _discover_dashboard_plugins():
+    from hermes_cli.config import get_hermes_home
+    from hermes_cli.plugin_isolation import ISOLATION_HOST, isolation_mode
+    if isolation_mode() != ISOLATION_HOST:
+        return None
+    for plugin in _discover_dashboard_plugins(user_home=get_hermes_home()):
         if plugin.get("name") != name or not plugin.get("_api_file") or plugin.get("source") != "user":
             continue
         if _plugin_api_mount_skip_reason(plugin, _get_enabled_set(), _get_disabled_set()):
@@ -881,7 +876,6 @@ def _mount_plugin_api_routes():
         if plugin.get("source") not in ("bundled", "project"):
             from hermes_cli.plugin_isolation import ISOLATION_HOST, isolation_mode
             if isolation_mode() == ISOLATION_HOST:
-                _mount_hosted_plugin_api(app, plugin, api_file_name)
                 continue
         if plugin.get("source") == "project":
             _log.warning(
@@ -932,3 +926,5 @@ def _mount_plugin_api_routes():
             _log.info("Mounted plugin API routes: /api/plugins/%s/", plugin["name"])
         except Exception as exc:
             _log.warning("Failed to load plugin %s API routes: %s", plugin["name"], exc)
+    # After in-process routes: keep their precedence, but don't restrict hosted names to startup discovery.
+    _mount_hosted_plugin_apis(app)
