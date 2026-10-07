@@ -285,55 +285,6 @@ def test_ancestor_units_are_keyed_by_unit_name_not_cgroup_path():
     ]
 
 
-def test_ancestor_units_read_the_system_manager_when_the_user_view_is_not_found(monkeypatch):
-    """``user@1000.service`` is a system unit; the user manager cannot answer for it."""
-    seen = []
-
-    def fake_show(names, *, system=False):
-        seen.append((tuple(names), system))
-        if system:
-            return {name: {
-                "LoadState": "loaded", "ManagedOOMMemoryPressure": "auto",
-                "ManagedOOMSwap": "kill",
-            } for name in names}
-        return {name: {
-            "LoadState": "not-found", "ManagedOOMMemoryPressure": "auto",
-            "ManagedOOMSwap": "auto",
-        } for name in names}
-
-    monkeypatch.setattr(ar, "_show_units", fake_show)
-    units = ar._ancestor_units(["user@1000.service"])
-    assert units["user@1000.service"]["AnsweredBy"] == "system"
-    assert units["user@1000.service"]["ManagedOOMSwap"] == "kill"
-    assert seen == [(("user@1000.service",), False), (("user@1000.service",), True)]
-
-
-def test_a_loaded_user_view_is_not_overridden_by_the_system_manager(monkeypatch):
-    """The managers disagree on `auto`; the view that can kill is the one kept."""
-    def fake_show(names, *, system=False):
-        assert not system, "a loaded user view must not trigger the system query"
-        return {name: {
-            "LoadState": "loaded", "ManagedOOMMemoryPressure": "kill",
-            "ManagedOOMSwap": "auto",
-        } for name in names}
-
-    monkeypatch.setattr(ar, "_show_units", fake_show)
-    units = ar._ancestor_units(["user.slice"])
-    assert units["user.slice"]["AnsweredBy"] == "user"
-    assert units["user.slice"]["ManagedOOMMemoryPressure"] == "kill"
-
-
-def test_an_unreadable_system_view_is_reported_not_fatal(monkeypatch):
-    def fake_show(names, *, system=False):
-        if system:
-            raise ar.AutonomousResourceUnavailable("no system bus here")
-        return {name: {"LoadState": "not-found"} for name in names}
-
-    monkeypatch.setattr(ar, "_show_units", fake_show)
-    units = ar._ancestor_units(["user@1000.service"])
-    assert "unreadable" in units["user@1000.service"]["SystemView"]
-
-
 def test_active_gateway_outside_the_aggregate_refuses(host):
     host.units["hermes-gateway-other.service"] = _unit(
         LIMITS, f"{MANAGER}/agents-controls.slice/hermes-gateway-other.service",
@@ -573,3 +524,94 @@ def test_real_native_slot_refuses_the_second_worker(tmp_path):
                 break
             time.sleep(0.1)
         assert third is not None and third.returncode == 0, third.stderr
+def test_ancestor_units_refuse_when_no_manager_reports_the_ancestor(monkeypatch):
+    """Unknown policy is incomplete visibility, not a clean bill of health.
+
+    Kernel memory limits cannot establish the absence of a systemd-oomd policy, so
+    an ancestor neither manager can describe must refuse the launch.
+    """
+    def fake_show(names, *, system=False):
+        if system:
+            raise ar.AutonomousResourceUnavailable("no system bus here")
+        return {name: {"LoadState": "not-found"} for name in names}
+
+    monkeypatch.setattr(ar, "_show_units", fake_show)
+    with pytest.raises(ar.AutonomousResourceUnavailable, match="could not be read"):
+        ar._ancestor_units(["user@1000.service"])
+
+
+def test_shared_ancestor_oom_policy_is_reported(host):
+    """The boundary report names the policy it read, not only its absence."""
+    report = host.admit(None)
+    observed = {entry["unit"]: entry for entry in report["shared_ancestor_oom_policy"]}
+    assert set(observed) >= {"user.slice", "user-1000.slice", "user@1000.service"}
+    assert observed["user.slice"]["effective"]["ManagedOOMMemoryPressure"] == "kill"
+def test_ancestor_units_read_the_owning_system_manager_only(monkeypatch):
+    """The user manager's same-named units are NOT the ancestors.
+
+    ``systemctl --user show user.slice`` answers with the user manager's own
+    ``user.slice`` at a different cgroup, whose policy would be attributed to the
+    real ancestor -- inventing one and hiding the other. The system manager owns
+    these units and is the view systemd-oomd reads, so it is the only source.
+    """
+    seen = []
+
+    def fake_show(names, *, system=False):
+        seen.append((tuple(names), system))
+        return {name: {
+            "LoadState": "loaded",
+            "ManagedOOMMemoryPressure": "auto",
+            "ManagedOOMSwap": "auto",
+        } for name in names}
+
+    monkeypatch.setattr(ar, "_show_units", fake_show)
+    units = ar._ancestor_units(["user.slice", "user@1000.service"])
+    assert seen == [
+        (("user.slice",), True), (("user@1000.service",), True),
+    ], "the user manager must not be consulted for an ancestor it does not own"
+    assert units["user.slice"]["views"]["system"]["ManagedOOMMemoryPressure"] == "auto"
+
+
+def test_ancestor_units_refuse_when_the_owning_manager_is_unreadable(monkeypatch):
+    """Incomplete visibility is failure: kernel limits say nothing about oomd."""
+    def fake_show(names, *, system=False):
+        raise ar.AutonomousResourceUnavailable("no system bus here")
+
+    monkeypatch.setattr(ar, "_show_units", fake_show)
+    with pytest.raises(ar.AutonomousResourceUnavailable, match="owning system manager could not be read"):
+        ar._ancestor_units(["user.slice"])
+
+
+def test_ancestor_units_refuse_when_the_owner_does_not_report_the_ancestor(monkeypatch):
+    def fake_show(names, *, system=False):
+        return {name: {"LoadState": "not-found"} for name in names}
+
+    monkeypatch.setattr(ar, "_show_units", fake_show)
+    with pytest.raises(ar.AutonomousResourceUnavailable, match="does not report this shared ancestor"):
+        ar._ancestor_units(["user@1000.service"])
+
+
+def test_auto_on_a_shared_ancestor_is_a_kill_target_while_oomd_runs(host):
+    """`auto` is systemd's default and resolves to kill for the user slices.
+
+    Only an explicit opt-out takes an ancestor out of systemd-oomd's reach, so an
+    `auto` marking must count as a candidate rather than as a clean bill of health.
+    """
+    candidates = host.admit(None)["oomd_kill_candidates"]
+    assert {entry["cgroup"] for entry in candidates} >= {
+        "/user.slice", "/user.slice/user-1000.slice",
+    }, candidates
+    active = Host(host.proc.parent, oomd_active=True)
+    with pytest.raises(ar.AutonomousResourceUnavailable, match="systemd-oomd is active"):
+        ar._validate_boundary(active.snapshot(), pid=None)
+
+
+def test_an_explicit_opt_out_ancestor_is_out_of_reach(host):
+    """Positive control: the refusal above comes from the policy, not from the shape."""
+    for name in ("user.slice", "user-1000.slice", "user@1000.service"):
+        host.units[name] = {"ManagedOOMMemoryPressure": "continue", "ManagedOOMSwap": "continue"}
+    quiet = Host(host.proc.parent, oomd_active=True)
+    for name in ("user.slice", "user-1000.slice", "user@1000.service"):
+        quiet.units[name] = {"ManagedOOMMemoryPressure": "continue", "ManagedOOMSwap": "continue"}
+    report = ar._validate_boundary(quiet.snapshot(), pid=None)
+    assert report["oomd_kill_candidates"] == [], report

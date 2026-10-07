@@ -89,6 +89,8 @@ UNIT_PROPERTIES = (
 OOM_POLICY_PROPERTIES = ("ManagedOOMMemoryPressure", "ManagedOOMSwap")
 #: ``auto`` is systemd's "unset"; only an explicit/effective ``kill`` is policy.
 OOM_KILL = "kill"
+#: The only value that takes an ancestor out of systemd-oomd's reach.
+OOM_CONTINUE = "continue"
 
 BOUNDARY_DIAGNOSTIC = "autonomous resource boundary unavailable"
 SLOT_DIAGNOSTIC = "autonomous worker slot occupied"
@@ -229,10 +231,10 @@ def _cgroup_populated(directory: Path) -> Optional[bool]:
                 return value.strip() == "1" if value.strip() in ("0", "1") else None
     except OSError:
         pass
-    try:
-        return bool((directory / "cgroup.procs").read_text().split())
-    except OSError:
-        return None
+    # No `cgroup.procs` fallback: an empty parent process list says nothing about a
+    # nested descendant, and `cgroup.events` is the only per-subtree answer. Falling
+    # back to it would read a busy scope as free exactly when a survivor matters.
+    return None
 
 
 def live_worker_scope_cgroups(root, manager_group: str) -> List[str]:
@@ -389,36 +391,32 @@ def _ancestor_unit_names(manager_group: str) -> List[str]:
     return [parts[index] for index in range(1, len(parts))]
 
 
-def _ancestor_units(names: List[str]) -> Dict[str, Dict[str, str]]:
-    """Properties of the units above the user manager, from BOTH managers.
+def _ancestor_units(names: List[str]) -> Dict[str, Dict[str, object]]:
+    """OOM policy for the units ABOVE the user manager, read from their OWNER.
 
-    ``user.slice`` and ``user-1000.slice`` are system units that the user manager
-    also answers for, and it resolves ``ManagedOOMMemoryPressure=auto`` to ``kill``
-    while the system manager reports the configured ``auto``. ``user@1000.service``
-    is not a user-manager unit at all, so the user manager answers ``not-found``.
+    ``user.slice``, ``user-1000.slice`` and ``user@1000.service`` are SYSTEM units.
+    The user manager answers for names that look like them -- its own
+    ``user.slice``/``user-1000.slice``, which live at a DIFFERENT cgroup -- so
+    reading through ``systemctl --user`` would attribute an unrelated unit's policy
+    to the ancestor, hiding a real one and inventing an imaginary one. The system
+    manager owns these units and is also the view ``systemd-oomd`` reads, so it is
+    the only source used here.
 
-    A not-found view is therefore re-read from the system manager rather than being
-    treated as "this ancestor has no policy", and each entry records which manager
-    answered. Where the two disagree the more kill-prone reading is the one kept,
-    because a disagreement must not hide a shared OOM domain.
+    Unreadable is not clean. Kernel memory limits say nothing about a userspace OOM
+    killer, so an ancestor whose owning manager cannot be read refuses the launch
+    rather than being assumed safe.
     """
-    units = _show_units(names)
-    for name, properties in list(units.items()):
-        if properties.get("LoadState") != "not-found":
-            properties = {**properties, "AnsweredBy": "user"}
-            units[name] = properties
-            continue
+    units: Dict[str, Dict[str, object]] = {}
+    for name in names:
         try:
-            system_view = _show_units([name], system=True).get(name, {})
+            properties = _show_units([name], system=True).get(name, {})
         except AutonomousResourceUnavailable as exc:
-            # Unreadable is reported, not fatal: the ancestor memory limits are
-            # still enforced from the cgroup files, which is the primary contract.
-            units[name] = {**properties, "AnsweredBy": "user", "SystemView": f"unreadable ({exc})"}
-            continue
-        if system_view.get("LoadState") == "loaded":
-            units[name] = {**system_view, "AnsweredBy": "system"}
-        else:
-            units[name] = {**properties, "AnsweredBy": "user", "SystemView": "not-found"}
+            _fail(f"{name}: its owning system manager could not be read ({exc})")
+        _require(
+            properties.get("LoadState") == "loaded",
+            f"{name}: the owning system manager does not report this shared ancestor",
+        )
+        units[name] = {**properties, "views": {"system": properties}}
     return units
 
 
@@ -509,24 +507,41 @@ def _require_shared_ancestors_clean(
                 f"shared ancestor {row['cgroup']} imposes {key}={row[key]} above {group}",
             )
     kill_policy = []
+    observed_policy = []
     for row in shared:
         # Each ancestor cgroup's owning unit is named by its last path component,
         # which is how `_ancestor_units` keys the map.
         unit = snapshot.units.get(Path(row["cgroup"]).name)
         if unit is None:
             continue
-        active = {key: unit.get(key) for key in OOM_POLICY_PROPERTIES if unit.get(key) == OOM_KILL}
-        if active:
-            kill_policy.append({
-                "cgroup": row["cgroup"], "properties": active,
-                "answered_by": unit.get("AnsweredBy"),
-            })
+        values = {key: unit.get(key) for key in OOM_POLICY_PROPERTIES}
+        observed_policy.append({
+            "cgroup": row["cgroup"],
+            "unit": Path(row["cgroup"]).name,
+            "effective": values,
+            "views": unit.get("views"),
+        })
+        # `auto` is systemd's default and resolves to a kill marking for the user
+        # slices, so with systemd-oomd running it is NOT a promise that the ancestor
+        # is outside oomd's reach. Only an explicit opt-out counts as out of reach.
+        reachable = {
+            key: value for key, value in values.items()
+            if value and value != OOM_CONTINUE
+        }
+        if reachable:
+            kill_policy.append({"cgroup": row["cgroup"], "properties": reachable})
     if snapshot.oomd_active and kill_policy:
         _fail(
-            f"systemd-oomd is active and a shared ancestor of {group} is a kill "
-            f"candidate: {kill_policy}"
+            f"systemd-oomd is active and every shared ancestor of {group} it can "
+            f"reach is a kill target: {kill_policy}; stop and disable the daemon, or "
+            "have its owner mark the ancestors out of reach through #26"
         )
-    return {**report, "shared": shared, "oomd_kill_candidates": kill_policy}
+    return {
+        **report, "shared": shared, "oomd_kill_candidates": kill_policy,
+        # What was actually read for each shared ancestor, so the acceptance report
+        # names the policy and which manager answered instead of only its absence.
+        "shared_oom_policy": observed_policy,
+    }
 
 
 def _require_gateways(snapshot: _Snapshot, aggregate: str, contract: _Contract) -> List[dict]:
@@ -618,6 +633,7 @@ def _validate_policy(snapshot: _Snapshot, contract: _Contract = _LIVE_CONTRACT) 
         "shared_ancestors": aggregate_report["shared"],
         "oomd_active": snapshot.oomd_active,
         "oomd_kill_candidates": aggregate_report["oomd_kill_candidates"],
+        "shared_ancestor_oom_policy": aggregate_report["shared_oom_policy"],
         "workers_ancestors": workers_report["ancestors"],
         "workers_effective_limits": workers_report["effective_limits"],
         "gateways": gateways,

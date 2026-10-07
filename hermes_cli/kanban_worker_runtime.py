@@ -553,17 +553,15 @@ def _raise_if_launch_refused(scope_unit: str, returncode: Optional[int]) -> None
     leaves our scope populated. Nothing here reads the exit code or stderr text.
     """
     from tools import autonomous_resources as resources
-    from tools.process_registry import _IS_LINUX, require_autonomous_boundary
+    from tools.process_registry import _IS_LINUX, autonomous_boundary_inventory
 
     if not _IS_LINUX:
         return
+    # INVENTORY, not admission: admission refuses on ANY populated worker scope --
+    # including this launch's own -- so it cannot tell "the slot was held by someone
+    # else" from "our scope exists and our child died inside it".
     try:
-        report = require_autonomous_boundary()
-    except resources.AutonomousWorkerBusy as exc:
-        raise resources.AutonomousWorkerBusy(
-            f"{exc}; worker launcher exited before bootstrap ({returncode}) because "
-            f"{scope_unit} was never created"
-        ) from exc
+        report = autonomous_boundary_inventory()
     except resources.AutonomousResourceUnavailable as exc:
         raise resources.AutonomousResourceUnavailable(
             f"{exc}; worker launcher exited before bootstrap ({returncode})"

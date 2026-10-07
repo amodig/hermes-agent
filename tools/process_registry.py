@@ -439,6 +439,16 @@ def autonomous_worker_scope_argv(
     return scoped, unit_name
 
 
+def autonomous_boundary_inventory() -> dict:
+    """Read-only boundary inventory: placement and occupancy, no admission.
+
+    Separate from :func:`require_autonomous_boundary` because admission refuses on
+    ANY populated worker scope -- including the caller's own -- which is exactly the
+    distinction a lost-admission-race check has to make.
+    """
+    return check_autonomous_boundary(pid=None)
+
+
 def require_autonomous_boundary(*, standalone_dispatch: bool = False) -> dict:
     """Refuse unless THIS process already sits inside the autonomous boundary.
 

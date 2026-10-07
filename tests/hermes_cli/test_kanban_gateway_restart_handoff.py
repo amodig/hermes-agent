@@ -1088,27 +1088,27 @@ def test_losing_the_native_admission_race_is_infrastructure(monkeypatch):
 
     scope = "hermes-worker-kanban-t_card-run-7.scope"
 
-    def _busy(**_kwargs):
-        raise autonomous_mod.AutonomousWorkerBusy("autonomous worker slot occupied: held")
-
-    monkeypatch.setattr(process_registry_mod, "require_autonomous_boundary", _busy)
-    with pytest.raises(autonomous_mod.AutonomousWorkerBusy):
-        kwr._raise_if_launch_refused(scope, 1)
-
     def _held_by_another(**_kwargs):
         return {
             "worker_scopes": ["/fixture/hermes-worker-someone-else.scope"],
             "worker_slot_occupied": True,
         }
 
-    monkeypatch.setattr(process_registry_mod, "require_autonomous_boundary", _held_by_another)
+    monkeypatch.setattr(
+        process_registry_mod, "autonomous_boundary_inventory", _held_by_another,
+    )
     with pytest.raises(autonomous_mod.AutonomousWorkerBusy):
         kwr._raise_if_launch_refused(scope, 1)
 
+    # Inventory, not admission: a populated scope of OURS means the child really did
+    # start and really did fail, so it is not infrastructure. Admission would refuse
+    # here too -- on the caller's own scope -- which is why the two are separate.
     def _our_scope_is_live(**_kwargs):
         return {"worker_scopes": [f"/fixture/{scope}"], "worker_slot_occupied": True}
 
-    monkeypatch.setattr(process_registry_mod, "require_autonomous_boundary", _our_scope_is_live)
+    monkeypatch.setattr(
+        process_registry_mod, "autonomous_boundary_inventory", _our_scope_is_live,
+    )
     assert kwr._raise_if_launch_refused(scope, 1) is None, (
         "a populated scope of ours means the bootstrap really failed"
     )
@@ -1116,5 +1116,14 @@ def test_losing_the_native_admission_race_is_infrastructure(monkeypatch):
     def _slot_free(**_kwargs):
         return {"worker_scopes": [], "worker_slot_occupied": False}
 
-    monkeypatch.setattr(process_registry_mod, "require_autonomous_boundary", _slot_free)
+    monkeypatch.setattr(
+        process_registry_mod, "autonomous_boundary_inventory", _slot_free,
+    )
     assert kwr._raise_if_launch_refused(scope, 1) is None
+
+    def _drift(**_kwargs):
+        raise autonomous_mod.AutonomousResourceUnavailable("boundary drifted")
+
+    monkeypatch.setattr(process_registry_mod, "autonomous_boundary_inventory", _drift)
+    with pytest.raises(autonomous_mod.AutonomousResourceUnavailable):
+        kwr._raise_if_launch_refused(scope, 1)
