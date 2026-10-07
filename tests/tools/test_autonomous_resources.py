@@ -591,27 +591,43 @@ def test_ancestor_units_refuse_when_the_owner_does_not_report_the_ancestor(monke
         ar._ancestor_units(["user@1000.service"])
 
 
-def test_auto_on_a_shared_ancestor_is_a_kill_target_while_oomd_runs(host):
-    """`auto` is systemd's default and resolves to kill for the user slices.
+def test_auto_only_ancestors_are_kill_targets_while_oomd_runs(host):
+    """`auto` alone must trigger the refusal: this systemd has no opt-out.
 
-    Only an explicit opt-out takes an ancestor out of systemd-oomd's reach, so an
-    `auto` marking must count as a candidate rather than as a clean bill of health.
+    The host reading is `auto` on all three ancestors, so a test that only ever sees
+    an explicit `kill` would pass even if `auto` were treated as safe. Both snapshots
+    are set to literal `auto` and the readings asserted, so the refusal can only come
+    from the `auto` values.
     """
-    candidates = host.admit(None)["oomd_kill_candidates"]
-    assert {entry["cgroup"] for entry in candidates} >= {
-        "/user.slice", "/user.slice/user-1000.slice",
-    }, candidates
+    for name in ("user.slice", "user-1000.slice", "user@1000.service"):
+        host.units[name] = {
+            "ManagedOOMMemoryPressure": "auto", "ManagedOOMSwap": "auto",
+        }
+    report = host.admit(None)
+    readings = {entry["unit"]: entry["effective"] for entry in report["shared_ancestor_oom_policy"]}
+    assert set(readings) == {"user.slice", "user-1000.slice", "user@1000.service"}, readings
+    assert all(value == "auto" for entry in readings.values() for value in entry.values()), readings
+    assert {entry["cgroup"] for entry in report["oomd_kill_candidates"]} == {
+        "/user.slice", "/user.slice/user-1000.slice", "/user.slice/user-1000.slice/user@1000.service",
+    }, report["oomd_kill_candidates"]
+
     active = Host(host.proc.parent, oomd_active=True)
+    for name in ("user.slice", "user-1000.slice", "user@1000.service"):
+        active.units[name] = {
+            "ManagedOOMMemoryPressure": "auto", "ManagedOOMSwap": "auto",
+        }
     with pytest.raises(ar.AutonomousResourceUnavailable, match="systemd-oomd is active"):
         ar._validate_boundary(active.snapshot(), pid=None)
 
 
-def test_an_explicit_opt_out_ancestor_is_out_of_reach(host):
-    """Positive control: the refusal above comes from the policy, not from the shape."""
-    for name in ("user.slice", "user-1000.slice", "user@1000.service"):
-        host.units[name] = {"ManagedOOMMemoryPressure": "continue", "ManagedOOMSwap": "continue"}
-    quiet = Host(host.proc.parent, oomd_active=True)
-    for name in ("user.slice", "user-1000.slice", "user@1000.service"):
-        quiet.units[name] = {"ManagedOOMMemoryPressure": "continue", "ManagedOOMSwap": "continue"}
-    report = ar._validate_boundary(quiet.snapshot(), pid=None)
-    assert report["oomd_kill_candidates"] == [], report
+def test_ancestors_are_clean_only_without_oomd(host):
+    """The daemon's state, not the ancestor's marking, is what makes it safe.
+
+    This is the positive control for the refusal above: the same ancestors pass with
+    the daemon stopped, so the refusal comes from the daemon and not from the shape of
+    the fixture.
+    """
+    report = host.admit(None)
+    assert report["oomd_active"] is False
+    assert report["oomd_kill_candidates"], "the readings are still reported"
+    assert host.admit(host.add_process(6000, AGGREGATE))["worker_slot_occupied"] is False

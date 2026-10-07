@@ -89,8 +89,6 @@ UNIT_PROPERTIES = (
 OOM_POLICY_PROPERTIES = ("ManagedOOMMemoryPressure", "ManagedOOMSwap")
 #: ``auto`` is systemd's "unset"; only an explicit/effective ``kill`` is policy.
 OOM_KILL = "kill"
-#: The only value that takes an ancestor out of systemd-oomd's reach.
-OOM_CONTINUE = "continue"
 
 BOUNDARY_DIAGNOSTIC = "autonomous resource boundary unavailable"
 SLOT_DIAGNOSTIC = "autonomous worker slot occupied"
@@ -522,19 +520,18 @@ def _require_shared_ancestors_clean(
             "views": unit.get("views"),
         })
         # `auto` is systemd's default and resolves to a kill marking for the user
-        # slices, so with systemd-oomd running it is NOT a promise that the ancestor
-        # is outside oomd's reach. Only an explicit opt-out counts as out of reach.
-        reachable = {
-            key: value for key, value in values.items()
-            if value and value != OOM_CONTINUE
-        }
-        if reachable:
-            kill_policy.append({"cgroup": row["cgroup"], "properties": reachable})
+        # slices, and this systemd accepts only `auto|kill` for these properties --
+        # there is no opt-out to look for. Every shared ancestor is therefore a
+        # target while the daemon runs, and its values are reported rather than
+        # filtered, so the refusal names what oomd could kill inside.
+        kill_policy.append({"cgroup": row["cgroup"], "properties": values})
     if snapshot.oomd_active and kill_policy:
         _fail(
-            f"systemd-oomd is active and every shared ancestor of {group} it can "
-            f"reach is a kill target: {kill_policy}; stop and disable the daemon, or "
-            "have its owner mark the ancestors out of reach through #26"
+            f"systemd-oomd is active and every shared ancestor of {group} is one of "
+            f"its kill targets: {kill_policy}. This systemd exposes no opt-out for "
+            "these units, so the shared failure domain cannot be excluded: stop and "
+            "disable the daemon (or have its owner change the host policy through "
+            "#26) before admitting autonomous work"
         )
     return {
         **report, "shared": shared, "oomd_kill_candidates": kill_policy,
