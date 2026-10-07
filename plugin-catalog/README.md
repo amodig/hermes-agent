@@ -10,7 +10,7 @@ Curated, Nous-approved Hermes plugins. Each YAML file in this directory
 Presence in this directory **is** the trust signal. The rules that keep it
 meaningful:
 
-<!-- admission-rules:start (mirrored in website/docs/developer-guide/plugins/catalog-submission.md; tests/website/test_catalog_rules_mirror.py keeps them identical) -->
+<!-- admission-rules:start (mirrored in website/docs/developer-guide/plugins/catalog-submission.md) -->
 1. **Human-merged gate.** Entries are added *only* via a PR to the
    `hermes-agent` repository, reviewed and merged by a maintainer. There is
    no self-serve registry, no automated ingestion.
@@ -142,6 +142,10 @@ capabilities:
   provides_middleware: []
   requires_env: []
 ```
+
+`known_issues` describes practical limits of the pinned version, such as required
+external servers or unsupported platforms. It does not waive admission checks:
+a known issue cannot make a failing new entry or pin update admissible.
 
 `version`, `image`, `screenshots` and `readme` are cosmetic: none is parsed or
 used to pick what installs. The sha stays the release; bump `version` in the
