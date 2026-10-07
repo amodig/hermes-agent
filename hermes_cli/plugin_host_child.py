@@ -28,12 +28,14 @@ import threading
 import time
 import types
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from hermes_cli.plugin_host_wire import (
     Channel, Opaque, PROTOCOL_VERSION, PluginHostUnsupported, bind_serving_request, decode, describe_signature,
     encode, is_async_callable, serving_request,
 )
+if TYPE_CHECKING:
+    from hermes_cli.plugins_ledger import PluginRegistration
 
 logger = logging.getLogger("hermes_cli.plugin_host_child")
 
@@ -132,12 +134,16 @@ class RemotePluginContext:
             raise AttributeError(f"'PluginContext' object has no attribute {name!r}")
         return functools.partial(self._runtime.ctx_call, self, name)
 
-    def on_unload(self, callback: Callable[[], Any]) -> None:
+    def on_unload(self, callback: Callable[[], Any]) -> PluginRegistration:
+        from hermes_cli.plugins_ledger import PluginRegistration
         if not callable(callback):
             raise TypeError("on_unload() callback must be callable")
         with self._runtime._lock:
             self._check_active()
-            self._runtime.unload_callbacks.setdefault(self._plugin_key, []).append(callback)
+            handle = PluginRegistration("on_unload", getattr(callback, "__name__", "callback"), callback,
+                                        plugin_key=self._plugin_key)
+            self._runtime.unload_callbacks.setdefault(self._plugin_key, []).append(handle)
+            return handle
 
     def spawn_task(self, coro: Any, *, name: Optional[str] = None) -> Any:
         return self._runtime.spawn(self, coro, name=name)
@@ -151,7 +157,7 @@ class HostRuntime:
         self.owners: Dict[int, str] = {}
         self._ids = itertools.count(1)
         self._lock = threading.RLock()
-        self.unload_callbacks: Dict[str, List[Callable[[], Any]]] = {}
+        self.unload_callbacks: Dict[str, List[PluginRegistration]] = {}
         self.background_tasks: Dict[str, set] = {}
         self.modules: Dict[str, str] = {}
         self.plugin_paths: Dict[str, Path] = {}
@@ -241,13 +247,19 @@ class HostRuntime:
         if not inspect.iscoroutine(coro):
             raise TypeError("spawn_task() requires a coroutine object")
         plugin_key = ctx._plugin_key
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
         with self._lock:
             try:
                 ctx._check_active()
             except RuntimeError:
                 coro.close()
                 raise
-            future = asyncio.run_coroutine_threadsafe(_on_behalf_of(coro, serving_request()), self.loop)
+            owned = _on_behalf_of(coro, serving_request())
+            future = self.loop.create_task(owned, name=name or f"plugin:{ctx.plugin_id}:task") \
+                if loop is self.loop else asyncio.run_coroutine_threadsafe(owned, self.loop)
             self.background_tasks.setdefault(plugin_key, set()).add(future)
         def forget(done):
             with self._lock:
@@ -257,7 +269,7 @@ class HostRuntime:
                     if not tasks:
                         self.background_tasks.pop(plugin_key, None)
         future.add_done_callback(forget)
-        return future
+        return asyncio.wrap_future(future, loop=loop) if loop is not None and loop is not self.loop else future
 
     # -- incoming ---------------------------------------------------------------------------------
     def handle(self, method: str, params: Dict[str, Any], _origin: Optional[int]) -> Any:
@@ -477,12 +489,15 @@ class HostRuntime:
             if ctx is not None:
                 ctx._cleaning = True
         for task in tasks:
-            task.cancel()
+            self.loop.call_soon_threadsafe(task.cancel)
         token = _CLEANUP_CONTEXT.set(ctx)
         try:
-            for callback in reversed(callbacks):
+            for handle in reversed(callbacks):
+                if not handle.active:
+                    continue
+                handle._disposed = True
                 try:
-                    self._run(callback())
+                    self._run(handle.release())
                 except Exception as exc:
                     errors.append(f"{type(exc).__name__}: {exc}")
         finally:

@@ -62,6 +62,48 @@ def _home_with_plugins(tmp_path, monkeypatch, plugins: dict, isolation="host"):
     return home
 
 
+@pytest.mark.platforms("any")
+@pytest.mark.parametrize("operation", ["spawn_task", "on_unload"])
+def test_hosted_context_task_and_cleanup_contracts(tmp_path, monkeypatch, operation):
+    bodies = {
+        "spawn_task": '''
+async def register(ctx):
+    async def work():
+        return 42
+    task = ctx.spawn_task(work(), name="contract-task")
+    assert await task == 42
+    assert task.done() and task.get_name() == "contract-task"
+''',
+        "on_unload": '''
+from pathlib import Path
+import os
+def register(ctx):
+    marker = Path(os.environ["HERMES_HOME"]) / "cleanup"
+    def cleanup():
+        with marker.open("a") as handle:
+            handle.write("once\\n")
+    handle = ctx.on_unload(cleanup)
+    assert handle.active
+    handle.dispose()
+    handle.dispose()
+    assert not handle.active
+    ctx.on_unload(cleanup)
+''',
+    }
+    home = _home_with_plugins(tmp_path, monkeypatch, {"contract": bodies[operation]})
+    manager = PluginManager()
+    try:
+        manager.discover_and_load()
+        assert manager._plugins["contract"].error is None
+        if operation == "on_unload":
+            assert (home / "cleanup").read_text().splitlines() == ["once"]
+        manager.unload()
+        if operation == "on_unload":
+            assert (home / "cleanup").read_text().splitlines() == ["once", "once"]
+    finally:
+        manager._plugin_host().shutdown()
+
+
 @pytest.mark.platforms("posix")  # os._exit / SIGKILL process semantics
 def test_plugin_runs_out_of_process_with_ctx_round_trips_and_survives_host_crash(tmp_path, monkeypatch):
     from agent import image_gen_registry
