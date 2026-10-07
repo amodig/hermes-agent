@@ -641,6 +641,10 @@ recorded so `hermes plugins update` can re-pin when the catalog moves:
 hermes plugins install <catalog-name>
 ```
 
+Declared known issues appear in the catalog's install summary. If an older live
+catalog omits them, the checkout supplies warnings only for the same pinned
+commit; an explicit published warning list (including an empty one) takes precedence.
+
 Explicit `owner/repo` or Git-URL identifiers never touch the catalog and are
 flagged as custom (unreviewed) sources. An explicit
 `--ref <40-char commit SHA>` pins a custom install.
