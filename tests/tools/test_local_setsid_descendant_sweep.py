@@ -19,6 +19,8 @@ import pytest
 
 pytestmark = pytest.mark.platforms("linux")
 
+import sys as _sys
+
 from tools.environments.local import LocalEnvironment
 
 
@@ -174,3 +176,79 @@ def test_kill_process_never_killpgs_the_callers_own_group(monkeypatch):
 
     assert killpg_calls == []
     assert killed == [12345]
+
+
+@pytest.mark.live_system_guard_bypass  # creates a disposable transient worker slice
+def test_kill_process_stops_the_scope_it_owns(tmp_path, monkeypatch):
+    """A cancelled gateway command must reap its whole cgroup, not just its group.
+
+    The survivor here detached with ``setsid`` AND outlived the leader, so by the
+    time the kill arrives there is no process group to signal and nothing left to
+    snapshot. The transient scope recorded on the Popen is the only reap that
+    reaches it, and only the scope this Popen owns may be stopped.
+    """
+    from tools import process_registry
+    from tests._fixtures import autonomous_slice as fixture
+
+    fixture.require_user_bus()
+    with fixture.disposable_boundary() as boundary:
+        monkeypatch.setattr(
+            process_registry, "_is_supervised_gateway_process", lambda: True,
+        )
+        monkeypatch.setattr(
+            process_registry, "require_autonomous_boundary",
+            lambda **_kwargs: {"aggregate": {"cgroup": boundary.aggregate_group}},
+        )
+        monkeypatch.setattr(process_registry, "live_contract", boundary.contract)
+
+        pid_file = tmp_path / "detached.pid"
+        script = textwrap.dedent(
+            """
+            import os, sys, time
+            pid = os.fork()
+            if pid == 0:
+                os.setsid()  # escape the leader's process group
+                with open(sys.argv[1], "w") as handle:
+                    handle.write(str(os.getpid()))
+                time.sleep(60)
+                os._exit(0)
+            os._exit(0)
+            """
+        ).strip()
+        command = (
+            f"{_sys.executable} -c {_sh_quote(script)} {_sh_quote(str(pid_file))} "
+            ">/dev/null 2>&1 & echo started"
+        )
+        env = LocalEnvironment(cwd=str(tmp_path))
+        proc = None
+        try:
+            proc = env._run_bash(command)
+            assert proc.wait(timeout=20) == 0, "the leader should exit immediately"
+
+            scope_unit = getattr(proc, "_hermes_scope_unit", "")
+            assert scope_unit.startswith("hermes-worker-local-"), scope_unit
+            assert scope_unit.endswith(".scope"), scope_unit
+
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not pid_file.exists():
+                time.sleep(0.05)
+            assert pid_file.exists(), "the detached survivor never wrote its pid"
+            survivor = int(pid_file.read_text().strip())
+            assert _pid_alive(survivor), "the survivor died before the kill"
+            assert fixture.cgroup_of(survivor) == f"{boundary.workers_group}/{scope_unit}"
+
+            env._kill_process(proc)
+            assert _wait_for_pid_exit(survivor), (
+                f"detached survivor {survivor} outlived the owned-scope reap; "
+                "_kill_process must stop the scope recorded on the Popen"
+            )
+        finally:
+            try:
+                if pid_file.exists():
+                    os.kill(int(pid_file.read_text().strip()), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
+            try:
+                env.cleanup()
+            except Exception:
+                pass

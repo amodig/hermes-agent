@@ -163,6 +163,24 @@ for name, module in tuple(sys.modules.items()):
     if name.startswith("__editable__") and isinstance(getattr(module, "MAPPING", None), dict):
         sys.modules.pop(name, None)
 
+# This probe proves the dispatcher HANDSHAKE -- deferred bootstrap, post-import
+# readiness and the pre-claim fence -- and deliberately runs outside any deployed
+# autonomous aggregate, so host resource POLICY is out of scope here. State the
+# boundary verdict and the scope capability explicitly rather than inheriting
+# whatever the runner has installed; the boundary, the native slot and the scope
+# route are proven by tests/tools/test_autonomous_resources.py (synthetic
+# snapshots) and by the disposable real-transient-slice tests, never by this probe.
+from tools import autonomous_resources as _autonomous_resources
+from tools import process_registry as _process_registry
+
+_process_registry.require_autonomous_boundary = (
+    lambda **_kwargs: {"aggregate": {"cgroup": "/probe/autonomous.slice"}}
+)
+_autonomous_resources.check_autonomous_worker = (
+    lambda pid, **_kwargs: {"worker_cgroup": "/probe/hermes-worker-%d.scope" % pid}
+)
+_process_registry._systemd_run_user_scope_available = lambda: False
+
 
 def _emit(payload):
     print("__HERMES_DISPATCHER_PROBE__" + json.dumps(payload, sort_keys=True))

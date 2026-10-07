@@ -30,6 +30,16 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, NamedTuple, Optional
 
+from tools.autonomous_resources import (
+    AUTONOMOUS_SLICE,
+    WORKER_SCOPE_PREFIX,
+    WORKER_SCOPE_SUFFIX,
+    AutonomousResourceUnavailable,
+    AutonomousWorkerBusy,
+    check_autonomous_boundary,
+    live_contract,
+)
+
 from hermes_cli.config import get_hermes_home
 
 from tools.process_registry_notifications import format_process_notification
@@ -170,18 +180,26 @@ def _worker_memory_max_bytes() -> int:
 
 def _systemd_scope_argv(
     binary: str, unit_name: str, *argv: str, slice_inherit: bool = True,
+    slice_name: Optional[str] = None,
 ) -> List[str]:
     """``systemd-run --user --scope`` argv shared by the probe and real spawns.
     ``--collect`` self-cleans the scope after exit; ``--unit`` names it for systemctl.
     No ``OOMPolicy=``: transient scopes reject it on systemd <253 (#102486).
-    ``slice_inherit`` adds ``--slice-inherit``, which keeps the scope inside the
-    CALLER's slice instead of the default ``app.slice``: a worker gets its own
-    cgroup (so an OOM in it cannot take the gateway down) while still counting
-    against the shared ancestor budget. It is a separate capability from "can we
-    create a scope at all" (systemd >= 248), so older hosts retain restart/OOM
-    isolation even when they cannot honour the shared slice budget.
+    ``slice_name`` places the scope in exactly that slice (``--slice=``); it takes
+    precedence over ``slice_inherit``, which keeps the scope inside the CALLER's
+    slice instead. Autonomous work always names ``autonomous-workers.slice``:
+    ``--slice-inherit`` is a capability of the *caller's* placement, and a caller
+    that is itself misplaced would inherit that mistake (landing the worker next
+    to the interactive session in the default ``app.slice`` on hosts without the
+    flag). ``--slice-inherit`` remains the route for the legacy non-autonomous
+    callers and for the capability probes (#70716, #132385).
     ``--expand-environment=no`` keeps the command byte-identical (#132385)."""
-    slice_args = ["--slice-inherit"] if slice_inherit else []
+    if slice_name:
+        slice_args = [f"--slice={slice_name}"]
+    elif slice_inherit:
+        slice_args = ["--slice-inherit"]
+    else:
+        slice_args = []
     no_expand = ["--expand-environment=no"] if _SYSTEMD_RUN_NO_EXPAND else []
     return [
         binary, "--user", "--scope", "--quiet", *slice_args, *no_expand,
@@ -365,14 +383,16 @@ def _is_supervised_gateway_process() -> bool:
         return False
 
 
-def _build_systemd_scope_argv(shell_argv: List[str], unit_suffix: str) -> List[str]:
+def _build_systemd_scope_argv(
+    shell_argv: List[str], unit_suffix: str, slice_name: Optional[str] = None,
+) -> List[str]:
     """Wrap *shell_argv* in a ``systemd-run --user --scope`` invocation with its own
     memory accounting, so an OOM in the worker cannot kill the gateway cgroup.
 
     ``--collect`` makes the transient scope self-clean after exit; ``--unit`` gives it a recognisable name
-    for ``systemctl --user status`` / journalctl. ``--slice-inherit`` is added when this systemd knows it,
-    keeping the scope inside the caller's slice; without it the legacy scope still isolates the executor
-    (an OOM cannot take the gateway down), it just lands in the default ``app.slice``. See #70716.
+    for ``systemctl --user status`` / journalctl. ``slice_name`` places it in exactly that slice, which is
+    what autonomous work requires (see :func:`_systemd_scope_argv`); without it the legacy
+    ``--slice-inherit`` route is kept for callers that are not autonomous. See #70716.
     """
     import shutil
 
@@ -380,10 +400,74 @@ def _build_systemd_scope_argv(shell_argv: List[str], unit_suffix: str) -> List[s
     if binary is None:
         # Caller should have probed availability; never pass None into Popen anyway.
         return shell_argv
+    inherit = False if slice_name else _slice_inherit_supported()
     return _systemd_scope_argv(
-        binary, f"hermes-worker-{unit_suffix}", *shell_argv,
-        slice_inherit=_slice_inherit_supported(),
+        binary, f"{WORKER_SCOPE_PREFIX}{unit_suffix}", *shell_argv,
+        slice_inherit=inherit, slice_name=slice_name,
     )
+
+
+def autonomous_worker_scope_argv(
+    command: List[str], *, unit_suffix: str,
+) -> tuple[List[str], str]:
+    """``(argv, unit_name)`` placing one top-level autonomous worker in its slice.
+
+    The single slot is :data:`AUTONOMOUS_WORKERS_SLICE`'s ``ConcurrencyHardMax``;
+    this only builds the argv that asks for it. Callers run
+    ``tools.autonomous_resources.check_autonomous_boundary`` first so a hopeless
+    launch is refused before any preparation, and MUST treat a missing scope
+    capability as a refusal rather than launching the command outside the slice.
+    """
+    from tools.autonomous_resources import AutonomousResourceUnavailable
+
+    unit_name = f"{WORKER_SCOPE_PREFIX}{unit_suffix}{WORKER_SCOPE_SUFFIX}"
+    workers_slice = live_contract().workers_unit
+    if not _systemd_run_user_scope_available():
+        raise AutonomousResourceUnavailable(
+            "autonomous resource boundary unavailable: systemd-run --user --scope is "
+            f"unavailable (usually no reachable user D-Bus session at /run/user/{os.getuid()}/bus), "  # windows-footgun: ok — autonomous scope only exists on Linux
+            f"so {unit_name} cannot be placed in {workers_slice}"
+        )
+    scoped = _build_systemd_scope_argv(
+        command, unit_suffix=unit_suffix, slice_name=workers_slice,
+    )
+    if scoped == command:
+        raise AutonomousResourceUnavailable(
+            "autonomous resource boundary unavailable: systemd-run disappeared after the "
+            f"availability probe, so {unit_name} cannot be placed in {workers_slice}"
+        )
+    return scoped, unit_name
+
+
+def require_autonomous_boundary(*, standalone_dispatch: bool = False) -> dict:
+    """Refuse unless THIS process already sits inside the autonomous boundary.
+
+    Called before any autonomous launch prepares work, so a dispatcher that
+    started in the interactive slice (a hand-run `hermes kanban dispatch`, a
+    terminal-started gateway) fails fast instead of placing autonomy next to the
+    editor.  Raises :class:`AutonomousWorkerBusy` when the single worker slot is
+    already held, and :class:`AutonomousResourceUnavailable` for any boundary
+    drift; both are infrastructure, never a property of the work being launched.
+
+    *standalone_dispatch* adds the supported way to place a dispatcher that is NOT
+    the supervised gateway (a hand-run `hermes kanban dispatch`, a CLI or a
+    standalone daemon) inside the boundary.  It deliberately does not relocate the
+    calling process: moving a live interactive process into another cgroup is not
+    something a launch path may do to its own session.
+    """
+    try:
+        return check_autonomous_boundary(pid=os.getpid())
+    except AutonomousWorkerBusy:
+        raise
+    except AutonomousResourceUnavailable as exc:
+        if not standalone_dispatch or _is_supervised_gateway_process():
+            raise
+        raise AutonomousResourceUnavailable(
+            f"{exc}; launch this dispatcher inside the boundary instead: systemd-run "
+            f"--user --scope --slice={AUTONOMOUS_SLICE} "
+            f"--property=Requires={live_contract().workers_unit} "
+            f"--property=After={live_contract().workers_unit} -- <dispatch command>"
+        ) from exc
 
 
 _scope_degraded_warned = False
@@ -461,36 +545,44 @@ def restart_safe_gateway_child_argv(
     command: List[str], *, unit_suffix: str, require_restart_safe_scope: bool,
     outlives_parent: bool = False,
 ) -> GatewayChildDispatch:
-    """Place a managed-systemd gateway child outside the gateway cgroup.
+    """Place a managed-systemd gateway child outside the interactive cgroup.
 
     A systemd-supervised gateway restart kills every process in the service
     cgroup, so children that must survive it run in a transient user scope.
-    Hosts with no user systemd session (containers, LXCs without linger) cannot
-    create one; hard-failing there is a silent cron outage, so callers state the
-    policy: ``require_restart_safe_scope=True`` raises
-    :class:`RestartSafeScopeUnavailable` (kanban's long-lived workers), ``False``
-    degrades to a direct external subprocess with a once-per-process warning
-    (cron, behind ``cron.require_restart_safe_scope``).
+    Autonomy gets a stricter contract than restart-safety alone: the child lands
+    in ``autonomous-workers.slice``, whose single ``ConcurrencyHardMax`` slot is
+    what actually admits it, and the caller must already be inside
+    ``autonomous.slice`` -- see :func:`require_autonomous_boundary`. Nothing on
+    this path may route the child back into the gateway's own cgroup, the
+    interactive slices, or the default ``app.slice``.
 
-    Older systemd without ``--slice-inherit`` retains a legacy scope with its
-    own memory limit, but warns that the shared slice budget cannot be honoured.
+    A process that is not the supervised gateway and whose child does not outlive
+    it keeps the caller's in-process route unchanged.
 
     ``outlives_parent=True`` (fire-and-forget kanban workers): any *other*
     systemd unit — a ``Type=oneshot`` dispatch timer, an operator's sequencer
     service — tears its cgroup down when it exits, so the child is scope-wrapped
-    there too (#113612). Whether that unit actually kills its children
-    (``KillMode``, lifetime) is not knowable here, so without a user bus it
-    degrades with a loud warning instead of refusing: a long-lived
-    ``Type=simple`` sequencer without linger keeps working. A cron job blocks its
-    caller until it finishes and never needs this.
+    there too (#113612).
+
+    Hosts with no user systemd session (containers, LXCs without linger) cannot
+    create the scope; hard-failing there is a silent cron outage, so callers state
+    the policy: ``require_restart_safe_scope=True`` raises
+    :class:`RestartSafeScopeUnavailable` (kanban's long-lived workers), ``False``
+    degrades to a direct external subprocess with a once-per-process warning
+    (cron, behind ``cron.require_restart_safe_scope``). A degraded child stays
+    inside the autonomous aggregate the boundary check already proved, so it
+    loses restart-safety but never containment.
     """
     if not _IS_LINUX:
-        return GatewayChildDispatch("in_process", command)
-    if not os.environ.get("INVOCATION_ID"):
         return GatewayChildDispatch("in_process", command)
     supervised_gateway = _is_supervised_gateway_process()
     if not supervised_gateway and not outlives_parent:
         return GatewayChildDispatch("in_process", command)
+    # Autonomous from here on: a kanban worker outlives its parent, and anything
+    # the supervised gateway spawns belongs to the autonomous failure domain.
+    # Nothing below may route it back into the gateway's or the interactive slice,
+    # so the boundary is proven BEFORE any capability fallback can trigger.
+    require_autonomous_boundary(standalone_dispatch=outlives_parent)
 
     def _degrade(detail: str) -> GatewayChildDispatch:
         if supervised_gateway:
@@ -505,19 +597,16 @@ def restart_safe_gateway_child_argv(
         return GatewayChildDispatch("degraded", command)
 
     if not _systemd_run_user_scope_available():
+        # The direct child stays inside the autonomous aggregate proven above: this
+        # loses restart-safety for this one child, never containment.
         return _degrade(
             "systemd-run --user --scope is unavailable (usually no reachable user D-Bus session at "
             f"/run/user/{os.getuid()}/bus). On a system-level service install, run "  # windows-footgun: ok — behind the _IS_LINUX return above
             "`sudo loginctl enable-linger <gateway-user>` and restart the gateway."
         )
-    if not _slice_inherit_supported():
-        logger.warning(
-            "systemd-run here does not support --slice-inherit: the %s scope will "
-            "land in the default slice, so the shared worker budget cannot be "
-            "honoured on this host (worker isolation is unaffected)",
-            f"hermes-worker-{unit_suffix}",
-        )
-    scoped = _build_systemd_scope_argv(command, unit_suffix=unit_suffix)
+    scoped = _build_systemd_scope_argv(
+        command, unit_suffix=unit_suffix, slice_name=live_contract().workers_unit,
+    )
     if scoped == command:
         return _degrade("systemd-run disappeared after the availability probe")
     return GatewayChildDispatch("scoped", scoped)
@@ -1344,23 +1433,26 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 logger.debug("Could not resolve environment temp dir: %s", exc)
         return tempfile.gettempdir()
 
-    def _scope_argv(self, session: ProcessSession, safe_command: str, unit_suffix: str, label: str) -> List[str]:
+    def _scope_argv(self, session: ProcessSession, safe_command: str, unit_suffix: str) -> List[str]:
         """Login-shell argv for *safe_command* (parity with LocalEnvironment: rc files
         sourced, user tools on PATH), wrapped in a transient systemd scope when we are
         the supervised gateway (own cgroup: an OOM kills only the worker, not the
-        gateway and its messaging control plane)."""
+        gateway and its messaging control plane).
+
+        A top-level executor in the supervised gateway is autonomous work: it must sit
+        in ``autonomous-workers.slice`` and it consumes that slice's single slot. A job
+        inside an already admitted worker inherits the worker's scope and never reaches
+        this branch, because the gateway identity check below is what distinguishes
+        them. Interactive sessions are untouched."""
         argv = [_find_shell(), "-lic", f"set +m; {safe_command}"]
         # This applies to both pipe mode and the PTY path above. See #70716.
         in_supervised_gateway = _IS_LINUX and _is_supervised_gateway_process()
-        if in_supervised_gateway and _systemd_run_user_scope_available():
-            session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
-            return _build_systemd_scope_argv(argv, unit_suffix=unit_suffix)
         if in_supervised_gateway:
-            # Under a supervisor but no private cgroup: a worker OOM can still take
-            # the whole gateway down.
-            logger.debug(
-                "%s background executor not isolated in a systemd scope "
-                "(systemd-run --user unavailable); worker shares the gateway cgroup.", label)
+            require_autonomous_boundary()
+            scoped, session.systemd_unit = autonomous_worker_scope_argv(
+                argv, unit_suffix=unit_suffix,
+            )
+            return scoped
         return argv
 
     @staticmethod
@@ -1395,7 +1487,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             from winpty import PtyProcess as _PtyProcessCls
         else:
             from ptyprocess import PtyProcess as _PtyProcessCls
-        pty_argv = self._scope_argv(session, safe_command, session.id, "PTY")
+        pty_argv = self._scope_argv(session, safe_command, session.id)
         pty_env = self._spawn_env(env_vars)
         if session.systemd_unit:
             pty_env = systemd_user_bus_env(pty_env)
@@ -1446,7 +1538,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # Pipe path (non-PTY or PTY fallback).
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
         unit_suffix = f"{session.id}-pipe-fallback" if pty_scope_attempted else session.id
-        spawn_argv = self._scope_argv(session, safe_command, unit_suffix, "Local")
+        spawn_argv = self._scope_argv(session, safe_command, unit_suffix)
         spawn_env = self._spawn_env(env_vars)
         if session.systemd_unit:
             spawn_env = systemd_user_bus_env(spawn_env)

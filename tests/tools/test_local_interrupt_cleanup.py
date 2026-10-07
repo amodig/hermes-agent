@@ -13,8 +13,10 @@ died.  See commit message for full context.
 """
 import contextlib
 import os
+import shlex
 import signal
 import subprocess
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -29,6 +31,20 @@ from tools.environments.local import LocalEnvironment
 def _isolate_hermes_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "logs").mkdir(exist_ok=True)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _sh_quote(value: str) -> str:
+    return shlex.quote(value)
 
 
 def _pgid_still_alive(pgid: int) -> bool:
@@ -316,3 +332,78 @@ def test_hard_exit_kill_never_blocks_on_a_slow_remote_cancel(monkeypatch):
     base.kill_live_foreground_processes(now=True)
     elapsed = time.monotonic() - t0
     assert cancelled.is_set() and elapsed < 1.0, f"blocked {elapsed:.2f}s"
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.live_system_guard_bypass  # creates a disposable transient worker slice
+def test_timeout_kill_reaps_a_detached_survivor_through_the_owned_scope(tmp_path, monkeypatch):
+    """The timeout path must reap the whole cgroup, not only the process group.
+
+    A supervised-gateway command runs in the autonomous worker slice. The survivor
+    below detached with ``setsid`` and outlived the leader, so the process-group
+    kill has nothing to signal: only stopping the scope recorded on the Popen
+    reaches it. A cancelled build must not leak processes into the aggregate.
+    """
+    import textwrap
+
+    from tools import process_registry
+    from tests._fixtures import autonomous_slice as fixture
+
+    fixture.require_user_bus()
+    with fixture.disposable_boundary() as boundary:
+        monkeypatch.setattr(
+            process_registry, "_is_supervised_gateway_process", lambda: True,
+        )
+        monkeypatch.setattr(
+            process_registry, "require_autonomous_boundary",
+            lambda **_kwargs: {"aggregate": {"cgroup": boundary.aggregate_group}},
+        )
+        monkeypatch.setattr(process_registry, "live_contract", boundary.contract)
+
+        pid_file = tmp_path / "detached.pid"
+        script = textwrap.dedent(
+            """
+            import os, pathlib, sys, time
+            pid = os.fork()
+            if pid == 0:
+                os.setsid()
+                # Record the cgroup from INSIDE the scope: by the time the caller
+                # returns, the timeout reap has already removed the survivor.
+                cgroup = pathlib.Path('/proc/self/cgroup').read_text(
+                ).splitlines()[-1][3:]
+                with open(sys.argv[1], "w") as handle:
+                    handle.write(str(os.getpid()) + "\\n" + cgroup + "\\n")
+                time.sleep(60)
+                os._exit(0)
+            time.sleep(60)
+            """
+        ).strip()
+        command = f"{sys.executable} -c {_sh_quote(script)} {_sh_quote(str(pid_file))}"
+        env = LocalEnvironment(cwd=str(tmp_path))
+        survivor = None
+        try:
+            result = env.execute(command, timeout=3)
+            assert result.get("returncode") not in (0,), f"expected the kill path: {result!r}"
+
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not pid_file.exists():
+                time.sleep(0.05)
+            assert pid_file.exists(), "the detached survivor never wrote its pid"
+            survivor_line, cgroup_line, *_ = pid_file.read_text().splitlines()
+            survivor = int(survivor_line)
+            assert cgroup_line.startswith(boundary.workers_group + "/"), cgroup_line
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and _pid_alive(survivor):
+                time.sleep(0.1)
+            del deadline
+            assert not _pid_alive(survivor), (
+                f"detached survivor {survivor} outlived the timeout kill"
+            )
+        finally:
+            try:
+                if pid_file.exists():
+                    os.kill(int(pid_file.read_text().strip()), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
+            with contextlib.suppress(Exception):
+                env.cleanup()

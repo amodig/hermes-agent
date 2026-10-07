@@ -2799,9 +2799,15 @@ def _dispatch_lane_task(
         except Exception as exc:
             if launch is not None and launch.cancel:
                 launch.cancel()
+            from tools.autonomous_resources import AutonomousResourceUnavailable
             from tools.process_registry import RestartSafeScopeUnavailable
 
-            infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
+            # Both mean the HOST could not place the worker (no restart-safe scope,
+            # or no valid autonomous boundary / a busy worker slot): nothing about the
+            # card ran, so it must not spend the card's retry budget (#114720).
+            infrastructure = isinstance(
+                exc, (RestartSafeScopeUnavailable, AutonomousResourceUnavailable),
+            )
             with _kb.write_txn(conn):
                 _kb._append_event(
                     conn,
@@ -2894,11 +2900,15 @@ def _dispatch_lane_task(
     except Exception as exc:
         if launch is not None and launch.cancel:
             launch.cancel()
+        from tools.autonomous_resources import AutonomousResourceUnavailable
         from tools.process_registry import RestartSafeScopeUnavailable
 
-        # The host refused the spawn (no restart-safe scope): nothing about the
-        # card ran, so it must not spend the card's retry budget (#114720).
-        infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
+        # The host refused the spawn (no restart-safe scope, or no valid autonomous
+        # boundary / a busy worker slot): nothing about the card ran, so it must not
+        # spend the card's retry budget (#114720).
+        infrastructure = isinstance(
+            exc, (RestartSafeScopeUnavailable, AutonomousResourceUnavailable),
+        )
         if infrastructure:
             _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
         if _record_task_failure(

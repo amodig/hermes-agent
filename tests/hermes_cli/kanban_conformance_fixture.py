@@ -161,6 +161,26 @@ class KanbanConformanceFixture(unittest.TestCase):
         self.conn.executescript(kb.SCHEMA_SQL)
         kb._ensure_lifecycle_schema(self.conn)
         kb._ensure_goal_revision_schema(self.conn)
+        # The autonomous boundary is HOST policy, and this fixture runs the real
+        # dispatcher outside any deployed autonomous aggregate. State the verdict
+        # explicitly here rather than reading the runner's systemd state; tests that
+        # assert a REFUSED launch override these, and the real decisions live in
+        # tests/tools/test_autonomous_resources.py.
+        from tools import autonomous_resources as _autonomous_resources
+        from tools import process_registry as _process_registry
+
+        self.boundary_stub = patch.object(
+            _process_registry, "require_autonomous_boundary",
+            lambda **_kwargs: {"aggregate": {"cgroup": "/fixture/autonomous.slice"}},
+        )
+        self.boundary_stub.start()
+        self.addCleanup(self.boundary_stub.stop)
+        self.worker_check_stub = patch.object(
+            _autonomous_resources, "check_autonomous_worker",
+            lambda pid, **_kwargs: {"worker_cgroup": f"/fixture/hermes-worker-{pid}.scope"},
+        )
+        self.worker_check_stub.start()
+        self.addCleanup(self.worker_check_stub.stop)
 
     def tearDown(self) -> None:
         self.conn.close()

@@ -620,6 +620,15 @@ def _default_spawn(
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
+    # Before ANY preparation: a host that cannot place an autonomous worker must not
+    # burn a prepared runtime generation, a resolved workspace, or (via the caller)
+    # a board claim on it. The scope wrapper re-checks at launch time, and the
+    # bootstrap PID is verified again before the grant.
+    from tools.process_registry import _IS_LINUX, require_autonomous_boundary
+
+    if _IS_LINUX:
+        require_autonomous_boundary(standalone_dispatch=True)
+
     from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
 
     profile_arg = normalize_profile_name(task.assignee)
@@ -814,6 +823,13 @@ def _default_spawn(
         )
         actual = early
         _worker_pid_aliases[proc.pid] = early.pid
+        if _IS_LINUX:
+            # The worker must already be in its own scope inside the autonomous
+            # worker slice: continuing its imports inside the gateway's cgroup
+            # would put an autonomous worker next to the interactive session.
+            from tools.autonomous_resources import check_autonomous_worker
+
+            check_autonomous_worker(early.pid)
         write_runtime_generation_owner(
             generation.root, pid=early.pid, start_time=early.start_time,
         )
@@ -867,6 +883,14 @@ def _default_spawn(
         def _grant(run_id: int, claim_lock: Optional[str]) -> None:
             if proc is None or proc.stdin is None:
                 raise RuntimeError("worker bootstrap pipe unavailable")
+            if _IS_LINUX:
+                # Last barrier before the worker may touch Kanban: the claim is
+                # already taken, so a boundary that drifted during bootstrap must
+                # stop the grant here. The caller releases the ungranted claim and
+                # keeps the task identity intact.
+                from tools.autonomous_resources import check_autonomous_worker
+
+                check_autonomous_worker(actual.pid)
             suffix = json.dumps({"run_id": run_id, "claim_lock": claim_lock})[1:].encode("utf-8")
             _write_worker_grant(grant_fd, grant_prefix + suffix + b"\n")
             # The buffered import handshake was already flushed. Only close an
