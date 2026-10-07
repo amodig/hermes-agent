@@ -326,9 +326,13 @@ class PluginHost:
             channel = self._channel
             if channel is None or channel.closed_reason is not None:
                 return
-            errors = (channel.call("unload", {"plugin_key": plugin_key}) or {}).get("errors") or []
+            errors = (channel.call("unload", {"plugin_key": plugin_key},
+                                   timeout=_SHUTDOWN_GRACE_SECS) or {}).get("errors") or []
             for error in errors:
                 logger.warning("Plugin '%s' on_unload callback failed in the plugin host: %s", plugin_key, error)
+        except TimeoutError:
+            logger.warning("Plugin '%s' cleanup timed out; retiring its host", plugin_key)
+            self.shutdown()
         except Exception:
             logger.warning("Failed to clean up plugin '%s' in the plugin host", plugin_key, exc_info=True)
         finally:

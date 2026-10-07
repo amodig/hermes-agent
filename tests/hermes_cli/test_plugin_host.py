@@ -314,6 +314,34 @@ def register(ctx):
 
 
 @pytest.mark.platforms("any")
+def test_load_deadline_retires_host_when_cleanup_callback_stalls(tmp_path, monkeypatch):
+    from hermes_cli import plugin_host
+
+    home = _home_with_plugins(tmp_path, monkeypatch, {"stalledcleanup": '''
+import time
+def register(ctx):
+    ctx.on_unload(lambda: time.sleep(4))
+    time.sleep(4)
+'''})
+    manager = PluginManager()
+    host = manager._plugin_host()
+    try:
+        host.ensure_started()
+        monkeypatch.setattr(plugin_host, "_SHUTDOWN_GRACE_SECS", 0.1)
+        (home / "config.yaml").write_text(yaml.safe_dump({"plugins": {
+            "enabled": ["stalledcleanup"], "isolation": "host", "load_timeout_seconds": 0.5,
+        }}), encoding="utf-8")
+        started = time.monotonic()
+        manager.discover_and_load()
+        assert time.monotonic() - started < 2
+        assert "timed out" in str(manager._plugins["stalledcleanup"].error)
+        assert not host.alive
+        assert "stalledcleanup" not in host._contexts
+    finally:
+        host.shutdown()
+
+
+@pytest.mark.platforms("any")
 def test_unload_callback_can_dispatch_back_to_parent(tmp_path, monkeypatch):
     from tools.registry import registry
     _home_with_plugins(tmp_path, monkeypatch, {"cleanupprobe": '''

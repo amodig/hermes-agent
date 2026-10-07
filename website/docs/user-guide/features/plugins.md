@@ -824,7 +824,9 @@ What changes in `host` mode:
   `plugins.load_timeout_seconds`; cleanup callbacks retain parent callback context until cleanup
   finishes. Timed-out loads cannot register more callbacks or start new `ctx.spawn_task()` work.
   Synchronous Python code already running cannot be forcibly stopped: its modules are evicted when
-  it returns, and the same plugin cannot load again until then. Other plugins keep their host process.
+  it returns, and the same plugin cannot load again until then. Cleanup gets a three-second grace;
+  a stalled unload callback retires the shared profile host rather than hanging discovery. Otherwise,
+  sibling plugins keep their host process.
 - **Deferred callbacks keep the owning profile.** Background callbacks bind current owner
   credentials and terminal policy even if multiplexing activates later; in-flight callbacks
   retain their caller's scope.
