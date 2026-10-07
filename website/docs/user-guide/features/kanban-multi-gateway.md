@@ -38,6 +38,8 @@ several enumerated board names to one database, work retains the canonical
 active board name rather than the first enumerated name. Without a database
 pin, distinct boards still dispatch independently; `kanban.max_spawn` remains
 per-board, and the auto-decomposition attempt budget is shared across boards.
+Auto-decomposition selects each board only within the tick's execution context;
+concurrent CLI or gateway writes retain their own selected board.
 
 ## Worker runtime generations
 

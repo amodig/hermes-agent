@@ -141,6 +141,39 @@ def test_dispatcher_visits_each_resolved_board_once(
         assert all(not result.spawned for _, result in dispatcher.tick_once())
 
 
+def test_auto_decompose_does_not_redirect_concurrent_board_writes(dispatcher_boards, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from hermes_cli import kanban_decompose as decomp
+
+    dispatcher, _, triage = dispatcher_boards
+    entered, release = Event(), Event()
+    attempts = []
+
+    def waiting_aux(_action, task_id, **_kwargs):
+        attempts.append((kb.get_current_board(), task_id))
+        entered.set()
+        assert release.wait(10), "concurrent board write never completed"
+        return None, "auxiliary provider unavailable"
+
+    monkeypatch.setattr(decomp, "_call_aux", waiting_aux)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(dispatcher.auto_decompose_tick, 1)
+        try:
+            assert entered.wait(10), "decomposition never reached the auxiliary call"
+            with kbc.connect_closing() as conn:
+                created = kb.create_task(conn, title="concurrent beta task")
+            with kbc.connect_closing(board="beta") as conn:
+                assert kb.get_task(conn, created).title == "concurrent beta task"
+            with kbc.connect_closing(board="default") as conn:
+                assert kb.get_task(conn, created) is None
+        finally:
+            release.set()
+        assert pending.result(timeout=10) == 0
+    assert attempts == [("default", triage["default"])]
+    assert kb.get_current_board() == "beta"
+
+
 @pytest.mark.parametrize("stop_at", ["grant_boundary", "after_grant"])
 def test_dispatcher_stops_before_later_boards(dispatcher_boards, monkeypatch, stop_at):
     dispatcher, ready, _ = dispatcher_boards

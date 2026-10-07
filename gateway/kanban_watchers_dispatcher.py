@@ -307,11 +307,8 @@ class _KanbanDispatcher:
             for slug in self._board_slugs():
                 if attempted >= auto_decompose_per_tick:
                     break
-                # Pin the board via env for the call: the decomposer connects
-                # with no board kwarg (same pattern as the dashboard specify endpoint).
-                prev_env = os.environ.get("HERMES_KANBAN_BOARD")
-                try:
-                    os.environ["HERMES_KANBAN_BOARD"] = slug
+                # The decomposer connects without a board kwarg; scope only this tick.
+                with _kb.scoped_current_board(slug):
                     try:
                         triage_ids = _decomp.list_triage_ids()
                     except Exception as exc:
@@ -322,11 +319,6 @@ class _KanbanDispatcher:
                             break
                         attempted += 1
                         successes += self._decompose_one(_decomp, slug, tid)
-                finally:
-                    if prev_env is None:
-                        os.environ.pop("HERMES_KANBAN_BOARD", None)
-                    else:
-                        os.environ["HERMES_KANBAN_BOARD"] = prev_env
         return successes
 
     @staticmethod
