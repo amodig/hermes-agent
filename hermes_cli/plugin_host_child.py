@@ -167,7 +167,7 @@ class HostRuntime:
         self.profiles: Dict[str, Dict[str, Any]] = {}
         # ponytail: serialize cold imports; shard only after capture stops replacing global registration.
         self._import_lock = threading.Lock()
-        self.instance_modules: Dict[str, Any] = {}
+        self.imported_modules: Dict[Path, types.ModuleType] = {}
         self.stopped = threading.Event()
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self.loop.run_forever, name="plugin-host-loop", daemon=True).start()
@@ -294,6 +294,16 @@ class HostRuntime:
     def op_hello(self, _params: Dict[str, Any]) -> Dict[str, Any]:
         return {"protocol": PROTOCOL_VERSION, "pid": os.getpid(), "python": sys.version.split()[0]}
 
+    def _import_directory(self, params: Dict[str, Any]) -> types.ModuleType:
+        """Called under _import_lock: general/category names share one source's import epoch."""
+        plugin_dir = Path(str(params["path"])).resolve()
+        module = self.imported_modules.get(plugin_dir)
+        if module is None:
+            module = self.imported_modules[plugin_dir] = _import_plugin(params)
+        self.plugin_paths[str(params["plugin_key"])] = plugin_dir
+        self.modules[str(params["plugin_key"])] = module.__name__
+        return module
+
     def op_load(self, params: Dict[str, Any]) -> Dict[str, Any]:
         plugin_key = str(params["plugin_key"])
         ctx = RemotePluginContext(self, plugin_key, params)
@@ -304,13 +314,12 @@ class HostRuntime:
             self.loading.add(plugin_key)
         try:
             with self._import_lock:
-                target = _import_plugin(params)
-                if params.get("path"):
-                    self.plugin_paths[plugin_key] = Path(str(params["path"])).resolve()
+                target = _import_plugin(params) if params.get("entrypoint") else self._import_directory(params)
             register = target if callable(target) and not isinstance(target, types.ModuleType) \
                 else getattr(target, "register", None)
             module_name = getattr(target, "__name__", None) or getattr(register, "__module__", None)
-            self.modules[plugin_key] = str(module_name or "")
+            if params.get("entrypoint"):
+                self.modules[plugin_key] = str(module_name or "")
             ctx._check_active()
             if not callable(register):
                 raise AttributeError(f"Plugin '{params.get('name')}' has no register() function")
@@ -337,10 +346,7 @@ class HostRuntime:
         # Hermes asks for a fresh instance many times (agent cache, doctor, dashboard); like the
         # in-process loader, the module body runs once per host and only the instance is new.
         with self._import_lock:
-            module = self.instance_modules.get(str(params["path"]))
-            if module is None:
-                module = self.instance_modules[str(params["path"])] = _import_plugin(params)
-        self.modules[plugin_key] = module.__name__
+            module = self._import_directory(params)
         base = _import_base(str(params["base"]))
         capture = str(params["capture"])
         captured: List[Any] = []
@@ -512,11 +518,17 @@ class HostRuntime:
             return {"errors": errors}  # never wait on a stalled import; op_load finishes eviction
         with self._import_lock:
             plugin_dir = self.plugin_paths.pop(plugin_key, None)
+            module_name = self.modules.pop(plugin_key, "")
             if plugin_dir is not None:
+                self.imported_modules.pop(plugin_dir, None)
+                # Other category/general keys described the same retired module, not a future reload.
+                for owner, path in list(self.plugin_paths.items()):
+                    if path == plugin_dir:
+                        self.plugin_paths.pop(owner)
+                        self.modules.pop(owner, None)
                 for _, module in self.asgi_apps.pop(plugin_dir, {}).values():
                     if sys.modules.get(module.__name__) is module:
                         sys.modules.pop(module.__name__, None)
-            module_name = self.modules.pop(plugin_key, "")
             if module_name:
                 for name in [m for m in sys.modules if m == module_name or m.startswith(module_name + ".")]:
                     sys.modules.pop(name, None)

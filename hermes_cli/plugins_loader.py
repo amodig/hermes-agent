@@ -466,8 +466,12 @@ class PluginLoaderMixin:
             # so a failing register() unwinds them too.
             self._register_declared_locales(manifest, ctx)
             if in_host and not self._is_manifest_only_language_pack(manifest):
-                self._plugin_host().load(manifest, ctx, module_name=module_name,
-                                         entrypoint=manifest.source not in {"user", "project"})
+                host_module_name = self._plugin_host().load(
+                    manifest, ctx, module_name=module_name, entrypoint=manifest.source not in {"user", "project"})
+                if manifest.source in {"user", "project"}:
+                    # Source identity for dual-kind hook ownership, never an import into Hermes.
+                    loaded.module = types.ModuleType(host_module_name)
+                    loaded.module.__file__ = str(Path(manifest.path) / "__init__.py")
                 return True
             # Reuse a deferred platform's already-imported package so its body doesn't run twice.
             # See #78050.

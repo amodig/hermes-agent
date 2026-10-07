@@ -836,8 +836,12 @@ What changes in `host` mode:
   retain their caller's scope.
 - **Dashboard APIs refresh on reload.** Unloading a plugin evicts its cached API and module
   without resetting sibling plugins or restarting the host.
-- **Category imports run once per host.** Concurrent first loads share the imported module;
-  each memory/context-engine/category load still creates a fresh provider instance.
+- **General and category loads share imports.** Concurrent first loads of one plugin directory
+  share its module until unload; each category load still creates a fresh provider instance.
+  A dual-kind general/memory plugin registers its hooks once, regardless of load order.
+- **Context-engine commands retain their owner.** Hosted sync and async slash commands use the
+  profile's command registry, preserve metadata and conflict checks, and refresh after a host
+  restart without removing another plugin's replacement command.
 - **Retained provider proxies refresh once after a host crash.** Concurrent callers share one
   replacement instance and one registration refresh rather than duplicating forwarded hooks.
 - **Ordinary JSON dictionaries stay dictionaries.** Keys resembling internal wire tags, such as

@@ -729,6 +729,42 @@ def register(ctx):
 
 
 @pytest.mark.platforms("any")
+@pytest.mark.parametrize("category_first", [False, True])
+def test_general_and_category_loads_share_import_and_refresh_on_reload(tmp_path, monkeypatch, category_first):
+    source = (
+        "from pathlib import Path\nimport os\n"
+        "with (Path(os.environ['HERMES_HOME']) / 'shared-imports').open('a') as handle:\n"
+        "    handle.write(str(os.getpid()) + '\\n')\n" + MEMORY_PLUGIN)
+    home = _home_with_plugins(tmp_path, monkeypatch, {"memprobe": source})
+    (home / "plugins" / "memprobe" / "plugin.yaml").write_text(
+        "name: memprobe\nversion: '1.0'\nkind: standalone\n", encoding="utf-8")
+    manager = PluginManager()
+    host = manager._plugin_host()
+    plugin_dir = home / "plugins" / "memprobe"
+    def category():
+        return host.load_instance(
+            plugin_dir, module_name="_hermes_memory_memprobe",
+            base_ref="agent.memory_provider:MemoryProvider", capture="register_memory_provider")
+    try:
+        if category_first:
+            category().whoami()
+        manager.discover_and_load()
+        assert manager._plugins["memprobe"].error is None
+        assert category().whoami() == host.info["pid"] != os.getpid()
+        marker = home / "shared-imports"
+        assert marker.read_text().splitlines() == [str(host.info["pid"])]
+        manifest = manager._plugins["memprobe"].manifest
+        manager.unload("memprobe")
+        manager._load_plugin(manifest)
+        assert manager._plugins["memprobe"].error is None
+        assert category().whoami() == host.info["pid"]
+        assert marker.read_text().splitlines() == [str(host.info["pid"])] * 2
+    finally:
+        manager.unload()
+        host.shutdown()
+
+
+@pytest.mark.platforms("any")
 def test_concurrent_category_loads_import_once_and_create_distinct_instances(tmp_path, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
     from threading import Barrier
