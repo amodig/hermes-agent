@@ -9,7 +9,7 @@ category: automation
 requires_hermes: ">=0.21.5"
 docs_url: https://github.com/AhmetArif0/hermes-ntfy-approval
 version: "1.0.1"
-image: https://raw.githubusercontent.com/AhmetArif0/hermes-ntfy-approval/e6d557073d7034002503c27113b80df1c64b3485/docs/card.png
+image: https://raw.githubusercontent.com/AhmetArif0/hermes-ntfy-approval/95d3a4b838073d6908c578ca1a9f04154349a2cf/docs/card.png
 platforms: []
 capabilities:
   provides_tools: []

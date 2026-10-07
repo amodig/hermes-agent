@@ -10,12 +10,12 @@ category: automation
 requires_hermes: ">=0.21.1"
 docs_url: https://github.com/bablobanov/hermes-agent-telegram-dashboard#readme
 version: "0.9.3"
-image: https://raw.githubusercontent.com/bablobanov/hermes-agent-telegram-dashboard/682e20b4664c8e70f51faa9db5f89e42c24f0c0c/docs/social-preview.jpg
+image: https://raw.githubusercontent.com/bablobanov/hermes-agent-telegram-dashboard/b60a100bc98ddff64f1e0087221bb893ddc5b398/docs/social-preview.jpg
 screenshots:
-  - https://raw.githubusercontent.com/bablobanov/hermes-agent-telegram-dashboard/682e20b4664c8e70f51faa9db5f89e42c24f0c0c/docs/screenshots/01-showcase.png
-  - https://raw.githubusercontent.com/bablobanov/hermes-agent-telegram-dashboard/682e20b4664c8e70f51faa9db5f89e42c24f0c0c/docs/screenshots/02-showcase-details.png
-  - https://raw.githubusercontent.com/bablobanov/hermes-agent-telegram-dashboard/682e20b4664c8e70f51faa9db5f89e42c24f0c0c/docs/screenshots/03-showcase-warning.png
-  - https://raw.githubusercontent.com/bablobanov/hermes-agent-telegram-dashboard/682e20b4664c8e70f51faa9db5f89e42c24f0c0c/docs/screenshots/04-showcase-stale.png
+  - https://raw.githubusercontent.com/bablobanov/hermes-agent-telegram-dashboard/b60a100bc98ddff64f1e0087221bb893ddc5b398/docs/screenshots/01-showcase.png
+  - https://raw.githubusercontent.com/bablobanov/hermes-agent-telegram-dashboard/b60a100bc98ddff64f1e0087221bb893ddc5b398/docs/screenshots/02-showcase-details.png
+  - https://raw.githubusercontent.com/bablobanov/hermes-agent-telegram-dashboard/b60a100bc98ddff64f1e0087221bb893ddc5b398/docs/screenshots/03-showcase-warning.png
+  - https://raw.githubusercontent.com/bablobanov/hermes-agent-telegram-dashboard/b60a100bc98ddff64f1e0087221bb893ddc5b398/docs/screenshots/04-showcase-stale.png
 platforms: []
 capabilities:
   provides_tools: []
