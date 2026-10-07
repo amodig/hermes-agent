@@ -179,7 +179,14 @@ _process_registry.require_autonomous_boundary = (
 _autonomous_resources.check_autonomous_worker = (
     lambda pid, **_kwargs: {"worker_cgroup": "/probe/hermes-worker-%d.scope" % pid}
 )
-_process_registry._systemd_run_user_scope_available = lambda: False
+# The worker is launched directly: this probe owns the bootstrap handshake, and the
+# scope route is exercised against real transient slices by
+# tests/tools/test_autonomous_resources.py and by the dotfiles smoke. A probe that
+# had to create systemd units would make the source layer depend on the runner's
+# bus, which is exactly what it must not do.
+_process_registry.restart_safe_gateway_child_argv = (
+    lambda command, **_kwargs: _process_registry.GatewayChildDispatch("in_process", command)
+)
 
 
 def _emit(payload):
