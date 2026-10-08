@@ -582,8 +582,12 @@ hermes kanban --board <slug> block <id> --quarantine-review \
 ```
 
 The model-side equivalent is `kanban_block` with `quarantine_review: true`,
-`kind: "capability"`, the same `reason`, and the observed `expected_version`
-(plus the resolved board). It bumps `version` by one, keeps the card sticky
+`kind: "capability"`, the same `reason`, and the observed `expected_version`.
+For a named-board refusal, pass the resolved `board`. For a database-pinned
+refusal, omit `board` and use the tool only in a session with the same effective
+`HERMES_KANBAN_DB` pin: an explicit tool board overrides that pin. If the session
+does not share the pin, replay the complete emitted CLI command instead.
+Quarantine bumps `version` by one, keeps the card sticky
 `blocked` even past the usual re-block→triage loop breaker, and preserves the
 goal revision, candidate pointer, contracts, assignee/model pins, graph edges,
 workspaces, runs, evidence, and both Git commits. A stale `version`, an active
