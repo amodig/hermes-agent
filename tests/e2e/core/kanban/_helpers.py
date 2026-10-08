@@ -14,9 +14,12 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+import pytest
 
 REPO = Path(__file__).resolve().parents[4]
 PY = sys.executable
@@ -103,9 +106,38 @@ class Board:
         assert env["HERMES_HOME"].startswith(str(self.root))
         return env
 
-    def cli(self, *args: str, timeout: float = 90.0, check: bool = True) -> subprocess.CompletedProcess:
+    def boundary_prefix(self) -> list[str]:
+        """argv prefix that places a dispatch inside the boundary the runtime demands.
+
+        The runtime refuses a standalone dispatch started outside the reviewed
+        autonomous boundary, and names this very invocation as the remedy, so the
+        harness does exactly that: the dispatcher runs in a transient scope inside
+        ``autonomous.slice``, where the gateway normally is.
+
+        A host that does not present the boundary -- no reachable user bus, a systemd
+        without ``ConcurrencyHardMax``, or simply not deployed -- SKIPS. That refusal
+        is the product working, and these tests are about the worker contract, not
+        about host policy; asserting them against a boundary the host does not have
+        would only prove the refusal.
+        """
+        from tests._fixtures.autonomous_slice import require_free_boundary
+
+        require_free_boundary()
+        return [
+            "systemd-run", "--user", "--scope", "--quiet", "--collect",
+            "--expand-environment=no",
+            "--slice=autonomous.slice",
+            "--unit", f"e2e-kanban-dispatch-{os.getpid()}-{uuid.uuid4().hex[:8]}",
+        ]
+
+    def cli(
+        self, *args: str, timeout: float = 90.0, check: bool = True, boundary: bool = False,
+    ) -> subprocess.CompletedProcess:
+        argv = [PY, "-m", "hermes_cli.main", "kanban", *args]
+        if boundary:
+            argv = [*self.boundary_prefix(), "--", *argv]
         proc = subprocess.run(
-            [PY, "-m", "hermes_cli.main", "kanban", *args], cwd=str(self.root), env=self.env(),
+            argv, cwd=str(self.root), env=self.env(),
             capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
         )
         if check and proc.returncode != 0:
@@ -120,7 +152,7 @@ class Board:
         return self.cli_json("create", title, "--assignee", "default", *extra)["id"]
 
     def dispatch(self, *extra: str, timeout: float = 90.0) -> dict:
-        res = self.cli_json("dispatch", *extra, timeout=timeout)
+        res = self.cli_json("dispatch", *extra, timeout=timeout, boundary=True)
         for tid in [s["task_id"] for s in res.get("spawned", [])]:
             pid = self.task(tid)["worker_pid"]
             if pid:

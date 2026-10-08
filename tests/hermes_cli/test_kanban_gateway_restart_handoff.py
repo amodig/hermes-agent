@@ -22,7 +22,14 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_runtime_generation as generations
 from hermes_cli.kanban_runtime import process_start_time
+from tools import autonomous_resources as autonomous_mod
+from tools import process_registry as process_mod
 from tests.hermes_cli import kanban_conformance_fixture as MODULE
+
+#: The real host-boundary validators, captured before any fixture stubs them.
+#: Tests that need the REAL decision restore these explicitly.
+REAL_REQUIRE_AUTONOMOUS_BOUNDARY = process_mod.require_autonomous_boundary
+REAL_CHECK_AUTONOMOUS_WORKER = autonomous_mod.check_autonomous_worker
 from tests.hermes_cli.test_kanban_runtime_generation import (
     _install_memory_loaders,
     _write_memory_provider,
@@ -43,6 +50,20 @@ def worker_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("INVOCATION_ID", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr("tools.process_registry._is_supervised_gateway_process", lambda: False)
+    # The autonomous boundary is HOST policy: this fixture exercises the worker
+    # lifecycle without a deployed autonomous slice, so the verdict is stubbed
+    # explicitly here rather than read from the runner. Tests that assert a REFUSED
+    # launch override these, and tests that need the real validator use a
+    # disposable transient slice (tests/_fixtures/autonomous_slice.py). The real
+    # decisions live in tests/tools/test_autonomous_resources.py.
+    monkeypatch.setattr(
+        "tools.process_registry.require_autonomous_boundary",
+        lambda **_kwargs: {"aggregate": {"cgroup": "/fixture/autonomous.slice"}},
+    )
+    monkeypatch.setattr(
+        "tools.autonomous_resources.check_autonomous_worker",
+        lambda pid, **_kwargs: {"worker_cgroup": f"/fixture/hermes-worker-{pid}.scope"},
+    )
     source = tmp_path / "install"
     MODULE._make_runtime_fixture(source)
     prepared = []
@@ -495,8 +516,8 @@ def test_explicit_current_install_entrypoint_is_sealed_and_custom_wrapper_is_ref
 
 
 @pytest.mark.platforms("linux")
-def test_oneshot_unit_dispatcher_scope_wraps_or_warns_never_dooms_silently(
-    worker_setup, monkeypatch, caplog,
+def test_oneshot_unit_dispatcher_scope_wraps_and_refuses_without_one(
+    worker_setup, monkeypatch,
 ):
     from tools import process_registry
 
@@ -508,47 +529,64 @@ def test_oneshot_unit_dispatcher_scope_wraps_or_warns_never_dooms_silently(
     monkeypatch.setattr(process_registry, "_slice_inherit_supported", lambda: True)
     monkeypatch.setattr(
         process_registry, "_build_systemd_scope_argv",
-        lambda cmd, unit_suffix: ["systemd-run", "--user", "--scope", "--unit", f"hermes-worker-{unit_suffix}", *cmd],
+        lambda cmd, unit_suffix, slice_name=None: [
+            "systemd-run", "--user", "--scope",
+            f"--slice={slice_name}", "--unit", f"hermes-worker-{unit_suffix}", *cmd,
+        ],
     )
     wrapped = kbd._restart_safe_worker_argv(task, command)
     assert wrapped[:3] == ["systemd-run", "--user", "--scope"]
+    assert "--slice=autonomous-workers.slice" in wrapped, wrapped
     assert f"hermes-worker-kanban-{task.id}-run-{task.current_run_id}" in wrapped
+    # Without a scope the launch is refused, not run unmanaged inside the unit:
+    # an unscoped autonomous child would escape both the native slot and the
+    # worker-scope evidence the boundary check reads.
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
-    monkeypatch.setattr(process_registry, "_scope_degraded_warned", False)
-    with caplog.at_level("WARNING", logger=process_registry.logger.name):
-        assert kbd._restart_safe_worker_argv(task, command) == command
-    warned = [r.getMessage() for r in caplog.records if "KILLED when the unit exits" in r.getMessage()]
-    assert len(warned) == 1 and "KillMode=process" in warned[0]
+    with pytest.raises(process_registry.AutonomousResourceUnavailable):
+        kbd._restart_safe_worker_argv(task, command)
     assert process_registry.restart_safe_gateway_child_argv(
         ["hermes", "cron"], unit_suffix="cron-job-1", require_restart_safe_scope=True,
     ).mode == "in_process"
 
 
 @pytest.mark.platforms("linux")
-@pytest.mark.parametrize("slice_inherit", [False, True])
-def test_real_user_systemd_scope_preserves_worker_context(worker_setup, monkeypatch, slice_inherit):
-    from tools import process_registry
+@pytest.mark.live_system_guard_bypass  # creates a disposable transient worker slice
+def test_real_user_systemd_scope_preserves_worker_context(worker_setup, monkeypatch):
+    """A REAL scope in the real worker slice preserves the worker's context.
 
-    if not process_registry._systemd_run_user_scope_available():
-        pytest.skip("systemd-run --user --scope is unavailable on this host")
-    if slice_inherit and not process_registry._slice_inherit_supported():
-        pytest.skip("systemd-run --slice-inherit is unavailable on this host")
-    monkeypatch.setattr(process_registry, "_slice_inherit_supported", lambda: slice_inherit)
-    workspace, task = worker_setup
-    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
-    monkeypatch.setenv("INVOCATION_ID", "managed-gateway-test")
-    launch = kbd._default_spawn(task, str(workspace), defer_grant=True)
-    try:
-        launch.grant(task.current_run_id, task.claim_lock)
-        observed = MODULE._wait_for_receipt(workspace.parent / "receipt.json")
-        assert observed["identity"]["pid"] == launch.pid
-        assert observed["cwd"] == str(workspace)
-        assert observed["task"] == task.id
-        assert observed["run"] == "23"
-        assert ".scope" in observed["cgroup"]
-        assert "hermes-gateway.service" not in observed["cgroup"]
-    finally:
-        _finish_launch(launch)
+    The worker slice is a disposable transient unit, never the production
+    ``autonomous-workers.slice``: the scope target comes from the live contract,
+    which this test points at its own fixture. Admission itself is stubbed by
+    ``worker_setup`` because the DISPATCHER here is the pytest process, which is
+    not inside any autonomous aggregate."""
+    from tools import process_registry
+    from tests._fixtures import autonomous_slice as fixture
+
+    fixture.require_user_bus()
+    # A cold Hermes worker boots into this slice, so it gets the production memory
+    # shape rather than the sleeper-sized default budgets.
+    with fixture.disposable_boundary(high_bytes=fixture.HERMES_BOOT_HIGH_BYTES, max_bytes=fixture.HERMES_BOOT_MAX_BYTES, swap_bytes=fixture.HERMES_BOOT_SWAP_BYTES) as boundary:
+        monkeypatch.setattr(process_registry, "live_contract", boundary.contract)
+        workspace, task = worker_setup
+        monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
+        monkeypatch.setenv("INVOCATION_ID", "managed-gateway-test")
+        launch = kbd._default_spawn(task, str(workspace), defer_grant=True)
+        try:
+            launch.grant(task.current_run_id, task.claim_lock)
+            observed = MODULE._wait_for_receipt(workspace.parent / "receipt.json")
+            assert observed["identity"]["pid"] == launch.pid
+            assert observed["cwd"] == str(workspace)
+            assert observed["task"] == task.id
+            assert observed["run"] == "23"
+            assert ".scope" in observed["cgroup"]
+            assert "hermes-gateway.service" not in observed["cgroup"]
+            # The receipt records the raw unified line, so strip the 0:: prefix.
+            worker_cgroup = observed["cgroup"].strip()
+            assert worker_cgroup.startswith("0::"), worker_cgroup
+            worker_cgroup = worker_cgroup[3:]
+            assert worker_cgroup.startswith(boundary.workers_group + "/"), worker_cgroup
+        finally:
+            _finish_launch(launch)
 
 
 @pytest.mark.platforms("linux")
@@ -579,6 +617,11 @@ from hermes_cli import kanban_runtime_generation as generations
 generations._runtime_storage_root = lambda: Path(sys.argv[2])
 from hermes_cli import kanban_db_dispatch as kbd
 from tests.hermes_cli.kanban_conformance_fixture import _prepare_fixture_generation
+from tools import autonomous_resources as _ar, process_registry as _pr
+# Host policy is stubbed in this child for the same reason as the parent fixture:
+# the dispatcher here is a bare subprocess, not a deployed autonomous gateway.
+_pr.require_autonomous_boundary = lambda **_kw: {'aggregate': {'cgroup': '/fixture/autonomous.slice'}}
+_ar.check_autonomous_worker = lambda pid, **_kw: {'worker_cgroup': '/fixture/hermes-worker-%d.scope' % pid}
 base = Path(sys.argv[1])
 conn = sqlite3.connect(base / 'restart.db')
 conn.row_factory = sqlite3.Row
@@ -647,7 +690,7 @@ def _proc_cgroup(pid: int) -> str:
 
 
 @pytest.mark.platforms("linux")
-@pytest.mark.live_system_guard_bypass  # cleanup signals our start-time-verified worker
+@pytest.mark.live_system_guard_bypass  # creates a disposable transient gateway-like service
 def test_worker_survives_a_real_user_service_restart(tmp_path, monkeypatch):
     """A REAL ``systemctl --user restart`` must not take the granted worker down.
 
@@ -655,22 +698,24 @@ def test_worker_survives_a_real_user_service_restart(tmp_path, monkeypatch):
     test_managed_gateway_restart_preserves_active_worker_and_single_side_effect``
     SIGTERMs a harness subprocess; it never restarts a service, so it cannot
     establish restart survival. This test starts a uniquely named transient user
-    service in the same slice the gateway occupies, has that service launch its
-    child through the real restart-safe scope, restarts the service for real, and
-    then observes the worker itself: same PID, same start time, same cgroup, and
-    a cgroup that is a SIBLING of the service inside the shared slice. Finally it
-    releases the worker and requires exactly one side effect.
-    """
-    from tools import process_registry
+    service in a DISPOSABLE autonomous aggregate, has that service launch its
+    child through the real restart-safe scope into the disposable worker slice,
+    restarts the service for real, and then observes the worker itself: same PID,
+    same start time, same cgroup, a cgroup that is a SIBLING of the service inside
+    the aggregate, a claim that spans the restart, a replacement dispatch held by
+    the single native slot, and exactly one side effect.
 
-    if not process_registry._systemd_run_user_scope_available():
-        pytest.skip("systemd-run --user --scope is unavailable on this host")
-    bus_env = process_registry.systemd_user_bus_env(os.environ)
+    Neither the production slices nor the production gateway are touched: the
+    fixture points the runtime's contract at its own transient units.
+    """
+    from tools import autonomous_resources, process_registry
+    from tests._fixtures import autonomous_slice as fixture
+
+    fixture.require_user_bus()
+    bus_env = fixture.user_bus_env()
     for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
         if key in bus_env:
             monkeypatch.setenv(key, bus_env[key])
-    if not process_registry._slice_inherit_supported():
-        pytest.skip("systemd-run --slice-inherit is required for shared-slice placement")
 
     base = tmp_path / "service-smoke"
     base.mkdir()
@@ -695,138 +740,390 @@ def test_worker_survives_a_real_user_service_restart(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     suffix = f"issue43-smoke-{uuid.uuid4().hex[:8]}"
-    unit = f"{suffix}.service"
+    unit = f"fixture-launcher-{suffix}.service"
     harness_py = base / "harness.py"
-    harness_py.write_text(
-        "import json, os, pathlib, subprocess, sys, time\n"
-        f"sys.path.insert(0, {str(Path(kbd.__file__).resolve().parents[1])!r})\n"
-        f"os.environ['HERMES_HOME'] = {str(base / 'home')!r}\n"
-        f"os.environ['HOME'] = {str(base)!r}\n"
-        "os.environ.setdefault('INVOCATION_ID', 'issue43-smoke')\n"
-        "from tools import process_registry\n"
-        "process_registry._is_supervised_gateway_process = lambda: True\n"
-        "dispatch = process_registry.restart_safe_gateway_child_argv(\n"
-        f"    [sys.executable, '-B', {str(worker_py)!r}], unit_suffix={suffix!r},\n"
-        "    require_restart_safe_scope=True, outlives_parent=True)\n"
-        "proc = subprocess.Popen(dispatch.argv, start_new_session=True,\n"
-        "    env=process_registry.systemd_user_bus_env(os.environ))\n"
-        "# ``systemd-run --scope`` moves the command into its scope asynchronously,\n"
-        "# so read the cgroup only once it has settled, or we record the service's.\n"
-        "cgroup = ''\n"
-        "deadline = time.monotonic() + 10\n"
-        "while time.monotonic() < deadline:\n"
-        "    cgroup = pathlib.Path('/proc/%d/cgroup' % proc.pid).read_text().strip()\n"
-        "    cgroup = cgroup.splitlines()[-1][3:]\n"
-        "    if cgroup.endswith('.scope'):\n"
-        "        break\n"
-        "    time.sleep(0.02)\n"
-        f"pathlib.Path({str(info)!r}).write_text(\n"
-        "    json.dumps({'pid': proc.pid, 'cgroup': cgroup, 'launcher_pid': os.getpid()}))\n"
-        "while True:\n"
-        "    time.sleep(0.2)\n",
-        encoding="utf-8",
-    )
+
+    def _harness_source(boundary_contract_kwargs):
+        return (
+            "import json, os, pathlib, subprocess, sys, time\n"
+            f"sys.path.insert(0, {str(Path(kbd.__file__).resolve().parents[1])!r})\n"
+            f"os.environ['HERMES_HOME'] = {str(base / 'home')!r}\n"
+            f"os.environ['HOME'] = {str(base)!r}\n"
+            "os.environ.setdefault('INVOCATION_ID', 'issue43-smoke')\n"
+            "from tools import autonomous_resources, process_registry\n"
+            "# This fixture's units, not the production slices: the runtime reads the\n"
+            "# contract at call time, so retargeting it retargets both the checks and\n"
+            "# the slice the scope is created in.\n"
+            "autonomous_resources._LIVE_CONTRACT = autonomous_resources._Contract(\n"
+            f"    **{boundary_contract_kwargs!r})\n"
+            "process_registry._is_supervised_gateway_process = lambda: True\n"
+            "dispatch = process_registry.restart_safe_gateway_child_argv(\n"
+            f"    [sys.executable, '-B', {str(worker_py)!r}], unit_suffix={suffix!r},\n"
+            "    require_restart_safe_scope=True, outlives_parent=True)\n"
+            "proc = subprocess.Popen(dispatch.argv, start_new_session=True,\n"
+            "    env=process_registry.systemd_user_bus_env(os.environ))\n"
+            "# ``systemd-run --scope`` moves the command into its scope asynchronously,\n"
+            "# so read the cgroup only once it has settled, or we record the service's.\n"
+            "cgroup = ''\n"
+            "deadline = time.monotonic() + 10\n"
+            "while time.monotonic() < deadline:\n"
+            "    cgroup = pathlib.Path('/proc/%d/cgroup' % proc.pid).read_text().strip()\n"
+            "    cgroup = cgroup.splitlines()[-1][3:]\n"
+            "    if cgroup.endswith('.scope'):\n"
+            "        break\n"
+            "    time.sleep(0.02)\n"
+            f"pathlib.Path({str(info)!r}).write_text(\n"
+            "    json.dumps({'pid': proc.pid, 'cgroup': cgroup, 'launcher_pid': os.getpid()}))\n"
+            "while True:\n"
+            "    time.sleep(0.2)\n"
+        )
+
+    def _try_worker_scope(boundary, name):
+        """Attempt one more top-level worker; returns the CompletedProcess."""
+        return subprocess.run(
+            ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+             f"--slice={boundary.workers_unit}", "--unit", f"{name}.scope",
+             "--", "/bin/true"],
+            capture_output=True, text=True, timeout=30, env=bus_env,
+        )
+
     worker_pid = None
     worker_start_time = None
-    try:
-        launch = subprocess.run(
-            # Same slice the CTO gateway occupies: the worker must stay inside
-            # that shared budget, not escape to app.slice.
-            ["systemd-run", "--user", "--unit", unit,
-             "--slice=agents-controls.slice", "--collect",
-             sys.executable, "-B", str(harness_py)],
-            capture_output=True, text=True, timeout=30,
+    service_log = base / "service.log"
+    # A cold Hermes worker boots into this slice, so it gets the production memory
+    # shape rather than the sleeper-sized default budgets.
+    with fixture.disposable_boundary(high_bytes=fixture.HERMES_BOOT_HIGH_BYTES, max_bytes=fixture.HERMES_BOOT_MAX_BYTES, swap_bytes=fixture.HERMES_BOOT_SWAP_BYTES) as boundary:
+        harness_py.write_text(
+            _harness_source(boundary.contract_kwargs()), encoding="utf-8",
         )
-        assert launch.returncode == 0, launch.stderr
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline and not (info.is_file() and started.is_file()):
-            time.sleep(0.05)
-        assert info.is_file(), "the launcher service never recorded its worker"
-        record = json.loads(info.read_text(encoding="utf-8"))
-        worker_pid = int(record["pid"])
-        worker_cgroup = str(record["cgroup"])
-        worker_start_time = process_start_time(worker_pid)
-        assert worker_cgroup.endswith(f"hermes-worker-{suffix}.scope"), worker_cgroup
-
-        service_cgroup = _unit_property(unit, "ControlGroup")
-        launcher_before = _unit_property(unit, "MainPID")
-        assert service_cgroup, "the fixture service has no cgroup"
-        budget = service_cgroup.rsplit("/", 1)[0]
-        assert worker_cgroup.startswith(budget + "/"), (
-            f"worker {worker_cgroup} left the launcher's shared slice {budget}"
-        )
-        assert not worker_cgroup.startswith(service_cgroup + "/"), (
-            "the worker must be a sibling of the launcher service, not inside it"
-        )
-        assert record["launcher_pid"] != worker_pid
-
-        # Claim the card BEFORE the restart so the assertion below is about a
-        # claim that genuinely spans it, not a claim created afterwards.
-        monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
-        conn = sqlite3.connect(base / "restart.db")
-        conn.row_factory = sqlite3.Row
-        conn.executescript(kb.SCHEMA_SQL)
-        kb._ensure_lifecycle_schema(conn)
-        kb._ensure_goal_revision_schema(conn)
-        task_id = kb.create_task(
-            conn, title="granted worker", assignee="coder", initial_status="blocked",
-            workspace_kind="scratch", workspace_path=str(base),
-        )
-        promoted, reason = kb.promote_task(conn, task_id, actor="test")
-        assert promoted, reason
-        claimed = kb.claim_task(
-            conn, task_id, claimer=f"{kb._claimer_id().split(':', 1)[0]}:smoke",
-        )
-        assert claimed is not None
-        kbd._set_worker_pid(conn, task_id, worker_pid)
-        run_id_before = claimed.current_run_id
-        claim_lock_before = claimed.claim_lock
-
-        subprocess.run(
-            ["systemctl", "--user", "restart", unit],
-            check=True, capture_output=True, text=True, timeout=30,
-        )
-        assert _unit_property(unit, "MainPID") != launcher_before, "service did not restart"
-        assert kbd._pid_alive(worker_pid), "the service restart killed the worker"
-        assert process_start_time(worker_pid) == worker_start_time
-        assert _proc_cgroup(worker_pid) == worker_cgroup
-
-        # The claim that existed across the restart is intact, and a replacement
-        # dispatcher leaves a worker the restart did not kill alone.
-        survived = kb.get_task(conn, task_id)
-        assert survived.status == "running"
-        assert survived.current_run_id == run_id_before
-        assert survived.claim_lock == claim_lock_before
-        assert survived.worker_pid == worker_pid
-        result = kbd.DispatchResult()
-        kbd._run_reclaim_phase(
-            conn, result, stale_timeout_seconds=0, failure_limit=3,
-            reconcile_orphans=True,
-        )
-        assert (result.interrupted, result.crashed, result.reclaimed) == ([], [], 0)
-        assert kb.get_task(conn, task_id).status == "running"
-        conn.close()
-
-        release.write_text("go", encoding="utf-8")
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline and not side_effect.is_file():
-            time.sleep(0.05)
-        assert side_effect.read_text(encoding="utf-8").splitlines() == ["once"]
-    finally:
-        subprocess.run(
-            ["systemctl", "--user", "stop", unit],
-            check=False, capture_output=True, text=True, timeout=30,
-        )
-        subprocess.run(
-            ["systemctl", "--user", "stop", f"hermes-worker-{suffix}.scope"],
-            check=False, capture_output=True, text=True, timeout=30,
-        )
-        if worker_pid is not None:
-            deadline = time.monotonic() + 5
-            while kbd._pid_alive(worker_pid) and time.monotonic() < deadline:
+        try:
+            launch = subprocess.run(
+                # The fixture aggregate, not production: the worker must stay inside
+                # that unauthorised-for-interactive-work budget.
+                ["systemd-run", "--user", "--unit", unit,
+                 f"--slice={boundary.aggregate_unit}", "--collect",
+                 f"--property=StandardOutput=append:{service_log}",
+                 f"--property=StandardError=append:{service_log}",
+                 sys.executable, "-B", str(harness_py)],
+                capture_output=True, text=True, timeout=30, env=bus_env,
+            )
+            assert launch.returncode == 0, launch.stderr
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline and not (info.is_file() and started.is_file()):
                 time.sleep(0.05)
-            if kbd._pid_alive(worker_pid) and process_start_time(worker_pid) == worker_start_time:
-                try:
-                    os.kill(worker_pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            assert info.is_file(), (
+                "the launcher service never recorded its worker; service output:\n"
+                + (service_log.read_text(encoding="utf-8") if service_log.is_file() else "(none)")
+            )
+            record = json.loads(info.read_text(encoding="utf-8"))
+            worker_pid = int(record["pid"])
+            worker_cgroup = str(record["cgroup"])
+            worker_start_time = process_start_time(worker_pid)
+            assert worker_cgroup.endswith(f"hermes-worker-{suffix}.scope"), worker_cgroup
+            assert worker_cgroup.startswith(boundary.workers_group + "/"), worker_cgroup
+
+            service_cgroup = _unit_property(unit, "ControlGroup")
+            launcher_before = _unit_property(unit, "MainPID")
+            assert service_cgroup, "the fixture service has no cgroup"
+            budget = service_cgroup.rsplit("/", 1)[0]
+            assert budget == boundary.aggregate_group
+            assert worker_cgroup.startswith(budget + "/"), (
+                f"worker {worker_cgroup} left the launcher's shared slice {budget}"
+            )
+            assert not worker_cgroup.startswith(service_cgroup + "/"), (
+                "the worker must be a sibling of the launcher service, not inside it"
+            )
+            assert record["launcher_pid"] != worker_pid
+
+            # Claim the card BEFORE the restart so the assertion below is about a
+            # claim that genuinely spans it, not a claim created afterwards.
+            monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+            conn = sqlite3.connect(base / "restart.db")
+            conn.row_factory = sqlite3.Row
+            conn.executescript(kb.SCHEMA_SQL)
+            kb._ensure_lifecycle_schema(conn)
+            kb._ensure_goal_revision_schema(conn)
+            task_id = kb.create_task(
+                conn, title="granted worker", assignee="coder", initial_status="blocked",
+                workspace_kind="scratch", workspace_path=str(base),
+            )
+            promoted, reason = kb.promote_task(conn, task_id, actor="test")
+            assert promoted, reason
+            claimed = kb.claim_task(
+                conn, task_id, claimer=f"{kb._claimer_id().split(':', 1)[0]}:smoke",
+            )
+            assert claimed is not None
+            kbd._set_worker_pid(conn, task_id, worker_pid)
+            run_id_before = claimed.current_run_id
+            claim_lock_before = claimed.claim_lock
+
+            subprocess.run(
+                ["systemctl", "--user", "restart", unit],
+                check=True, capture_output=True, text=True, timeout=30, env=bus_env,
+            )
+            assert _unit_property(unit, "MainPID") != launcher_before, "service did not restart"
+            assert kbd._pid_alive(worker_pid), "the service restart killed the worker"
+            assert process_start_time(worker_pid) == worker_start_time
+            assert _proc_cgroup(worker_pid) == worker_cgroup
+
+            # The claim that existed across the restart is intact, and a replacement
+            # dispatcher leaves a worker the restart did not kill alone.
+            survived = kb.get_task(conn, task_id)
+            assert survived.status == "running"
+            assert survived.current_run_id == run_id_before
+            assert survived.claim_lock == claim_lock_before
+            assert survived.worker_pid == worker_pid
+            result = kbd.DispatchResult()
+            kbd._run_reclaim_phase(
+                conn, result, stale_timeout_seconds=0, failure_limit=3,
+                reconcile_orphans=True,
+            )
+            assert (result.interrupted, result.crashed, result.reclaimed) == ([], [], 0)
+            assert kb.get_task(conn, task_id).status == "running"
+
+            # The single native slot is what actually admits a worker: while the
+            # survivor's scope is live, another top-level worker is refused.
+            held = _try_worker_scope(boundary, f"hermes-worker-replacement-{suffix}")
+            assert held.returncode != 0, "a second native worker was admitted"
+            assert "Concurrency limit" in held.stderr, held.stderr
+            conn.close()
+
+            release.write_text("go", encoding="utf-8")
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline and not side_effect.is_file():
+                time.sleep(0.05)
+            assert side_effect.read_text(encoding="utf-8").splitlines() == ["once"]
+
+            # Only after the whole scope has emptied does the slot come back.
+            deadline = time.monotonic() + 30
+            freed = None
+            while time.monotonic() < deadline:
+                freed = _try_worker_scope(boundary, f"hermes-worker-after-{suffix}")
+                if freed.returncode == 0:
+                    break
+                time.sleep(0.1)
+            assert freed is not None and freed.returncode == 0, (
+                f"the worker slot never freed: {freed.stderr}"
+            )
+        finally:
+            subprocess.run(
+                ["systemctl", "--user", "stop", unit],
+                check=False, capture_output=True, text=True, timeout=30, env=bus_env,
+            )
+            if worker_pid is not None:
+                deadline = time.monotonic() + 5
+                while kbd._pid_alive(worker_pid) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                if kbd._pid_alive(worker_pid) and process_start_time(worker_pid) == worker_start_time:
+                    try:
+                        os.kill(worker_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.live_system_guard_bypass  # creates a disposable transient worker slice
+def test_occupied_native_slot_refuses_dispatch_without_charging_retries(tmp_path, monkeypatch):
+    """A permissive scheduling cap cannot admit a second autonomous worker.
+
+    Two halves, each asserted where it is real. The ADMISSION half runs inside the
+    fixture aggregate, so the real validator decides with a genuinely placed
+    launcher and a genuinely held slot: two different profile homes both come back
+    ``busy`` with the slot diagnostic, and the same call is ADMITTED once the
+    holder is released. The BOOKKEEPING half drives ``dispatch_once`` with
+    ``max_in_progress`` deliberately permissive, keeping the real occupied-slot
+    verdict and replacing only the launcher-placement half (this pytest process is
+    not a gateway), and asserts the card keeps its retry budget.
+    """
+    from tests._fixtures import autonomous_slice as fixture
+
+    fixture.require_user_bus()
+    runtime_root = str(Path(kbd.__file__).resolve().parents[1])
+    homes = []
+    for suffix in ("a", "b"):
+        home = tmp_path / f"home-{suffix}"
+        (home / "profiles" / "coder").mkdir(parents=True)
+        (home / "config.yaml").write_text("{}\n", encoding="utf-8")
+        (home / "profiles" / "coder" / "config.yaml").write_text("{}\n", encoding="utf-8")
+        homes.append(home)
+
+    with fixture.disposable_boundary() as boundary:
+        boundary.install(monkeypatch)
+        probe = tmp_path / "admission_probe.py"
+        probe.write_text(
+            "import json, os, sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "from tools import autonomous_resources as ar, process_registry as pr\n"
+            "ar._LIVE_CONTRACT = ar._Contract(**%r)\n"
+            "out = {}\n"
+            "try:\n"
+            "    report = pr.require_autonomous_boundary()\n"
+            "    out['admission'] = 'admitted'\n"
+            "    out['launcher_cgroup'] = report['launcher_cgroup']\n"
+            "except ar.AutonomousWorkerBusy as exc:\n"
+            "    out['admission'] = 'busy'\n"
+            "    out['admission_error'] = str(exc)\n"
+            "except ar.AutonomousResourceUnavailable as exc:\n"
+            "    out['admission'] = 'drift'\n"
+            "    out['admission_error'] = str(exc)\n"
+            "print('__ADMISSION__' + json.dumps(out, sort_keys=True))\n"
+            % (boundary.contract_kwargs(),),
+            encoding="utf-8",
+        )
+
+        def _admission():
+            completed = subprocess.run(
+                boundary.launcher_argv(
+                    [sys.executable, "-B", str(probe), runtime_root],
+                    unit_suffix="adm",
+                ),
+                capture_output=True, text=True, timeout=120, env=fixture.user_bus_env(),
+            )
+            assert completed.returncode == 0, completed.stderr
+            for line in completed.stdout.splitlines():
+                if line.startswith("__ADMISSION__"):
+                    return json.loads(line[len("__ADMISSION__"):])
+            raise AssertionError(
+                f"the admission probe produced no verdict: {completed.stdout!r} {completed.stderr!r}"
+            )
+
+        holder = subprocess.Popen(
+            ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+             f"--slice={boundary.workers_unit}",
+             "--unit", f"hermes-worker-{boundary.token}-holder.scope",
+             "--", sys.executable, "-c", "import time; time.sleep(60)"],
+            env=fixture.user_bus_env(), start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                if autonomous_mod.check_autonomous_boundary(pid=None)["worker_slot_occupied"]:
+                    break
+                time.sleep(0.05)
+            assert autonomous_mod.check_autonomous_boundary(pid=None)["worker_slot_occupied"]
+
+            verdict = _admission()
+            assert verdict["admission"] == "busy", verdict
+            assert verdict["admission_error"].startswith(autonomous_mod.SLOT_DIAGNOSTIC), verdict
+
+            # The real occupied-slot verdict, with only the launcher half replaced
+            # because this process is not a gateway. The in-aggregate probe above
+            # covers that half against the real validator.
+            def _occupancy_boundary(**_kwargs):
+                report = autonomous_mod.check_autonomous_boundary(pid=None)
+                if report["worker_slot_occupied"]:
+                    raise autonomous_mod.AutonomousWorkerBusy(
+                        f"{autonomous_mod.SLOT_DIAGNOSTIC}: {report['workers']['cgroup']} "
+                        f"already holds {report['worker_scopes']}"
+                    )
+                return report
+
+            monkeypatch.setattr(process_mod, "require_autonomous_boundary", _occupancy_boundary)
+
+            for home in homes:
+                monkeypatch.setenv("HERMES_HOME", str(home))
+                monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+                conn = sqlite3.connect(home / "kanban.db")
+                conn.row_factory = sqlite3.Row
+                conn.executescript(kb.SCHEMA_SQL)
+                kb._ensure_lifecycle_schema(conn)
+                kb._ensure_goal_revision_schema(conn)
+                task_id = kb.create_task(
+                    conn, title=f"blocked by the slot {home.name}", assignee="coder",
+                    initial_status="blocked", workspace_kind="scratch", workspace_path=str(home),
+                )
+                promoted, reason = kb.promote_task(conn, task_id, actor="test")
+                assert promoted, reason
+
+                result = kbd.dispatch_once(
+                    conn, max_spawn=5, max_in_progress=5,
+                    max_in_progress_per_profile=5, reconcile_orphans=False,
+                )
+                assert result.spawned == [], result
+                row = conn.execute(
+                    "SELECT status, consecutive_failures, worker_pid FROM tasks WHERE id = ?",
+                    (task_id,),
+                ).fetchone()
+                assert row["status"] == "ready", dict(row)
+                assert row["consecutive_failures"] == 0, dict(row)
+                assert not row["worker_pid"], dict(row)
+                event = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'spawn_refused' "
+                    "ORDER BY id DESC LIMIT 1", (task_id,),
+                ).fetchone()
+                assert event is not None, "the refusal was not recorded"
+                payload = json.loads(event["payload"])
+                assert payload.get("infrastructure") is True, payload
+                assert payload["error"].startswith(autonomous_mod.SLOT_DIAGNOSTIC), payload
+                conn.close()
+        finally:
+            holder.terminate()
+            holder.wait(timeout=10)
+
+        # The same admission is granted once the slot is free, which is what shows
+        # the refusal above came from the slot rather than from the fixture.
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if not autonomous_mod.check_autonomous_boundary(pid=None)["worker_slot_occupied"]:
+                break
+            time.sleep(0.05)
+        freed = _admission()
+        assert freed["admission"] == "admitted", freed
+        assert freed["launcher_cgroup"].startswith(boundary.aggregate_group + "/"), freed
+
+
+@pytest.mark.platforms("linux")
+def test_losing_the_native_admission_race_is_infrastructure(monkeypatch):
+    """The loser of a native admission race must not spend the card's retry.
+
+    Two dispatchers can pass the capacity precheck before either scope activates;
+    systemd admits exactly one, and the loser's launcher exits before bootstrap --
+    which looks exactly like a crash. The manager's own state separates them: OUR
+    scope absent while the slot is held is a refused activation, our scope
+    populated is a real bootstrap failure, and an empty slice is a real failure.
+    """
+    from hermes_cli import kanban_worker_runtime as kwr
+    from tools import process_registry as process_registry_mod
+
+    scope = "hermes-worker-kanban-t_card-run-7.scope"
+
+    def _held_by_another(**_kwargs):
+        return {
+            "worker_scopes": ["/fixture/hermes-worker-someone-else.scope"],
+            "worker_slot_occupied": True,
+        }
+
+    monkeypatch.setattr(
+        process_registry_mod, "autonomous_boundary_inventory", _held_by_another,
+    )
+    with pytest.raises(autonomous_mod.AutonomousWorkerBusy):
+        kwr._raise_if_launch_refused(scope, 1)
+
+    # Inventory, not admission: a populated scope of OURS means the child really did
+    # start and really did fail, so it is not infrastructure. Admission would refuse
+    # here too -- on the caller's own scope -- which is why the two are separate.
+    def _our_scope_is_live(**_kwargs):
+        return {"worker_scopes": [f"/fixture/{scope}"], "worker_slot_occupied": True}
+
+    monkeypatch.setattr(
+        process_registry_mod, "autonomous_boundary_inventory", _our_scope_is_live,
+    )
+    assert kwr._raise_if_launch_refused(scope, 1) is None, (
+        "a populated scope of ours means the bootstrap really failed"
+    )
+
+    def _slot_free(**_kwargs):
+        return {"worker_scopes": [], "worker_slot_occupied": False}
+
+    monkeypatch.setattr(
+        process_registry_mod, "autonomous_boundary_inventory", _slot_free,
+    )
+    assert kwr._raise_if_launch_refused(scope, 1) is None
+
+    def _drift(**_kwargs):
+        raise autonomous_mod.AutonomousResourceUnavailable("boundary drifted")
+
+    monkeypatch.setattr(process_registry_mod, "autonomous_boundary_inventory", _drift)
+    with pytest.raises(autonomous_mod.AutonomousResourceUnavailable):
+        kwr._raise_if_launch_refused(scope, 1)

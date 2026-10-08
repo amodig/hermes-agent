@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -870,6 +871,61 @@ def _leader_is_ours(pgid, expected_start) -> bool:
         return True
 
 
+def _stop_owned_scope(proc) -> None:
+    """Stop the transient systemd scope OWNED by this Popen, if any.
+
+    A scoped foreground command can leave double-forked descendants alive in its
+    cgroup after the leader exits; the scope is the authoritative reap for them
+    (the process-group signal only covers the group and reparented escapees are
+    outside it). Only the unit recorded on THIS Popen is stopped, so a timeout or
+    cancellation can never stop another command's scope.
+    """
+    unit = getattr(proc, "_hermes_scope_unit", "")
+    if not unit:
+        return
+    with contextlib.suppress(Exception):
+        # Lazy: tools.process_registry imports this module at import time.
+        from tools.process_registry import _stop_systemd_unit
+
+        _stop_systemd_unit(unit)
+
+
+def _autonomous_worker_scope(argv, *, unit_suffix):
+    """``(argv, unit_name)`` for a top-level supervised-gateway foreground command.
+
+    Returns ``(argv, "")`` unchanged for an interactive shell and for a command
+    already running inside an admitted worker: those inherit the scope they
+    already have and must not consume the single autonomous slot a second time. It
+    also returns unchanged, with a once-per-process warning, when the host has no
+    autonomous boundary at all -- see
+    :func:`tools.process_registry.warn_autonomous_boundary_missing_once`.
+    """
+    if platform.system() != "Linux":
+        return argv, ""
+    # Lazy: tools.process_registry imports this module at import time.
+    from tools import autonomous_resources
+    from tools.process_registry import (
+        _is_supervised_gateway_process,
+        autonomous_worker_scope_argv,
+        require_autonomous_boundary,
+        warn_autonomous_boundary_missing_once,
+    )
+
+    if not _is_supervised_gateway_process():
+        return argv, ""
+    try:
+        require_autonomous_boundary()
+        return autonomous_worker_scope_argv(argv, unit_suffix=unit_suffix)
+    except autonomous_resources.AutonomousWorkerBusy:
+        raise  # a real hold: the slot exists and is taken
+    except autonomous_resources.AutonomousResourceUnavailable as exc:
+        # No boundary on this host: refusing would not contain anything (the
+        # gateway is already in the interactive slice on such a host) and would only
+        # take the terminal away from the human. Run as before this change, loudly.
+        warn_autonomous_boundary_missing_once(str(exc))
+        return argv, ""
+
+
 def _kill_process_group_posix(proc) -> None:
     """TERM the group, wait, KILL, then sweep setsid escapees. Descendants are
     snapshotted BEFORE the first signal — once the wrapper dies they reparent to
@@ -1049,12 +1105,31 @@ class LocalEnvironment(BaseEnvironment):
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
+        # A top-level foreground command in the supervised gateway is autonomous
+        # work: it runs in the autonomous worker slice, so a build, test run or
+        # shell snippet cannot OOM the gateway that owns the messaging control
+        # plane, and its scope is what reaps double-forked descendants on
+        # timeout/cancellation. Interactive sessions and commands already inside
+        # an admitted worker are returned unchanged.
+        args, scope_unit = _autonomous_worker_scope(
+            args, unit_suffix=f"local-{os.getpid()}-{uuid.uuid4().hex[:8]}",
+        )
+        run_env = _make_run_env(self.env)
+        if scope_unit:
+            # Same derivation process_registry uses for its scoped spawns: the
+            # capability probe proved the bus reachable, so the child must carry
+            # the same two variables or the wrapper fails on a reachable bus.
+            from tools.process_registry import systemd_user_bus_env
+
+            run_env = systemd_user_bus_env(run_env)
         proc = subprocess.Popen(
-            args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
+            args, text=True, env=run_env, encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             start_new_session=True, cwd=self.cwd,
             **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
+        if scope_unit:
+            proc._hermes_scope_unit = scope_unit
         if not _IS_WINDOWS:
             with contextlib.suppress(ProcessLookupError):
                 proc._hermes_pgid = os.getpgid(proc.pid)
@@ -1069,7 +1144,8 @@ class LocalEnvironment(BaseEnvironment):
         return proc
 
     def _kill_process(self, proc):
-        """Kill the entire process group (all children)."""
+        """Kill the entire process group (all children), then the owned scope."""
+        _stop_owned_scope(proc)
         try:
             (_kill_process_windows if _IS_WINDOWS else _kill_process_group_posix)(proc)
         except OSError:  # ProcessLookupError / PermissionError included
@@ -1080,6 +1156,7 @@ class LocalEnvironment(BaseEnvironment):
         """SIGKILL the whole group with no TERM grace or wait: the caller os._exit()s next."""
         if _IS_WINDOWS:  # already a forced tree kill
             return self._kill_process(proc)
+        _stop_owned_scope(proc)
         with contextlib.suppress(OSError):
             pgid = getattr(proc, "_hermes_pgid", None) or os.getpgid(proc.pid)
             # PID-reuse guard (#43044): never SIGKILL a group whose leader's start time

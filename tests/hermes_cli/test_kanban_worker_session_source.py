@@ -54,6 +54,9 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
         claim_lock=None,
         claim_expires=None,
         tenant=None,
+        # A granted worker always has a run; the launch contract refuses to place one
+        # that does not.
+        current_run_id=1,
     )
     workspace = str(tmp_path / "ws")
     os.makedirs(workspace, exist_ok=True)
@@ -120,3 +123,14 @@ def test_retag_gate_is_per_board(db, tmp_path):
 
     assert db.retag_kanban_worker_sessions(str(board_a)) == 1
     assert db.retag_kanban_worker_sessions(str(board_b)) == 1
+
+
+from tests._fixtures.autonomous_boundary import stub_scope_capability  # noqa: F401
+
+
+@pytest.fixture(autouse=True)
+def _scope_capability_for_argv_assertions(stub_scope_capability):
+    """These tests assert the argv/env a gateway worker launch would use, never a
+    real scope: a runner with no user bus cannot create one, and the runtime now
+    refuses an autonomous child it cannot place."""
+    return stub_scope_capability

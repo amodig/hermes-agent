@@ -22,6 +22,7 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
+import dataclasses
 
 
 # ---------------------------------------------------------------------------
@@ -702,7 +703,9 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     try:
         tid = kb.create_task(conn, title="skill-loading test",
                              assignee="some-profile")
-        task = kb.get_task(conn, tid)
+        # A granted worker always has a run; the launch contract refuses to place a
+        # task without one.
+        task = dataclasses.replace(kb.get_task(conn, tid), current_run_id=1)
         workspace = kbw.resolve_workspace(task)
         pid = kbd._default_spawn(task, str(workspace))
         assert pid == 99999
@@ -1604,3 +1607,14 @@ def test_dead_worker_reap_reads_the_log_of_the_dispatching_board(kanban_home):
         assert "no reassignment operation" in (task.last_failure_error or "")
     finally:
         conn.close()
+
+
+from tests._fixtures.autonomous_boundary import stub_scope_capability  # noqa: F401
+
+
+@pytest.fixture(autouse=True)
+def _scope_capability_for_argv_assertions(stub_scope_capability):
+    """These tests assert the argv/env a gateway worker launch would use, never a
+    real scope: a runner with no user bus cannot create one, and the runtime now
+    refuses an autonomous child it cannot place."""
+    return stub_scope_capability

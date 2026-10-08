@@ -250,6 +250,9 @@ from tests._fixtures.live_system_guard import (  # noqa: F401 — _live_system_g
     _LIVE_SYSTEM_GUARD_BYPASS_MARK,
     _live_system_guard,
 )
+from tests._fixtures.autonomous_boundary import (  # noqa: F401 — registers here
+    _stub_autonomous_boundary,
+)
 from tests._fixtures.platform_gating import _platforms_gate_reason, _reject_contradictory_platform_marks
 
 

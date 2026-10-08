@@ -21,6 +21,8 @@ from typing import Optional
 from typing import TYPE_CHECKING
 import uuid
 
+from tools.autonomous_resources import WORKER_SCOPE_PREFIX, WORKER_SCOPE_SUFFIX
+
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
 
@@ -522,35 +524,75 @@ def _open_worker_log(task: Task, board: Optional[str]):
     rotate_bytes, backup_count = dispatcher.worker_log_rotation_config()
     dispatcher._rotate_worker_log(log_path, rotate_bytes, backup_count)
     return open(log_path, "ab")
+def _worker_scope_suffix(task: Task, *, preparation_id: Optional[str]) -> str:
+    """Transient scope suffix for one worker launch.
+
+    Shared by the launcher and by the refused-activation check, so the latter looks
+    for the exact unit the launch would have created instead of guessing a name.
+    """
+    if task.current_run_id is None:
+        # Pre-claim workers use the preparation id as their temporary scope;
+        # the grant binds the eventual run before Kanban tools are available.
+        return (
+            f"kanban-{task.id}-preparation-{preparation_id}"
+            if preparation_id
+            else f"kanban-{task.id}-run-missing"
+        )
+    return f"kanban-{task.id}-run-{task.current_run_id}"
+
+
+def _raise_if_launch_refused(scope_unit: str, returncode: Optional[int]) -> None:
+    """Raise infrastructure when the launcher died because its scope was refused.
+
+    Two dispatchers can pass the capacity precheck before either scope activates;
+    systemd admits exactly one, and the loser's launcher exits non-zero before
+    bootstrap. That card never ran, so it must not spend a retry -- but the same
+    exit code also describes a genuine bootstrap crash, which must still be a real
+    failure. The difference is the manager's own state: a refused activation leaves
+    OUR scope absent while the slot is held by the winner, whereas a real crash
+    leaves our scope populated. Nothing here reads the exit code or stderr text.
+    """
+    from tools import autonomous_resources as resources
+    from tools.process_registry import _IS_LINUX, autonomous_boundary_inventory
+
+    if not _IS_LINUX:
+        return
+    # INVENTORY, not admission: admission refuses on ANY populated worker scope --
+    # including this launch's own -- so it cannot tell "the slot was held by someone
+    # else" from "our scope exists and our child died inside it".
+    try:
+        report = autonomous_boundary_inventory()
+    except resources.AutonomousResourceUnavailable as exc:
+        raise resources.AutonomousResourceUnavailable(
+            f"{exc}; worker launcher exited before bootstrap ({returncode})"
+        ) from exc
+    if any(path.endswith("/" + scope_unit) for path in report.get("worker_scopes", [])):
+        return
+    if report.get("worker_slot_occupied"):
+        raise resources.AutonomousWorkerBusy(
+            "autonomous worker slot occupied: the worker launcher was refused before "
+            f"bootstrap ({returncode}); {scope_unit} was not created"
+        )
+
+
 def _restart_safe_worker_argv(
     task: Task, command: list[str], *, preparation_id: Optional[str] = None,
 ) -> list[str]:
     """Wrap a managed-gateway worker in the shared restart-safe scope."""
     from tools.process_registry import restart_safe_gateway_child_argv
 
+    suffix = _worker_scope_suffix(task, preparation_id=preparation_id)
+    scoped = restart_safe_gateway_child_argv(
+        command, unit_suffix=suffix, require_restart_safe_scope=True, outlives_parent=True,
+    )
     if task.current_run_id is None:
-        # Pre-claim workers use the preparation id as their temporary scope;
-        # the grant binds the eventual run before Kanban tools are available.
-        suffix = (
-            f"kanban-{task.id}-preparation-{preparation_id}"
-            if preparation_id
-            else f"kanban-{task.id}-run-missing"
-        )
-        scoped = restart_safe_gateway_child_argv(
-            command, unit_suffix=suffix, require_restart_safe_scope=True, outlives_parent=True,
-        )
         if scoped.mode != "in_process" and not preparation_id:
             raise RuntimeError(
                 "cannot create restart-safe systemd scope for Kanban worker: "
                 "the claimed task has no current run id"
             )
         return scoped.argv
-
-    return restart_safe_gateway_child_argv(
-        command,
-        unit_suffix=f"kanban-{task.id}-run-{task.current_run_id}",
-        require_restart_safe_scope=True, outlives_parent=True,
-    ).argv
+    return scoped.argv
 
 
 def _worker_project_plugins_enabled(env: dict[str, str]) -> bool:
@@ -619,6 +661,15 @@ def _default_spawn(
     _check_not_stopping(should_stop, task.id)
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
+
+    # Before ANY preparation: a host that cannot place an autonomous worker must not
+    # burn a prepared runtime generation, a resolved workspace, or (via the caller)
+    # a board claim on it. The scope wrapper re-checks at launch time, and the
+    # bootstrap PID is verified again before the grant.
+    from tools.process_registry import _IS_LINUX, require_autonomous_boundary
+
+    if _IS_LINUX:
+        require_autonomous_boundary(standalone_dispatch=True)
 
     from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
 
@@ -766,9 +817,15 @@ def _default_spawn(
         # scope exists: a drain observed here costs one prepared generation and
         # nothing else.
         _check_not_stopping(should_stop, task.id)
+        deferred_preparation_id = preparation_id if defer_grant else None
+        worker_scope_unit = (
+            f"{WORKER_SCOPE_PREFIX}"
+            f"{_worker_scope_suffix(task, preparation_id=deferred_preparation_id)}"
+            f"{WORKER_SCOPE_SUFFIX}"
+        )
         cmd = dispatcher._restart_safe_worker_argv(
             task, generation.command_prefix + cli_args,
-            preparation_id=preparation_id if defer_grant else None,
+            preparation_id=deferred_preparation_id,
         )
         from tools.process_registry import systemd_user_bus_env
         env = systemd_user_bus_env(env)
@@ -804,6 +861,7 @@ def _default_spawn(
                 if payload is not None:
                     break
             if proc.poll() is not None:
+                _raise_if_launch_refused(worker_scope_unit, proc.returncode)
                 raise RuntimeError(f"worker exited before bootstrap ({proc.returncode})")
             time.sleep(0.05)
         if payload is None:
@@ -814,6 +872,13 @@ def _default_spawn(
         )
         actual = early
         _worker_pid_aliases[proc.pid] = early.pid
+        if _IS_LINUX:
+            # The worker must already be in its own scope inside the autonomous
+            # worker slice: continuing its imports inside the gateway's cgroup
+            # would put an autonomous worker next to the interactive session.
+            from tools.autonomous_resources import check_autonomous_worker
+
+            check_autonomous_worker(early.pid)
         write_runtime_generation_owner(
             generation.root, pid=early.pid, start_time=early.start_time,
         )
@@ -867,6 +932,14 @@ def _default_spawn(
         def _grant(run_id: int, claim_lock: Optional[str]) -> None:
             if proc is None or proc.stdin is None:
                 raise RuntimeError("worker bootstrap pipe unavailable")
+            if _IS_LINUX:
+                # Last barrier before the worker may touch Kanban: the claim is
+                # already taken, so a boundary that drifted during bootstrap must
+                # stop the grant here. The caller releases the ungranted claim and
+                # keeps the task identity intact.
+                from tools.autonomous_resources import check_autonomous_worker
+
+                check_autonomous_worker(actual.pid)
             suffix = json.dumps({"run_id": run_id, "claim_lock": claim_lock})[1:].encode("utf-8")
             _write_worker_grant(grant_fd, grant_prefix + suffix + b"\n")
             # The buffered import handshake was already flushed. Only close an

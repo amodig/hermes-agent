@@ -169,6 +169,15 @@ def test_execute_code_after_update_imports_third_party_deps(updated, provider):
 
 
 def test_kanban_worker_spawned_after_update_boots(updated, provider):
+    """A worker spawned by ``hermes kanban dispatch`` after an update uses the PM interpreter.
+
+    The dispatch is a real standalone CLI invocation, which now refuses to start
+    outside the reviewed autonomous boundary, so this needs a host that presents a
+    free one. Without it the refusal is the product working.
+    """
+    from tests._fixtures.autonomous_slice import require_free_boundary
+
+    require_free_boundary()
     sb, mark = updated["sb"], _marks(updated["logs"])
     n = len(provider.main_requests())
     log = sb.root / "kanban-dispatch.log"

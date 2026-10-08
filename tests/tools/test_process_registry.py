@@ -2158,6 +2158,15 @@ class TestSystemdCgroupIsolation:
             "gateway.status.get_running_pid",
             lambda *, cleanup_stale=False: os.getpid(),
         )
+        # Admission reads THIS host's systemd state. These tests exercise spawn
+        # plumbing, so the boundary verdict is stubbed explicitly here rather than
+        # reading a live slice — and only on success paths; tests asserting that a
+        # refused launch does not run unscoped override this themselves. The real
+        # boundary decisions live in tests/tools/test_autonomous_resources.py.
+        monkeypatch.setattr(
+            "tools.process_registry.require_autonomous_boundary",
+            lambda **_kwargs: {"aggregate": {"cgroup": "/fixture/autonomous.slice"}},
+        )
 
     def _fake_popen_capture(self):
         """Return (fake_popen, captured) where captured["argv"] gets the
@@ -2213,6 +2222,11 @@ class TestSystemdCgroupIsolation:
         assert argv[unit_idx + 1] == f"hermes-worker-{session.id}", (
             argv
         )  # _build_systemd_scope_argv uses bare name
+        # Autonomous work names its slice explicitly: --slice-inherit would place
+        # the scope where the CALLER already is, which is the shared interactive
+        # slice this contract exists to leave.
+        assert "--slice=autonomous-workers.slice" in argv, argv
+        assert "--slice-inherit" not in argv, argv
         properties = [
             argv[index + 1]
             for index, value in enumerate(argv[:-1])
@@ -2243,33 +2257,79 @@ class TestSystemdCgroupIsolation:
         # The session must record the unit name so kill_process can stop it.
         assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
 
-    def test_falls_back_when_systemd_run_unavailable(self, registry, monkeypatch, _gateway_identity):
-        """Under a supervisor but without systemd-run, fall back to the
-        legacy ``start_new_session=True`` path (worker shares the gateway
-        cgroup)."""
+    @pytest.mark.parametrize("failure", ["no-boundary", "no-scope-capability"])
+    def test_runs_unscoped_with_a_warning_when_the_host_has_no_boundary(
+        self, registry, monkeypatch, _gateway_identity, caplog, failure,
+    ):
+        """A host with no autonomous boundary must not lose its terminal.
+
+        Refusing the command would not contain anything: on such a host the gateway
+        already sits in the interactive slice, so the work is uncontained either way.
+        Run in the gateway's own cgroup, as before this contract, and say so once.
+        """
+        import tools.process_registry as pr
+
         fake_popen, captured = self._fake_popen_capture()
 
         monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
-        monkeypatch.setattr(
-            "tools.process_registry._systemd_run_user_scope_available",
-            lambda: False,
-        )
+        monkeypatch.setattr("tools.process_registry._gateway_scope_missing_warned", False)
         monkeypatch.setattr(
             "gateway.restart.is_gateway_supervisor_process",
             lambda environ=None: True,
         )
+        if failure == "no-boundary":
+            def _unavailable(**_kwargs):
+                raise pr.AutonomousResourceUnavailable(
+                    "autonomous resource boundary unavailable: autonomous aggregate: "
+                    "not installed"
+                )
+
+            monkeypatch.setattr(pr, "require_autonomous_boundary", _unavailable)
+        else:
+            monkeypatch.setattr(
+                "tools.process_registry._systemd_run_user_scope_available", lambda: False,
+            )
+
+        with (
+            patch("subprocess.Popen", side_effect=fake_popen),
+            patch("threading.Thread", return_value=MagicMock()),
+            patch.object(registry, "_write_checkpoint"),
+            caplog.at_level("WARNING", logger=pr.logger.name),
+        ):
+            for _ in range(2):
+                registry.spawn_local("echo hello", cwd="/tmp")
+
+        assert captured["argv"] == ["/bin/bash", "-lic", "set +m; echo hello"], captured["argv"]
+        assert captured["start_new_session"] is True
+        warnings = [r for r in caplog.records if "no autonomous memory boundary" in r.getMessage()]
+        assert len(warnings) == 1, [r.getMessage() for r in caplog.records]
+
+    def test_a_busy_slot_still_refuses(self, registry, monkeypatch, _gateway_identity):
+        """With the boundary PRESENT, a taken slot is a real hold: never run unscoped."""
+        import tools.process_registry as pr
+
+        fake_popen, captured = self._fake_popen_capture()
+
+        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
+        monkeypatch.setattr(
+            "gateway.restart.is_gateway_supervisor_process",
+            lambda environ=None: True,
+        )
+
+        def _busy(**_kwargs):
+            raise pr.AutonomousWorkerBusy("autonomous worker slot occupied: held")
+
+        monkeypatch.setattr(pr, "require_autonomous_boundary", _busy)
 
         with (
             patch("subprocess.Popen", side_effect=fake_popen),
             patch("threading.Thread", return_value=MagicMock()),
             patch.object(registry, "_write_checkpoint"),
         ):
-            registry.spawn_local("echo hello", cwd="/tmp")
+            with pytest.raises(pr.AutonomousWorkerBusy):
+                registry.spawn_local("echo hello", cwd="/tmp")
 
-        argv = captured["argv"]
-        # No systemd-run wrapping — direct shell invocation.
-        assert argv == ["/bin/bash", "-lic", "set +m; echo hello"], argv
-        assert captured["start_new_session"] is True
+        assert captured == {}, "a refused executor must never reach subprocess.Popen"
 
     def test_falls_back_when_not_under_supervisor(self, registry, monkeypatch):
         """CLI mode (no supervisor) must NOT wrap in a systemd scope even if
@@ -3178,19 +3238,17 @@ def test_model_not_found_notice_absent_when_fallback_chain_configured(monkeypatc
 
 @pytest.mark.platforms("linux")
 @pytest.mark.parametrize("slice_inherit", [False, True])
-@pytest.mark.parametrize("required", [False, True])
 @pytest.mark.parametrize("caller_slice", [False, True])
-def test_systemd_scope_capabilities_preserve_isolation_on_legacy_hosts(
-    monkeypatch, slice_inherit, required, caller_slice,
-):
-    """Lacking slice inheritance must not disable restart-safe worker scopes."""
+def test_legacy_scope_route_still_honours_slice_inheritance(monkeypatch, slice_inherit, caller_slice):
+    """The non-autonomous scope route keeps ``--slice-inherit`` where the host has it.
+
+    Autonomous work no longer depends on this capability (see the sibling test),
+    but the capability probes and any non-autonomous caller must be unchanged."""
     import tools.process_registry as pr
 
     monkeypatch.setattr(shutil, "which", lambda _name, **_kwargs: "/usr/bin/systemd-run")
     monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", None)
     monkeypatch.setattr(pr, "_SLICE_INHERIT_SUPPORTED", None)
-    monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: True)
-    monkeypatch.setenv("INVOCATION_ID", "fixture")
     calls = []
 
     def systemd_run(argv, **_kwargs):
@@ -3204,19 +3262,60 @@ def test_systemd_scope_capabilities_preserve_isolation_on_legacy_hosts(
         )
 
     monkeypatch.setattr(pr.subprocess, "run", systemd_run)
-    command = ["/bin/sh", "-c", "exit 0"]
-    ordinary = pr._build_systemd_scope_argv(command, unit_suffix="ordinary")
+    ordinary = pr._build_systemd_scope_argv(["/bin/sh", "-c", "exit 0"], unit_suffix="ordinary")
     assert "--scope" in ordinary
     assert ("--slice-inherit" in ordinary) is (slice_inherit and caller_slice)
     assert any(part.startswith("MemoryMax=") for part in ordinary)
 
+    # Only the inherit capability probe creates a scope here; building argv does not.
+    assert len([argv for argv in calls if "--help" in argv]) == 1
+    assert len([argv for argv in calls if "--scope" in argv]) == int(slice_inherit)
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("slice_inherit", [False, True])
+@pytest.mark.parametrize("required", [False, True])
+def test_autonomous_gateway_child_names_the_worker_slice_regardless_of_inherit(
+    monkeypatch, slice_inherit, required,
+):
+    """A host without ``--slice-inherit`` must still place autonomy correctly.
+
+    The old contract fell back to a scope in the default ``app.slice`` when the
+    flag was missing — the interactive slice this whole boundary exists to leave.
+    Naming the slice directly removes that fallback and the probe it needed."""
+    import tools.process_registry as pr
+
+    monkeypatch.setattr(shutil, "which", lambda _name, **_kwargs: "/usr/bin/systemd-run")
+    monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", None)
+    monkeypatch.setattr(pr, "_SLICE_INHERIT_SUPPORTED", None)
+    monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: True)
+    monkeypatch.setattr(
+        pr, "require_autonomous_boundary",
+        lambda **_kwargs: {"aggregate": {"cgroup": "/fixture/autonomous.slice"}},
+    )
+    monkeypatch.setenv("INVOCATION_ID", "fixture")
+    calls = []
+
+    def systemd_run(argv, **_kwargs):
+        calls.append(argv)
+        if "--help" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=b"--scope --slice-inherit" if slice_inherit else b"--scope",
+            )
+        assert "--scope" in argv
+        # A caller whose own slice is invisible to the manager is exactly the case
+        # --slice-inherit used to fail on; an explicit --slice= must not care.
+        return subprocess.CompletedProcess(argv, 1 if "--slice-inherit" in argv else 0)
+
+    monkeypatch.setattr(pr.subprocess, "run", systemd_run)
     dispatch = pr.restart_safe_gateway_child_argv(
-        command, unit_suffix="worker", require_restart_safe_scope=required,
+        ["/bin/sh", "-c", "exit 0"], unit_suffix="worker", require_restart_safe_scope=required,
     )
     assert dispatch.mode == "scoped"
-    assert "--scope" in dispatch.argv
-    assert ("--slice-inherit" in dispatch.argv) is (slice_inherit and caller_slice)
+    assert "--slice=autonomous-workers.slice" in dispatch.argv, dispatch.argv
+    assert "--slice-inherit" not in dispatch.argv, dispatch.argv
     assert any(part.startswith("MemoryMax=") for part in dispatch.argv)
 
-    assert len([argv for argv in calls if "--help" in argv]) == 1
-    assert len([argv for argv in calls if "--scope" in argv]) == 1 + int(slice_inherit)
+    # Exactly one scope is created and no inherit capability is probed any more.
+    assert not [argv for argv in calls if "--help" in argv]
+    assert len([argv for argv in calls if "--scope" in argv]) == 1

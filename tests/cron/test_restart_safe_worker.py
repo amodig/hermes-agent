@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -76,10 +77,27 @@ def test_genuine_external_worker_crash_is_recovered_unknown(
     assert recovered["status"] == "unknown"
 
 
+def _stub_autonomous_boundary(monkeypatch, process_registry):
+    """Stand in for the host's autonomous boundary in launch-plumbing tests.
+
+    These tests run on the runner, not inside a deployed autonomous aggregate, so
+    the verdict is stubbed EXPLICITLY per test rather than read from whatever the
+    machine happens to have. The real decisions live in
+    tests/tools/test_autonomous_resources.py, the disposable transient slices in
+    tests/_fixtures/autonomous_slice.py, and dotfiles'
+    scripts/check_autonomous_isolation.py.
+    """
+    monkeypatch.setattr(
+        process_registry, "require_autonomous_boundary",
+        lambda **_kwargs: {"aggregate": {"cgroup": "/fixture/autonomous.slice"}},
+    )
+
+
 @pytest.mark.platforms("linux")
 def test_restart_safe_gateway_child_fails_closed_when_required(monkeypatch):
     import tools.process_registry as process_registry
 
+    _stub_autonomous_boundary(monkeypatch, process_registry)
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
     monkeypatch.setenv("INVOCATION_ID", "managed-service")
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
@@ -93,26 +111,29 @@ def test_restart_safe_gateway_child_fails_closed_when_required(monkeypatch):
 
 
 @pytest.mark.platforms("linux")
-def test_restart_safe_gateway_child_degrades_without_scope(monkeypatch, caplog):
-    """Managed gateway + no user bus degrades to a mode distinct from the
-    in-process passthrough, and warns once per process, not per dispatch."""
+@pytest.mark.parametrize("required", [False, True])
+def test_restart_safe_gateway_child_refuses_without_a_scope(monkeypatch, required):
+    """No user scope means no launch, whichever policy flag the caller passes.
+
+    A scope-less autonomous child would consume no ``ConcurrencyHardMax`` slot and
+    would not appear in the live worker scopes the boundary check reads, so the
+    next autonomous launch could start beside it. ``require_restart_safe_scope``
+    only selects which infrastructure error surfaces.
+    """
     import tools.process_registry as process_registry
 
+    _stub_autonomous_boundary(monkeypatch, process_registry)
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
     monkeypatch.setenv("INVOCATION_ID", "managed-service")
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
-    monkeypatch.setattr(process_registry, "_scope_degraded_warned", False)
 
-    command = ["python", "worker.py"]
-    with caplog.at_level("WARNING", logger=process_registry.logger.name):
-        for _ in range(2):
-            dispatch = process_registry.restart_safe_gateway_child_argv(
-                command, unit_suffix="cron-job-1", require_restart_safe_scope=False
-            )
-    assert dispatch.mode == "degraded"
-    assert dispatch.argv == command
-    warnings = [r for r in caplog.records if "without restart-safe cgroup isolation" in r.getMessage()]
-    assert len(warnings) == 1
+    with pytest.raises(
+        process_registry.RestartSafeScopeUnavailable, match="restart-safe systemd scope",
+    ):
+        process_registry.restart_safe_gateway_child_argv(
+            ["python", "worker.py"], unit_suffix="cron-job-1",
+            require_restart_safe_scope=required,
+        )
 
 
 def test_restart_safe_gateway_child_is_unchanged_outside_managed_gateway(monkeypatch):
@@ -598,30 +619,33 @@ def test_launch_external_worker_stays_in_process_outside_managed_gateway(
 
 
 @pytest.mark.platforms("linux")
-def test_launch_external_worker_degrades_by_default_with_real_helper(
+def test_launch_external_worker_refuses_without_a_scope(
     tmp_path, monkeypatch,
 ):
-    """Managed gateway + no bus, through the real helper and real config
-    plumbing: the default still Popens the job externally with the #101940
-    handoff (never in-process)."""
+    """Managed gateway + no bus, through the real helper and real config plumbing:
+    the fire is refused BEFORE the handoff, so no payload, no ack and no Popen is
+    created from an uncertain attempt."""
     import cron.scheduler as scheduler
     import tools.process_registry as process_registry
 
     job = {"id": "job-1", "execution_id": "exec-1", "prompt": "work"}
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(scheduler, "load_config_readonly", lambda: {})
+    _stub_autonomous_boundary(monkeypatch, process_registry)
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
     monkeypatch.setenv("INVOCATION_ID", "managed-service")
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
     spawned, payloads, handoff, _get = _stub_external_worker_launch(scheduler, monkeypatch)
 
-    assert scheduler._launch_external_cron_worker(job) is True
-    # Direct command, NOT a systemd-run wrapper — but still an external Popen.
-    assert "systemd-run" not in " ".join(spawned[0][0])
-    assert spawned[0][1]["start_new_session"] is True
-    assert payloads[0]["job"]["id"] == "job-1"
-    handoff.assert_called_once_with("exec-1")
+    with pytest.raises(
+        process_registry.RestartSafeScopeUnavailable, match="restart-safe systemd scope",
+    ):
+        scheduler._launch_external_cron_worker(job)
+    assert spawned == [], "a refused fire must not spawn anything"
+    assert payloads == [], "a refused fire must not write a payload"
+    handoff.assert_not_called()
     assert not (tmp_path / "cron/external-workers/exec-1.json").exists()
+    assert not (tmp_path / "cron/external-workers/exec-1.ready").exists()
 
 
 def test_launch_external_worker_pins_the_gateways_tree_on_pythonpath(
@@ -1070,20 +1094,30 @@ def test_lost_execution_start_cas_prevents_side_effects(monkeypatch):
 
 
 @pytest.mark.platforms("linux")
-@pytest.mark.live_system_guard_bypass
+@pytest.mark.live_system_guard_bypass  # creates disposable transient slices/units
 def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
     tmp_path, monkeypatch
 ):
+    """A cron worker survives its gateway's restart, inside a DISPOSABLE boundary.
+
+    The production slices and the production gateway are never touched: the
+    fixture creates its own transient aggregate and worker slice, retargets the
+    runtime contract at them, and lets the REAL boundary validator and the REAL
+    native slot decide. It also records the two facts that make the slot load
+    bearing -- while the survivor's scope is live a replacement is refused, and
+    the slot returns only after the whole scope has emptied.
+    """
     import cron.delivery_queue as delivery_queue
     import cron.executions as executions
     import cron.scheduler as scheduler
     from cron.jobs import create_job, use_cron_store
     from gateway.config import Platform, PlatformConfig
     from gateway.status import _pid_exists
-    from tools import process_registry
+    from hermes_cli.kanban_runtime import process_start_time
+    from tools import autonomous_resources, process_registry
+    from tests._fixtures import autonomous_slice as fixture
 
-    if not process_registry._systemd_run_user_scope_available():
-        pytest.skip("systemd-run --user --scope is unavailable on this host")
+    fixture.require_user_bus()
 
     home = tmp_path / "profile"
     scripts_dir = home / "scripts"
@@ -1131,93 +1165,156 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
 
     adapter.send = send
     gateway_config = Mock()
-    gateway_config.platforms = {
-        Platform.TELEGRAM: PlatformConfig(enabled=True),
-    }
+    gateway_config.platforms = {Platform.TELEGRAM: PlatformConfig(enabled=True)}
     gateway_config.get_home_channel = lambda _platform: None
-    monkeypatch.setattr(
-        "gateway.config.load_gateway_config", lambda: gateway_config
-    )
-    monkeypatch.setattr(
-        scheduler, "load_config", lambda: {"cron": {"wrap_response": False}}
-    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: gateway_config)
+    monkeypatch.setattr(scheduler, "load_config", lambda: {"cron": {"wrap_response": False}})
     replacement_loop = asyncio.new_event_loop()
-    replacement_thread = threading.Thread(
-        target=replacement_loop.run_forever,
-        daemon=True,
-    )
+    replacement_thread = threading.Thread(target=replacement_loop.run_forever, daemon=True)
     replacement_thread.start()
     deadline = time.monotonic() + 2
     while not replacement_loop.is_running() and time.monotonic() < deadline:
         time.sleep(0.01)
     assert replacement_loop.is_running()
 
-    harness = (
-        "import json, os, pathlib, time\n"
-        f"os.environ['HERMES_HOME'] = {str(home)!r}\n"
-        "os.environ['INVOCATION_ID'] = 'restart-fixture'\n"
-        "from cron import scheduler\n"
-        "from tools import process_registry\n"
-        "process_registry._is_supervised_gateway_process = lambda: True\n"
-        f"job = json.loads(pathlib.Path({str(payload)!r}).read_text())\n"
-        "if not scheduler.run_one_job(job, adapters=None, loop=None):\n"
-        "    raise SystemExit('worker was not isolated')\n"
-        f"pathlib.Path({str(launched)!r}).write_text('returned')\n"
-    )
-    parent = subprocess.Popen([sys.executable, "-c", harness])
     worker_pid = None
-    try:
-        deadline = time.monotonic() + 10
-        current = None
-        while time.monotonic() < deadline:
-            if parent.poll() is not None:
-                pytest.fail(f"gateway fixture exited early with {parent.returncode}")
-            current = executions.latest_execution(job["id"])
-            if started.exists() and current and current.get("pid") != os.getpid():
-                break
-            time.sleep(0.05)
-        assert started.exists()
-        assert current is not None
-        execution = current
-        worker_pid = int(current["pid"])
-        assert not launched.exists(), "handoff returned before execution completed"
+    worker_start_time = None
+    # A cold Hermes worker boots into this slice, so it gets the production memory
+    # shape rather than the sleeper-sized default budgets.
+    with fixture.disposable_boundary(high_bytes=fixture.HERMES_BOOT_HIGH_BYTES, max_bytes=fixture.HERMES_BOOT_MAX_BYTES, swap_bytes=fixture.HERMES_BOOT_SWAP_BYTES) as boundary:
+        harness = (
+            "import json, os, pathlib\n"
+            f"os.environ['HERMES_HOME'] = {str(home)!r}\n"
+            "os.environ['INVOCATION_ID'] = 'restart-fixture'\n"
+            "from cron import scheduler\n"
+            "from tools import autonomous_resources, process_registry\n"
+            "# This fixture's units, never the production slices. The runtime reads\n"
+            "# the contract at call time, so the checks and the scope target follow.\n"
+            "autonomous_resources._LIVE_CONTRACT = autonomous_resources._Contract(\n"
+            f"    **{boundary.contract_kwargs()!r})\n"
+            "process_registry._is_supervised_gateway_process = lambda: True\n"
+            f"job = json.loads(pathlib.Path({str(payload)!r}).read_text())\n"
+            "if not scheduler.run_one_job(job, adapters=None, loop=None):\n"
+            "    raise SystemExit('worker was not isolated')\n"
+            f"pathlib.Path({str(launched)!r}).write_text('returned')\n"
+        )
+        harness_log = tmp_path / "harness.log"
+        harness_out = harness_log.open("wb")
+        parent = boundary.launch(
+            [sys.executable, "-c", harness], stdout=harness_out, stderr=subprocess.STDOUT,
+        )
+        try:
+            def _diagnostics() -> str:
+                harness_out.flush()
+                workers_dir = home / "cron" / "external-workers"
+                detail = "\n".join(
+                    f"--- {path.name} ---\n{path.read_text(errors='replace')}"
+                    for path in sorted(workers_dir.iterdir())
+                ) if workers_dir.is_dir() else "(no external-worker directory)"
+                return ("harness output:\n" + harness_log.read_text(errors="replace")
+                        + "\nexternal-worker files:\n" + detail)
 
-        # Replacing a managed gateway kills its old process tree. The active
-        # cron owner must remain in its transient scope and keep the same PID.
-        # NOTE: this stops the HARNESS SUBPROCESS, it does not restart a systemd
-        # service. Real surviving-a-service-restart proof lives in
-        # tests/hermes_cli/test_kanban_gateway_restart_handoff.py::
-        # test_worker_survives_a_real_user_service_restart.
-        parent.terminate()
-        parent.wait(timeout=5)
-        assert _pid_exists(worker_pid)
+            # Wait for the EXTERNAL WORKER's placement, not merely for the probe
+            # file: the durable row first carries the launcher's pid and is adopted
+            # by the worker afterwards, and ``systemd-run --scope`` moves that
+            # process into its scope asynchronously. Polling the real cgroup is what
+            # makes this independent of which of the two lands first.
+            deadline = time.monotonic() + 120
+            current = None
+            worker_pid = None
+            worker_cgroup = ""
+            while time.monotonic() < deadline:
+                if parent.poll() is not None:
+                    pytest.fail(
+                        f"gateway fixture exited early with {parent.returncode};\n"
+                        + _diagnostics()
+                    )
+                current = executions.latest_execution(job["id"])
+                if started.exists() and current and current.get("pid"):
+                    candidate = int(current["pid"])
+                    try:
+                        group = fixture.cgroup_of(candidate)
+                    except FileNotFoundError:
+                        group = ""
+                    if group.startswith(boundary.workers_group + "/"):
+                        worker_pid, worker_cgroup = candidate, group
+                        break
+                time.sleep(0.05)
+            assert worker_pid is not None, (
+                "the cron worker was never recorded inside "
+                f"{boundary.workers_group}; last row={dict(current) if current else None}\n"
+                + _diagnostics()
+            )
+            execution = current
+            worker_start_time = process_start_time(worker_pid)
+            assert not launched.exists(), "handoff returned before execution completed"
 
-        release.write_text("go", encoding="utf-8")
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            row = delivery_queue.get_status(execution["id"])
-            if row and row["status"] == "pending":
-                scheduler.drain_delivery_queue(
-                    {Platform.TELEGRAM: adapter}, replacement_loop
-                )
-            current = executions.latest_execution(job["id"])
-            if current and current["status"] == "completed":
-                break
-            time.sleep(0.05)
-        assert executions.latest_execution(job["id"])["status"] == "completed"
-        assert side_effect.read_text(encoding="utf-8").splitlines() == ["once"]
-        assert delivery_queue.get_status(execution["id"])["status"] == "delivered"
-        assert len(sent) == 1
-        assert "completed" in sent[0][0]
-    finally:
-        replacement_loop.call_soon_threadsafe(replacement_loop.stop)
-        replacement_thread.join(timeout=2)
-        replacement_loop.close()
-        if parent.poll() is None:
+            # Replacing a managed gateway kills its own service tree. The active
+            # cron owner lives in the worker slice, so it must remain: same PID,
+            # same start time, same cgroup.
             parent.terminate()
             parent.wait(timeout=5)
-        if worker_pid is not None and _pid_exists(worker_pid):
-            os.kill(worker_pid, signal.SIGKILL)
+            assert _pid_exists(worker_pid)
+            assert process_start_time(worker_pid) == worker_start_time
+
+            # The single native slot is the admission authority: while the
+            # survivor is live, a replacement top-level worker is refused.
+            second = subprocess.run(
+                ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+                 f"--slice={boundary.workers_unit}",
+                 "--unit", f"hermes-worker-replacement-{boundary.token}.scope",
+                 "--", "/bin/true"],
+                capture_output=True, text=True, timeout=30,
+                env=fixture.user_bus_env(),
+            )
+            assert second.returncode != 0, "a second native worker was admitted"
+            assert "Concurrency limit" in second.stderr, second.stderr
+
+            release.write_text("go", encoding="utf-8")
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                row = delivery_queue.get_status(execution["id"])
+                if row and row["status"] == "pending":
+                    scheduler.drain_delivery_queue({Platform.TELEGRAM: adapter}, replacement_loop)
+                current = executions.latest_execution(job["id"])
+                if current and current["status"] == "completed":
+                    break
+                time.sleep(0.05)
+            assert executions.latest_execution(job["id"])["status"] == "completed"
+            assert side_effect.read_text(encoding="utf-8").splitlines() == ["once"]
+            assert delivery_queue.get_status(execution["id"])["status"] == "delivered"
+            assert len(sent) == 1
+            assert "completed" in sent[0][0]
+
+            # Only after the whole scope has emptied does the slot come back.
+            deadline = time.monotonic() + 20
+            freed = None
+            while time.monotonic() < deadline:
+                freed = subprocess.run(
+                    ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+                     f"--slice={boundary.workers_unit}",
+                     "--unit", f"hermes-worker-after-{boundary.token}.scope",
+                     "--", "/bin/true"],
+                    capture_output=True, text=True, timeout=30,
+                    env=fixture.user_bus_env(),
+                )
+                if freed.returncode == 0:
+                    break
+                time.sleep(0.1)
+            assert freed is not None and freed.returncode == 0, (
+                f"the worker slot never freed: {freed.stderr}"
+            )
+        finally:
+            replacement_loop.call_soon_threadsafe(replacement_loop.stop)
+            replacement_thread.join(timeout=2)
+            replacement_loop.close()
+            if parent.poll() is None:
+                parent.terminate()
+                parent.wait(timeout=5)
+            if worker_pid is not None and _pid_exists(worker_pid):
+                os.kill(worker_pid, signal.SIGKILL)
+            with contextlib.suppress(Exception):
+                harness_out.close()
 
 
 def test_post_handoff_waiter_failure_records_bookkeeping_without_alert(

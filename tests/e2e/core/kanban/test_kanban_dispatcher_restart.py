@@ -28,6 +28,7 @@ from collections import Counter
 
 import pytest
 
+from tests._fixtures.autonomous_slice import require_free_boundary
 from tests.e2e.core.kanban._helpers import PY, Board, pid_alive, wait_until
 from tests.fakes.fake_llm_provider import FakeLLMServer, Text, ToolCall
 
@@ -65,7 +66,15 @@ def _event_count(board: Board, kind: str) -> int:
 
 
 def _kill_dispatcher_after(board: Board, kind: str | None) -> None:
-    """Launch one real dispatch tick and SIGKILL it once a new ``kind`` event lands (None: at once)."""
+    """Launch one real dispatch tick and SIGKILL it once a new ``kind`` event lands (None: at once).
+
+    A standalone ``hermes kanban dispatch`` now refuses to start outside the reviewed
+    autonomous boundary, so the scenario needs one -- and this module SIGKILLs the
+    dispatcher mid-tick, which cannot be reproduced faithfully by wrapping it in a
+    transient scope. Skip where the host does not present a free boundary; the
+    refusal is the product working, not a failure of this scenario.
+    """
+    require_free_boundary()
     before = _event_count(board, kind) if kind else 0
     proc = subprocess.Popen(
         [PY, "-m", "hermes_cli.main", "kanban", "dispatch", "--json"], cwd=str(board.root),
