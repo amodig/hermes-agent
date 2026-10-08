@@ -103,6 +103,14 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
 
 @pytest.fixture()
 def moved_review_dispatch(isolated_kanban_home, monkeypatch, tmp_path):
+    # Patch before importing kanban_db: kanban_runtime sweeps the runtime
+    # storage root at import time (%LOCALAPPDATA%\hermes on Windows = the real
+    # home), so the redirect must already be in place (kanban_conformance_fixture
+    # does the same).
+    from hermes_cli import kanban_runtime_generation as generation
+    monkeypatch.setattr(
+        generation, "_runtime_storage_root", lambda: tmp_path / "runtime-storage",
+    )
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_db_dispatch as kbd
