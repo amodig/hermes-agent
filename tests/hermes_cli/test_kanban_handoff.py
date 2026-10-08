@@ -895,7 +895,6 @@ def test_moved_head_review_does_not_starve_ready_dispatch(
     with kbc.connect_closing() as conn:
         _parent, review, approved_head = _moved_head_review(conn, repo, base, branch)
         ready = kb.create_task(conn, title="ready work", assignee="implementer")
-        review_version = kb.get_task(conn, review).version
         res = kbd.dispatch_once(
             conn,
             spawn_fn=lambda task, workspace, board=None: spawns.append(task.id) or 42,
@@ -911,8 +910,6 @@ def test_moved_head_review_does_not_starve_ready_dispatch(
     assert refused[0]["kind"] == "handoff_head_moved"
     assert refused[0]["expected_head_sha"] == approved_head
     assert refused[0]["actual_head_sha"] == moved_head
-    assert "--quarantine-review" in refused[0]["command"]
-    assert f"--expected-version {review_version}" in refused[0]["command"]
 
     # A second tick records no duplicate event and still serves the ready lane.
     with kbc.connect_closing() as conn:

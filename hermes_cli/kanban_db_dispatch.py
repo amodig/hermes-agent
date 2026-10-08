@@ -2566,23 +2566,35 @@ def _note_handoff_refusal(
     command = ""
     if lane == "review":
         recovery = "Quarantine this unclaimed review pending operator recovery. " + recovery
+        argv = ["hermes", "kanban"]
+        database_pin = None
         pin = os.environ.get("HERMES_KANBAN_DB", "").strip()
         if pin and (_kb._explicit_board_slug(board) is None
                     or _kb._explicit_board_intent_pinned()):
             # A gateway machine-flow fence can make the pin outrank its slug.
             # Preserve that database even when replayed outside the fence.
-            argv = ["env", f"HERMES_KANBAN_DB={_kb.kanban_db_path(board).resolve()}",
-                    "hermes", "kanban"]
-        else:
-            argv = ["hermes", "kanban"]
-            if board:
-                argv.extend(["--board", board])
+            database_pin = str(_kb.kanban_db_path(board).resolve())
+        elif board:
+            argv.extend(["--board", board])
         argv.extend([
             "block", task_id, "--quarantine-review", "--expected-version", str(version),
             "--kind", "capability", "--reason",
             "Immutable parent handoff is not startable; quarantine pending operator recovery",
         ])
-        command = shlex.join(argv)
+        if sys.platform == "win32":
+            command = "& " + " ".join("'" + arg.replace("'", "''") + "'" for arg in argv)
+            if database_pin is not None:
+                quoted_pin = "'" + database_pin.replace("'", "''") + "'"
+                command = (
+                    "& { $previous = $env:HERMES_KANBAN_DB; try { "
+                    f"$env:HERMES_KANBAN_DB = {quoted_pin}; {command}"
+                    " } finally { $env:HERMES_KANBAN_DB = $previous } }"
+                )
+            recovery += " Run this command in PowerShell on Windows."
+        else:
+            if database_pin is not None:
+                argv = ["env", f"HERMES_KANBAN_DB={database_pin}", *argv]
+            command = shlex.join(argv)
     result.handoff_refused.append({
         "task_id": task_id, **error, "recovery": recovery, "command": command,
     })

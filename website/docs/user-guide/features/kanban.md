@@ -544,13 +544,15 @@ and completed with an immutable head.
 
 ### Unstartable review quarantine
 
-A `REVIEW` card whose recorded immutable head is no longer what the reviewer was
-handed — the branch/worktree moved, or the recorded workspace is missing or
-dirty — cannot start. The dispatcher reports the refusal and moves on, so an
-ineligible review never starves READY work. An explicit `reviewed_parent`
-handoff is verified against its own recorded workspace and branch — resolving
-that workspace's HEAD only when no branch was recorded — never the review card's
-assigned branch.
+A `REVIEW` card whose recorded immutable head no longer matches its branch or
+worktree head, or whose recorded workspace cannot be resolved, cannot start.
+The dispatcher reports the refusal and moves on, so an ineligible review never
+starves READY work. An explicit `reviewed_parent` handoff is verified against
+its own recorded workspace and branch — resolving that workspace's HEAD only
+when no branch was recorded — never the review card's assigned branch.
+For this explicit provenance, a dirty recorded workspace also refuses as
+`handoff_unverifiable`; ordinary implementation handoffs retain their existing
+exact-head check without a claim-time dirty-worktree check.
 
 `hermes kanban dispatch --dry-run --json` predicts the same refusal without
 writing anything: each `handoff_refused` entry carries `task_id`, the guard
@@ -563,11 +565,13 @@ creates no run, prepares no workspace, and spawns no worker; the rest of a
 dry-run tick still performs its existing reclaim/promotion bookkeeping. The
 human-readable output prints the same refusals.
 
-For a named board, the command includes `--board <slug>`. When dispatch instead
-uses an effective `HERMES_KANBAN_DB` pin, it emits
+For a named board, the command includes `--board <slug>`. On POSIX, an effective
+`HERMES_KANBAN_DB` pin produces
 `env HERMES_KANBAN_DB=<absolute-path> hermes kanban block ...` without a board
-override, preserving the refused task's database outside the gateway's routing
-fence. Copy the whole command, including that environment assignment.
+override. Windows commands are rendered for PowerShell; a pinned command
+temporarily sets `$env:HERMES_KANBAN_DB` inside a `try`/`finally` block and
+restores its previous value. Copy the whole command so it retains the refused
+task's database outside the gateway's routing fence.
 
 Quarantine the single unclaimed card by copying `command`, or:
 

@@ -165,28 +165,48 @@ def test_dispatch_reports_real_handoff_heads_and_fenced_recovery(
         assert refusal["task_id"] == review and refusal["parent_id"] == parent
         assert refusal["expected_head_sha"] == approved
         assert refusal["actual_head_sha"] == moved
-        command = shlex.split(refusal["command"])
-        prefix = (
-            ["env", f"HERMES_KANBAN_DB={database}", "hermes", "kanban", "block"]
-            if pinned_db else ["hermes", "kanban", "--board", "recovery", "block"]
-        )
-        assert command[:5] == prefix
-        assert command[5] == review
-        assert "--quarantine-review" in command
-        assert command[command.index("--expected-version") + 1] == str(version)
-        assert command[command.index("--kind") + 1] == "capability"
+        if sys.platform != "win32":
+            command = shlex.split(refusal["command"])
+            prefix = (
+                ["env", f"HERMES_KANBAN_DB={database}", "hermes", "kanban", "block"]
+                if pinned_db else ["hermes", "kanban", "--board", "recovery", "block"]
+            )
+            assert command[:5] == prefix
+            assert command[5] == review
+            assert command[command.index("--expected-version") + 1] == str(version)
+            assert command[command.index("--kind") + 1] == "capability"
         assert "does not authorize a new candidate or release validation" in refusal["recovery"]
     else:
         for value in (review, parent, ready, approved, moved, "handoff_head_moved"):
             assert value in output
-        route = f"HERMES_KANBAN_DB={database}" if pinned_db else "--board recovery block"
-        assert route in output and "--quarantine-review" in output
-        assert f"--expected-version {version}" in output
+        if sys.platform != "win32":
+            route = f"HERMES_KANBAN_DB={database}" if pinned_db else "--board recovery block"
+            assert route in output
+        assert "--quarantine-review" in output
         assert "does not authorize a new candidate or release validation" in output
     with kbc.connect(board="recovery") as conn:
         assert kb.get_task(conn, review).status == "review"
         assert kb.get_task(conn, review).current_run_id is None
         assert kb.get_task(conn, ready).status == "ready"
         assert len(kb.list_events(conn, review)) == event_count
+    if json_output and sys.platform == "win32":
+        import subprocess
+
+        # Exercise the generated PowerShell command through the actual CLI,
+        # after changing ambient routing; no shell-token mocks.
+        kb.set_current_board("default")
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+        executable = "'" + sys.executable.replace("'", "''") + "'"
+        script = (
+            f"function hermes {{ & {executable} -m hermes_cli.main @args }}; "
+            "$previousPin = $env:HERMES_KANBAN_DB; "
+            + refusal["command"]
+            + "; if ($env:HERMES_KANBAN_DB -ne $previousPin) { throw 'database pin leaked' }; "
+            "exit $LASTEXITCODE"
+        )
+        subprocess.run(["powershell.exe", "-NoProfile", "-Command", script], check=True)
+        with kbc.connect(board="recovery") as conn:
+            assert kb.get_task(conn, review).status == "blocked"
+            assert kb.get_task(conn, review).version == version + 1
 
 

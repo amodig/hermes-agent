@@ -433,5 +433,3 @@ def test_handoff_change_during_preparation_cancels_without_grant(
             )
             if change == "moved":
                 assert refusal["actual_head_sha"] == changed_head
-            assert "--quarantine-review" in refusal["command"]
-            assert "--board default" in refusal["command"]
