@@ -101,9 +101,10 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
 
 
 
+@pytest.mark.parametrize("pinned_db", [False, True])
 @pytest.mark.parametrize("json_output", [False, True])
 def test_dispatch_reports_real_handoff_heads_and_fenced_recovery(
-    isolated_kanban_home, monkeypatch, tmp_path, capsys, json_output,
+    isolated_kanban_home, monkeypatch, tmp_path, capsys, json_output, pinned_db,
 ):
     from hermes_cli import kanban as kb_cli
     from hermes_cli import kanban_db as kb
@@ -146,10 +147,15 @@ def test_dispatch_reports_real_handoff_heads_and_fenced_recovery(
         ready = kb.create_task(conn, title="ready work", assignee="implementer")
         version = kb.get_task(conn, review).version
         event_count = len(kb.list_events(conn, review))
+    database = kb.kanban_db_path(board="recovery").resolve()
+    if pinned_db:
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(database))
     args = argparse.Namespace(
-        dry_run=True, max=1, failure_limit=2, json=json_output, board=None,
+        dry_run=True, max=1, failure_limit=2, json=json_output,
+        board="default" if pinned_db else None,
     )
-    assert kb_cli._cmd_dispatch(args) == 0
+    with kb.pin_first_board_resolution():
+        assert kb_cli._cmd_dispatch(args) == 0
     output = capsys.readouterr().out
     if json_output:
         payload = json.loads(output)
@@ -160,7 +166,11 @@ def test_dispatch_reports_real_handoff_heads_and_fenced_recovery(
         assert refusal["expected_head_sha"] == approved
         assert refusal["actual_head_sha"] == moved
         command = shlex.split(refusal["command"])
-        assert command[:5] == ["hermes", "kanban", "--board", "recovery", "block"]
+        prefix = (
+            ["env", f"HERMES_KANBAN_DB={database}", "hermes", "kanban", "block"]
+            if pinned_db else ["hermes", "kanban", "--board", "recovery", "block"]
+        )
+        assert command[:5] == prefix
         assert command[5] == review
         assert "--quarantine-review" in command
         assert command[command.index("--expected-version") + 1] == str(version)
@@ -169,7 +179,8 @@ def test_dispatch_reports_real_handoff_heads_and_fenced_recovery(
     else:
         for value in (review, parent, ready, approved, moved, "handoff_head_moved"):
             assert value in output
-        assert "--board recovery block" in output and "--quarantine-review" in output
+        route = f"HERMES_KANBAN_DB={database}" if pinned_db else "--board recovery block"
+        assert route in output and "--quarantine-review" in output
         assert f"--expected-version {version}" in output
         assert "does not authorize a new candidate or release validation" in output
     with kbc.connect(board="recovery") as conn:

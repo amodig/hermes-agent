@@ -563,6 +563,12 @@ creates no run, prepares no workspace, and spawns no worker; the rest of a
 dry-run tick still performs its existing reclaim/promotion bookkeeping. The
 human-readable output prints the same refusals.
 
+For a named board, the command includes `--board <slug>`. When dispatch instead
+uses an effective `HERMES_KANBAN_DB` pin, it emits
+`env HERMES_KANBAN_DB=<absolute-path> hermes kanban block ...` without a board
+override, preserving the refused task's database outside the gateway's routing
+fence. Copy the whole command, including that environment assignment.
+
 Quarantine the single unclaimed card by copying `command`, or:
 
 ```bash
