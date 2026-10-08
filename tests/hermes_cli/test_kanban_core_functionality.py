@@ -22,6 +22,7 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
+import dataclasses
 
 
 # ---------------------------------------------------------------------------
@@ -702,7 +703,9 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     try:
         tid = kb.create_task(conn, title="skill-loading test",
                              assignee="some-profile")
-        task = kb.get_task(conn, tid)
+        # A granted worker always has a run; the launch contract refuses to place a
+        # task without one.
+        task = dataclasses.replace(kb.get_task(conn, tid), current_run_id=1)
         workspace = kbw.resolve_workspace(task)
         pid = kbd._default_spawn(task, str(workspace))
         assert pid == 99999

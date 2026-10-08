@@ -1212,6 +1212,9 @@ class TestSharedBoardPaths:
             claim_expires=None,
             tenant=None,
             branch_name="wt/t_dispatch_env",
+            # A granted worker always has a run; the launch contract refuses to place
+            # one that does not.
+            current_run_id=1,
         )
         kbd._default_spawn(task, str(tmp_path / "ws"))
 

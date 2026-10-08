@@ -54,6 +54,9 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
         claim_lock=None,
         claim_expires=None,
         tenant=None,
+        # A granted worker always has a run; the launch contract refuses to place one
+        # that does not.
+        current_run_id=1,
     )
     workspace = str(tmp_path / "ws")
     os.makedirs(workspace, exist_ok=True)

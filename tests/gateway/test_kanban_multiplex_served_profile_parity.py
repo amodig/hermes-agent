@@ -19,6 +19,7 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_notify as kbn
 from hermes_constants import get_hermes_home
+import dataclasses
 
 
 @pytest.fixture
@@ -50,7 +51,9 @@ def test_worker_for_served_profile_gets_its_own_env_and_toolset_pin(served, monk
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="t", assignee="alpha")
-        task = kb.get_task(conn, tid)
+        # A granted worker always has a run; the launch contract refuses to place a
+        # task without one.
+        task = dataclasses.replace(kb.get_task(conn, tid), current_run_id=1)
     finally:
         conn.close()
 

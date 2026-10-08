@@ -309,6 +309,9 @@ class TestWorkerSpawnEnv:
             claim_lock=None,
             claim_expires=None,
             tenant=None,
+            # A granted worker always has a run; the launch contract refuses to place
+            # one that does not, so the fixture models the real call.
+            current_run_id=1,
         )
 
         kbd._default_spawn(task, str(fresh_home / "ws"), board="spawntest")
