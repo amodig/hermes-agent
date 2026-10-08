@@ -587,6 +587,9 @@ claim or run, a changed state, or a now-valid handoff refuses (the error starts
 `review quarantine refused`) and mutates nothing. `kanban_unblock` later
 restores the review lane; it is not approval, and a still-moved candidate stays
 unclaimable and keeps its validator gated.
+Operator quarantine also applies to an unclaimed `goal_mode` review. It does
+not weaken ordinary goal-mode block restrictions: an active worker cannot
+use quarantine to exit its goal loop or bypass the completion judge.
 
 ### Recommended handoff evidence
 

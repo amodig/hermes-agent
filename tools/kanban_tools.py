@@ -923,8 +923,11 @@ def _handle_block(args: dict, **kw) -> str:
         # loop instead. Restrict goal_mode tasks to the kinds that represent a genuine external blocker the
         # worker cannot resolve itself; `capability` and `transient` (or an unset kind) route back through
         # kanban_complete, which the judge now gates.
+        # Operator quarantine has no goal-loop run to escape; block_task fences
+        # it to an unclaimed REVIEW with a current immutable-handoff refusal.
         task = kb.get_task(conn, tid)
-        _check(not (task and task.goal_mode and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS),
+        _check(not (task and task.goal_mode and quarantine_review is not True
+                    and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS),
                f"goal_mode tasks can only block with kind in "
                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
                f"finished or cannot proceed for another reason, call kanban_complete instead — "

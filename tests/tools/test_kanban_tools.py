@@ -432,20 +432,64 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
-def test_block_quarantine_tool_cannot_quarantine_its_active_worker(worker_env):
-    from hermes_cli import kanban_db_connect as kbc
+def test_goal_mode_review_quarantine_requires_operator_context(
+    worker_env, monkeypatch, tmp_path,
+):
+    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+    from tests.hermes_cli.test_kanban_handoff import _repo, _commit
     from tools import kanban_tools  # noqa: F401 — ensure registration
     from tools.registry import registry
 
+    handler = registry.get_entry("kanban_block").handler
     with kbc.connect_closing() as conn:
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET goal_mode = 1 WHERE id = ?", (worker_env,))
         before = list(conn.iterdump())
-    result = json.loads(registry.get_entry("kanban_block").handler({
+    ordinary = json.loads(handler({
+        "task_id": worker_env, "kind": "capability", "reason": "operator recovery",
+    }))
+    assert "goal_mode tasks can only block" in ordinary["error"]
+    worker = json.loads(handler({
         "task_id": worker_env, "quarantine_review": True, "expected_version": 1,
         "kind": "capability", "reason": "operator recovery",
     }))
-    assert "cannot use expected_run_id" in result["error"]
+    assert "cannot use expected_run_id" in worker["error"]
     with kbc.connect_closing() as conn:
         assert list(conn.iterdump()) == before
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+    repo, base, branch = _repo(tmp_path)
+    with kbc.connect_closing() as conn:
+        candidate = kb.create_task(
+            conn, title="goal implementation", assignee="implementer", goal_mode=True,
+            workspace_kind="worktree", workspace_path=str(repo), branch_name=branch,
+            lifecycle_contract={
+                "kind": "code", "review_mode": "same_card",
+                "reviewer": "reviewer", "validation_required": False,
+            },
+        )
+        run = kb.claim_task(conn, candidate)
+        head = _commit(repo)
+        assert kb.request_review(
+            conn, candidate, expected_run_id=run.current_run_id,
+            summary="implemented", metadata={"base_sha": base, "head_sha": head},
+        )
+        _commit(repo, "src/moved.py")
+        version = kb.get_task(conn, candidate).version
+        handoff = kb.latest_handoff(conn, candidate)
+        runs = list(conn.execute("SELECT * FROM task_runs WHERE task_id = ?", (candidate,)))
+    operator = json.loads(handler({
+        "task_id": candidate, "quarantine_review": True, "expected_version": version,
+        "kind": "capability", "reason": "immutable candidate moved",
+    }))
+    assert operator["ok"] is True
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, candidate)
+        assert task.status == "blocked" and task.goal_mode
+        assert task.version == version + 1 and task.current_run_id is None
+        assert kb.latest_handoff(conn, candidate) == handoff
+        assert list(conn.execute("SELECT * FROM task_runs WHERE task_id = ?", (candidate,))) == runs
 
 
 def test_schedule_parks_current_worker_with_reason(worker_env):
