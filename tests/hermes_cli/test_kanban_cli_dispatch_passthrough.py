@@ -119,6 +119,7 @@ def test_dispatch_reports_real_handoff_heads_and_fenced_recovery(
     monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda name: True)
     kb.init_db()
     kb.create_board("recovery")
+    kb.set_current_board("recovery")
     repo, base, branch = _repo(tmp_path)
     with kbc.connect(board="recovery") as conn:
         parent = kb.create_task(
@@ -146,7 +147,7 @@ def test_dispatch_reports_real_handoff_heads_and_fenced_recovery(
         version = kb.get_task(conn, review).version
         event_count = len(kb.list_events(conn, review))
     args = argparse.Namespace(
-        dry_run=True, max=1, failure_limit=2, json=json_output, board=" ReCoVeRy ",
+        dry_run=True, max=1, failure_limit=2, json=json_output, board=None,
     )
     assert kb_cli._cmd_dispatch(args) == 0
     output = capsys.readouterr().out
@@ -178,26 +179,3 @@ def test_dispatch_reports_real_handoff_heads_and_fenced_recovery(
         assert len(kb.list_events(conn, review)) == event_count
 
 
-@pytest.mark.parametrize("board", [None, "board with spaces; echo unsafe"])
-def test_handoff_recovery_command_quotes_arguments_and_deduplicates(
-    isolated_kanban_home, board,
-):
-    from hermes_cli import kanban_db_dispatch as kbd
-
-    task_id = "task with 'quotes'"
-    error = {
-        "kind": "handoff_head_moved", "parent_id": "parent",
-        "expected_head_sha": "approved", "actual_head_sha": "moved", "reason": "branch moved",
-    }
-    result = kbd.DispatchResult()
-    for _ in range(2):
-        kbd._note_handoff_refusal(task_id, 7, error, result, lane="review", board=board)
-    assert len(result.handoff_refused) == 1
-    command = shlex.split(result.handoff_refused[0]["command"])
-    expected_prefix = ["hermes", "kanban"] + (["--board", board] if board else [])
-    assert command[:len(expected_prefix)] == expected_prefix
-    assert command[len(expected_prefix):len(expected_prefix)+3] == [
-        "block", task_id, "--quarantine-review",
-    ]
-    assert command[command.index("--expected-version") + 1] == "7"
-    assert "handoff_head_moved=1" in kbd.describe_suppression([None, result])

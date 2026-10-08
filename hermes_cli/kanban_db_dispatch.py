@@ -3307,9 +3307,14 @@ def run_daemon(
             # Re-resolved every tick (config load is mtime-cached) so operator
             # edits apply without a restart.
             max_in_progress = resolve_max_in_progress(configured_max_in_progress())
-            with contextlib.closing(_kbc.connect()) as conn:
+            # Pin emitted recovery commands (handoff_refused[].command) to the
+            # board connect() actually opens; HERMES_KANBAN_DB pins a path
+            # that may not map to a board slug, so skip resolution then.
+            _board = None if os.environ.get("HERMES_KANBAN_DB") else _kb.get_current_board()
+            with contextlib.closing(_kbc.connect(board=_board)) as conn:
                 res = dispatch_once(
                     conn,
+                    board=_board,
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,

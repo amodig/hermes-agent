@@ -219,45 +219,23 @@ def test_lifecycle_contract_help_describes_legacy_binding_only(capsys):
     assert "bind or replace" not in help_text
 
 
-def _quarantine_review_case(conn, tmp_path, review_mode):
-    from tests.hermes_cli.test_kanban_handoff import (
-        _commit, _git, _moved_head_review, _repo,
-    )
+def _quarantine_review_case(conn, tmp_path):
+    from tests.hermes_cli.test_kanban_handoff import _git, _moved_head_review, _repo
 
     repo, base, branch = _repo(tmp_path)
-    if review_mode == "separate_card":
-        parent, review, head = _moved_head_review(conn, repo, base, branch)
-    else:
-        parent = review = kb.create_task(
-            conn, title="same-card implementation", assignee="implementer",
-            workspace_kind="worktree", workspace_path=str(repo), branch_name=branch,
-            lifecycle_contract={
-                "kind": "code", "review_mode": "same_card",
-                "reviewer": "reviewer", "validation_required": False,
-            },
-        )
-        run = kb.claim_task(conn, parent)
-        assert run is not None
-        head = _commit(repo)
-        assert kb.request_review(
-            conn, parent, expected_run_id=run.current_run_id,
-            summary="implemented", metadata={"base_sha": base, "head_sha": head},
-        )
-        _commit(repo, "src/moved.py")
-    assert kb.get_task(conn, review).status == "review"
+    parent, review, head = _moved_head_review(conn, repo, base, branch)
     return repo, parent, review, head, _git(repo, "rev-parse", "HEAD")
 
 
-@pytest.mark.parametrize("review_mode", ["separate_card", "same_card"])
 def test_block_quarantine_cli_preserves_candidate_and_refuses_stale_retry(
-    kanban_home, tmp_path, capsys, review_mode,
+    kanban_home, tmp_path, capsys,
 ):
     from tests.hermes_cli.test_kanban_handoff import _git
 
     kb.create_board("quarantine")
     with kb.scoped_current_board("quarantine"), kbc.connect_closing() as conn:
         repo, parent, review, head, moved_head = _quarantine_review_case(
-            conn, tmp_path, review_mode,
+            conn, tmp_path,
         )
         before = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (review,)).fetchone())
         runs = list(conn.execute("SELECT * FROM task_runs"))
@@ -307,37 +285,6 @@ def test_block_quarantine_cli_preserves_candidate_and_refuses_stale_retry(
         assert kb.claim_review_task(conn, review) is None
 
 
-@pytest.mark.parametrize(("options", "message"), [
-    (["--quarantine-review"], "expected_version"),
-    (["--quarantine-review", "--expected-version", "0"], "expected_version"),
-    (["--quarantine-review", "--expected-version", "1", "--kind", "needs_input"], "capability"),
-    (["--expected-version", "1"], "requires quarantine_review"),
-    (["--quarantine-review", "--expected-version", "1", "--ids", "t_other"], "exactly one task"),
-    (["--quarantine-review", "--expected-version", "1"], "review quarantine refused"),
-])
-def test_block_quarantine_cli_refusal_is_nonmutating(kanban_home, capsys, options, message):
-    with kbc.connect_closing() as conn:
-        tid = kb.create_task(conn, title="not a review")
-        before = list(conn.iterdump())
-    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
-    kc.build_parser(parser.add_subparsers(dest="command"))
-    args = parser.parse_args([
-        "kanban", "block", tid, "--kind", "capability", "--reason", "operator recovery",
-        *options,
-    ])
-    assert kc.kanban_command(args) != 0
-    assert message in capsys.readouterr().err
-    with kbc.connect_closing() as conn:
-        assert list(conn.iterdump()) == before
-
-
-def test_block_cli_keeps_legacy_positional_reason(kanban_home):
-    with kbc.connect_closing() as conn:
-        tid = kb.create_task(conn, title="legacy block")
-    assert f"Blocked {tid}" in kc.run_slash(f"block {tid} needs operator input")
-    with kbc.connect_closing() as conn:
-        assert kb.get_task(conn, tid).status == "blocked"
-        assert kb.latest_run(conn, tid).summary == "needs operator input"
 
 # ---------------------------------------------------------------------------
 

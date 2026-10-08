@@ -82,6 +82,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         default_assignee = max_in_progress_per_profile = max_in_progress = None
         max_spawn = getattr(args, "max", None)
     board = kb._normalize_board_slug(getattr(args, "board", None))
+    if board is None and not os.environ.get("HERMES_KANBAN_DB"):
+        # Pin emitted recovery commands (handoff_refused[].command) to the
+        # board connect() will actually open, so a copied command still
+        # targets the right board after the operator switches boards. An
+        # explicit HERMES_KANBAN_DB path may not map to any board slug, so
+        # leave the command board-less in that case.
+        board = kb.get_current_board()
     with kbc.connect_closing(board=board) as conn:
         res = kbd.dispatch_once(
             conn,
