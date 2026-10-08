@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 import uuid
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from hermes_platform.host import facts as host_facts
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -2581,7 +2582,7 @@ def _note_handoff_refusal(
             "--kind", "capability", "--reason",
             "Immutable parent handoff is not startable; quarantine pending operator recovery",
         ])
-        if sys.platform == "win32":
+        if host_facts.os_family() == "win32":
             command = "& " + " ".join("'" + arg.replace("'", "''") + "'" for arg in argv)
             if database_pin is not None:
                 quoted_pin = "'" + database_pin.replace("'", "''") + "'"

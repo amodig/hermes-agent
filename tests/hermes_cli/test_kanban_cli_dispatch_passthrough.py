@@ -101,12 +101,8 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
 
 
 
-@pytest.mark.parametrize("pinned_db", [False, True])
-@pytest.mark.parametrize("json_output", [False, True])
-def test_dispatch_reports_real_handoff_heads_and_fenced_recovery(
-    isolated_kanban_home, monkeypatch, tmp_path, capsys, json_output, pinned_db,
-):
-    from hermes_cli import kanban as kb_cli
+@pytest.fixture()
+def moved_review_dispatch(isolated_kanban_home, monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_db_dispatch as kbd
@@ -122,7 +118,7 @@ def test_dispatch_reports_real_handoff_heads_and_fenced_recovery(
     kb.create_board("recovery")
     kb.set_current_board("recovery")
     repo, base, branch = _repo(tmp_path)
-    with kbc.connect(board="recovery") as conn:
+    with kbc.connect_closing(board="recovery") as conn:
         parent = kb.create_task(
             conn, title="implementation", assignee="implementer",
             workspace_kind="worktree", workspace_path=str(repo), branch_name=branch,
@@ -147,7 +143,26 @@ def test_dispatch_reports_real_handoff_heads_and_fenced_recovery(
         ready = kb.create_task(conn, title="ready work", assignee="implementer")
         version = kb.get_task(conn, review).version
         event_count = len(kb.list_events(conn, review))
-    database = kb.kanban_db_path(board="recovery").resolve()
+    return SimpleNamespace(
+        parent=parent, review=review, ready=ready, approved=approved, moved=moved,
+        version=version, event_count=event_count,
+        database=kb.kanban_db_path(board="recovery").resolve(),
+    )
+
+
+@pytest.mark.parametrize("pinned_db", [False, True])
+@pytest.mark.parametrize("json_output", [False, True])
+def test_dispatch_reports_real_handoff_heads_and_fenced_recovery(
+    moved_review_dispatch, monkeypatch, capsys, json_output, pinned_db,
+):
+    from hermes_cli import kanban as kb_cli, kanban_db as kb, kanban_db_connect as kbc
+    from hermes_platform.host import facts as host_facts
+
+    case = moved_review_dispatch
+    parent, review, ready = case.parent, case.review, case.ready
+    approved, moved, version = case.approved, case.moved, case.version
+    event_count = case.event_count
+    database = case.database
     if pinned_db:
         monkeypatch.setenv("HERMES_KANBAN_DB", str(database))
     args = argparse.Namespace(
@@ -165,7 +180,7 @@ def test_dispatch_reports_real_handoff_heads_and_fenced_recovery(
         assert refusal["task_id"] == review and refusal["parent_id"] == parent
         assert refusal["expected_head_sha"] == approved
         assert refusal["actual_head_sha"] == moved
-        if sys.platform != "win32":
+        if host_facts.os_family() != "win32":
             command = shlex.split(refusal["command"])
             prefix = (
                 ["env", f"HERMES_KANBAN_DB={database}", "hermes", "kanban", "block"]
@@ -179,34 +194,60 @@ def test_dispatch_reports_real_handoff_heads_and_fenced_recovery(
     else:
         for value in (review, parent, ready, approved, moved, "handoff_head_moved"):
             assert value in output
-        if sys.platform != "win32":
+        if host_facts.os_family() != "win32":
             route = f"HERMES_KANBAN_DB={database}" if pinned_db else "--board recovery block"
             assert route in output
         assert "--quarantine-review" in output
         assert "does not authorize a new candidate or release validation" in output
-    with kbc.connect(board="recovery") as conn:
+    with kbc.connect_closing(board="recovery") as conn:
         assert kb.get_task(conn, review).status == "review"
         assert kb.get_task(conn, review).current_run_id is None
         assert kb.get_task(conn, ready).status == "ready"
         assert len(kb.list_events(conn, review)) == event_count
-    if json_output and sys.platform == "win32":
-        import subprocess
 
-        # Exercise the generated PowerShell command through the actual CLI,
-        # after changing ambient routing; no shell-token mocks.
-        kb.set_current_board("default")
-        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
-        executable = "'" + sys.executable.replace("'", "''") + "'"
-        script = (
-            f"function hermes {{ & {executable} -m hermes_cli.main @args }}; "
-            "$previousPin = $env:HERMES_KANBAN_DB; "
-            + refusal["command"]
-            + "; if ($env:HERMES_KANBAN_DB -ne $previousPin) { throw 'database pin leaked' }; "
-            "exit $LASTEXITCODE"
-        )
-        subprocess.run(["powershell.exe", "-NoProfile", "-Command", script], check=True)
-        with kbc.connect(board="recovery") as conn:
-            assert kb.get_task(conn, review).status == "blocked"
-            assert kb.get_task(conn, review).version == version + 1
+
+@pytest.mark.platforms("windows")
+@pytest.mark.parametrize("pinned_db", [False, True])
+def test_powershell_recovery_replays_original_database(
+    moved_review_dispatch, monkeypatch, tmp_path, capsys, pinned_db,
+):
+    import sqlite3
+    import subprocess
+    from hermes_cli import kanban as kb_cli, kanban_db as kb, kanban_db_connect as kbc
+
+    case = moved_review_dispatch
+    database = tmp_path / "operator's pinned database.db"
+    if pinned_db:
+        with kbc.connect_closing(board="recovery") as source:
+            target = sqlite3.connect(database)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(database))
+    args = argparse.Namespace(
+        dry_run=True, max=1, failure_limit=2, json=True,
+        board="default" if pinned_db else None,
+    )
+    with kb.pin_first_board_resolution():
+        assert kb_cli._cmd_dispatch(args) == 0
+    refusal, = json.loads(capsys.readouterr().out)["handoff_refused"]
+    kb.set_current_board("default")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    executable = "'" + sys.executable.replace("'", "''") + "'"
+    script = (
+        f"function hermes {{ & {executable} -m hermes_cli.main @args }}; "
+        "$previousPin = $env:HERMES_KANBAN_DB; "
+        + refusal["command"]
+        + "; if ($env:HERMES_KANBAN_DB -ne $previousPin) { throw 'database pin leaked' }; "
+        "exit $LASTEXITCODE"
+    )
+    subprocess.run(["powershell.exe", "-NoProfile", "-Command", script], check=True)
+    with kbc.connect_closing(db_path=database if pinned_db else case.database) as conn:
+        assert kb.get_task(conn, case.review).status == "blocked"
+        assert kb.get_task(conn, case.review).version == case.version + 1
+    if pinned_db:
+        with kbc.connect_closing(board="recovery") as conn:
+            assert kb.get_task(conn, case.review).status == "review"
 
 
