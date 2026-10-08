@@ -439,6 +439,36 @@ def autonomous_worker_scope_argv(
     return scoped, unit_name
 
 
+_gateway_scope_missing_warned = False
+
+
+def warn_autonomous_boundary_missing_once(detail: str) -> None:
+    """Warn once per process that the gateway's OWN tool processes cannot be scoped.
+
+    A supervised gateway with no autonomous boundary on the host cannot place its
+    executors in ``autonomous-workers.slice``. Refusing the command would not add
+    containment -- on such a host the gateway already sits in the interactive slice,
+    so the work is uncontained either way -- it would only take the terminal away
+    from the human. Run in the gateway's own cgroup, as before this change, and say
+    so once: the fix is to deploy the reviewed policy and restart the gateway.
+
+    This is the ONLY place a gateway executor runs unscoped, and it is reachable
+    only when the boundary is absent. With the boundary present, a busy worker slot
+    still refuses: there the slot is real and taking it silently would break the
+    single-worker invariant.
+    """
+    global _gateway_scope_missing_warned
+    if _gateway_scope_missing_warned:
+        return
+    _gateway_scope_missing_warned = True
+    logger.warning(
+        "this supervised gateway has no autonomous memory boundary, so its tool "
+        "processes run in the gateway's own cgroup instead of a worker scope (%s). "
+        "Deploy the reviewed autonomous.slice / autonomous-workers.slice policy and "
+        "restart the gateway to contain them.", detail,
+    )
+
+
 def autonomous_boundary_inventory() -> dict:
     """Read-only boundary inventory: placement and occupancy, no admission.
 
@@ -1438,11 +1468,16 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # This applies to both pipe mode and the PTY path above. See #70716.
         in_supervised_gateway = _IS_LINUX and _is_supervised_gateway_process()
         if in_supervised_gateway:
-            require_autonomous_boundary()
-            scoped, session.systemd_unit = autonomous_worker_scope_argv(
-                argv, unit_suffix=unit_suffix,
-            )
-            return scoped
+            try:
+                require_autonomous_boundary()
+                scoped, session.systemd_unit = autonomous_worker_scope_argv(
+                    argv, unit_suffix=unit_suffix,
+                )
+                return scoped
+            except AutonomousWorkerBusy:
+                raise  # a real hold: the slot exists and is taken
+            except AutonomousResourceUnavailable as exc:
+                warn_autonomous_boundary_missing_once(str(exc))
         return argv
 
     @staticmethod

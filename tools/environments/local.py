@@ -895,21 +895,35 @@ def _autonomous_worker_scope(argv, *, unit_suffix):
 
     Returns ``(argv, "")`` unchanged for an interactive shell and for a command
     already running inside an admitted worker: those inherit the scope they
-    already have and must not consume the single autonomous slot a second time.
+    already have and must not consume the single autonomous slot a second time. It
+    also returns unchanged, with a once-per-process warning, when the host has no
+    autonomous boundary at all -- see
+    :func:`tools.process_registry.warn_autonomous_boundary_missing_once`.
     """
     if platform.system() != "Linux":
         return argv, ""
     # Lazy: tools.process_registry imports this module at import time.
+    from tools import autonomous_resources
     from tools.process_registry import (
         _is_supervised_gateway_process,
         autonomous_worker_scope_argv,
         require_autonomous_boundary,
+        warn_autonomous_boundary_missing_once,
     )
 
     if not _is_supervised_gateway_process():
         return argv, ""
-    require_autonomous_boundary()
-    return autonomous_worker_scope_argv(argv, unit_suffix=unit_suffix)
+    try:
+        require_autonomous_boundary()
+        return autonomous_worker_scope_argv(argv, unit_suffix=unit_suffix)
+    except autonomous_resources.AutonomousWorkerBusy:
+        raise  # a real hold: the slot exists and is taken
+    except autonomous_resources.AutonomousResourceUnavailable as exc:
+        # No boundary on this host: refusing would not contain anything (the
+        # gateway is already in the interactive slice on such a host) and would only
+        # take the terminal away from the human. Run as before this change, loudly.
+        warn_autonomous_boundary_missing_once(str(exc))
+        return argv, ""
 
 
 def _kill_process_group_posix(proc) -> None:

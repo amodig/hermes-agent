@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import subprocess
+import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +51,25 @@ UNIT_PROPERTIES = (
 )
 
 
+def supports_concurrency_hard_max() -> bool:
+    """Whether this systemd manager knows the property at all (>= 258).
+
+    Read from the root slice rather than from a fixture unit, so the answer does not
+    depend on anything this fixture creates. The ``--`` is required: the unit name
+    starts with a dash.
+    """
+    completed = _run(
+        # ``--property`` must precede the ``--``: the unit name starts with a dash,
+        # so the separator has to come last.
+        ["systemctl", "--user", "show", "--property=LoadState,ConcurrencyHardMax",
+         "--", "-.slice"],
+    )
+    properties = dict(
+        line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line
+    )
+    return properties.get("LoadState") == "loaded" and bool(properties.get("ConcurrencyHardMax"))
+
+
 def require_user_bus() -> None:
     """Skip (never pass) when the real-kernel fixture cannot run here."""
     from tools import process_registry
@@ -58,6 +78,43 @@ def require_user_bus() -> None:
         pytest.skip("disposable systemd slices require Linux")
     if not process_registry._systemd_run_user_scope_available():
         pytest.skip("systemd-run --user --scope is unavailable on this host")
+    if not supports_concurrency_hard_max():
+        pytest.skip(
+            "this systemd does not support ConcurrencyHardMax (needs >= 258), so the "
+            "native slot cannot be created here"
+        )
+
+
+def require_free_boundary() -> None:
+    """Skip unless the host presents a FREE autonomous boundary.
+
+    Autonomous dispatch refuses unless the caller is inside a deployed aggregate
+    whose single worker slot is free -- on CI, and on any undeployed or held host,
+    that is the product working correctly, not a test failure. Scenarios that drive
+    a real dispatcher (or a manual gateway with an embedded one) therefore state the
+    precondition instead of asserting against a boundary the host does not have.
+    """
+    if sys.platform != "linux":
+        pytest.skip("the autonomous boundary is Linux-only")
+    properties = {}
+    try:
+        completed = _run([
+            "systemctl", "--user", "show", "autonomous-workers.slice",
+            "--property=LoadState,ConcurrencyHardMax",
+        ])
+    except OSError:
+        pass
+    else:
+        properties = dict(
+            line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line
+        )
+    if properties.get("LoadState") != "loaded" or properties.get("ConcurrencyHardMax") != "1":
+        pytest.skip(
+            "no free autonomous boundary on this host (LoadState="
+            f"{properties.get('LoadState')!r}, ConcurrencyHardMax="
+            f"{properties.get('ConcurrencyHardMax')!r}); place this scenario inside "
+            "`systemd-run --user --scope --slice=autonomous.slice ...` before enabling it"
+        )
 
 
 def user_bus_env() -> Dict[str, str]:
@@ -294,3 +351,4 @@ def disposable_boundary(
         )
         leftover = boundary._worker_scope_units()
         assert not leftover, f"fixture worker scopes survived teardown: {leftover}"
+

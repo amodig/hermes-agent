@@ -272,6 +272,9 @@ def _quiet_wait(pred, *, timeout: float, what: str, interval: float = 1.0):
 
 def run(column: str, root: Path) -> SimpleNamespace:
     """Boot the fleet, update, let everything settle, and record what the user would see."""
+    from tests._fixtures.autonomous_slice import require_free_boundary
+
+    require_free_boundary()
     o = SimpleNamespace(column=column)
     model = Model(f"CRON-HANDOFF-{secrets.token_hex(4)}")
     with FakeLLMServer(model) as srv, X.cell(

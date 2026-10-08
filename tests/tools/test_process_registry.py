@@ -2257,36 +2257,76 @@ class TestSystemdCgroupIsolation:
         # The session must record the unit name so kill_process can stop it.
         assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
 
-    def test_refuses_when_systemd_run_unavailable(self, registry, monkeypatch, _gateway_identity):
-        """Under a supervisor but without systemd-run, the executor is REFUSED
-        rather than run inside the gateway cgroup.
+    @pytest.mark.parametrize("failure", ["no-boundary", "no-scope-capability"])
+    def test_runs_unscoped_with_a_warning_when_the_host_has_no_boundary(
+        self, registry, monkeypatch, _gateway_identity, caplog, failure,
+    ):
+        """A host with no autonomous boundary must not lose its terminal.
 
-        A gateway executor is autonomous work: falling back to a bare shell would
-        put it back next to the gateway that owns the messaging control plane, and
-        the interactive session beyond it."""
+        Refusing the command would not contain anything: on such a host the gateway
+        already sits in the interactive slice, so the work is uncontained either way.
+        Run in the gateway's own cgroup, as before this contract, and say so once.
+        """
+        import tools.process_registry as pr
+
+        fake_popen, captured = self._fake_popen_capture()
+
+        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
+        monkeypatch.setattr("tools.process_registry._gateway_scope_missing_warned", False)
+        monkeypatch.setattr(
+            "gateway.restart.is_gateway_supervisor_process",
+            lambda environ=None: True,
+        )
+        if failure == "no-boundary":
+            def _unavailable(**_kwargs):
+                raise pr.AutonomousResourceUnavailable(
+                    "autonomous resource boundary unavailable: autonomous aggregate: "
+                    "not installed"
+                )
+
+            monkeypatch.setattr(pr, "require_autonomous_boundary", _unavailable)
+        else:
+            monkeypatch.setattr(
+                "tools.process_registry._systemd_run_user_scope_available", lambda: False,
+            )
+
+        with (
+            patch("subprocess.Popen", side_effect=fake_popen),
+            patch("threading.Thread", return_value=MagicMock()),
+            patch.object(registry, "_write_checkpoint"),
+            caplog.at_level("WARNING", logger=pr.logger.name),
+        ):
+            for _ in range(2):
+                registry.spawn_local("echo hello", cwd="/tmp")
+
+        assert captured["argv"] == ["/bin/bash", "-lic", "set +m; echo hello"], captured["argv"]
+        assert captured["start_new_session"] is True
+        warnings = [r for r in caplog.records if "no autonomous memory boundary" in r.getMessage()]
+        assert len(warnings) == 1, [r.getMessage() for r in caplog.records]
+
+    def test_a_busy_slot_still_refuses(self, registry, monkeypatch, _gateway_identity):
+        """With the boundary PRESENT, a taken slot is a real hold: never run unscoped."""
         import tools.process_registry as pr
 
         fake_popen, captured = self._fake_popen_capture()
 
         monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
         monkeypatch.setattr(
-            "tools.process_registry._systemd_run_user_scope_available",
-            lambda: False,
-        )
-        monkeypatch.setattr(
             "gateway.restart.is_gateway_supervisor_process",
             lambda environ=None: True,
         )
+
+        def _busy(**_kwargs):
+            raise pr.AutonomousWorkerBusy("autonomous worker slot occupied: held")
+
+        monkeypatch.setattr(pr, "require_autonomous_boundary", _busy)
 
         with (
             patch("subprocess.Popen", side_effect=fake_popen),
             patch("threading.Thread", return_value=MagicMock()),
             patch.object(registry, "_write_checkpoint"),
         ):
-            with pytest.raises(
-                pr.AutonomousResourceUnavailable,
-                match="autonomous resource boundary unavailable",
-            ):
+            with pytest.raises(pr.AutonomousWorkerBusy):
                 registry.spawn_local("echo hello", cwd="/tmp")
 
         assert captured == {}, "a refused executor must never reach subprocess.Popen"
