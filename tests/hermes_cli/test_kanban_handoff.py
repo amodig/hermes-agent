@@ -847,3 +847,291 @@ def test_rework_review_reuses_cards_and_requires_new_head_approval(
         assert kb.get_task(conn, descendant).status == "ready"
         assert kb.latest_handoff(conn, implementation)["head_sha"] == second_head
         assert first_head != second_head
+
+
+# ---------------------------------------------------------------------------
+# Issue #51: an ineligible REVIEW must not starve READY work; the deterministic
+# handoff refusal is reported for operator recovery; event recording dedups by
+# content, not encoded key order.
+# ---------------------------------------------------------------------------
+
+
+def _moved_head_review(conn, repo: Path, base: str, branch: str):
+    """Approved separate-card review whose parent branch then moved.
+
+    Returns ``(parent, review, approved_head)`` with the review card parked
+    unclaimed in ``review`` and its immutable handoff now stale.
+    """
+    parent, review = _lane(conn, repo, branch)
+    run = kb.claim_task(conn, parent)
+    assert run is not None
+    approved_head = _commit(repo)
+    assert kb.complete_task(
+        conn,
+        parent,
+        expected_run_id=run.current_run_id,
+        summary="implemented src/changed.py",
+        metadata={"base_sha": base, "head_sha": approved_head},
+    )
+    assert kb.get_task(conn, review).status == "review"
+    _commit(repo, "src/moved.py")
+    return parent, review, approved_head
+
+
+def test_moved_head_review_does_not_starve_ready_dispatch(
+    kanban_home, tmp_path, monkeypatch, all_assignees_spawnable
+):
+    """Cap 1: the ineligible review consumes no slot; the ready card spawns."""
+    import hermes_cli.config as cfgmod
+
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    repo, base, branch = _repo(tmp_path)
+    spawns: list = []
+    with kbc.connect_closing() as conn:
+        _parent, review, approved_head = _moved_head_review(conn, repo, base, branch)
+        ready = kb.create_task(conn, title="ready work", assignee="implementer")
+        original_check = kb._parent_handoff_start_error
+        version = kb.get_task(conn, review).version
+
+        def check_after_operator_edit(connection, task_id, *, phase):
+            error = original_check(connection, task_id, phase=phase)
+            if task_id == review and kb.get_task(connection, review).version == version:
+                assert kb.update_task(
+                    connection, review, expected_version=version,
+                    reason="Operator changes the review model after the lane snapshot",
+                    model="unit-test-model",
+                )
+            return error
+
+        monkeypatch.setattr(kb, "_parent_handoff_start_error", check_after_operator_edit)
+        res = kbd.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace, board=None: spawns.append(task.id) or 42,
+            max_in_progress=1,
+        )
+        moved_head = _git(repo, "rev-parse", "HEAD")
+        events = [e for e in kb.list_events(conn, review) if e.kind == "handoff_head_moved"]
+
+    assert [task_id for task_id, *_ in res.spawned] == [ready]
+    assert len(events) == 1  # one durable record, not one per tick
+    refused = [e for e in res.handoff_refused if e["task_id"] == review]
+    assert len(refused) == 1
+    assert refused[0]["kind"] == "handoff_head_moved"
+    assert refused[0]["expected_head_sha"] == approved_head
+    assert refused[0]["actual_head_sha"] == moved_head
+    import shlex
+
+    command = shlex.split(refused[0]["command"])
+    assert command[command.index("--expected-version") + 1] == str(version + 1)
+
+    # A second tick records no duplicate event and still serves the ready lane.
+    with kbc.connect_closing() as conn:
+        assert kb.complete_task(
+            conn, ready, summary="finished eligible work",
+            expected_run_id=kb.get_task(conn, ready).current_run_id,
+        )
+        next_ready = kb.create_task(conn, title="next ready work", assignee="implementer")
+        res2 = kbd.dispatch_once(
+            conn, spawn_fn=lambda task, workspace, board=None: 42, max_in_progress=1,
+        )
+        events2 = [e for e in kb.list_events(conn, review) if e.kind == "handoff_head_moved"]
+    assert len(events2) == 1
+    assert res2.handoff_refused[0]["task_id"] == review
+    assert [task_id for task_id, *_ in res2.spawned] == [next_ready]
+
+
+def test_handoff_error_recording_dedups_by_content(kanban_home):
+    """Identical errors dedup even when the stored payload's key order differs;
+    a changed head records exactly one new event."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="card", assignee="worker")
+        error = {
+            "kind": "handoff_head_moved",
+            "parent_id": "parent-1",
+            "expected_head_sha": "aaa",
+            "actual_head_sha": "bbb",
+            "reason": "parent task branch moved after approval",
+        }
+        reordered = dict(reversed(list(error.items())))
+        assert json.dumps(reordered) != json.dumps(error, sort_keys=True)
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "handoff_head_moved", reordered)
+        with kb.write_txn(conn):
+            kb._record_parent_handoff_start_error(conn, tid, error)
+        with kb.write_txn(conn):
+            kb._record_parent_handoff_start_error(conn, tid, error)
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "handoff_head_moved"]
+        assert len(events) == 1
+
+        moved_again = {**error, "actual_head_sha": "ccc"}
+        with kb.write_txn(conn):
+            kb._record_parent_handoff_start_error(conn, tid, moved_again)
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "handoff_head_moved"]
+        assert len(events) == 2
+        assert events[-1].payload["actual_head_sha"] == "ccc"
+    # Reopening the connection (a dispatcher restart) must not reset dedup.
+    with kbc.connect_closing() as conn:
+        with kb.write_txn(conn):
+            kb._record_parent_handoff_start_error(conn, tid, moved_again)
+        assert len([e for e in kb.list_events(conn, tid) if e.kind == "handoff_head_moved"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Issue #33 (detached reviewed-parent provenance): an explicit reviewed_parent
+# handoff resolves the recorded workspace HEAD, never the review card's stale
+# assigned branch.
+# ---------------------------------------------------------------------------
+
+
+def _detached_reviewed_graph(conn, repo: Path, base: str):
+    """Implementation completed from a detached HEAD; reviewer card carries a
+    stale assigned branch; reviewer approved; tester waiting in ready.
+
+    Returns ``(implementation, reviewer, tester, approved_head)``.
+    """
+    implementation = kb.create_task(
+        conn,
+        title="implementation",
+        assignee="implementer",
+        workspace_kind="worktree",
+        workspace_path=str(repo),
+        lifecycle_contract={
+            "kind": "code",
+            "review_mode": "separate_card",
+            "reviewer": "reviewer",
+            "validation_required": True,
+        },
+    )
+    reviewer = kb.create_task(
+        conn,
+        title="review",
+        assignee="reviewer",
+        parents=[implementation],
+        workspace_kind="worktree",
+        workspace_path=str(repo),
+        branch_name="task/immutable",
+        lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
+    )
+    tester = kb.create_task(
+        conn,
+        title="validation",
+        assignee="tester",
+        parents=[reviewer],
+        lifecycle_contract={"kind": "validation", "candidate_task_id": implementation},
+    )
+    run = kb.claim_task(conn, implementation, claimer="implementer:1")
+    assert run is not None
+    _git(repo, "checkout", "--detach", "HEAD")
+    approved_head = _commit(repo, "src/detached.py")
+    assert kb.complete_task(
+        conn,
+        implementation,
+        expected_run_id=run.current_run_id,
+        summary="implemented from a detached HEAD",
+        metadata={"base_sha": base, "head_sha": approved_head},
+    )
+    handoff = kb.latest_handoff(conn, implementation)
+    assert handoff["head_sha"] == approved_head
+    assert "branch_name" not in handoff  # detached: no branch recorded
+
+    reviewer_run = kb.claim_review_task(conn, reviewer, claimer="reviewer:1")
+    assert reviewer_run is not None
+    assert kb.complete_task(
+        conn,
+        reviewer,
+        expected_run_id=reviewer_run.current_run_id,
+        verdict="APPROVE",
+        summary="review approved the detached candidate",
+        metadata={"reviewed_head_sha": approved_head},
+    )
+    assert kb.get_task(conn, tester).status == "ready"
+    reviewed = kb.latest_handoff(conn, reviewer)
+    assert reviewed.get("handoff_provenance", {}).get("kind") == "reviewed_parent"
+    return implementation, reviewer, tester, approved_head
+
+
+def test_reviewed_parent_detached_head_allows_validation_claim(kanban_home, tmp_path):
+    """The recorded workspace's detached HEAD is the approved candidate; the
+    review card's stale assigned branch must not be consulted."""
+    repo, base, branch = _repo(tmp_path)
+    with kbc.connect_closing() as conn:
+        _impl, _reviewer, tester, approved_head = _detached_reviewed_graph(conn, repo, base)
+        # The stale branch still points at the base commit, NOT the candidate.
+        assert _git(repo, "rev-parse", branch) != approved_head
+        assert _git(repo, "rev-parse", "HEAD") == approved_head
+        tester_run = kb.claim_task(conn, tester, claimer="tester:1")
+        assert tester_run is not None
+
+
+# ---------------------------------------------------------------------------
+# Issue #51 recovery: explicit CAS-fenced quarantine of an unclaimed REVIEW.
+# ---------------------------------------------------------------------------
+
+
+def test_quarantine_racing_claim_preserves_winning_run(kanban_home, tmp_path, monkeypatch):
+    import contextlib
+    import threading
+
+    repo, base, branch = _repo(tmp_path)
+    waiting = threading.Event()
+    release = threading.Event()
+    results = []
+    original_txn = kb.write_txn
+
+    @contextlib.contextmanager
+    def racing_txn(conn):
+        if threading.current_thread().name == "quarantine":
+            waiting.set()
+            assert release.wait(10)
+        with original_txn(conn):
+            yield
+
+    with kbc.connect_closing() as conn:
+        parent, review = _lane(conn, repo, branch)
+        implementation = kb.claim_task(conn, parent)
+        head = _commit(repo)
+        assert kb.complete_task(
+            conn, parent, expected_run_id=implementation.current_run_id,
+            summary="candidate", metadata={"base_sha": base, "head_sha": head},
+        )
+        version = kb.get_task(conn, review).version
+        monkeypatch.setattr(kb, "write_txn", racing_txn)
+
+        def quarantine():
+            try:
+                with kbc.connect_closing() as other:
+                    results.append(kb.block_task(
+                        other, review, reason="quarantine", kind="capability",
+                        quarantine_review=True, expected_version=version,
+                    ))
+            except BaseException as exc:
+                results.append(exc)
+
+        thread = threading.Thread(target=quarantine, name="quarantine")
+        thread.start()
+        try:
+            assert waiting.wait(10)
+            winner = kb.claim_review_task(conn, review, claimer="winning-reviewer")
+            assert winner is not None
+            _commit(repo, "src/moved.py")
+            before_events = [tuple(row) for row in conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ?", (review,)
+            )]
+        finally:
+            release.set()
+            thread.join(10)
+        assert not thread.is_alive()
+        assert results == [False]
+        current = kb.get_task(conn, review)
+        assert current.status == "running"
+        assert current.version == version
+        assert current.current_run_id == winner.current_run_id
+        assert current.claim_lock == winner.claim_lock
+        assert [tuple(row) for row in conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ?", (review,)
+        )] == before_events

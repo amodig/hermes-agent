@@ -33,6 +33,8 @@ def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "ok")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
@@ -198,7 +200,7 @@ def _park_in_review(conn: sqlite3.Connection, title: str, assignee: str) -> str:
     return tid
 
 
-def test_review_lane_gets_reserved_slot_under_ready_backlog(
+def test_review_lane_gets_first_service_under_ready_backlog(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
     import hermes_cli.config as cfgmod
@@ -217,7 +219,7 @@ def test_review_lane_gets_reserved_slot_under_ready_backlog(
         )
 
     spawned_ids = [s[0] for s in res.spawned]
-    # Budget 2: one ready + the reserved review slot — never 2×ready.
+    # Budget 2: one review followed by READY — never 2×READY.
     assert len(spawned_ids) == 2
     assert review_id in spawned_ids
 
@@ -244,12 +246,10 @@ def _cap_review_row(conn: sqlite3.Connection, review_id: str) -> dict:
 
 
 @pytest.mark.parametrize("make_unspawnable", [_guard_review_row, _cap_review_row])
-def test_unspawnable_review_does_not_reserve_the_only_ready_slot(
+def test_unspawnable_review_does_not_consume_the_only_ready_slot(
     kanban_home, all_assignees_spawnable, monkeypatch, make_unspawnable,
 ):
-    """A review card the review loop would refuse this tick (respawn guard,
-    per-profile cap) must not consume the fairness reservation — otherwise the
-    ready lane starves every tick while the reserved slot goes unused."""
+    """A guarded or profile-capped review must leave capacity for READY."""
     import hermes_cli.config as cfgmod
 
     monkeypatch.setattr(
@@ -262,12 +262,14 @@ def test_unspawnable_review_does_not_reserve_the_only_ready_slot(
         ready_id = kb.create_task(conn, title="ready-now", assignee="alice")
         review_id = _park_in_review(conn, "review-unspawnable", "reviewer")
         caps = make_unspawnable(conn, review_id)
-        res = kbd.dispatch_once(conn, spawn_fn=_fake_spawn_factory(spawns), **caps)
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), **caps,
+        )
 
     assert [task_id for task_id, *_ in res.spawned] == [ready_id]
 
 
-def test_unguarded_review_reserves_the_only_ready_slot(
+def test_unguarded_review_gets_the_only_ready_slot(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
     """A dispatchable review card still receives the single shared slot."""
@@ -289,7 +291,7 @@ def test_unguarded_review_reserves_the_only_ready_slot(
     assert [task_id for task_id, *_ in res.spawned] == [review_id]
 
 
-def test_review_reservation_released_when_no_review_work(
+def test_ready_gets_full_budget_when_no_review_work(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
     import hermes_cli.config as cfgmod
@@ -335,14 +337,14 @@ def test_nonspawnable_review_does_not_tax_ready_budget(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
 
-    # Human-lane review is not spawnable → no reservation, ready gets both.
+    # Human-lane review is not spawnable; READY gets both slots.
     assert len(res.spawned) == 2
 
 
 def test_review_budget_still_bounded_by_shared_cap(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
-    """The reservation caps the ready lane; it grants review no extra slots."""
+    """The review opportunity grants no extra slots beyond the shared cap."""
     import hermes_cli.config as cfgmod
     monkeypatch.setattr(
         cfgmod, "load_config",
@@ -358,5 +360,76 @@ def test_review_budget_still_bounded_by_shared_cap(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
 
-    # Budget 2 total across both lanes, reservation notwithstanding.
+    # Budget 2 total across both lanes.
     assert len(res.spawned) == 2
+
+
+@pytest.mark.parametrize("change", ["moved", "unavailable", "claimed_elsewhere"])
+def test_handoff_change_during_preparation_cancels_without_grant(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path, change,
+):
+    from hermes_cli.kanban_runtime import prospective_identity
+    from tests.hermes_cli.test_kanban_handoff import _repo, _lane, _commit
+
+    monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: True)
+    repo, base, branch = _repo(tmp_path)
+    grants, cancelled = [], []
+    changed_head = None
+    with kbc.connect() as conn:
+        parent, review = _lane(conn, repo, branch)
+        implementation = kb.claim_task(conn, parent)
+        assert implementation is not None
+        approved_head = _commit(repo)
+        assert kb.complete_task(
+            conn, parent, expected_run_id=implementation.current_run_id,
+            summary="implemented src/changed.py",
+            metadata={"base_sha": base, "head_sha": approved_head},
+        )
+        # Preparation is a local stand-in; the guard still resolves the real
+        # parent's Git checkout, independent of the review worker's workspace.
+        conn.execute(
+            "UPDATE tasks SET workspace_kind = 'scratch', workspace_path = NULL, "
+            "branch_name = NULL WHERE id = ?", (review,),
+        )
+        ready = kb.create_task(conn, title="ready", assignee="alice")
+
+        def prepare(task, workspace, **kwargs):
+            nonlocal changed_head
+            if task.id == review:
+                if change == "claimed_elsewhere":
+                    with kbc.connect() as other:
+                        assert kb.claim_review_task(other, review, claimer="other:reviewer") is not None
+                if change == "unavailable":
+                    repo.rename(tmp_path / "temporarily-unavailable")
+                else:
+                    changed_head = _commit(repo, "src/moved.py")
+            identity = prospective_identity()
+            return kbd.WorkerLaunch(
+                pid=identity.pid, runtime_identity=identity.as_dict(), preparation_id="fixture",
+                grant=lambda *args: grants.append(task.id),
+                cancel=lambda: cancelled.append(task.id),
+            )
+
+        monkeypatch.setattr(kbd, "_default_spawn", prepare)
+        result = kbd.dispatch_once(conn, max_in_progress=1, board="default")
+        expected = [] if change == "claimed_elsewhere" else [ready]
+        assert [tid for tid, *_ in result.spawned] == expected
+        assert grants == expected
+        assert cancelled == [review]
+        if change == "claimed_elsewhere":
+            assert result.handoff_refused == [], "a competing claim is not our handoff refusal"
+            assert kb.get_task(conn, review).claim_lock == "other:reviewer"
+        else:
+            assert kb.get_task(conn, review).current_run_id is None
+            assert conn.execute(
+                "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (review,),
+            ).fetchone()[0] == 0
+            assert len(result.handoff_refused) == 1
+            refusal = result.handoff_refused[0]
+            assert refusal["task_id"] == review and refusal["parent_id"] == parent
+            assert refusal["expected_head_sha"] == approved_head
+            assert refusal["kind"] == (
+                "handoff_unverifiable" if change == "unavailable" else "handoff_head_moved"
+            )
+            if change == "moved":
+                assert refusal["actual_head_sha"] == changed_head

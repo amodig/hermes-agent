@@ -81,10 +81,19 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     except Exception:
         default_assignee = max_in_progress_per_profile = max_in_progress = None
         max_spawn = getattr(args, "max", None)
-    with kbc.connect_closing() as conn:
+    board = kb._normalize_board_slug(getattr(args, "board", None))
+    if board is None and not os.environ.get("HERMES_KANBAN_DB"):
+        # Pin emitted recovery commands (handoff_refused[].command) to the
+        # board connect() will actually open, so a copied command still
+        # targets the right board after the operator switches boards. An
+        # explicit HERMES_KANBAN_DB path may not map to any board slug, so
+        # leave the command board-less in that case.
+        board = kb.get_current_board()
+    with kbc.connect_closing(board=board) as conn:
         res = kbd.dispatch_once(
             conn,
             dry_run=args.dry_run,
+            board=board,
             max_spawn=max_spawn,
             max_in_progress=max_in_progress,
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
@@ -110,6 +119,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "reason": reason}
                 for (tid, reason) in res.respawn_guarded
             ],
+            "handoff_refused": res.handoff_refused,
             "rate_limited": res.rate_limited,
             "skipped_locked": res.skipped_locked,
             "memory_pressure": res.memory_pressure,
@@ -150,6 +160,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     for tid, reason in res.respawn_guarded:
         print(f"Guarded ({reason}): {tid}")
+    for refusal in res.handoff_refused:
+        print(f"Handoff refused ({refusal['kind']}): {refusal['task_id']}")
+        print(f"  {refusal['reason']}")
+        for key in ("expected_head_sha", "actual_head_sha"):
+            if key in refusal:
+                print(f"  {key}: {refusal[key]}")
+        print(f"  Recovery: {refusal['recovery']}")
+        if refusal["command"]:
+            print(f"  {refusal['command']}")
     if res.rate_limited:
         print(f"Rate-limited (released to ready, no failure counted): {', '.join(res.rate_limited)}")
     if res.skipped_locked:

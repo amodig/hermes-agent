@@ -218,6 +218,74 @@ def test_lifecycle_contract_help_describes_legacy_binding_only(capsys):
     assert "classification must be supplied at task creation" in help_text
     assert "bind or replace" not in help_text
 
+
+def _quarantine_review_case(conn, tmp_path):
+    from tests.hermes_cli.test_kanban_handoff import _git, _moved_head_review, _repo
+
+    repo, base, branch = _repo(tmp_path)
+    parent, review, head = _moved_head_review(conn, repo, base, branch)
+    return repo, parent, review, head, _git(repo, "rev-parse", "HEAD")
+
+
+def test_block_quarantine_cli_preserves_candidate_and_refuses_stale_retry(
+    kanban_home, tmp_path, capsys,
+):
+    from tests.hermes_cli.test_kanban_handoff import _git
+
+    kb.create_board("quarantine")
+    with kb.scoped_current_board("quarantine"), kbc.connect_closing() as conn:
+        repo, parent, review, head, moved_head = _quarantine_review_case(
+            conn, tmp_path,
+        )
+        before = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (review,)).fetchone())
+        runs = list(conn.execute("SELECT * FROM task_runs"))
+        links = list(conn.execute("SELECT * FROM task_links"))
+        handoff = kb.latest_handoff(conn, parent)
+
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    kc.build_parser(parser.add_subparsers(dest="command"))
+    args = parser.parse_args([
+        "kanban", "--board", "quarantine", "block", review,
+        "--quarantine-review", "--expected-version", str(before["version"]),
+        "--kind", "capability", "--reason",
+        "Immutable parent handoff is not startable; quarantine pending operator recovery",
+    ])
+    assert kc.kanban_command(args) == 0
+    assert f"Blocked {review}" in capsys.readouterr().out
+    with kb.scoped_current_board("quarantine"), kbc.connect_closing() as conn:
+        after = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (review,)).fetchone())
+        assert after["status"] == "blocked"
+        assert after["version"] == before["version"] + 1
+        assert after["block_kind"] == "capability"
+        for field in before.keys() - {"status", "version", "block_kind", "block_recurrences"}:
+            assert after[field] == before[field], field
+        assert list(conn.execute("SELECT * FROM task_runs")) == runs
+        assert list(conn.execute("SELECT * FROM task_links")) == links
+        assert kb.latest_handoff(conn, parent) == handoff
+        event, = [event for event in kb.list_events(conn, review) if event.kind == "blocked"]
+        assert event.run_id is None
+        assert event.payload["source_status"] == "review"
+        assert event.payload["handoff_error"]["expected_head_sha"] == head
+        assert event.payload["handoff_error"]["actual_head_sha"] == moved_head
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, review).status == "blocked"
+        quarantined = list(conn.iterdump())
+    assert _git(repo, "cat-file", "-t", head) == "commit"
+    assert _git(repo, "cat-file", "-t", moved_head) == "commit"
+
+    assert kc.kanban_command(args) == 1
+    assert "review quarantine refused" in capsys.readouterr().err
+    with kb.scoped_current_board("quarantine"), kbc.connect_closing() as conn:
+        assert list(conn.iterdump()) == quarantined
+    assert kc.kanban_command(parser.parse_args([
+        "kanban", "--board", "quarantine", "unblock", review,
+    ])) == 0
+    with kb.scoped_current_board("quarantine"), kbc.connect_closing() as conn:
+        assert kb.get_task(conn, review).status == "review"
+        assert kb.claim_review_task(conn, review) is None
+
+
+
 # ---------------------------------------------------------------------------
 
 def test_archive_rm_purges_archived_lifecycle_graph(kanban_home):

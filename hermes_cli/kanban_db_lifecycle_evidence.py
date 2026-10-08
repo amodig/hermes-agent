@@ -1,7 +1,6 @@
 """Kanban lifecycle evidence, handoff, and acceptance helpers."""
 from __future__ import annotations
 
-import json
 import sqlite3
 from pathlib import Path
 from typing import Any, Optional
@@ -541,11 +540,20 @@ def _parent_handoff_start_error(
                 "parent_id": parent_id,
                 "reason": "parent completion has no head_sha",
             }
-        branch = handoff.get("branch_name") or parent.branch_name
-        workspace = handoff.get("workspace_path") or parent.workspace_path
+        provenance = handoff.get("handoff_provenance")
+        reviewed_parent = (
+            isinstance(provenance, dict) and provenance.get("kind") == "reviewed_parent"
+        )
+        if reviewed_parent:
+            # A detached reviewed-parent handoff records no branch; resolve the
+            # recorded workspace HEAD instead of the review card's stale branch.
+            branch = str(handoff.get("branch_name") or "").strip() or None
+            workspace = str(handoff.get("workspace_path") or "").strip()
+        else:
+            branch = handoff.get("branch_name") or parent.branch_name
+            workspace = handoff.get("workspace_path") or parent.workspace_path
         snapshot = _kb._git_snapshot(workspace, branch)
         actual = snapshot["branch_head"] if snapshot else None
-        resolved = _kb._resolve_commit(snapshot["path"], expected) if snapshot else None
         if actual is None:
             return {
                 "kind": "handoff_unverifiable",
@@ -553,6 +561,14 @@ def _parent_handoff_start_error(
                 "expected_head_sha": expected,
                 "reason": "parent branch/worktree head is unavailable",
             }
+        if reviewed_parent and snapshot["dirty_files"]:
+            return {
+                "kind": "handoff_unverifiable",
+                "parent_id": parent_id,
+                "expected_head_sha": expected,
+                "reason": "reviewed parent worktree is dirty",
+            }
+        resolved = _kb._resolve_commit(snapshot["path"], expected)
         if resolved != actual:
             return {
                 "kind": "handoff_head_moved",
@@ -569,12 +585,11 @@ def _record_parent_handoff_start_error(
     error: dict[str, Any],
 ) -> None:
     kind = str(error.get("kind") or "handoff_unverifiable")
-    encoded = json.dumps(error, ensure_ascii=False, sort_keys=True)
     previous = conn.execute(
         "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
         (task_id, kind),
     ).fetchone()
-    if previous and previous["payload"] == encoded:
+    if previous and _kb._json_dict(previous["payload"]) == error:
         return
     _kb._append_event(conn, task_id, kind, error)
 

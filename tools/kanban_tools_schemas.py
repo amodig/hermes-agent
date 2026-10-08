@@ -244,7 +244,11 @@ KANBAN_BLOCK_SCHEMA = _schema(
         "no agent can do), or 'transient' (a flaky failure that may clear). "
         "``reason`` is shown to the human on the board. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
-        "auto-escalated to triage. Use for genuine blockers only — don't "
+        "auto-escalated to triage, except explicit review quarantine stays blocked. "
+        "Use quarantine_review with expected_version to park one unclaimed REVIEW "
+        "whose immutable parent handoff cannot start, with kind='capability'. "
+        "Quarantine creates no run or verdict, authorizes no new candidate, and "
+        "does not release validation. Use for genuine blockers only — don't "
         "block on things you can resolve yourself."
     ),
     {
@@ -263,6 +267,15 @@ KANBAN_BLOCK_SCHEMA = _schema(
                 "if no parent is open it is recorded as needs_input instead. "
                 "The others surface to a human. Omit only if none apply."
             ),
+        },
+        "quarantine_review": _prop("boolean", (
+            "Explicitly quarantine one unclaimed REVIEW with a current handoff refusal. "
+            "Requires kind='capability', a nonempty reason, and expected_version."
+        )),
+        "expected_version": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Observed task version, required only with quarantine_review=true.",
         },
     },
     ["reason"],

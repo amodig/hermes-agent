@@ -542,6 +542,70 @@ worktree, and optional patch hash. The original completion, runs, comments,
 and edges remain; dependents stay gated until the same parent is recommitted
 and completed with an immutable head.
 
+### Unstartable review quarantine
+
+A `REVIEW` card whose recorded immutable head no longer matches its branch or
+worktree head, or whose recorded workspace cannot be resolved, cannot start.
+The dispatcher reports the refusal and moves on, so an ineligible review never
+starves READY work. An explicit `reviewed_parent` handoff is verified against
+its own recorded workspace and branch — resolving that workspace's HEAD only
+when no branch was recorded — never the review card's assigned branch.
+For this explicit provenance, a dirty recorded workspace also refuses as
+`handoff_unverifiable`; ordinary implementation handoffs retain their existing
+exact-head check without a claim-time dirty-worktree check.
+
+`hermes kanban dispatch --dry-run --json` predicts the same refusal without
+writing anything: each `handoff_refused` entry carries `task_id`, the guard
+`kind` (`handoff_head_moved` or `handoff_unverifiable`), `parent_id`,
+`expected_head_sha`/`actual_head_sha` when known, `recovery` guidance, and
+`command` — the exact quarantine command for that card. `command` is empty for a
+READY validation refusal, which needs the named parent's handoff inspected
+rather than a review transition. The refusal path itself appends no event,
+creates no run, prepares no workspace, and spawns no worker; the rest of a
+dry-run tick still performs its existing reclaim/promotion bookkeeping. The
+human-readable output prints the same refusals.
+
+For a named board, the command includes `--board <slug>`. On POSIX, an effective
+`HERMES_KANBAN_DB` pin produces
+`env HERMES_KANBAN_DB=<absolute-path> hermes kanban block ...` without a board
+override. Windows commands are rendered for PowerShell; a pinned command
+temporarily sets `$env:HERMES_KANBAN_DB` inside a `try`/`finally` block and
+restores its previous value. Copy the whole command so it retains the refused
+task's database outside the gateway's routing fence.
+
+Keep preflight inspection and postflight readback on that same database:
+task IDs are database-local. Pass the resolved board to CLI `show` and native
+`kanban_show` for named-board refusals. For pinned refusals, retain the CLI
+database-pin wrapper, or use `kanban_show` without `board` in a session sharing
+that pin. Both inspection surfaces honor an omitted board's database pin;
+an explicit board retains normal named-board precedence outside worker fences.
+
+Quarantine the single unclaimed card by copying `command`, or:
+
+```bash
+hermes kanban --board <slug> block <id> --quarantine-review \
+  --expected-version <observed version> --kind capability \
+  --reason 'Immutable parent handoff is not startable; quarantine pending operator recovery'
+```
+
+The model-side equivalent is `kanban_block` with `quarantine_review: true`,
+`kind: "capability"`, the same `reason`, and the observed `expected_version`.
+For a named-board refusal, pass the resolved `board`. For a database-pinned
+refusal, omit `board` and use the tool only in a session with the same effective
+`HERMES_KANBAN_DB` pin: an explicit tool board overrides that pin. If the session
+does not share the pin, replay the complete emitted CLI command instead.
+Quarantine bumps `version` by one, keeps the card sticky
+`blocked` even past the usual re-block→triage loop breaker, and preserves the
+goal revision, candidate pointer, contracts, assignee/model pins, graph edges,
+workspaces, runs, evidence, and both Git commits. A stale `version`, an active
+claim or run, a changed state, or a now-valid handoff refuses (the error starts
+`review quarantine refused`) and mutates nothing. `kanban_unblock` later
+restores the review lane; it is not approval, and a still-moved candidate stays
+unclaimable and keeps its validator gated.
+Operator quarantine also applies to an unclaimed `goal_mode` review. It does
+not weaken ordinary goal-mode block restrictions: an active worker cannot
+use quarantine to exit its goal loop or bypass the completion judge.
+
 ### Recommended handoff evidence
 
 `kanban_complete(summary=..., metadata={...})` is intentionally flexible:

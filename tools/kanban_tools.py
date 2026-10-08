@@ -731,7 +731,12 @@ def _handle_show(args: dict, **kw) -> str:
     # Resolve the slug before connecting so the connection and the recovery
     # command cannot name different boards.
     board = _resolved_board(args.get("board"))
-    with _board(board) as (kb, conn):
+    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+
+    db_path = kb.kanban_db_path(
+        board=args.get("board") if os.environ.get("HERMES_KANBAN_DB", "").strip() else board,
+    )
+    with kbc.connect_closing(db_path, board=board) as conn:
         task = _existing_task(kb, conn, tid)
         effective_goal = kb.get_effective_goal(conn, tid)
         dependencies = kb.evaluate_dependencies(conn, tid)
@@ -904,6 +909,9 @@ def _handle_complete(args: dict, **kw) -> str:
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
     tid = _worker_guard("kanban_block", args)
+    quarantine_review = args.get("quarantine_review", False)
+    if quarantine_review is True:
+        _check(isinstance(args.get("reason"), str), "reason must be a string")
     reason = _redact(
         _require_text(args, "reason", "reason is required — explain what input you need"))
     kind = args.get("kind")
@@ -920,14 +928,23 @@ def _handle_block(args: dict, **kw) -> str:
         # loop instead. Restrict goal_mode tasks to the kinds that represent a genuine external blocker the
         # worker cannot resolve itself; `capability` and `transient` (or an unset kind) route back through
         # kanban_complete, which the judge now gates.
+        # Operator quarantine has no goal-loop run to escape; block_task fences
+        # it to an unclaimed REVIEW with a current immutable-handoff refusal.
         task = kb.get_task(conn, tid)
-        _check(not (task and task.goal_mode and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS),
+        _check(not (task and task.goal_mode and quarantine_review is not True
+                    and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS),
                f"goal_mode tasks can only block with kind in "
                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
-        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
-        _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
+        ok = kb.block_task(
+            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid),
+            quarantine_review=quarantine_review, expected_version=args.get("expected_version"),
+        )
+        _check(ok, (
+            "review quarantine refused: stale version, active claim, changed state, "
+            "or no current handoff refusal"
+        ) if quarantine_review else f"could not block {tid} (unknown id or not in running/ready)")
         landed_kind = kb.get_task(conn, tid).block_kind
         extra: dict = {"block_kind": landed_kind}
         if kind == "dependency" and landed_kind != kind:
