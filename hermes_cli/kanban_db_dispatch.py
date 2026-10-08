@@ -2789,8 +2789,12 @@ def _dispatch_lane_task(
         return False
     handoff_error = _kb._parent_handoff_start_error(conn, task_id, phase=lane)
     if handoff_error is not None:
+        current = _kb.get_task(conn, task_id)
+        if (current is None or current.status != lane or current.claim_lock is not None
+                or current.current_run_id is not None):
+            return False
         _note_handoff_refusal(
-            task_id, row["version"], handoff_error, result, lane=lane, board=board,
+            task_id, current.version, handoff_error, result, lane=lane, board=board,
         )
         if not dry_run:
             with _kb.write_txn(conn):

@@ -491,7 +491,11 @@ def _cmd_show(args: argparse.Namespace) -> int:
     # Resolve once and use the same slug for the connection and the projection:
     # re-reading the current-board pointer later could name another board.
     board = getattr(args, "board", None) or kb.get_current_board()
-    with kbc.connect_closing(board=board) as conn:
+    requested_board = getattr(args, "board", None)
+    db_path = kb.kanban_db_path(
+        board=requested_board if os.environ.get("HERMES_KANBAN_DB", "").strip() else board,
+    )
+    with kbc.connect_closing(db_path, board=board) as conn:
         task = kb.get_task(conn, args.task_id)
         if not task:
             return _err(f"no such task: {args.task_id}")

@@ -206,6 +206,44 @@ def test_dispatch_reports_real_handoff_heads_and_fenced_recovery(
         assert len(kb.list_events(conn, review)) == event_count
 
 
+def test_pinned_recovery_inspection_and_readback_keep_original_database(
+    moved_review_dispatch, monkeypatch, tmp_path, capsys,
+):
+    import sqlite3
+    from hermes_cli import kanban as kb_cli, kanban_db as kb, kanban_db_connect as kbc
+    from tools import kanban_tools
+
+    case = moved_review_dispatch
+    pinned = tmp_path / "pinned.db"
+    with kbc.connect_closing(board="recovery") as source:
+        with sqlite3.connect(pinned) as target:
+            source.backup(target)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
+    with kbc.connect_closing() as conn:
+        assert kb.update_task(
+            conn, case.review, expected_version=case.version,
+            reason="Operator changes only the pinned review's model",
+            model="unit-test-model",
+        )
+    args = argparse.Namespace(task_id=case.review, board=None, json=True)
+    assert kb_cli._cmd_show(args) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["task"]["version"] == case.version + 1
+    assert json.loads(kanban_tools._handle_show({"task_id": case.review}))["task"]["version"] == case.version + 1
+    result = json.loads(kanban_tools._handle_block({
+        "task_id": case.review, "quarantine_review": True, "kind": "capability",
+        "expected_version": shown["task"]["version"],
+        "reason": "Immutable parent handoff is not startable; quarantine pending operator recovery",
+    }))
+    assert result["ok"] and result["status"] == "blocked"
+    assert kb_cli._cmd_show(args) == 0
+    readback = json.loads(capsys.readouterr().out)["task"]
+    assert (readback["status"], readback["version"]) == ("blocked", case.version + 2)
+    assert json.loads(kanban_tools._handle_show({"task_id": case.review}))["task"]["status"] == "blocked"
+    original = json.loads(kanban_tools._handle_show({"task_id": case.review, "board": "recovery"}))["task"]
+    assert (original["status"], original["version"]) == ("review", case.version)
+
+
 @pytest.mark.platforms("windows")
 @pytest.mark.parametrize("pinned_db", [False, True])
 def test_powershell_recovery_replays_original_database(

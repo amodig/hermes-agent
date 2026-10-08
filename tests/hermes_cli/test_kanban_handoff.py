@@ -895,6 +895,20 @@ def test_moved_head_review_does_not_starve_ready_dispatch(
     with kbc.connect_closing() as conn:
         _parent, review, approved_head = _moved_head_review(conn, repo, base, branch)
         ready = kb.create_task(conn, title="ready work", assignee="implementer")
+        original_check = kb._parent_handoff_start_error
+        version = kb.get_task(conn, review).version
+
+        def check_after_operator_edit(connection, task_id, *, phase):
+            error = original_check(connection, task_id, phase=phase)
+            if task_id == review and kb.get_task(connection, review).version == version:
+                assert kb.update_task(
+                    connection, review, expected_version=version,
+                    reason="Operator changes the review model after the lane snapshot",
+                    model="unit-test-model",
+                )
+            return error
+
+        monkeypatch.setattr(kb, "_parent_handoff_start_error", check_after_operator_edit)
         res = kbd.dispatch_once(
             conn,
             spawn_fn=lambda task, workspace, board=None: spawns.append(task.id) or 42,
@@ -910,6 +924,10 @@ def test_moved_head_review_does_not_starve_ready_dispatch(
     assert refused[0]["kind"] == "handoff_head_moved"
     assert refused[0]["expected_head_sha"] == approved_head
     assert refused[0]["actual_head_sha"] == moved_head
+    import shlex
+
+    command = shlex.split(refused[0]["command"])
+    assert command[command.index("--expected-version") + 1] == str(version + 1)
 
     # A second tick records no duplicate event and still serves the ready lane.
     with kbc.connect_closing() as conn:

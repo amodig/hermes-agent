@@ -573,6 +573,13 @@ temporarily sets `$env:HERMES_KANBAN_DB` inside a `try`/`finally` block and
 restores its previous value. Copy the whole command so it retains the refused
 task's database outside the gateway's routing fence.
 
+Keep preflight inspection and postflight readback on that same database:
+task IDs are database-local. Pass the resolved board to CLI `show` and native
+`kanban_show` for named-board refusals. For pinned refusals, retain the CLI
+database-pin wrapper, or use `kanban_show` without `board` in a session sharing
+that pin. Both inspection surfaces honor an omitted board's database pin;
+an explicit board retains normal named-board precedence outside worker fences.
+
 Quarantine the single unclaimed card by copying `command`, or:
 
 ```bash

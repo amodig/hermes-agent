@@ -731,7 +731,12 @@ def _handle_show(args: dict, **kw) -> str:
     # Resolve the slug before connecting so the connection and the recovery
     # command cannot name different boards.
     board = _resolved_board(args.get("board"))
-    with _board(board) as (kb, conn):
+    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+
+    db_path = kb.kanban_db_path(
+        board=args.get("board") if os.environ.get("HERMES_KANBAN_DB", "").strip() else board,
+    )
+    with kbc.connect_closing(db_path, board=board) as conn:
         task = _existing_task(kb, conn, tid)
         effective_goal = kb.get_effective_goal(conn, tid)
         dependencies = kb.evaluate_dependencies(conn, tid)
