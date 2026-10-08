@@ -122,3 +122,14 @@ def test_notifier_pings_run_under_the_subscribers_profile(served, monkeypatch):
     assert len(alpha_adapter.sent) == 1
     assert alpha_adapter.sent[0]["home"] == str(served.alpha)
     assert alpha_adapter.sent[0]["strict"] is True
+
+
+from tests._fixtures.autonomous_boundary import stub_scope_capability  # noqa: F401
+
+
+@pytest.fixture(autouse=True)
+def _scope_capability_for_argv_assertions(stub_scope_capability):
+    """These tests assert the argv/env a gateway worker launch would use, never a
+    real scope: a runner with no user bus cannot create one, and the runtime now
+    refuses an autonomous child it cannot place."""
+    return stub_scope_capability

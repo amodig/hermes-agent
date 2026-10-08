@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import subprocess
 
+import pytest
+
 
 def _make_task(kb, *, assignee: str):
     return kb.Task(
@@ -189,3 +191,14 @@ toolsets:
     assert "kanban_complete" in names
     assert "kanban_list" not in names
     assert resolved != ["kanban"]
+
+
+from tests._fixtures.autonomous_boundary import stub_scope_capability  # noqa: F401
+
+
+@pytest.fixture(autouse=True)
+def _scope_capability_for_argv_assertions(stub_scope_capability):
+    """These tests assert the argv/env a gateway worker launch would use, never a
+    real scope: a runner with no user bus cannot create one, and the runtime now
+    refuses an autonomous child it cannot place."""
+    return stub_scope_capability
