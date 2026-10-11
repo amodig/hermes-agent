@@ -1308,6 +1308,7 @@ from hermes_cli.kanban_db_lifecycle_rework import (
     _typed_rework_graph,
     request_changes,
     rework_review_graph,
+    supersede_candidate,
 )
 from hermes_cli.kanban_db_lifecycle_completion import (
     ArtifactPreservationError,

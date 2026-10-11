@@ -1,7 +1,7 @@
 """``hermes kanban …`` — dispatch (``kanban_command``), task-verb handlers, ``run_slash`` for ``/kanban``.
 DB work lives in ``kanban_db``; siblings: ``kanban_parser`` (argparse, re-exported ``build_parser``),
 ``kanban_output`` (text/--json), ``kanban_boards`` (``boards …``), ``kanban_ops`` (dispatch/daemon/
-tail/watch/gc/repair).
+tail/watch/gc/repair), ``kanban_recovery`` (``supersede-candidate``).
 """
 
 from __future__ import annotations
@@ -214,7 +214,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "gc", "update", "rework-review",
+    "gc", "update", "rework-review", "supersede-candidate",
     "request-review", "request-changes", "reopen-review",
 })
 
@@ -1327,6 +1327,13 @@ def _cmd_rework_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_supersede_candidate(args: argparse.Namespace) -> int:
+    """Dispatch seam only — the recovery verb lives in ``kanban_recovery``."""
+    from hermes_cli import kanban_recovery as recovery
+
+    return recovery._cmd_supersede_candidate(args)
+
+
 def _cmd_reopen_review(args: argparse.Namespace) -> int:
     ids, rc = _require_ids(args)
     if rc:
@@ -1613,6 +1620,7 @@ _HANDLERS = {
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "rework-review": _cmd_rework_review,
+    "supersede-candidate": _cmd_supersede_candidate,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,

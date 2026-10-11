@@ -414,6 +414,21 @@ _SPECS = [
              help="Why the rejected review is being reworked"),
         _json_flag(help="Emit JSON output"),
     ], help="Atomically requeue a rejected typed lifecycle chain"),
+    _cmd("supersede-candidate", [
+        _arg("--implementation-id", required=True, help="Typed code implementation task id"),
+        _arg("--expected-versions", required=True,
+             help='JSON object mapping the implementation and every descendant card id to its '
+                  'current version, e.g. \'{"T-1":7,"T-2":4,"T-3":2}\''),
+        _arg("--expected-candidate-run-id", required=True, type=int,
+             help="Current immutable implementation candidate run id"),
+        _arg("--expected-head-sha", required=True,
+             help="Recorded candidate head commit; must match the immutable handoff and quarantine"),
+        _arg("--replacement-head-sha", required=True,
+             help="Observed newer commit that descends from the recorded head and equals workspace HEAD"),
+        _arg("--reason", required=True, nargs="+",
+             help="Why the unreviewed moved candidate is being superseded"),
+        _json_flag(help="Emit JSON output"),
+    ], help="Supersede one unreviewed moved-head candidate and reopen implementation"),
     _cmd("reopen-review", [
         _TASK_IDS,
         _reason("Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons."),

@@ -30,7 +30,7 @@ from tools.kanban_tools_schemas import (
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
     KANBAN_REQUEUE_HANDOFF_SCHEMA, KANBAN_REWORK_REVIEW_SCHEMA, KANBAN_SHOW_SCHEMA,
-    KANBAN_SCHEDULE_SCHEMA, KANBAN_UNBLOCK_SCHEMA,
+    KANBAN_SCHEDULE_SCHEMA, KANBAN_SUPERSEDE_CANDIDATE_SCHEMA, KANBAN_UNBLOCK_SCHEMA,
     KANBAN_UNLINK_SCHEMA, KANBAN_UPDATE_SCHEMA,
 )
 
@@ -1592,13 +1592,42 @@ def _handle_rework_review(args: dict, **kw) -> str:
     return _ok(**outcome)
 
 
+@_kanban_handler("kanban_supersede_candidate")
+def _handle_supersede_candidate(args: dict, **kw) -> str:
+    _require_orchestrator_tool("kanban_supersede_candidate")
+    board, reason = _repair_common(args)
+    implementation_id = str(args.get("implementation_id") or "").strip()
+    expected_versions = args.get("expected_versions")
+    _check(implementation_id, "implementation_id is required")
+    _check(
+        isinstance(expected_versions, dict) and expected_versions,
+        "expected_versions must be an object mapping task ids to versions",
+    )
+    _check(
+        args.get("expected_candidate_run_id") is not None,
+        "expected_candidate_run_id is required",
+    )
+    with _board(board) as (kb, conn):
+        outcome = kb.supersede_candidate(
+            conn,
+            implementation_id,
+            expected_versions=expected_versions,
+            expected_candidate_run_id=args["expected_candidate_run_id"],
+            expected_head_sha=str(args.get("expected_head_sha") or ""),
+            replacement_head_sha=str(args.get("replacement_head_sha") or ""),
+            reason=reason,
+            author=_persisted_identity(),
+        )
+    return _ok(**outcome)
+
+
 
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
 _ORCHESTRATOR_TOOLS = frozenset({
     "kanban_list", "kanban_unblock", "kanban_update", "kanban_unlink", "kanban_archive",
-    "kanban_requeue_handoff", "kanban_rework_review",
+    "kanban_requeue_handoff", "kanban_rework_review", "kanban_supersede_candidate",
 })
 _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
@@ -1620,7 +1649,8 @@ _TOOLS = (
     ("kanban_unlink", KANBAN_UNLINK_SCHEMA, _handle_unlink, "🔗"),
     ("kanban_archive", KANBAN_ARCHIVE_SCHEMA, _handle_archive, "📦"),
     ("kanban_requeue_handoff", KANBAN_REQUEUE_HANDOFF_SCHEMA, _handle_requeue_handoff, "↩"),
-    ("kanban_rework_review", KANBAN_REWORK_REVIEW_SCHEMA, _handle_rework_review, "↩"))
+    ("kanban_rework_review", KANBAN_REWORK_REVIEW_SCHEMA, _handle_rework_review, "↩"),
+    ("kanban_supersede_candidate", KANBAN_SUPERSEDE_CANDIDATE_SCHEMA, _handle_supersede_candidate, "↩"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
     _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode

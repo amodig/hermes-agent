@@ -4491,6 +4491,7 @@ from hermes_cli.kanban_db_lifecycle import (  # noqa: E402
     request_changes,
     request_review,
     rework_review_graph,
+    supersede_candidate,
     unblock_task,
     update_task,
 )

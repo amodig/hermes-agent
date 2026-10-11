@@ -341,7 +341,7 @@ def _commit_completion(
                         metadata=metadata,
                     )
                     stamp_run_id = synthetic_run_id
-                should_stamp = synthetic_run_id is not None or not (
+                should_stamp = typed_phase == "implementation" or synthetic_run_id is not None or not (
                     isinstance(metadata, dict)
                     and isinstance(metadata.get("lifecycle"), dict)
                 )
@@ -510,6 +510,11 @@ def _commit_completion(
                             metadata.get("lifecycle")
                             if isinstance(metadata, dict)
                             else None
+                        ),
+                        **(
+                            {"candidate_supersession": metadata["candidate_supersession"]}
+                            if isinstance(metadata, dict) and "candidate_supersession" in metadata
+                            else {}
                         ),
                     },
                     run_id=run_id,
@@ -835,6 +840,10 @@ def _completed_event_payload(
         payload.update(_kb._handoff_fields(metadata))
         if isinstance(metadata.get("lifecycle"), dict):
             payload["lifecycle"] = dict(metadata["lifecycle"])
+            if metadata["lifecycle"].get("phase") == "implementation" and isinstance(
+                metadata.get("candidate_supersession"), dict,
+            ):
+                payload["candidate_supersession"] = dict(metadata["candidate_supersession"])
     return payload
 
 def _flag_phantom_prose_refs(
@@ -1255,6 +1264,18 @@ def request_review(
             if implementer is None and trow["assignee"] != reviewer:
                 implementer = trow["assignee"]
             if typed_code:
+                try:
+                    metadata, _handoff = _kb._prepare_completion_handoff(
+                        conn, task_id, metadata, phase="implementation",
+                    )
+                except (_kb.HandoffValidationError, _kb.CompletionContractError) as error:
+                    _kb._append_event(
+                        conn, task_id,
+                        "completion_blocked_handoff"
+                        if isinstance(error, _kb.HandoffValidationError) else "completion_blocked_contract",
+                        {"reason": error.reason}, run_id=expected_run_id,
+                    )
+                    return _ret(False, str(error))
                 stamp_run_id = expected_run_id or trow["current_run_id"]
                 if stamp_run_id is None:
                     synthetic_run_id = _kb._synthesize_ended_run(
@@ -1265,31 +1286,26 @@ def request_review(
                         metadata=metadata,
                     )
                     stamp_run_id = synthetic_run_id
-                should_stamp = synthetic_run_id is not None or not (
-                    isinstance(metadata, dict)
-                    and isinstance(metadata.get("lifecycle"), dict)
-                )
-                if should_stamp:
-                    try:
-                        metadata = _kb._stamp_lifecycle_metadata(
-                            conn,
-                            task_id,
-                            metadata,
-                            phase="implementation",
-                            run_id=stamp_run_id,
-                            verdict=None,
+                try:
+                    metadata = _kb._stamp_lifecycle_metadata(
+                        conn,
+                        task_id,
+                        metadata,
+                        phase="implementation",
+                        run_id=stamp_run_id,
+                        verdict=None,
+                    )
+                except LifecycleEvidenceError as error:
+                    if synthetic_run_id is not None:
+                        conn.execute(
+                            "DELETE FROM task_runs WHERE id = ? AND task_id = ?",
+                            (synthetic_run_id, task_id),
                         )
-                    except LifecycleEvidenceError as error:
-                        if synthetic_run_id is not None:
-                            conn.execute(
-                                "DELETE FROM task_runs WHERE id = ? AND task_id = ?",
-                                (synthetic_run_id, task_id),
-                            )
-                        _kb._append_event(
-                            conn, task_id, "completion_blocked_lifecycle", {"reason": str(error)},
-                            run_id=expected_run_id,
-                        )
-                        return _ret(False, str(error))
+                    _kb._append_event(
+                        conn, task_id, "completion_blocked_lifecycle", {"reason": str(error)},
+                        run_id=expected_run_id,
+                    )
+                    return _ret(False, str(error))
 
             assignee_sql = ", assignee = ?" if reviewer is not None else ""
             run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
@@ -1357,6 +1373,11 @@ def request_review(
                     "implementer": implementer,
                     "reviewer": reviewer,
                     "lifecycle": lifecycle,
+                    **(
+                        {"candidate_supersession": metadata["candidate_supersession"]}
+                        if isinstance(metadata, dict) and "candidate_supersession" in metadata
+                        else {}
+                    ),
                     **({"artifacts": _cleaned_artifact_paths(metadata)} if _cleaned_artifact_paths(metadata) else {}),
                 },
                 run_id=run_id,
