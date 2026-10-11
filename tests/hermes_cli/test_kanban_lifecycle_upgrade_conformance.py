@@ -642,12 +642,6 @@ class KanbanLifecycleUpgradeConformance(MODULE.KanbanConformanceFixture):
                 found.append(entry)
         return found
 
-    def test_same_card_supersede_recovers_unreviewed_moved_candidate(self) -> None:
-        self._exercise_supersede_recovery("same_card")
-
-    def test_separate_card_supersede_recovers_unreviewed_moved_candidate(self) -> None:
-        self._exercise_supersede_recovery("separate_card")
-
     def _exercise_supersede_recovery(self, mode: str) -> None:
         case = self._candidate_fixture(mode, extra_child=True)
         implementation = case["implementation"]
@@ -809,12 +803,6 @@ class KanbanLifecycleUpgradeConformance(MODULE.KanbanConformanceFixture):
                 kb.handoff_phase(self.conn, self._task(implementation)), "implementation",
             )
 
-    def test_same_card_supersede_fresh_handoff_reuses_existing_newer_head(self) -> None:
-        self._exercise_supersede_fresh_handoff("same_card")
-
-    def test_separate_card_supersede_fresh_handoff_reuses_existing_newer_head(self) -> None:
-        self._exercise_supersede_fresh_handoff("separate_card")
-
     def _exercise_supersede_fresh_handoff(self, mode: str) -> None:
         case = self._candidate_fixture(mode)
         implementation = case["implementation"]
@@ -861,12 +849,6 @@ class KanbanLifecycleUpgradeConformance(MODULE.KanbanConformanceFixture):
         self.assertNotEqual(get_lifecycle_state(self.conn, implementation)["acceptance"], "accepted")
         self._assert_final_pass(implementation, reviewer, tester, case["moved_head"])
 
-    def test_same_card_supersede_without_declared_validation(self) -> None:
-        self._exercise_supersede_without_validation("same_card")
-
-    def test_separate_card_supersede_without_declared_validation(self) -> None:
-        self._exercise_supersede_without_validation("separate_card")
-
     def _exercise_supersede_without_validation(self, mode: str) -> None:
         case = self._candidate_fixture(
             mode, validation_required=False,
@@ -892,12 +874,6 @@ class KanbanLifecycleUpgradeConformance(MODULE.KanbanConformanceFixture):
             kb.child_ids(self.conn, case["implementation"]),
             [case["reviewer"]] if case["reviewer"] else [],
         )
-
-    def test_same_card_supersede_after_older_accepted_candidate_stays_pending(self) -> None:
-        self._exercise_supersede_after_older_accepted_candidate("same_card")
-
-    def test_separate_card_supersede_after_older_accepted_candidate_stays_pending(self) -> None:
-        self._exercise_supersede_after_older_accepted_candidate("separate_card")
 
     def _exercise_supersede_after_older_accepted_candidate(self, mode: str) -> None:
         raw = tempfile.TemporaryDirectory(
@@ -982,12 +958,6 @@ class KanbanLifecycleUpgradeConformance(MODULE.KanbanConformanceFixture):
         self._run_review(implementation, reviewer, moved, "APPROVE")
         self.assertEqual(self._task(tester).status, "ready")
         self._assert_final_pass(implementation, reviewer, tester, moved)
-
-    def test_same_card_supersede_refuses_version_head_and_workspace_faults(self) -> None:
-        self._exercise_supersede_refusals("same_card")
-
-    def test_separate_card_supersede_refuses_version_head_and_workspace_faults(self) -> None:
-        self._exercise_supersede_refusals("separate_card")
 
     def _exercise_supersede_refusals(self, mode: str) -> None:
         # stale, missing, and extra version-map entries
@@ -1082,12 +1052,6 @@ class KanbanLifecycleUpgradeConformance(MODULE.KanbanConformanceFixture):
         )
         self._assert_supersede_refused(divergent)
 
-    def test_same_card_supersede_refuses_conflicting_graph_and_role_state(self) -> None:
-        self._exercise_supersede_state_refusals("same_card")
-
-    def test_separate_card_supersede_refuses_conflicting_graph_and_role_state(self) -> None:
-        self._exercise_supersede_state_refusals("separate_card")
-
     def _exercise_supersede_state_refusals(self, mode: str) -> None:
         # the declared validation edge removed: the chain is no longer complete
         case = self._candidate_fixture(mode)
@@ -1159,12 +1123,6 @@ class KanbanLifecycleUpgradeConformance(MODULE.KanbanConformanceFixture):
         third = self._new_head(case["repo"], "version 3")
         self._assert_supersede_refused(case, replacement_head_sha=third)
 
-    def test_same_card_supersede_replay_after_success_is_stale(self) -> None:
-        self._exercise_supersede_replay("same_card")
-
-    def test_separate_card_supersede_replay_after_success_is_stale(self) -> None:
-        self._exercise_supersede_replay("separate_card")
-
     def _exercise_supersede_replay(self, mode: str) -> None:
         case = self._candidate_fixture(mode)
         versions = self._versions(*self._affected(case))
@@ -1174,12 +1132,6 @@ class KanbanLifecycleUpgradeConformance(MODULE.KanbanConformanceFixture):
         with self.assertRaises(ValueError):
             self._supersede(case, versions=versions)
         self.assertEqual(self._dump_db(), dump_before)
-
-    def test_same_card_fresh_handoff_rejects_superseded_head_and_accepts_descendant(self) -> None:
-        self._exercise_fresh_handoff_ancestry("same_card")
-
-    def test_separate_card_fresh_handoff_rejects_superseded_head_and_accepts_descendant(self) -> None:
-        self._exercise_fresh_handoff_ancestry("separate_card")
 
     def _exercise_fresh_handoff_ancestry(self, mode: str) -> None:
         case = self._candidate_fixture(mode)
@@ -1214,12 +1166,6 @@ class KanbanLifecycleUpgradeConformance(MODULE.KanbanConformanceFixture):
         self.assertIsNotNone(state["candidate_run_id"])
         self.assertNotEqual(state["candidate_run_id"], case["candidate_run_id"])
 
-    def test_same_card_supersede_allows_older_rejected_candidate_role_history(self) -> None:
-        self._exercise_supersede_allows_older_role_runs("same_card")
-
-    def test_separate_card_supersede_allows_older_rejected_candidate_role_history(self) -> None:
-        self._exercise_supersede_allows_older_role_runs("separate_card")
-
     def _exercise_supersede_allows_older_role_runs(self, mode: str) -> None:
         case = self._candidate_fixture(
             mode, prior_rejection=True,
@@ -1242,6 +1188,37 @@ class KanbanLifecycleUpgradeConformance(MODULE.KanbanConformanceFixture):
         outcome = self._supersede(case)
         self.assertEqual(outcome["superseded_candidate_run_id"], candidate_run_id)
         self.assertEqual(set(outcome["versions"]), set(self._affected(case)))
+
+    # The two DB-operation invariants below drive every supersession scenario
+    # through the reusable fixtures above, in both review modes.
+
+    _SUPERSEDE_RECOVERY_SCENARIOS = (
+        ("recovers_unreviewed_moved_candidate", "_exercise_supersede_recovery"),
+        ("fresh_handoff_reuses_existing_newer_head", "_exercise_supersede_fresh_handoff"),
+        ("fresh_handoff_ancestry_boundary", "_exercise_fresh_handoff_ancestry"),
+        ("without_declared_validation", "_exercise_supersede_without_validation"),
+        ("after_older_accepted_candidate", "_exercise_supersede_after_older_accepted_candidate"),
+        ("allows_older_rejected_candidate_role_runs", "_exercise_supersede_allows_older_role_runs"),
+    )
+
+    _SUPERSEDE_REFUSAL_SCENARIOS = (
+        ("version_head_and_workspace_faults", "_exercise_supersede_refusals"),
+        ("conflicting_graph_and_role_state", "_exercise_supersede_state_refusals"),
+        ("replay_after_success_is_stale", "_exercise_supersede_replay"),
+    )
+
+    def _drive_supersede_scenarios(self, scenarios) -> None:
+        for mode in ("same_card", "separate_card"):
+            for name, helper in scenarios:
+                with self.subTest(mode=mode, scenario=name):
+                    getattr(self, helper)(mode)
+
+    def test_supersede_candidate_recovers_and_hands_off_fresh_candidate(self) -> None:
+        self._drive_supersede_scenarios(self._SUPERSEDE_RECOVERY_SCENARIOS)
+
+    def test_supersede_candidate_refusals_leave_board_unchanged(self) -> None:
+        self._drive_supersede_scenarios(self._SUPERSEDE_REFUSAL_SCENARIOS)
+
 
 if __name__ == "__main__":
     unittest.main()
