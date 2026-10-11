@@ -1,7 +1,7 @@
 """``hermes kanban …`` — dispatch (``kanban_command``), task-verb handlers, ``run_slash`` for ``/kanban``.
 DB work lives in ``kanban_db``; siblings: ``kanban_parser`` (argparse, re-exported ``build_parser``),
 ``kanban_output`` (text/--json), ``kanban_boards`` (``boards …``), ``kanban_ops`` (dispatch/daemon/
-tail/watch/gc/repair).
+tail/watch/gc/repair), ``kanban_recovery`` (``supersede-candidate``).
 """
 
 from __future__ import annotations
@@ -1328,49 +1328,10 @@ def _cmd_rework_review(args: argparse.Namespace) -> int:
 
 
 def _cmd_supersede_candidate(args: argparse.Namespace) -> int:
-    if os.environ.get("HERMES_KANBAN_TASK"):
-        return _err(
-            "kanban supersede-candidate is orchestrator-only; workers must hand off "
-            "their assigned task"
-        )
-    board = str(getattr(args, "board", "") or "").strip()
-    if not board:
-        return _err("kanban supersede-candidate requires an explicit --board <slug>", 2)
-    reason = " ".join(getattr(args, "reason", ()) or ())
-    reason = str(kb.redact_review_value(reason)).strip()
-    if not reason:
-        return _err("kanban supersede-candidate requires a non-empty --reason", 2)
-    try:
-        expected_versions = json.loads(getattr(args, "expected_versions", None) or "")
-    except (TypeError, ValueError):
-        return _err(
-            "kanban supersede-candidate requires --expected-versions as a JSON object "
-            'of task ids to versions, e.g. \'{"T-1":7,"T-2":4}\'',
-            2,
-        )
-    with kbc.connect_closing() as conn:
-        try:
-            outcome = kb.supersede_candidate(
-                conn,
-                args.implementation_id,
-                expected_versions=expected_versions,
-                expected_candidate_run_id=args.expected_candidate_run_id,
-                expected_head_sha=args.expected_head_sha,
-                replacement_head_sha=args.replacement_head_sha,
-                reason=reason,
-                author=_profile_author(),
-            )
-        except (ValueError, kb.LifecycleEvidenceError) as exc:
-            return _err(f"kanban: supersede-candidate: {exc}")
-    if _json_out(args, outcome):
-        return 0
-    print(
-        f"Superseded {args.implementation_id} candidate "
-        f"{outcome['superseded_candidate_run_id']} "
-        f"{outcome['superseded_head_sha'][:12]} -> {outcome['replacement_head_sha'][:12]}; "
-        f"status {outcome['status']} (invalidated {len(outcome['invalidated'])} card(s))"
-    )
-    return 0
+    """Dispatch seam only — the recovery verb lives in ``kanban_recovery``."""
+    from hermes_cli import kanban_recovery as recovery
+
+    return recovery._cmd_supersede_candidate(args)
 
 
 def _cmd_reopen_review(args: argparse.Namespace) -> int:
