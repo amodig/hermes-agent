@@ -698,7 +698,7 @@ def supersede_candidate(
             conn.execute(
                 "UPDATE tasks SET status = ?, assignee = ?, version = version + 1, "
                 "completed_at = NULL, result = NULL, candidate_run_id = NULL, current_run_id = NULL, "
-                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                 "block_kind = CASE WHEN ? = 'blocked' THEN block_kind ELSE NULL END, "
                 "block_recurrences = CASE WHEN ? = 'blocked' THEN block_recurrences ELSE 0 END "
                 "WHERE id = ?",

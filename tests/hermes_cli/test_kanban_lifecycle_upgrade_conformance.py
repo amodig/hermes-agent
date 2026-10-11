@@ -403,7 +403,7 @@ class KanbanLifecycleUpgradeConformance(MODULE.KanbanConformanceFixture):
 
     _SUPERSEDE_MUTABLE_FIELDS = frozenset({
         "status", "version", "completed_at", "result", "candidate_run_id",
-        "current_run_id", "claim_lock", "claim_expires", "worker_pid",
+        "current_run_id", "claim_lock", "claim_expires", "worker_pid", "worker_started_at",
         "block_kind", "block_recurrences",
     })
 
@@ -655,6 +655,12 @@ class KanbanLifecycleUpgradeConformance(MODULE.KanbanConformanceFixture):
         tester = case["tester"]
         extra = case["extra"]
         affected = self._affected(case)
+        # Reconciliation may clear the PID while leaving its old start fingerprint.
+        with kb.write_txn(self.conn):
+            self.conn.executemany(
+                "UPDATE tasks SET worker_started_at = ? WHERE id = ?",
+                [(123456, task_id) for task_id in affected],
+            )
         versions = self._versions(*affected)
         before_rows = self._task_rows(affected)
         before_children = kb.child_ids(self.conn, implementation)
@@ -705,7 +711,7 @@ class KanbanLifecycleUpgradeConformance(MODULE.KanbanConformanceFixture):
                 self.assertEqual(after[field], value, f"{task_id}.{field}")
             for field in (
                 "candidate_run_id", "current_run_id", "claim_lock", "claim_expires",
-                "worker_pid", "completed_at", "result",
+                "worker_pid", "worker_started_at", "completed_at", "result",
             ):
                 self.assertIsNone(after[field], f"{task_id}.{field}")
             self.assertEqual(after["version"], before["version"] + 1)
