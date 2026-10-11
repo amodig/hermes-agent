@@ -516,13 +516,13 @@ class KanbanLifecycleUpgradeConformance(MODULE.KanbanConformanceFixture):
     def _quarantined_candidate(
         self, repo: Path, mode: str, *, validation_required: bool = True,
         extra_child: bool = False, prior_rejection: bool = False, divergent: bool = False,
-        branch: str = "task/candidate",
+        branch: str | None = "task/candidate",
     ) -> dict:
         """Base -> H1 handoff, branch moved to H2, review quarantined unstarted."""
-        base, head = self._candidate_repo(repo, branch)
+        base, head = self._candidate_repo(repo, branch or "task/candidate")
         implementation, reviewer, tester = self._typed_graph(
             repo, mode, validation_required=validation_required,
-            branch=branch, workspace_kind="worktree",
+            branch=branch, workspace_kind="worktree" if branch else "dir",
         )
         extra = None
         if extra_child:
@@ -803,8 +803,10 @@ class KanbanLifecycleUpgradeConformance(MODULE.KanbanConformanceFixture):
                 kb.handoff_phase(self.conn, self._task(implementation)), "implementation",
             )
 
-    def _exercise_supersede_fresh_handoff(self, mode: str) -> None:
-        case = self._candidate_fixture(mode)
+    def _exercise_supersede_fresh_handoff(
+        self, mode: str, *, branch: str | None = "task/candidate",
+    ) -> None:
+        case = self._candidate_fixture(mode, branch=branch)
         implementation = case["implementation"]
         reviewer = case["reviewer"]
         tester = case["tester"]
@@ -1215,6 +1217,9 @@ class KanbanLifecycleUpgradeConformance(MODULE.KanbanConformanceFixture):
 
     def test_supersede_candidate_recovers_and_hands_off_fresh_candidate(self) -> None:
         self._drive_supersede_scenarios(self._SUPERSEDE_RECOVERY_SCENARIOS)
+        for mode in ("same_card", "separate_card"):
+            with self.subTest(mode=mode, scenario="no_recorded_branch"):
+                self._exercise_supersede_fresh_handoff(mode, branch=None)
 
     def test_supersede_candidate_refusals_leave_board_unchanged(self) -> None:
         self._drive_supersede_scenarios(self._SUPERSEDE_REFUSAL_SCENARIOS)

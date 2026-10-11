@@ -430,7 +430,6 @@ def _supersession_git_heads(
     if (
         snapshot["head"] != snapshot["branch_head"]
         or (branch and snapshot["current_branch"] not in {None, branch})
-        or (not branch and snapshot["current_branch"] is not None)
     ):
         raise ValueError("candidate workspace is not on its recorded branch or detached HEAD")
     path = snapshot["path"]
