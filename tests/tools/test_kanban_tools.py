@@ -1743,16 +1743,18 @@ def _supersede_candidate_tool_env(monkeypatch, tmp_path):
     with kbc.connect_closing(board="recovery") as conn:
         case = _supersede_candidate_case(conn, tmp_path)
         quarantined = list(conn.iterdump())
+    from tools.registry import discover_builtin_tools
+    discover_builtin_tools()
     return case, quarantined
 
 
 def test_supersede_candidate_tool_recovers_named_board(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
-    from tools import kanban_tools as kt
+    from tools.registry import registry
 
     case, _quarantined = _supersede_candidate_tool_env(monkeypatch, tmp_path)
-    out = json.loads(kt._handle_supersede_candidate({
+    out = json.loads(registry.dispatch("kanban_supersede_candidate", {
         "board": "recovery",
         "implementation_id": case["implementation"],
         "expected_versions": case["versions"],
@@ -1781,7 +1783,7 @@ def test_supersede_candidate_tool_refuses_missing_board_and_worker_context(
     monkeypatch, tmp_path,
 ):
     from hermes_cli import kanban_db_connect as kbc
-    from tools import kanban_tools as kt
+    from tools.registry import registry
 
     case, quarantined = _supersede_candidate_tool_env(monkeypatch, tmp_path)
     payload = {
@@ -1792,11 +1794,11 @@ def test_supersede_candidate_tool_refuses_missing_board_and_worker_context(
         "replacement_head_sha": case["moved_head"],
         "reason": "supersede the unreviewed moved candidate",
     }
-    missing_board = json.loads(kt._handle_supersede_candidate(dict(payload)))
+    missing_board = json.loads(registry.dispatch("kanban_supersede_candidate", dict(payload)))
     assert "board is required" in missing_board["error"]
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", case["implementation"])
-    worker = json.loads(kt._handle_supersede_candidate({**payload, "board": "recovery"}))
+    worker = json.loads(registry.dispatch("kanban_supersede_candidate", {**payload, "board": "recovery"}))
     assert "orchestrator-only" in worker["error"]
 
     with kbc.connect_closing(board="recovery") as conn:
