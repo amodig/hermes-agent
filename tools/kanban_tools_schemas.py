@@ -842,3 +842,51 @@ KANBAN_REWORK_REVIEW_SCHEMA = _schema(
         "reason",
     ],
 )
+
+KANBAN_SUPERSEDE_CANDIDATE_SCHEMA = _schema(
+    "kanban_supersede_candidate",
+    (
+        "Atomically supersede one typed code candidate whose recorded immutable "
+        "head moved before any reviewer run, retiring only the matching moved-head "
+        "review quarantine and reopening the same implementation for a fresh "
+        "handoff. Refuses when a role already started, when the graph/versions "
+        "changed, or when the replacement is not a clean descendant of the "
+        "recorded head. Creates no run or verdict; preserves cards, edges, runs and "
+        "old handoffs as history. Orchestrator-only."
+    ),
+    {
+        "implementation_id": _prop("string", "Typed code implementation task id."),
+        "expected_versions": {
+            "type": "object",
+            "description": (
+                "Exact current version of the implementation and every descendant "
+                "card (reviewer, tester, and any other descendant), keyed by task id. "
+                "A missing, extra, or stale entry refuses without writes."
+            ),
+            "additionalProperties": {"type": "integer", "minimum": 1},
+        },
+        "expected_candidate_run_id": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Current immutable implementation candidate run id.",
+        },
+        "expected_head_sha": _prop(
+            "string",
+            "Recorded candidate head commit; must match the immutable handoff and quarantine.",
+        ),
+        "replacement_head_sha": _prop(
+            "string",
+            "Observed newer commit that is a descendant of the recorded head and the workspace HEAD.",
+        ),
+        "reason": _prop("string", "Why the unreviewed moved candidate is being superseded."),
+    },
+    [
+        "board",
+        "implementation_id",
+        "expected_versions",
+        "expected_candidate_run_id",
+        "expected_head_sha",
+        "replacement_head_sha",
+        "reason",
+    ],
+)

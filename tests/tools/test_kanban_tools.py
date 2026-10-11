@@ -1720,3 +1720,85 @@ class TestDefaultTaskId:
         assert kt._default_task_id("") == worker_env
         assert kt._default_task_id("   ") == worker_env
         assert kt._default_task_id(None) == worker_env
+
+
+# ---------------------------------------------------------------------------
+# supersede-candidate — orchestrator-only unreviewed moved-head recovery
+# ---------------------------------------------------------------------------
+
+def _supersede_candidate_tool_env(monkeypatch, tmp_path):
+    """Isolated home + named board holding one quarantined moved-head candidate."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tests.hermes_cli.test_kanban_cli import _supersede_candidate_case
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "cto")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    kb._INITIALIZED_PATHS.clear()
+    kb.create_board("recovery")
+    with kbc.connect_closing(board="recovery") as conn:
+        case = _supersede_candidate_case(conn, tmp_path)
+        quarantined = list(conn.iterdump())
+    return case, quarantined
+
+
+def test_supersede_candidate_tool_recovers_named_board(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    case, _quarantined = _supersede_candidate_tool_env(monkeypatch, tmp_path)
+    out = json.loads(kt._handle_supersede_candidate({
+        "board": "recovery",
+        "implementation_id": case["implementation"],
+        "expected_versions": case["versions"],
+        "expected_candidate_run_id": case["candidate_run_id"],
+        "expected_head_sha": case["head"],
+        "replacement_head_sha": case["moved_head"],
+        "reason": "supersede the unreviewed moved candidate",
+    }))
+    assert out["ok"] is True, out
+    assert out["implementation_id"] == case["implementation"]
+    assert out["reviewer_id"] == case["reviewer"]
+    assert out["tester_id"] == case["tester"]
+    assert out["status"] == "ready"
+    assert (out["superseded_head_sha"], out["replacement_head_sha"]) == (
+        case["head"], case["moved_head"],
+    )
+
+    with kbc.connect_closing(board="recovery") as conn:
+        assert kb.get_task(conn, case["implementation"]).status == "ready"
+        assert kb.get_task(conn, case["reviewer"]).status == "todo"
+        assert kb.claim_review_task(conn, case["reviewer"]) is None
+        assert kb.claim_task(conn, case["tester"]) is None
+
+
+def test_supersede_candidate_tool_refuses_missing_board_and_worker_context(
+    monkeypatch, tmp_path,
+):
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    case, quarantined = _supersede_candidate_tool_env(monkeypatch, tmp_path)
+    payload = {
+        "implementation_id": case["implementation"],
+        "expected_versions": case["versions"],
+        "expected_candidate_run_id": case["candidate_run_id"],
+        "expected_head_sha": case["head"],
+        "replacement_head_sha": case["moved_head"],
+        "reason": "supersede the unreviewed moved candidate",
+    }
+    missing_board = json.loads(kt._handle_supersede_candidate(dict(payload)))
+    assert "board is required" in missing_board["error"]
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", case["implementation"])
+    worker = json.loads(kt._handle_supersede_candidate({**payload, "board": "recovery"}))
+    assert "orchestrator-only" in worker["error"]
+
+    with kbc.connect_closing(board="recovery") as conn:
+        assert list(conn.iterdump()) == quarantined
+

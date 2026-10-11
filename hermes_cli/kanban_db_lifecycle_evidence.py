@@ -7,6 +7,7 @@ from typing import Any, Optional
 
 from hermes_cli.kanban_db_lazy import _kb
 from hermes_cli.kanban_lifecycle import (
+    LIFECYCLE_SCHEMA_VERSION,
     LifecycleEvidenceError,
     _latest_head,
     get_lifecycle_state,
@@ -31,6 +32,70 @@ def _latest_lifecycle_run_id(
             return run_id
         return None
     return None
+
+def _pending_candidate_supersession(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict[str, Any]]:
+    event = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'candidate_superseded' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if event is None:
+        return None
+    payload = _kb._json_dict(event["payload"])
+    provenance = {
+        "supersession_event_id": event["id"],
+        "superseded_candidate_run_id": payload.get("superseded_candidate_run_id"),
+        "superseded_head_sha": payload.get("superseded_head_sha"),
+        "replacement_head_sha": payload.get("replacement_head_sha"),
+    }
+    old_run_id = provenance["superseded_candidate_run_id"]
+    if (
+        isinstance(old_run_id, bool) or not isinstance(old_run_id, int) or old_run_id < 1
+        or any(
+            not isinstance(provenance[key], str) or not provenance[key].strip()
+            for key in ("superseded_head_sha", "replacement_head_sha")
+        )
+    ):
+        raise LifecycleEvidenceError("candidate supersession provenance is malformed")
+    # Only a coherent, successful implementation run AND its immutable handoff
+    # consume recovery. An attempted run or an arbitrary review event cannot.
+    handoffs = conn.execute(
+        "SELECT e.payload, e.run_id, r.metadata FROM task_events e "
+        "JOIN task_runs r ON r.id = e.run_id AND r.task_id = e.task_id "
+        "WHERE e.task_id = ? AND e.id > ? AND e.kind IN ('completed', 'review_requested') "
+        "AND r.ended_at IS NOT NULL AND r.outcome = e.kind "
+        "AND r.status != 'running' ORDER BY e.id",
+        (task_id, event["id"]),
+    ).fetchall()
+    for handoff in handoffs:
+        metadata = _kb._json_dict(handoff["metadata"])
+        lifecycle = metadata.get("lifecycle")
+        event_payload = _kb._json_dict(handoff["payload"])
+        if (
+            isinstance(lifecycle, dict)
+            and type(lifecycle.get("schema")) is int
+            and lifecycle.get("schema") == LIFECYCLE_SCHEMA_VERSION
+            and lifecycle.get("phase") == "implementation"
+            and lifecycle.get("candidate_task_id") == task_id
+            and lifecycle.get("candidate_run_id") == handoff["run_id"]
+            and handoff["run_id"] > old_run_id
+            and "verdict" in lifecycle and lifecycle["verdict"] is None
+            and isinstance(lifecycle.get("head_sha"), str)
+            and bool(lifecycle["head_sha"].strip())
+            and lifecycle["head_sha"] != provenance["superseded_head_sha"]
+            and isinstance(lifecycle.get("goal_revision_ids"), dict)
+            and task_id in lifecycle["goal_revision_ids"]
+            and "task_goal_revision_id" in lifecycle
+            and lifecycle["goal_revision_ids"][task_id] == lifecycle.get("task_goal_revision_id")
+            and event_payload.get("lifecycle") == lifecycle
+            and metadata.get("candidate_supersession") == provenance
+            and event_payload.get("candidate_supersession") == provenance
+        ):
+            return None
+    return provenance
+
 
 def _stamp_lifecycle_metadata(
     conn: sqlite3.Connection,
@@ -98,6 +163,26 @@ def _stamp_lifecycle_metadata(
         )
         if rejected_head and (supplied_head or current_head) == rejected_head:
             raise LifecycleEvidenceError("rework requires a new implementation head")
+        supersession = _pending_candidate_supersession(conn, task_id)
+        if supersession is not None:
+            path = Path(str(updated.get("workspace_path") or task.workspace_path or "")).expanduser()
+            resolved_head = _kb._resolve_commit(path, supplied_head)
+            replacement = _kb._resolve_commit(path, supersession["replacement_head_sha"])
+            superseded = _kb._resolve_commit(path, supersession["superseded_head_sha"])
+            if (
+                not resolved_head or not replacement or not superseded
+                or resolved_head == superseded
+                or not _kb._is_ancestor(path, replacement, resolved_head)
+            ):
+                raise LifecycleEvidenceError(
+                    "superseded candidate handoff must retain the replacement head as an ancestor"
+                )
+            existing_supersession = updated.get("candidate_supersession")
+            if existing_supersession is not None and existing_supersession != supersession:
+                raise LifecycleEvidenceError("candidate supersession provenance conflicts with recovery")
+            updated["candidate_supersession"] = supersession
+        else:
+            updated.pop("candidate_supersession", None)
     if phase != "implementation" and current_head and supplied_head and supplied_head != current_head:
         raise LifecycleEvidenceError("lifecycle evidence head_sha does not match the candidate head")
     head_sha = supplied_head or current_head or _kb.latest_handoff(conn, candidate_task_id).get("head_sha")

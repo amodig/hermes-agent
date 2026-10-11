@@ -895,6 +895,38 @@ def _verdict_for(
 
 
 
+def _superseded_without_candidate(
+    conn: sqlite3.Connection, candidate_id: str, *, cache: Optional[_ProjectionCache] = None,
+) -> bool:
+    """Recognize the reset snapshot without reinterpreting older role verdicts."""
+    row = _task_row(conn, candidate_id, cache)
+    if row is None or row["candidate_run_id"] is not None or row["status"] == "archived":
+        return False
+    snapshot = _projection_cache_for(conn, cache)
+    events = (
+        snapshot.events_by_task.get(candidate_id, ())
+        if snapshot is not None
+        else conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'candidate_superseded' ORDER BY id DESC LIMIT 1",
+            (candidate_id,),
+        ).fetchall()
+    )
+    recovery = next((event for event in events if event["kind"] == "candidate_superseded"), None)
+    if recovery is None:
+        return False
+    payload = _json_column(recovery["payload"])
+    versions = payload.get("expected_versions")
+    expected_version = versions.get(candidate_id) if isinstance(versions, dict) else None
+    if type(expected_version) is not int or row["version"] != expected_version + 1:
+        return False
+    implementations = _evidence_rows(conn, candidate_id, "implementation", cache=cache)
+    return bool(implementations) and (
+        implementations[0][0] == payload.get("superseded_candidate_run_id")
+        and implementations[0][1].get("task_goal_revision_id") == _task_goal_revision_id(row)
+    )
+
+
 def _get_lifecycle_state(
     conn: sqlite3.Connection,
     task_id: str,
@@ -955,6 +987,13 @@ def _get_lifecycle_state(
         elif verdict in {"APPROVE", "PASS"} and row["status"] == "done":
             state["acceptance"] = "accepted"
         else:
+            state["acceptance"] = "pending"
+        if (
+            row["status"] != "archived"
+            and snapshot["run_id"] is None
+            and set(state["diagnostics"]) <= {"candidate_missing"}
+            and _superseded_without_candidate(conn, candidate_id, cache=cache)
+        ):
             state["acceptance"] = "pending"
         return state
 
@@ -1043,6 +1082,12 @@ def _get_lifecycle_state(
     elif required_review_ok and required_validation_ok and row["status"] == "done":
         state["acceptance"] = "accepted"
     else:
+        state["acceptance"] = "pending"
+    if (
+        implementation_snapshot["run_id"] is None
+        and set(state["diagnostics"]) <= {"candidate_missing"}
+        and _superseded_without_candidate(conn, task_id, cache=cache)
+    ):
         state["acceptance"] = "pending"
     return state
 

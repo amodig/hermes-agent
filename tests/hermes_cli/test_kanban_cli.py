@@ -394,3 +394,183 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# supersede-candidate — unreviewed moved-head candidate recovery
+# ---------------------------------------------------------------------------
+
+def _supersede_candidate_case(conn, tmp_path):
+    """Base -> H1 handoff, branch moved to H2, unstarted review quarantined.
+
+    The H2 commit stays on the branch, so the recovery lane has no new commit
+    to manufacture: the implementer hands off the existing newer head.
+    """
+    from tests.hermes_cli.test_kanban_handoff import _commit, _lane, _repo
+
+    repo, base, branch = _repo(tmp_path)
+    implementation, reviewer = _lane(conn, repo, branch, validation_required=True)
+    tester = kb.create_task(
+        conn,
+        title="recovery tester",
+        assignee="tester",
+        lifecycle_contract={"kind": "validation", "candidate_task_id": implementation},
+    )
+    kb.link_tasks(conn, reviewer, tester, requirement="review_approved")
+    run = kb.claim_task(conn, implementation)
+    head = _commit(repo)
+    assert kb.complete_task(
+        conn,
+        implementation,
+        expected_run_id=run.current_run_id,
+        summary="implemented src/changed.py",
+        metadata={"base_sha": base, "head_sha": head},
+    )
+    assert kb.get_task(conn, reviewer).status == "review"
+    moved_head = _commit(repo, "src/moved.py")
+    assert kb.block_task(
+        conn,
+        reviewer,
+        reason="immutable parent handoff moved; quarantine pending supported recovery",
+        kind="capability",
+        quarantine_review=True,
+        expected_version=kb.get_task(conn, reviewer).version,
+    )
+    candidate_run_id = conn.execute(
+        "SELECT candidate_run_id FROM tasks WHERE id = ?", (implementation,)
+    ).fetchone()[0]
+    return {
+        "repo": repo,
+        "head": head,
+        "moved_head": moved_head,
+        "implementation": implementation,
+        "reviewer": reviewer,
+        "tester": tester,
+        "candidate_run_id": candidate_run_id,
+        "versions": {
+            task_id: kb.get_task(conn, task_id).version
+            for task_id in (implementation, reviewer, tester)
+        },
+    }
+
+
+def _supersede_candidate_flags(case, **overrides):
+    values = {
+        "--implementation-id": case["implementation"],
+        "--expected-versions": json.dumps(case["versions"]),
+        "--expected-candidate-run-id": str(case["candidate_run_id"]),
+        "--expected-head-sha": case["head"],
+        "--replacement-head-sha": case["moved_head"],
+        "--reason": "Supersede moved candidate before any reviewer run",
+    }
+    values.update(overrides)
+    flags: list[str] = []
+    for flag, value in values.items():
+        flags += [flag, value]
+    return flags
+
+
+def test_supersede_candidate_cli_recovers_unreviewed_moved_candidate(
+    kanban_home, tmp_path, monkeypatch, capsys,
+):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    kb.create_board("recovery")
+    with kb.scoped_current_board("recovery"), kbc.connect_closing() as conn:
+        case = _supersede_candidate_case(conn, tmp_path)
+        runs_before = list(conn.execute("SELECT * FROM task_runs"))
+        links_before = list(conn.execute("SELECT * FROM task_links"))
+
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    kc.build_parser(parser.add_subparsers(dest="command"))
+    args = parser.parse_args([
+        "kanban", "--board", "recovery", "supersede-candidate",
+        *_supersede_candidate_flags(case), "--json",
+    ])
+    assert kc.kanban_command(args) == 0
+
+    outcome = json.loads(capsys.readouterr().out)
+    assert outcome["implementation_id"] == case["implementation"]
+    assert outcome["reviewer_id"] == case["reviewer"]
+    assert outcome["tester_id"] == case["tester"]
+    assert outcome["status"] == "ready"
+    assert outcome["superseded_candidate_run_id"] == case["candidate_run_id"]
+    assert (outcome["superseded_head_sha"], outcome["replacement_head_sha"]) == (
+        case["head"], case["moved_head"],
+    )
+    assert outcome["versions"] == {
+        task_id: version + 1 for task_id, version in case["versions"].items()
+    }
+
+    with kb.scoped_current_board("recovery"), kbc.connect_closing() as conn:
+        assert kb.get_task(conn, case["implementation"]).status == "ready"
+        assert kb.get_task(conn, case["reviewer"]).status == "todo"
+        assert kb.get_task(conn, case["tester"]).status == "todo"
+        # History and edges are preserved; no review/test run was started.
+        assert list(conn.execute("SELECT * FROM task_runs")) == runs_before
+        assert list(conn.execute("SELECT * FROM task_links")) == links_before
+        assert kb.claim_review_task(conn, case["reviewer"]) is None
+        assert kb.claim_task(conn, case["tester"]) is None
+        # Readiness recompute must not release the reviewer/tester early.
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, case["reviewer"]).status == "todo"
+        assert kb.get_task(conn, case["tester"]).status == "todo"
+        superseded = [
+            event for event in kb.list_events(conn, case["implementation"])
+            if event.kind == "candidate_superseded"
+        ]
+        assert len(superseded) == 1
+        assert superseded[0].run_id == case["candidate_run_id"]
+
+
+def test_supersede_candidate_cli_requires_explicit_board_and_valid_json(
+    kanban_home, tmp_path, monkeypatch, capsys,
+):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    kb.create_board("recovery")
+    with kb.scoped_current_board("recovery"), kbc.connect_closing() as conn:
+        case = _supersede_candidate_case(conn, tmp_path)
+        quarantined = list(conn.iterdump())
+
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    kc.build_parser(parser.add_subparsers(dest="command"))
+
+    missing_board = parser.parse_args([
+        "kanban", "supersede-candidate", *_supersede_candidate_flags(case),
+    ])
+    assert kc.kanban_command(missing_board) == 2
+    assert "requires an explicit --board" in capsys.readouterr().err
+
+    bad_json = parser.parse_args([
+        "kanban", "--board", "recovery", "supersede-candidate",
+        *_supersede_candidate_flags(case, **{"--expected-versions": "not-json"}),
+    ])
+    assert kc.kanban_command(bad_json) == 2
+    assert "JSON object" in capsys.readouterr().err
+
+    with kb.scoped_current_board("recovery"), kbc.connect_closing() as conn:
+        assert list(conn.iterdump()) == quarantined
+
+
+def test_supersede_candidate_cli_rejects_worker_context(
+    kanban_home, tmp_path, monkeypatch, capsys,
+):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    kb.create_board("recovery")
+    with kb.scoped_current_board("recovery"), kbc.connect_closing() as conn:
+        case = _supersede_candidate_case(conn, tmp_path)
+        quarantined = list(conn.iterdump())
+
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    kc.build_parser(parser.add_subparsers(dest="command"))
+    args = parser.parse_args([
+        "kanban", "--board", "recovery", "supersede-candidate",
+        *_supersede_candidate_flags(case), "--json",
+    ])
+    monkeypatch.setenv("HERMES_KANBAN_TASK", case["implementation"])
+    assert kc.kanban_command(args) == 1
+    assert "orchestrator-only" in capsys.readouterr().err
+    with kb.scoped_current_board("recovery"), kbc.connect_closing() as conn:
+        assert list(conn.iterdump()) == quarantined
+
+

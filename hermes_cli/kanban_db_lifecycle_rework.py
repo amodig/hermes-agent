@@ -17,7 +17,14 @@ from hermes_cli.kanban_db_lifecycle_evidence import (
     _implementation_routing,
     _stamp_lifecycle_metadata,
 )
-from hermes_cli.kanban_lifecycle import get_lifecycle_state, safe_decode_contract
+from hermes_cli.kanban_lifecycle import (
+    _direct_role_children,
+    decode_contract,
+    get_lifecycle_state,
+    lifecycle_metadata,
+    safe_decode_contract,
+    validate_edge,
+)
 
 def _rework_fingerprint(
     implementation_id: str,
@@ -343,6 +350,406 @@ def _typed_rework_graph(
             fields += ("assignee",)
         _kb.notify_task_updated(conn, entry["id"], fields)
     return result
+
+def _supersession_roles(
+    conn: sqlite3.Connection, implementation: Any,
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve only the declared, unambiguous typed review/validation chain."""
+    implementation_id = implementation.id
+    contract = implementation.lifecycle_contract
+    same_card = contract["review_mode"] == "same_card"
+    reviewers = _direct_role_children(conn, implementation_id, "review")
+    if len(reviewers) != (0 if same_card else 1):
+        raise ValueError("candidate supersession requires exactly the declared review card")
+    reviewer_id = reviewers[0] if reviewers else None
+    review_id = reviewer_id or implementation_id
+    validators = _direct_role_children(
+        conn, review_id, "validation", candidate_id=implementation_id,
+    )
+    if len(validators) != int(contract["validation_required"]):
+        raise ValueError("candidate supersession requires exactly the declared validation card")
+    tester_id = validators[0] if validators else None
+    declared = {task_id for task_id in (reviewer_id, tester_id) if task_id}
+    # A disconnected or misplaced role is contradictory, not a second chain to infer.
+    for row in conn.execute(
+        "SELECT id, lifecycle_contract FROM tasks WHERE lifecycle_contract IS NOT NULL"
+    ).fetchall():
+        role = safe_decode_contract(row["lifecycle_contract"])
+        if role and role.get("candidate_task_id") == implementation_id and row["id"] not in declared:
+            raise ValueError(f"undeclared lifecycle role card {row['id']}")
+    for role_id, parent_id, requirement in (
+        (reviewer_id, implementation_id, "phase_finished"),
+        (tester_id, review_id, "review_approved"),
+    ):
+        if role_id is None:
+            continue
+        parents = conn.execute(
+            "SELECT parent_id, requirement FROM task_links WHERE child_id = ?", (role_id,),
+        ).fetchall()
+        if len(parents) != 1 or (
+            parents[0]["parent_id"], parents[0]["requirement"]
+        ) != (parent_id, requirement):
+            raise ValueError(f"lifecycle role card {role_id} has contradictory parent edges")
+        validate_edge(conn, parent_id, role_id, requirement)
+        role_task = _kb.get_task(conn, role_id)
+        _kb._validate_lifecycle_role_identity(
+            conn, role_task.lifecycle_contract, role_task.assignee, task_id=role_id,
+        )
+    _kb._validate_lifecycle_role_identity(
+        conn, contract, implementation.assignee, task_id=implementation_id,
+    )
+    return reviewer_id, tester_id
+
+
+def _supersession_git_heads(
+    implementation: Any,
+    metadata: dict[str, Any],
+    lifecycle: dict[str, Any],
+    handoff_error: dict[str, Any],
+    expected_head_sha: str,
+    replacement_head_sha: str,
+) -> tuple[str, str]:
+    """Read-only Git fence; repeated immediately before the scheduling writes."""
+    from pathlib import Path
+
+    handoff = _kb._handoff_fields(metadata)
+    workspace = str(handoff.get("workspace_path") or implementation.workspace_path or "").strip()
+    branch = str(handoff.get("branch_name") or implementation.branch_name or "").strip() or None
+    if implementation.workspace_path and (
+        Path(workspace).expanduser().resolve()
+        != Path(implementation.workspace_path).expanduser().resolve()
+    ):
+        raise ValueError("candidate workspace no longer matches the recorded task workspace")
+    if implementation.branch_name and branch != implementation.branch_name:
+        raise ValueError("candidate branch no longer matches the recorded task branch")
+    snapshot = _kb._git_snapshot(workspace, branch)
+    if snapshot is None:
+        raise ValueError("candidate workspace is unavailable")
+    if snapshot["dirty_files"]:
+        raise ValueError("candidate workspace has dirty or untracked files")
+    if (
+        snapshot["head"] != snapshot["branch_head"]
+        or (branch and snapshot["current_branch"] not in {None, branch})
+        or (not branch and snapshot["current_branch"] is not None)
+    ):
+        raise ValueError("candidate workspace is not on its recorded branch or detached HEAD")
+    path = snapshot["path"]
+    old_head = _kb._resolve_commit(path, lifecycle["head_sha"])
+    new_head = _kb._resolve_commit(path, replacement_head_sha)
+    if (
+        not old_head
+        or old_head != _kb._resolve_commit(path, expected_head_sha)
+        or old_head != _kb._resolve_commit(path, handoff_error.get("expected_head_sha"))
+    ):
+        raise ValueError("expected head does not match the pinned candidate and quarantine")
+    if (
+        not new_head
+        or new_head != snapshot["head"]
+        or new_head != _kb._resolve_commit(path, handoff_error.get("actual_head_sha"))
+    ):
+        raise ValueError("replacement head does not match the workspace and quarantine")
+    if old_head == new_head or not _kb._is_ancestor(path, old_head, new_head):
+        raise ValueError("replacement head must be a distinct descendant of the candidate head")
+    return old_head, new_head
+
+
+def _supersession_never_started(
+    conn: sqlite3.Connection,
+    implementation_id: str,
+    role_ids: set[str],
+    candidate_run_id: int,
+    completion_event_id: int,
+    runs: list[sqlite3.Row],
+) -> None:
+    for run in runs:
+        metadata = _kb._json_dict(run["metadata"])
+        lifecycle = metadata.get("lifecycle")
+        lifecycle = lifecycle if isinstance(lifecycle, dict) else {}
+        bound = (
+            lifecycle.get("candidate_run_id") == candidate_run_id
+            or metadata.get("candidate_run_id") == candidate_run_id
+        )
+        role_run = run["task_id"] in role_ids and run["id"] != candidate_run_id
+        role_evidence = (
+            lifecycle.get("phase") in {"review", "validation"}
+            or lifecycle.get("verdict") is not None
+            or metadata.get("verdict") is not None
+        )
+        if (role_run and (run["id"] > candidate_run_id or bound)) or (
+            bound and role_evidence
+        ):
+            raise ValueError(f"review or validation already started in run {run['id']}")
+    for task_id in role_ids | {implementation_id}:
+        events = conn.execute(
+            "SELECT id, kind, payload FROM task_events WHERE task_id = ? ORDER BY id",
+            (task_id,),
+        ).fetchall()
+        for event in events:
+            payload = _kb._json_dict(event["payload"])
+            lifecycle = payload.get("lifecycle")
+            lifecycle = lifecycle if isinstance(lifecycle, dict) else {}
+            bound = (
+                lifecycle.get("candidate_run_id") == candidate_run_id
+                or payload.get("candidate_run_id") == candidate_run_id
+            )
+            role_evidence = (
+                lifecycle.get("phase") in {"review", "validation"}
+                or lifecycle.get("verdict") is not None
+                or payload.get("verdict") is not None
+            )
+            if bound and role_evidence:
+                raise ValueError(f"candidate already has role evidence in event {event['id']}")
+            if event["id"] > completion_event_id and task_id in role_ids and (
+                event["kind"] in {
+                    "claimed", "completed", "review_requested", "validation_requested",
+                    "changes_requested",
+                }
+                or role_evidence
+            ):
+                raise ValueError(f"review or validation already attempted in event {event['id']}")
+
+
+def supersede_candidate(
+    conn: sqlite3.Connection,
+    implementation_id: str,
+    *,
+    expected_versions: dict[str, int],
+    expected_candidate_run_id: int,
+    expected_head_sha: str,
+    replacement_head_sha: str,
+    reason: str,
+    author: Optional[str] = None,
+) -> dict[str, Any]:
+    """Reopen a quarantined, never-reviewed moved candidate without rewriting history."""
+    with _kb.write_txn(conn):
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            raise ValueError("candidate supersession is an orchestrator-only operation")
+        if not isinstance(implementation_id, str) or not implementation_id.strip():
+            raise ValueError("implementation_id is required")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("reason is required")
+        reason = str(_kb.redact_review_value(reason)).strip()
+        if not reason:
+            raise ValueError("reason is required")
+        actor = str(author or os.environ.get("HERMES_PROFILE") or "orchestrator").strip() or "orchestrator"
+        if (
+            isinstance(expected_candidate_run_id, bool)
+            or not isinstance(expected_candidate_run_id, int)
+            or expected_candidate_run_id < 1
+        ):
+            raise ValueError("expected_candidate_run_id must be an integer >= 1")
+        if not isinstance(expected_versions, dict) or not expected_versions or any(
+            not isinstance(task_id, str) or not task_id.strip()
+            or isinstance(version, bool) or not isinstance(version, int) or version < 1
+            for task_id, version in expected_versions.items()
+        ):
+            raise ValueError("expected_versions must map nonblank task ids to integers >= 1")
+        if any(
+            not isinstance(head, str) or not head.strip()
+            for head in (expected_head_sha, replacement_head_sha)
+        ):
+            raise ValueError("expected_head_sha and replacement_head_sha are required")
+        implementation = _kb.get_task(conn, implementation_id)
+        contract = implementation.lifecycle_contract if implementation else None
+        if not contract or contract.get("kind") != "code":
+            raise ValueError("candidate supersession requires a classified code implementation")
+        rows = conn.execute(
+            """
+            WITH RECURSIVE graph(id) AS (
+                SELECT ?
+                UNION
+                SELECT l.child_id FROM task_links l JOIN graph g ON g.id = l.parent_id
+            )
+            SELECT t.* FROM graph JOIN tasks t ON t.id = graph.id ORDER BY t.id
+            """,
+            (implementation_id,),
+        ).fetchall()
+        if {row["id"] for row in rows} != set(expected_versions):
+            raise ValueError("expected_versions must cover exactly the implementation and all descendants")
+        for row in rows:
+            if row["version"] != expected_versions[row["id"]]:
+                raise ValueError(
+                    f"task {row['id']} update conflict: expected version "
+                    f"{expected_versions[row['id']]}, current version {row['version']}"
+                )
+            if row["status"] == "archived":
+                raise ValueError(f"cannot supersede archived task {row['id']}")
+            if row["status"] == "running" or any(
+                row[field] not in (None, "") for field in ("claim_lock", "current_run_id", "worker_pid")
+            ):
+                raise ValueError(f"task {row['id']} has unresolved worker or claim state")
+            if decode_contract(row["lifecycle_contract"]) is None:
+                raise ValueError(f"task {row['id']} has an unclassified lifecycle contract")
+            for edge in conn.execute(
+                "SELECT child_id, requirement FROM task_links WHERE parent_id = ?", (row["id"],),
+            ).fetchall():
+                if _kb._would_cycle(conn, row["id"], edge["child_id"]):
+                    raise ValueError("candidate lifecycle graph contains a cycle")
+                validate_edge(conn, row["id"], edge["child_id"], edge["requirement"])
+        reviewer_id, tester_id = _supersession_roles(conn, implementation)
+        same_card = reviewer_id is None
+        review_id = reviewer_id or implementation_id
+        implementation_row = next(row for row in rows if row["id"] == implementation_id)
+        review_row = next(row for row in rows if row["id"] == review_id)
+        if implementation_row["candidate_run_id"] != expected_candidate_run_id:
+            raise ValueError("expected_candidate_run_id does not match the current candidate")
+        run = conn.execute(
+            "SELECT * FROM task_runs WHERE id = ? AND task_id = ?",
+            (expected_candidate_run_id, implementation_id),
+        ).fetchone()
+        metadata = _kb._json_dict(_kb._row_get(run, "metadata"))
+        lifecycle = metadata.get("lifecycle")
+        if (
+            run is None or run["ended_at"] is None
+            or run["outcome"] not in {"completed", "review_requested"}
+            or run["status"] == "running"
+            or not isinstance(lifecycle, dict)
+            or not isinstance(lifecycle.get("head_sha"), str)
+            or not lifecycle["head_sha"].strip()
+            or json.dumps(lifecycle, sort_keys=True) != json.dumps(lifecycle_metadata(
+                conn, implementation_id, phase="implementation",
+                run_id=expected_candidate_run_id, verdict=None,
+                candidate_task_id=implementation_id, head_sha=lifecycle["head_sha"],
+            ), sort_keys=True)
+        ):
+            raise ValueError("pinned candidate is not a finished, current implementation envelope")
+        goal = _kb.get_effective_goal(conn, implementation_id)
+        if not goal or goal.get("task_id") != implementation_id or (
+            goal.get("id") != lifecycle["task_goal_revision_id"]
+        ):
+            raise ValueError("candidate does not bind the current effective goal")
+        completion = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind IN ('completed', 'review_requested') ORDER BY id LIMIT 1",
+            (implementation_id, expected_candidate_run_id),
+        ).fetchone()
+        if completion is None or _kb._json_dict(completion["payload"]).get("lifecycle") != lifecycle:
+            raise ValueError("pinned candidate has no matching immutable handoff event")
+        if implementation.status != ("blocked" if same_card else "done") or (
+            review_row["status"] != "blocked"
+            or _kb._resume_status_from_events(conn, review_id) != "review"
+        ):
+            raise ValueError("candidate requires a blocked review-phase quarantine")
+        quarantine = conn.execute(
+            "SELECT id, kind, payload FROM task_events WHERE task_id = ? "
+            "AND kind IN ('blocked', 'unblocked', 'gave_up') ORDER BY id DESC LIMIT 1",
+            (review_id,),
+        ).fetchone()
+        payload = _kb._json_dict(_kb._row_get(quarantine, "payload"))
+        handoff_error = payload.get("handoff_error")
+        if (
+            quarantine is None or quarantine["kind"] != "blocked"
+            or quarantine["id"] <= completion["id"]
+            or payload.get("source_status") != "review"
+            or not isinstance(handoff_error, dict)
+            or handoff_error.get("kind") != "handoff_head_moved"
+            or handoff_error.get("parent_id") != implementation_id
+        ):
+            raise ValueError("candidate requires a current matching moved-head review quarantine")
+        runs = conn.execute(
+            "SELECT * FROM task_runs WHERE task_id IN (" + ",".join("?" for _ in rows) + ")",
+            tuple(row["id"] for row in rows),
+        ).fetchall()
+        for affected_run in runs:
+            if affected_run["ended_at"] is None or affected_run["worker_pid"] is not None:
+                raise ValueError(
+                    f"run {affected_run['id']} has unresolved worker state; "
+                    "normal worker reconciliation must finish before supersession"
+                )
+        role_ids = {review_id}
+        if tester_id:
+            role_ids.add(tester_id)
+        _supersession_never_started(
+            conn, implementation_id, role_ids, expected_candidate_run_id, completion["id"], runs,
+        )
+        implementer = implementation.assignee
+        if same_card:
+            implementer = _kb._canonical_assignee(
+                _implementation_routing(conn, implementation_id).get("implementer")
+            )
+            if not implementer:
+                raise ValueError("same-card supersession requires original implementation routing")
+            _kb._validate_lifecycle_role_identity(
+                conn, contract, implementer, task_id=implementation_id, phase="implementation",
+            )
+        old_head, new_head = _supersession_git_heads(
+            implementation, metadata, lifecycle, handoff_error, expected_head_sha, replacement_head_sha,
+        )
+        acceptance_before = _capture_acceptance(conn, implementation_id, include_descendants=True)
+        status = "ready" if _parents_satisfied(conn, implementation_id) else "todo"
+        statuses = {
+            row["id"]: (
+                status if row["id"] == implementation_id else "blocked"
+                if row["id"] != review_id and row["status"] == "blocked"
+                and _kb._has_sticky_block(conn, row["id"]) else "todo"
+            )
+            for row in rows
+        }
+        if (old_head, new_head) != _supersession_git_heads(
+            implementation, metadata, lifecycle, handoff_error, expected_head_sha, replacement_head_sha,
+        ):
+            raise ValueError("candidate Git observations changed during supersession")
+        invalidated: list[dict[str, Any]] = []
+        versions = {}
+        for row in rows:
+            task_id = row["id"]
+            new_status = statuses[task_id]
+            new_assignee = implementer if task_id == implementation_id else row["assignee"]
+            conn.execute(
+                "UPDATE tasks SET status = ?, assignee = ?, version = version + 1, "
+                "completed_at = NULL, result = NULL, candidate_run_id = NULL, current_run_id = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "block_kind = CASE WHEN ? = 'blocked' THEN block_kind ELSE NULL END, "
+                "block_recurrences = CASE WHEN ? = 'blocked' THEN block_recurrences ELSE 0 END "
+                "WHERE id = ?",
+                (new_status, new_assignee, new_status, new_status, task_id),
+            )
+            versions[task_id] = row["version"] + 1
+            entry = {
+                "id": task_id, "prior_assignee": row["assignee"], "new_assignee": new_assignee,
+                "prior_status": row["status"], "new_status": new_status,
+                "prior_version": row["version"], "new_version": versions[task_id],
+                "prior_completed_at": row["completed_at"], "prior_result": row["result"],
+                "prior_candidate_run_id": row["candidate_run_id"], "new_candidate_run_id": None,
+            }
+            invalidated.append(entry)
+            _kb._append_event(conn, task_id, "acceptance_invalidated", {
+                "implementation": implementation_id, "reviewer": reviewer_id, "tester": tester_id,
+                "actor": actor, "reason": reason, "superseded_head_sha": old_head, **entry,
+            })
+        _kb._append_event(conn, review_id, "unblocked", {
+            "actor": actor, "reason": reason, "prior_block_event_id": quarantine["id"],
+            "recovery": "candidate_superseded", "status": statuses[review_id],
+            "resume_status": "ready" if same_card else "review",
+        })
+        _kb._append_event(conn, implementation_id, "candidate_superseded", {
+            "actor": actor, "reason": reason, "implementation_id": implementation_id,
+            "reviewer_id": reviewer_id, "tester_id": tester_id,
+            "superseded_candidate_run_id": expected_candidate_run_id,
+            "superseded_head_sha": old_head, "replacement_head_sha": new_head,
+            "supersedes_completion_event_id": completion["id"],
+            "quarantine_event_id": quarantine["id"], "handoff_error": handoff_error,
+            "expected_versions": expected_versions, "invalidated": invalidated,
+        }, run_id=expected_candidate_run_id)
+        event_id = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND kind = 'candidate_superseded' "
+            "AND run_id = ? ORDER BY id DESC LIMIT 1",
+            (implementation_id, expected_candidate_run_id),
+        ).fetchone()["id"]
+        _emit_acceptance_changes(conn, acceptance_before, source_task_id=implementation_id)
+    for entry in invalidated:
+        fields = ("status", "version", "completed_at", "result", "candidate_run_id")
+        if same_card and entry["id"] == implementation_id:
+            fields += ("assignee",)
+        _kb.notify_task_updated(conn, entry["id"], fields)
+    return {
+        "implementation_id": implementation_id, "reviewer_id": reviewer_id, "tester_id": tester_id,
+        "status": status, "supersession_event_id": event_id,
+        "superseded_candidate_run_id": expected_candidate_run_id,
+        "superseded_head_sha": old_head, "replacement_head_sha": new_head,
+        "versions": versions, "invalidated": invalidated,
+    }
+
 
 def rework_review_graph(
     conn: sqlite3.Connection,

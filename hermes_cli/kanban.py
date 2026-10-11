@@ -214,7 +214,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "gc", "update", "rework-review",
+    "gc", "update", "rework-review", "supersede-candidate",
     "request-review", "request-changes", "reopen-review",
 })
 
@@ -1327,6 +1327,52 @@ def _cmd_rework_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_supersede_candidate(args: argparse.Namespace) -> int:
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err(
+            "kanban supersede-candidate is orchestrator-only; workers must hand off "
+            "their assigned task"
+        )
+    board = str(getattr(args, "board", "") or "").strip()
+    if not board:
+        return _err("kanban supersede-candidate requires an explicit --board <slug>", 2)
+    reason = " ".join(getattr(args, "reason", ()) or ())
+    reason = str(kb.redact_review_value(reason)).strip()
+    if not reason:
+        return _err("kanban supersede-candidate requires a non-empty --reason", 2)
+    try:
+        expected_versions = json.loads(getattr(args, "expected_versions", None) or "")
+    except (TypeError, ValueError):
+        return _err(
+            "kanban supersede-candidate requires --expected-versions as a JSON object "
+            'of task ids to versions, e.g. \'{"T-1":7,"T-2":4}\'',
+            2,
+        )
+    with kbc.connect_closing() as conn:
+        try:
+            outcome = kb.supersede_candidate(
+                conn,
+                args.implementation_id,
+                expected_versions=expected_versions,
+                expected_candidate_run_id=args.expected_candidate_run_id,
+                expected_head_sha=args.expected_head_sha,
+                replacement_head_sha=args.replacement_head_sha,
+                reason=reason,
+                author=_profile_author(),
+            )
+        except (ValueError, kb.LifecycleEvidenceError) as exc:
+            return _err(f"kanban: supersede-candidate: {exc}")
+    if _json_out(args, outcome):
+        return 0
+    print(
+        f"Superseded {args.implementation_id} candidate "
+        f"{outcome['superseded_candidate_run_id']} "
+        f"{outcome['superseded_head_sha'][:12]} -> {outcome['replacement_head_sha'][:12]}; "
+        f"status {outcome['status']} (invalidated {len(outcome['invalidated'])} card(s))"
+    )
+    return 0
+
+
 def _cmd_reopen_review(args: argparse.Namespace) -> int:
     ids, rc = _require_ids(args)
     if rc:
@@ -1613,6 +1659,7 @@ _HANDLERS = {
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "rework-review": _cmd_rework_review,
+    "supersede-candidate": _cmd_supersede_candidate,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
