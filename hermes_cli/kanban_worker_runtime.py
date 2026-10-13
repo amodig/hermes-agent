@@ -672,10 +672,13 @@ def _scope_activation_is_inside(unit_name: str, run) -> bool:
     activation = _scope_activation_epoch(unit_name)
     if activation is None:
         return False
-    started = int(run["started_at"])
+    started = run["started_at"]
+    if started is None:
+        # Legacy row with no attempt start: nothing to compare against, so no proof.
+        return False
     ended = int(run["ended_at"] or started)
     return (
-        started - _SCOPE_ATTEMPT_WINDOW_SECONDS
+        int(started) - _SCOPE_ATTEMPT_WINDOW_SECONDS
         <= activation
         <= ended + _SCOPE_ATTEMPT_WINDOW_SECONDS
     )
