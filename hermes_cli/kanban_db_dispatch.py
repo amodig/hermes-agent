@@ -118,10 +118,11 @@ class DispatchResult:
     """Task ids whose worker outlived its closed run and was terminated by
     :func:`reap_terminal_workers`."""
     reconciled_worker_scopes: list[dict] = field(default_factory=list)
-    """Sanitized events from :func:`reconcile_orphan_worker_scopes` (#57): each
-    names the exact scope, task, run and reason, the outcome, and whether the
-    single worker slot came free. Refusals are included, so an operator can see a
-    slot the dispatcher deliberately left held and why."""
+    """Sanitized events from :func:`reconcile_orphan_worker_scopes` (#57) for the
+    scopes this tick ACTED on: exact unit, task, run, reason, outcome, board and
+    whether the single worker slot came free. A refusal changes nothing on the
+    host, so it is logged rather than reported as activity — a live worker's scope
+    is refused on every tick while it runs."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -3065,6 +3066,11 @@ def _apply_default_assignee(
     return True
 
 
+# Worker-scope reconciliation outcomes that mean the tick ACTED on the host. A
+# refusal changes nothing there, so it is never reported as tick activity.
+_SCOPE_ACTION_OUTCOMES = frozenset({"reaped", "failed", "would_reap"})
+
+
 def _run_reclaim_phase(
     conn: sqlite3.Connection,
     result: DispatchResult,
@@ -3100,9 +3106,14 @@ def _run_reclaim_phase(
     # still open is only provably an orphan once that sweep has ended it -- and
     # still before this tick measures capacity, so the tick that discovers it can
     # free the slot and claim the next eligible card in the same pass.
-    result.reconciled_worker_scopes = reconcile_orphan_worker_scopes(
-        conn, apply=not dry_run, board=board,
-    )
+    result.reconciled_worker_scopes = [
+        event for event in reconcile_orphan_worker_scopes(
+            conn, apply=not dry_run, board=board,
+        )
+        # Only actions are tick activity: a live worker's scope is refused on every
+        # tick while it runs, and a refusal changes nothing on the host.
+        if event["outcome"] in _SCOPE_ACTION_OUTCOMES
+    ]
 
 
 def _tick_spawn_budget(
