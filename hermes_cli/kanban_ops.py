@@ -123,11 +123,19 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "rate_limited": res.rate_limited,
             "skipped_locked": res.skipped_locked,
             "memory_pressure": res.memory_pressure,
+            "reconciled_worker_scopes": res.reconciled_worker_scopes,
         }, ascii=True)
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
     if res.reaped_terminal_workers:
         print(f"Reaped workers of finished tasks: {', '.join(res.reaped_terminal_workers)}")
+    if res.reconciled_worker_scopes:
+        # Operator-facing: an unreaped scope is what holds the single worker slot.
+        scopes = ", ".join(
+            f"{event['unit']} ({event['reason']}/{event['outcome']})"
+            for event in res.reconciled_worker_scopes
+        )
+        print(f"Worker scopes: {scopes}")
     for label, items in (
         ("Crashed:     ", res.crashed),
         ("Interrupted: ", res.interrupted),
@@ -285,6 +293,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             res.reclaimed or res.crashed or res.timed_out or res.promoted
             or res.spawned or res.auto_blocked or res.stale
             or res.interrupted or res.cancelled or res.reaped_terminal_workers
+            or res.reconciled_worker_scopes
         )
         if did_work:
             print(
@@ -292,6 +301,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
                 f"crashed={len(res.crashed)} timed_out={len(res.timed_out)} stale={len(res.stale)} "
                 f"interrupted={len(res.interrupted)} cancelled={len(res.cancelled)} "
                 f"reaped_terminal_workers={len(res.reaped_terminal_workers)} "
+                f"reconciled_worker_scopes={len(res.reconciled_worker_scopes)} "
                 f"promoted={res.promoted} spawned={len(res.spawned)} "
                 f"auto_blocked={len(res.auto_blocked)}",
                 flush=True,

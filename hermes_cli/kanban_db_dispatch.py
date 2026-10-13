@@ -117,6 +117,11 @@ class DispatchResult:
     reaped_terminal_workers: list[str] = field(default_factory=list)
     """Task ids whose worker outlived its closed run and was terminated by
     :func:`reap_terminal_workers`."""
+    reconciled_worker_scopes: list[dict] = field(default_factory=list)
+    """Sanitized events from :func:`reconcile_orphan_worker_scopes` (#57): each
+    names the exact scope, task, run and reason, the outcome, and whether the
+    single worker slot came free. Refusals are included, so an operator can see a
+    slot the dispatcher deliberately left held and why."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -3060,6 +3065,7 @@ def _run_reclaim_phase(
     failure_limit: int,
     reconcile_orphans: bool,
     board: Optional[str] = None,
+    dry_run: bool = False,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
@@ -3067,6 +3073,11 @@ def _run_reclaim_phase(
     # reused, so nothing after this may probe, defer on, or signal it.
     result.interrupted = pause_host_interrupted_runs(conn)
     result.reaped_terminal_workers = reap_terminal_workers(conn)
+    # A transient worker scope stays active while any of its cgroup remains, so a
+    # descendant of an ended worker keeps the single slot (#57). Reap it here,
+    # before this tick measures capacity and spawns, so the same tick can claim
+    # the next eligible card.
+    result.reconciled_worker_scopes = reconcile_orphan_worker_scopes(conn, apply=not dry_run)
     result.reclaimed = _kb.release_stale_claims(
         conn, failure_limit=failure_limit, auto_blocked=result.auto_blocked,
     )
@@ -3196,6 +3207,7 @@ def _dispatch_once_locked(
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
+        dry_run=dry_run,
     )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
@@ -3409,6 +3421,7 @@ reap_worker_zombies = _kwr.reap_worker_zombies
 _module_hermes_argv = _kwr._module_hermes_argv
 _resolve_hermes_argv = _kwr._resolve_hermes_argv
 _worker_terminal_timeout_env = _kwr._worker_terminal_timeout_env
+reconcile_orphan_worker_scopes = _kwr.reconcile_orphan_worker_scopes
 _resolve_worker_cli_toolsets = _kwr._resolve_worker_cli_toolsets
 _retagged_workspace_roots = _kwr._retagged_workspace_roots
 _retag_legacy_worker_sessions = _kwr._retag_legacy_worker_sessions
