@@ -808,13 +808,14 @@ def _reconcile_worker_scope(
     owner: dict[str, Any],
     workers_group: str,
     apply: bool,
+    board: str = "",
 ) -> dict[str, Any]:
     """Decide one live scope: stop it, or say why not. Never stops on doubt."""
     task_id = str(owner["task_id"])
 
     def _event(
         reason: str, outcome: str, *, run_id: Optional[int] = None,
-        pid: Optional[int] = None, slot_freed: bool = False,
+        pid: Optional[int] = None, slot_freed: bool = False, board: str = "",
     ) -> dict[str, Any]:
         event: dict[str, Any] = {
             "unit": unit,
@@ -829,6 +830,8 @@ def _reconcile_worker_scope(
             event["preparation_id"] = owner["preparation_id"]
         if pid:
             event["pid"] = pid
+        if board:
+            event["board"] = board
         return event
 
     if str(Path(cgroup).parent) != workers_group:
@@ -868,13 +871,20 @@ def _reconcile_worker_scope(
         # A transient scope cannot survive re-instantiation, so an attempt from a
         # previous boot cannot own a live one: the name match is a coincidence.
         return _event("stale_boot", "refused", run_id=run_id, pid=pid)
+    recorded_board = str(_kb()._json_dict(run["metadata"]).get("board") or "")
+    local_board = str(board or "")
+    if recorded_board and local_board and recorded_board != local_board:
+        # The attempt belongs to another board; its own dispatcher owns this scope.
+        return _event("foreign_board", "refused", run_id=run_id, pid=pid, board=recorded_board)
     if not _scope_activation_is_inside(unit, run):
         # The unit name carries a task and a run/preparation identity but no board,
         # and board imports preserve those identities; the scope's own activation
         # inside this attempt's lifetime is what makes it this attempt's to stop.
         return _event("scope_not_from_attempt", "refused", run_id=run_id, pid=pid)
     if not apply:
-        return _event("run_ended_worker_gone", "would_reap", run_id=run_id, pid=pid)
+        return _event(
+            "run_ended_worker_gone", "would_reap", run_id=run_id, pid=pid, board=recorded_board,
+        )
 
     from tools import process_registry as registry
 
@@ -886,6 +896,7 @@ def _reconcile_worker_scope(
         run_id=run_id,
         pid=pid,
         slot_freed=slot_freed,
+        board=recorded_board,
     )
     if not stopped:
         _kb()._log.warning(
@@ -907,7 +918,7 @@ def _reconcile_worker_scope(
 
 
 def reconcile_orphan_worker_scopes(
-    conn: sqlite3.Connection, *, apply: bool = True,
+    conn: sqlite3.Connection, *, apply: bool = True, board: Optional[str] = None,
 ) -> "list[dict[str, Any]]":
     """Reap worker scopes left standing by an attempt that already ended (#57).
 
@@ -959,6 +970,10 @@ def reconcile_orphan_worker_scopes(
         _kb()._log.debug("kanban worker scopes: boundary inventory unavailable (%s)", exc)
         return []
     workers_group = str((inventory.get("workers") or {}).get("cgroup") or "")
+    try:
+        local_board = _kb()._normalize_board_slug(board or _kb().get_current_board())
+    except Exception:
+        local_board = ""
     events: list[dict[str, Any]] = []
     for cgroup in inventory.get("worker_scopes") or []:
         unit = Path(str(cgroup)).name
@@ -969,7 +984,7 @@ def reconcile_orphan_worker_scopes(
             events.append(
                 _reconcile_worker_scope(
                     conn, unit=unit, cgroup=str(cgroup), owner=owner,
-                    workers_group=workers_group, apply=apply,
+                    workers_group=workers_group, apply=apply, board=local_board,
                 )
             )
         except Exception:

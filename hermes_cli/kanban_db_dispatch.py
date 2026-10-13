@@ -1547,6 +1547,7 @@ def _set_worker_pid(
     conn: sqlite3.Connection, task_id: str, pid: int, *,
     runtime_identity: Optional[Mapping[str, Any]] = None,
     preparation_id: Optional[str] = None,
+    board: Optional[str] = None,
 ) -> None:
     """Record the spawned child's PID only while its run still owns the claim."""
     started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
@@ -1591,6 +1592,13 @@ def _set_worker_pid(
         if preparation_id:
             metadata["preparation_id"] = str(preparation_id)
             event["preparation_id"] = str(preparation_id)
+        if board:
+            # Provenance for the scope this launch is about to create: a worker
+            # scope is host-global and its unit name carries no board, so the
+            # board that recorded the attempt has to be readable from the record
+            # itself when a later tick reconciles a surviving scope (#57).
+            metadata["board"] = _kb._normalize_board_slug(board)
+            event["board"] = metadata["board"]
         conn.execute(
             "UPDATE task_runs SET worker_pid = ?, worker_started_at = ?, metadata = ? WHERE id = ? AND ended_at IS NULL",
             (int(pid), started_at, _kb._json_or_null(metadata or None), int(run_id)),
@@ -2713,7 +2721,7 @@ def _record_granted_spawn(
     if launch.pid:
         _step("worker pid", lambda: _set_worker_pid(
             conn, claimed.id, int(launch.pid), runtime_identity=launch.runtime_identity,
-            preparation_id=launch.preparation_id,
+            preparation_id=launch.preparation_id, board=board,
         ))
     _step("spawned hook", lambda: _kb._fire_worker_spawned_hook(
         conn, claimed, workspace, launch.pid, board=board,
@@ -2976,7 +2984,7 @@ def _dispatch_lane_task(
         if pid:
             _set_worker_pid(
                 conn, claimed.id, int(pid), runtime_identity=launch_identity,
-                preparation_id=preparation_id,
+                preparation_id=preparation_id, board=board,
             )
         _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
         result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
@@ -3092,7 +3100,9 @@ def _run_reclaim_phase(
     # still open is only provably an orphan once that sweep has ended it -- and
     # still before this tick measures capacity, so the tick that discovers it can
     # free the slot and claim the next eligible card in the same pass.
-    result.reconciled_worker_scopes = reconcile_orphan_worker_scopes(conn, apply=not dry_run)
+    result.reconciled_worker_scopes = reconcile_orphan_worker_scopes(
+        conn, apply=not dry_run, board=board,
+    )
 
 
 def _tick_spawn_budget(
