@@ -3073,11 +3073,6 @@ def _run_reclaim_phase(
     # reused, so nothing after this may probe, defer on, or signal it.
     result.interrupted = pause_host_interrupted_runs(conn)
     result.reaped_terminal_workers = reap_terminal_workers(conn)
-    # A transient worker scope stays active while any of its cgroup remains, so a
-    # descendant of an ended worker keeps the single slot (#57). Reap it here,
-    # before this tick measures capacity and spawns, so the same tick can claim
-    # the next eligible card.
-    result.reconciled_worker_scopes = reconcile_orphan_worker_scopes(conn, apply=not dry_run)
     result.reclaimed = _kb.release_stale_claims(
         conn, failure_limit=failure_limit, auto_blocked=result.auto_blocked,
     )
@@ -3091,6 +3086,13 @@ def _run_reclaim_phase(
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
+    # A transient worker scope stays active while any of its cgroup remains, so a
+    # descendant of an ended worker keeps the single slot (#57). This runs after
+    # every path above that can CLOSE a run -- a worker that died with its run
+    # still open is only provably an orphan once that sweep has ended it -- and
+    # still before this tick measures capacity, so the tick that discovers it can
+    # free the slot and claim the next eligible card in the same pass.
+    result.reconciled_worker_scopes = reconcile_orphan_worker_scopes(conn, apply=not dry_run)
 
 
 def _tick_spawn_budget(
