@@ -76,8 +76,12 @@ def _inventory(*cgroups: str) -> dict:
     }
 
 
-def _stub_inventory(monkeypatch, *cgroups: str) -> list[str]:
-    """Install an inventory and a recording stop; return the stopped units."""
+def _stub_inventory(monkeypatch, *cgroups: str, activation="now") -> list[str]:
+    """Install an inventory and a recording stop; return the stopped units.
+
+    ``activation`` is what the manager would report for the scope: ``"now"`` (inside
+    the attempt's window), an int epoch, or ``None`` for unreadable evidence.
+    """
     stopped: list[str] = []
     monkeypatch.setattr(
         registry, "autonomous_boundary_inventory", lambda: _inventory(*cgroups),
@@ -85,6 +89,8 @@ def _stub_inventory(monkeypatch, *cgroups: str) -> list[str]:
     monkeypatch.setattr(
         registry, "_stop_systemd_unit", lambda unit: stopped.append(unit) or True,
     )
+    reported = int(time.time()) if activation == "now" else activation
+    monkeypatch.setattr(kwr, "_scope_activation_epoch", lambda unit: reported)
     return stopped
 
 
@@ -124,13 +130,13 @@ def _dead_pid() -> int:
     return proc.pid
 
 
-def _handoff_metadata(*, preparation_id: str, pid: int, fingerprint) -> dict:
+def _handoff_metadata(*, preparation_id: str, pid: int, fingerprint, host_epoch=None) -> dict:
     """The shape ``_set_worker_pid`` plus a worker handoff leave on the run."""
     return {
         "preparation_id": preparation_id,
         "worker_pid": pid,
         "worker_start_time": 60017552,
-        "host_epoch": "c7ddbf44-c99a-4dc8-badd-360e45d60d7f:13",
+        "host_epoch": host_epoch or kwr._current_host_epoch(),
         "runtime_identity": {
             "worker_pid": pid,
             "worker_started_at": fingerprint,
@@ -367,7 +373,7 @@ def test_stop_failure_is_reported_and_recorded(conn, monkeypatch):
         conn, task_id, 16,
         metadata={"preparation_id": PREPARATION_ID, "worker_pid": _dead_pid()},
     )
-    monkeypatch.setattr(registry, "autonomous_boundary_inventory", lambda: _inventory(cgroup))
+    _stub_inventory(monkeypatch, cgroup)
     monkeypatch.setattr(registry, "_stop_systemd_unit", lambda unit: False)
 
     events = kwr.reconcile_orphan_worker_scopes(conn)
@@ -375,6 +381,75 @@ def test_stop_failure_is_reported_and_recorded(conn, monkeypatch):
     assert events[0]["outcome"] == "failed"
     assert events[0]["slot_freed"] is False
     assert [e["outcome"] for e in _reclaim_events(conn, task_id)] == ["failed"]
+
+
+def test_a_scope_activated_outside_the_attempt_is_not_stopped(conn, monkeypatch):
+    """Another board's live scope can carry the same task/run identity.
+
+    The unit name holds a task and a run/preparation identity but no board, and a
+    board import preserves those identities, so a matching name is not proof the
+    live scope belongs to the attempt that ended here. An activation long after
+    that attempt was over means the unit came from a different launch.
+    """
+    task_id = kb.create_task(conn, title="not ours", assignee="implementer")
+    unit = _unit_name(task_id, run_id=31)
+    _insert_run(conn, task_id, 31, worker_pid=_dead_pid())
+    stopped = _stub_inventory(monkeypatch, f"{WORKERS_GROUP}/{unit}", activation=int(time.time()) + 86400)
+
+    events = kwr.reconcile_orphan_worker_scopes(conn)
+
+    assert stopped == []
+    assert events[0]["reason"] == "scope_not_from_attempt"
+    assert events[0]["outcome"] == "refused"
+
+
+def test_an_unreadable_activation_refuses(conn, monkeypatch):
+    """No activation evidence means no proof of ownership: fail closed."""
+    task_id = kb.create_task(conn, title="unreadable", assignee="implementer")
+    unit = _unit_name(task_id, run_id=32)
+    _insert_run(conn, task_id, 32, worker_pid=_dead_pid())
+    stopped = _stub_inventory(monkeypatch, f"{WORKERS_GROUP}/{unit}", activation=None)
+
+    events = kwr.reconcile_orphan_worker_scopes(conn)
+
+    assert stopped == []
+    assert events[0]["reason"] == "scope_not_from_attempt"
+
+
+def test_an_attempt_from_a_previous_boot_refuses(conn, monkeypatch):
+    """A transient scope cannot survive re-instantiation, so the name match lies."""
+    task_id = kb.create_task(conn, title="previous boot", assignee="implementer")
+    unit = _unit_name(task_id, preparation_id=PREPARATION_ID)
+    _insert_run(
+        conn, task_id, 33,
+        metadata=_handoff_metadata(
+            preparation_id=PREPARATION_ID, pid=_dead_pid(), fingerprint="boot:1|1",
+            host_epoch="00000000-0000-0000-0000-000000000000:1",
+        ),
+    )
+    stopped = _stub_inventory(monkeypatch, f"{WORKERS_GROUP}/{unit}")
+
+    events = kwr.reconcile_orphan_worker_scopes(conn)
+
+    assert stopped == []
+    assert events[0]["reason"] == "stale_boot"
+
+
+def test_slot_free_is_only_ever_reported_on_evidence(monkeypatch, tmp_path):
+    """A collected or emptied scope reads free; anything else does not."""
+    monkeypatch.setattr(kwr, "CGROUP_ROOT", tmp_path)
+    group = "/user.slice/worker.slice/hermes-worker-kanban-t_x-run-1.scope"
+    assert kwr._scope_slot_free(group) is True, "a collected scope is a free slot"
+
+    directory = tmp_path / group.lstrip("/")
+    directory.mkdir(parents=True)
+    assert kwr._scope_slot_free(group) is False, "unreadable population is not a free slot"
+
+    (directory / "cgroup.events").write_text("populated 1\nfrozen 0\n", encoding="utf-8")
+    assert kwr._scope_slot_free(group) is False, "a populated scope holds the slot"
+
+    (directory / "cgroup.events").write_text("populated 0\nfrozen 0\n", encoding="utf-8")
+    assert kwr._scope_slot_free(group) is True, "an emptied scope frees the slot"
 
 
 def test_unreadable_boundary_is_not_fatal(conn, monkeypatch):
@@ -406,6 +481,43 @@ def test_repeated_reconciliation_after_a_reap_is_idempotent(conn, monkeypatch):
     assert kwr.reconcile_orphan_worker_scopes(conn) == []
     assert stopped == []
     assert len(_reclaim_events(conn, task_id)) == 1
+
+
+def test_a_run_closed_earlier_in_the_same_tick_still_frees_its_scope(conn, monkeypatch):
+    """Reconciliation must run after the sweeps that can close a run.
+
+    A worker that dies while its run is still open leaves a populated scope; the
+    run only becomes provably finished when a later sweep in the same reclaim phase
+    ends it. Reconciling before those sweeps would refuse ``run_not_terminal`` and
+    defer recovery to the next tick, so this asserts the same-call ordering.
+    """
+    task_id = kb.create_task(conn, title="closed this tick", assignee="implementer")
+    unit = _unit_name(task_id, preparation_id=PREPARATION_ID)
+    _insert_run(
+        conn, task_id, 34, status="running", ended=False,
+        metadata=_handoff_metadata(
+            preparation_id=PREPARATION_ID, pid=_dead_pid(), fingerprint="boot:1|1",
+        ),
+    )
+    stopped = _stub_inventory(monkeypatch, f"{WORKERS_GROUP}/{unit}")
+
+    def _close_the_run(conn, **_kwargs):
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET status = 'timed_out', outcome = 'timed_out', ended_at = ? "
+                "WHERE id = 34", (int(time.time()),),
+            )
+        return []
+
+    monkeypatch.setattr(kbd, "detect_stale_running", _close_the_run)
+    result = kbd.DispatchResult()
+
+    kbd._run_reclaim_phase(
+        conn, result, stale_timeout_seconds=1, failure_limit=3, reconcile_orphans=True,
+    )
+
+    assert stopped == [unit], "the tick that closed the run must free the slot itself"
+    assert [event["outcome"] for event in result.reconciled_worker_scopes] == ["reaped"]
 
 
 def test_the_reclaim_phase_reconciles_scopes_before_capacity_is_measured(conn, monkeypatch):
