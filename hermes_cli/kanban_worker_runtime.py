@@ -636,14 +636,18 @@ def _scope_activation_epoch(unit_name: str) -> Optional[int]:
     Read from the manager; the transient unit file it writes at activation is the
     fallback. Nothing here guesses: an unreadable activation fails closed.
     """
+    from hermes_platform.resolver import locate_command
     from tools import process_registry as registry
-    import shutil
 
-    systemctl = shutil.which("systemctl")
-    if systemctl is not None:
+    try:
+        systemctl = locate_command("systemctl").command
+    except Exception as exc:
+        _kb()._log.debug("kanban worker scopes: systemctl cannot be resolved (%s)", exc)
+        systemctl = ()
+    if systemctl:
         try:
             completed = subprocess.run(
-                [systemctl, "--user", "--timestamp=unix", "show", unit_name,
+                [*systemctl, "--user", "--timestamp=unix", "show", unit_name,
                  "--property=ActiveEnterTimestamp", "--value"],
                 capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
                 env=registry.systemd_user_bus_env(),
@@ -939,20 +943,25 @@ def reconcile_orphan_worker_scopes(
     worker slice, name an attempt recorded on this board, and that attempt's run
     must have ENDED while the worker identity recorded at spawn is provably gone
     (a recycled PID, a fingerprint from another boot epoch, or a PID that is
-    simply absent all count as gone; an unreadable identity does not). A live
-    worker, a closed run whose agent is still finalising its handoff, a newer
-    live run for the card, a scope outside the worker slice, and a suffix this
-    module cannot read all refuse instead: the scope is left exactly as found and
-    reported, never stopped. The stop is therefore never the first signal a LIVE
-    parent receives (``tools/AGENTS.md``): the recorded worker is already proven
-    dead, recycled, or from a previous boot before it can run. Failures are
-    fail-closed and reported, not retried with broader authority. One gap is
-    deliberate: a launch that died during pre-claim preparation has no run row and
-    no recorded identity, so its scope is refused as ``run_not_recorded`` rather
-    than reaped on evidence that does not exist. That is an operator's stop of the
-    exact unit named in the refusal, not a rule this module is entitled to widen --
-    a scope's only process could be the worker itself, and nothing in unit or
-    cgroup metadata distinguishes the two.
+    simply absent all count as gone; an unreadable identity does not). The unit
+    name carries no board and a board import preserves task and run identities, so
+    the scope has to prove itself too: its own activation must fall inside that
+    attempt's lifetime window, an attempt recorded against another instantiation
+    or another board refuses, and neither an unreadable activation nor an
+    unreadable population is ever read in this module's favour. A live worker, a
+    closed run whose agent is still finalising its handoff, a newer live run for
+    the card, a scope outside the worker slice, and a suffix this module cannot
+    read all refuse instead: the scope is left exactly as found and reported, never
+    stopped. The stop is therefore never the first signal a LIVE parent receives
+    (``tools/AGENTS.md``): the recorded worker is already proven dead, recycled, or
+    from a previous boot before it can run. Failures are fail-closed and reported,
+    not retried with broader authority. One gap is deliberate: a launch that died
+    during pre-claim preparation has no run row and no recorded identity, so its
+    scope is refused as ``run_not_recorded`` rather than reaped on evidence that
+    does not exist. That is an operator's stop of the exact unit named in the
+    refusal, not a rule this module is entitled to widen -- a scope's only process
+    could be the worker itself, and nothing in unit or cgroup metadata
+    distinguishes the two.
 
     Returns bounded, sanitized events -- exact unit, cgroup, task, run, reason,
     outcome, and whether the slot came free -- for the dispatch result and the
@@ -981,15 +990,28 @@ def reconcile_orphan_worker_scopes(
         if owner is None:
             continue  # not a Kanban worker scope: not ours to stop
         try:
-            events.append(
-                _reconcile_worker_scope(
-                    conn, unit=unit, cgroup=str(cgroup), owner=owner,
-                    workers_group=workers_group, apply=apply, board=local_board,
-                )
+            event = _reconcile_worker_scope(
+                conn, unit=unit, cgroup=str(cgroup), owner=owner,
+                workers_group=workers_group, apply=apply, board=local_board,
             )
         except Exception:
             # One unreadable scope must not cost the tick its other work.
             _kb()._log.debug("kanban worker scopes: reconciliation failed for %s", unit, exc_info=True)
+            continue
+        if event["outcome"] == "refused":
+            if event["reason"] == "worker_identity_unknown":
+                # A populated scope whose attempt is gone but whose worker identity
+                # cannot be read is a slot only an operator can clear.
+                _kb()._log.warning(
+                    "kanban worker scopes: %s (task %s) holds the worker slot with an "
+                    "unverifiable worker identity; stop that exact unit by hand",
+                    unit, event["task_id"],
+                )
+            else:
+                _kb()._log.debug(
+                    "kanban worker scopes: leaving %s alone (%s)", unit, event["reason"],
+                )
+        events.append(event)
     return events
 
 
