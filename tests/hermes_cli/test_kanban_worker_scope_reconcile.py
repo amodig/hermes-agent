@@ -226,6 +226,14 @@ def test_scope_is_reaped_only_when_its_own_attempt_ended_and_its_worker_is_gone(
             assert events[0]["outcome"] == "refused"
             assert _reclaim_events(conn, task_id) == [], f"{reason}: refusal was recorded"
 
+        # A refusal is not tick activity: the dispatcher must still report an idle
+        # tick while a live worker's scope occupies the slot.
+        result = kbd.DispatchResult()
+        kbd._run_reclaim_phase(
+            conn, result, stale_timeout_seconds=0, failure_limit=3, reconcile_orphans=True,
+        )
+        assert result.reconciled_worker_scopes == [], result.reconciled_worker_scopes
+
         # A live worker's own card also protects its scope from a terminal run row.
         task_id = kb.create_task(conn, title="card holds a live worker", assignee="implementer")
         unit = _unit_name(task_id, preparation_id=PREPARATION_ID)
