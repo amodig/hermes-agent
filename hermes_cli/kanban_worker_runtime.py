@@ -34,6 +34,12 @@ def _dispatcher():
     return kanban_db_dispatch
 
 
+def _current_host_epoch() -> str:
+    from hermes_cli.kanban_runtime import current_host_epoch
+
+    return current_host_epoch()
+
+
 def _kb():
     # Late-bound facade access: the facade imports this module through
     # ``kanban_db_dispatch``, so a module-level import here would make a
@@ -608,7 +614,71 @@ _KANBAN_SCOPE_SUFFIX_GRAMMAR = (
     re.compile(r"^kanban-(?P<task>.+)-run-(?P<run>[0-9]+)$"),
 )
 
-_SCOPE_RUN_COLUMNS = "id, task_id, status, ended_at, worker_pid, worker_started_at, metadata"
+_SCOPE_RUN_COLUMNS = (
+    "id, task_id, status, started_at, ended_at, worker_pid, worker_started_at, metadata"
+)
+
+#: Slack around an attempt's own life when matching a LIVE scope to it, in seconds.
+#: The launch creates the scope before the claim (pre-claim preparation is bounded
+#: by the bootstrap phase timeouts) and a clock step is possible, so the window has
+#: to be generous -- and still far smaller than the age of any historical or
+#: imported run, which is what it exists to exclude.
+_SCOPE_ATTEMPT_WINDOW_SECONDS = 600
+
+
+def _scope_activation_epoch(unit_name: str) -> Optional[int]:
+    """When the manager activated *unit_name*, or ``None`` when unreadable.
+
+    A transient scope is created by exactly one launch, so its activation time is
+    the only scope-side fact that proves a live scope belongs to the attempt being
+    reconciled rather than to another board whose task/run identities happen to
+    match (a board import preserves those identities, the unit name carries none).
+    Read from the manager; the transient unit file it writes at activation is the
+    fallback. Nothing here guesses: an unreadable activation fails closed.
+    """
+    from tools import process_registry as registry
+    import shutil
+
+    systemctl = shutil.which("systemctl")
+    if systemctl is not None:
+        try:
+            completed = subprocess.run(
+                [systemctl, "--user", "--timestamp=unix", "show", unit_name,
+                 "--property=ActiveEnterTimestamp", "--value"],
+                capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
+                env=registry.systemd_user_bus_env(),
+            )
+            value = completed.stdout.strip().lstrip("@").strip()
+            if value.isdigit():
+                return int(value)
+        except (OSError, subprocess.SubprocessError) as exc:
+            _kb()._log.debug("kanban worker scopes: activation of %s unreadable (%s)", unit_name, exc)
+    runtime_dir = registry.systemd_user_bus_env().get("XDG_RUNTIME_DIR")
+    if not runtime_dir:
+        return None
+    try:
+        return int((Path(runtime_dir) / "systemd" / "transient" / unit_name).stat().st_mtime)
+    except OSError:
+        return None
+
+
+def _scope_activation_is_inside(unit_name: str, run) -> bool:
+    """Whether *unit_name* was activated inside *run*'s own lifetime window.
+
+    A worker scope cannot exist before its launch or, for a scope still standing,
+    long after its attempt ended: an activation outside that window means the unit
+    belongs to some other launch, so it is not this attempt's scope to stop.
+    """
+    activation = _scope_activation_epoch(unit_name)
+    if activation is None:
+        return False
+    started = int(run["started_at"])
+    ended = int(run["ended_at"] or started)
+    return (
+        started - _SCOPE_ATTEMPT_WINDOW_SECONDS
+        <= activation
+        <= ended + _SCOPE_ATTEMPT_WINDOW_SECONDS
+    )
 
 
 def _kanban_scope_owner(unit_name: str) -> Optional[dict[str, Any]]:
@@ -694,16 +764,18 @@ def _run_worker_identity(run) -> "tuple[Optional[int], Any]":
 def _scope_slot_free(cgroup: str) -> bool:
     """Whether *cgroup* no longer holds a process, directly or through a descendant.
 
-    ``cgroup.events`` answers for the whole subtree, which is the evidence
-    admission already uses, and a scope ``--collect`` removed reads as free
-    because the directory is gone. Unreadable content is never reported as free.
+    ``cgroup.events`` answers for the whole subtree, which is the evidence admission
+    already uses, and a scope ``--collect`` already removed reads as free because its
+    directory is gone. A cgroup that is still there but whose population cannot be
+    read is reported as NOT free: the slot is only ever called free on evidence.
     """
-    try:
-        events = (
-            CGROUP_ROOT / cgroup.lstrip("/") / "cgroup.events"
-        ).read_text(encoding="utf-8-sig")
-    except OSError:
+    directory = CGROUP_ROOT / cgroup.lstrip("/")
+    if not directory.is_dir():
         return True
+    try:
+        events = (directory / "cgroup.events").read_text(encoding="utf-8-sig")
+    except OSError:
+        return False
     for line in events.splitlines():
         key, _, value = line.partition(" ")
         if key == "populated":
@@ -788,6 +860,16 @@ def _reconcile_worker_scope(
         # A card can finish before its agent does: the run is closed while the
         # worker is still finalising its handoff. Its scope is still in use.
         return _event("worker_alive", "refused", run_id=run_id, pid=pid)
+    run_epoch = str(_kb()._json_dict(run["metadata"]).get("host_epoch") or "")
+    if run_epoch and _dispatcher()._instantiation_changed(run_epoch, _current_host_epoch()):
+        # A transient scope cannot survive re-instantiation, so an attempt from a
+        # previous boot cannot own a live one: the name match is a coincidence.
+        return _event("stale_boot", "refused", run_id=run_id, pid=pid)
+    if not _scope_activation_is_inside(unit, run):
+        # The unit name carries a task and a run/preparation identity but no board,
+        # and board imports preserve those identities; the scope's own activation
+        # inside this attempt's lifetime is what makes it this attempt's to stop.
+        return _event("scope_not_from_attempt", "refused", run_id=run_id, pid=pid)
     if not apply:
         return _event("run_ended_worker_gone", "would_reap", run_id=run_id, pid=pid)
 
