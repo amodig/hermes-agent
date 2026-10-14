@@ -117,6 +117,12 @@ class DispatchResult:
     reaped_terminal_workers: list[str] = field(default_factory=list)
     """Task ids whose worker outlived its closed run and was terminated by
     :func:`reap_terminal_workers`."""
+    reconciled_worker_scopes: list[dict] = field(default_factory=list)
+    """Sanitized events from :func:`reconcile_orphan_worker_scopes` (#57) for the
+    scopes this tick ACTED on: exact unit, task, run, reason, outcome, board and
+    whether the single worker slot came free. A refusal changes nothing on the
+    host, so it is logged rather than reported as activity — a live worker's scope
+    is refused on every tick while it runs."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -1542,6 +1548,7 @@ def _set_worker_pid(
     conn: sqlite3.Connection, task_id: str, pid: int, *,
     runtime_identity: Optional[Mapping[str, Any]] = None,
     preparation_id: Optional[str] = None,
+    board: Optional[str] = None,
 ) -> None:
     """Record the spawned child's PID only while its run still owns the claim."""
     started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
@@ -1586,6 +1593,13 @@ def _set_worker_pid(
         if preparation_id:
             metadata["preparation_id"] = str(preparation_id)
             event["preparation_id"] = str(preparation_id)
+        if board:
+            # Provenance for the scope this launch is about to create: a worker
+            # scope is host-global and its unit name carries no board, so the
+            # board that recorded the attempt has to be readable from the record
+            # itself when a later tick reconciles a surviving scope (#57).
+            metadata["board"] = _kb._normalize_board_slug(board)
+            event["board"] = metadata["board"]
         conn.execute(
             "UPDATE task_runs SET worker_pid = ?, worker_started_at = ?, metadata = ? WHERE id = ? AND ended_at IS NULL",
             (int(pid), started_at, _kb._json_or_null(metadata or None), int(run_id)),
@@ -2708,7 +2722,7 @@ def _record_granted_spawn(
     if launch.pid:
         _step("worker pid", lambda: _set_worker_pid(
             conn, claimed.id, int(launch.pid), runtime_identity=launch.runtime_identity,
-            preparation_id=launch.preparation_id,
+            preparation_id=launch.preparation_id, board=board,
         ))
     _step("spawned hook", lambda: _kb._fire_worker_spawned_hook(
         conn, claimed, workspace, launch.pid, board=board,
@@ -2971,7 +2985,7 @@ def _dispatch_lane_task(
         if pid:
             _set_worker_pid(
                 conn, claimed.id, int(pid), runtime_identity=launch_identity,
-                preparation_id=preparation_id,
+                preparation_id=preparation_id, board=board,
             )
         _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
         result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
@@ -3052,6 +3066,11 @@ def _apply_default_assignee(
     return True
 
 
+# Worker-scope reconciliation outcomes that mean the tick ACTED on the host. A
+# refusal changes nothing there, so it is never reported as tick activity.
+_SCOPE_ACTION_OUTCOMES = frozenset({"reaped", "failed", "would_reap"})
+
+
 def _run_reclaim_phase(
     conn: sqlite3.Connection,
     result: DispatchResult,
@@ -3060,6 +3079,7 @@ def _run_reclaim_phase(
     failure_limit: int,
     reconcile_orphans: bool,
     board: Optional[str] = None,
+    dry_run: bool = False,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
@@ -3080,6 +3100,20 @@ def _run_reclaim_phase(
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
+    # A transient worker scope stays active while any of its cgroup remains, so a
+    # descendant of an ended worker keeps the single slot (#57). This runs after
+    # every path above that can CLOSE a run -- a worker that died with its run
+    # still open is only provably an orphan once that sweep has ended it -- and
+    # still before this tick measures capacity, so the tick that discovers it can
+    # free the slot and claim the next eligible card in the same pass.
+    result.reconciled_worker_scopes = [
+        event for event in reconcile_orphan_worker_scopes(
+            conn, apply=not dry_run, board=board,
+        )
+        # Only actions are tick activity: a live worker's scope is refused on every
+        # tick while it runs, and a refusal changes nothing on the host.
+        if event["outcome"] in _SCOPE_ACTION_OUTCOMES
+    ]
 
 
 def _tick_spawn_budget(
@@ -3196,6 +3230,7 @@ def _dispatch_once_locked(
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
+        dry_run=dry_run,
     )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
@@ -3409,6 +3444,7 @@ reap_worker_zombies = _kwr.reap_worker_zombies
 _module_hermes_argv = _kwr._module_hermes_argv
 _resolve_hermes_argv = _kwr._resolve_hermes_argv
 _worker_terminal_timeout_env = _kwr._worker_terminal_timeout_env
+reconcile_orphan_worker_scopes = _kwr.reconcile_orphan_worker_scopes
 _resolve_worker_cli_toolsets = _kwr._resolve_worker_cli_toolsets
 _retagged_workspace_roots = _kwr._retagged_workspace_roots
 _retag_legacy_worker_sessions = _kwr._retag_legacy_worker_sessions

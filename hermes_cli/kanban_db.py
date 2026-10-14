@@ -331,6 +331,7 @@ _TICK_ACTIVITY_FIELDS = (
     "timed_out", "auto_blocked", "rate_limited", "interrupted", "cancelled",
     "auto_assigned_default", "respawn_guarded", "skipped_per_profile_capped",
     "skipped_unassigned", "skipped_nonspawnable", "handoff_refused",
+    "reconciled_worker_scopes",
 )
 
 

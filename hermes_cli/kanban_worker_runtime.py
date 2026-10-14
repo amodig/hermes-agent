@@ -10,6 +10,7 @@ import contextlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -21,7 +22,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 import uuid
 
-from tools.autonomous_resources import WORKER_SCOPE_PREFIX, WORKER_SCOPE_SUFFIX
+from tools.autonomous_resources import CGROUP_ROOT, WORKER_SCOPE_PREFIX, WORKER_SCOPE_SUFFIX
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -31,6 +32,12 @@ def _dispatcher():
     from hermes_cli import kanban_db_dispatch
 
     return kanban_db_dispatch
+
+
+def _current_host_epoch() -> str:
+    from hermes_cli.kanban_runtime import current_host_epoch
+
+    return current_host_epoch()
 
 
 def _kb():
@@ -593,6 +600,419 @@ def _restart_safe_worker_argv(
             )
         return scoped.argv
     return scoped.argv
+
+
+#: Bounded cleanup event kind appended when the dispatcher reaps an orphaned worker scope.
+WORKER_SCOPE_RECLAIM_EVENT = "worker_scope_reclaimed"
+
+#: Inverse grammar of :func:`_worker_scope_suffix`. Only these two shapes name an
+#: attempt this module can look up in ``task_runs``; every other suffix (a cron or
+#: terminal scope, a ``-run-missing`` launch, a shape a later release adds) is left
+#: exactly as found instead of guessed at.
+_KANBAN_SCOPE_SUFFIX_GRAMMAR = (
+    re.compile(r"^kanban-(?P<task>.+)-preparation-(?P<preparation>[0-9a-f]{32})$"),
+    re.compile(r"^kanban-(?P<task>.+)-run-(?P<run>[0-9]+)$"),
+)
+
+_SCOPE_RUN_COLUMNS = (
+    "id, task_id, status, started_at, ended_at, worker_pid, worker_started_at, metadata"
+)
+
+#: Slack around an attempt's own life when matching a LIVE scope to it, in seconds.
+#: The launch creates the scope before the claim (pre-claim preparation is bounded
+#: by the bootstrap phase timeouts) and a clock step is possible, so the window has
+#: to be generous -- and still far smaller than the age of any historical or
+#: imported run, which is what it exists to exclude.
+_SCOPE_ATTEMPT_WINDOW_SECONDS = 600
+
+
+def _scope_activation_epoch(unit_name: str) -> Optional[int]:
+    """When the manager activated *unit_name*, or ``None`` when unreadable.
+
+    A transient scope is created by exactly one launch, so its activation time is
+    the only scope-side fact that proves a live scope belongs to the attempt being
+    reconciled rather than to another board whose task/run identities happen to
+    match (a board import preserves those identities, the unit name carries none).
+    Read from the manager; the transient unit file it writes at activation is the
+    fallback. Nothing here guesses: an unreadable activation fails closed.
+    """
+    from hermes_platform.resolver import locate_command
+    from tools import process_registry as registry
+
+    try:
+        systemctl = locate_command("systemctl").command
+    except Exception as exc:
+        _kb()._log.debug("kanban worker scopes: systemctl cannot be resolved (%s)", exc)
+        systemctl = ()
+    if systemctl:
+        try:
+            completed = subprocess.run(
+                [*systemctl, "--user", "--timestamp=unix", "show", unit_name,
+                 "--property=ActiveEnterTimestamp", "--value"],
+                capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
+                env=registry.systemd_user_bus_env(),
+            )
+            value = completed.stdout.strip().lstrip("@").strip()
+            if value.isdigit():
+                return int(value)
+        except (OSError, subprocess.SubprocessError) as exc:
+            _kb()._log.debug("kanban worker scopes: activation of %s unreadable (%s)", unit_name, exc)
+    runtime_dir = registry.systemd_user_bus_env().get("XDG_RUNTIME_DIR")
+    if not runtime_dir:
+        return None
+    try:
+        return int((Path(runtime_dir) / "systemd" / "transient" / unit_name).stat().st_mtime)
+    except OSError:
+        return None
+
+
+def _scope_activation_is_inside(unit_name: str, run) -> bool:
+    """Whether *unit_name* was activated inside *run*'s own lifetime window.
+
+    A worker scope cannot exist before its launch or, for a scope still standing,
+    long after its attempt ended: an activation outside that window means the unit
+    belongs to some other launch, so it is not this attempt's scope to stop.
+    """
+    activation = _scope_activation_epoch(unit_name)
+    if activation is None:
+        return False
+    started = run["started_at"]
+    if started is None:
+        # Legacy row with no attempt start: nothing to compare against, so no proof.
+        return False
+    ended = int(run["ended_at"] or started)
+    return (
+        int(started) - _SCOPE_ATTEMPT_WINDOW_SECONDS
+        <= activation
+        <= ended + _SCOPE_ATTEMPT_WINDOW_SECONDS
+    )
+
+
+def _kanban_scope_owner(unit_name: str) -> Optional[dict[str, Any]]:
+    """The attempt a Kanban worker scope unit names, or ``None`` if it names none.
+
+    Inverse of :func:`_worker_scope_suffix`: reconciliation only ever acts on the
+    exact unit a launch recorded, so the unit name has to answer "which attempt
+    owns this scope" on its own. ``None`` means the caller must leave the unit
+    alone -- stopping a scope kills every process in it, and an unrecognised
+    suffix (another subsystem's scope, or a future shape) carries no evidence
+    that a Hermes attempt owned it.
+    """
+    if not unit_name.startswith(WORKER_SCOPE_PREFIX) or not unit_name.endswith(WORKER_SCOPE_SUFFIX):
+        return None
+    suffix = unit_name[len(WORKER_SCOPE_PREFIX):-len(WORKER_SCOPE_SUFFIX)]
+    for pattern in _KANBAN_SCOPE_SUFFIX_GRAMMAR:
+        match = pattern.match(suffix)
+        if match is None:
+            continue
+        owner: dict[str, Any] = {"task_id": match.group("task")}
+        preparation_id = match.groupdict().get("preparation")
+        if preparation_id is not None:
+            owner["preparation_id"] = preparation_id
+        else:
+            owner["run_id"] = int(match.group("run"))
+        return owner
+    return None
+
+
+def _orphan_scope_run(conn: sqlite3.Connection, owner: dict[str, Any]):
+    """The ``task_runs`` row a live worker scope belongs to, or ``None``.
+
+    A pre-claim launch names its ``preparation_id``, which is the only identity a
+    worker has before the grant writes its run, so that form is matched against
+    the metadata ``_set_worker_pid`` records: the ``LIKE`` only narrows the rows
+    and exact JSON equality decides. No row means no attempt to prove finished,
+    which is a reason to leave the scope alone.
+    """
+    if "run_id" in owner:
+        return conn.execute(
+            f"SELECT {_SCOPE_RUN_COLUMNS} FROM task_runs WHERE id = ? AND task_id = ?",
+            (int(owner["run_id"]), owner["task_id"]),
+        ).fetchone()
+    preparation_id = str(owner["preparation_id"])
+    for row in conn.execute(
+        f"SELECT {_SCOPE_RUN_COLUMNS} FROM task_runs WHERE task_id = ? AND metadata LIKE ?",
+        (owner["task_id"], f"%{preparation_id}%"),
+    ):
+        metadata = _kb()._json_dict(row["metadata"])
+        if str(metadata.get("preparation_id") or "") == preparation_id:
+            return row
+    return None
+
+
+def _run_worker_identity(run) -> "tuple[Optional[int], Any]":
+    """``(pid, started_at)`` recorded for the worker of *run*.
+
+    ``_set_worker_pid`` writes the run row's pair at spawn, and the worker's own
+    handoff writes ``metadata["worker_pid"]`` beside the host epoch and start
+    time; either is a spawn-time fingerprint the liveness check can compare, and
+    two releases have left both shapes in the table. An unreadable identity is
+    reported as unknown rather than assumed dead.
+    """
+    metadata = _kb()._json_dict(run["metadata"])
+    identity = metadata.get("runtime_identity")
+    identity = identity if isinstance(identity, dict) else {}
+    pid = (
+        metadata.get("worker_pid")
+        or identity.get("worker_pid")
+        or identity.get("pid")
+        or run["worker_pid"]
+    )
+    if not pid:
+        return None, None
+    started_at: Any = run["worker_started_at"] or identity.get("worker_started_at")
+    if started_at is None and metadata.get("host_epoch") and metadata.get("worker_start_time"):
+        started_at = f"{metadata['host_epoch']}|{metadata['worker_start_time']}"
+    if started_at is None:
+        started_at = identity.get("start_time")
+    return int(pid), started_at
+
+
+def _scope_slot_free(cgroup: str) -> bool:
+    """Whether *cgroup* no longer holds a process, directly or through a descendant.
+
+    ``cgroup.events`` answers for the whole subtree, which is the evidence admission
+    already uses, and a scope ``--collect`` already removed reads as free because its
+    directory is gone. A cgroup that is still there but whose population cannot be
+    read is reported as NOT free: the slot is only ever called free on evidence.
+    """
+    directory = CGROUP_ROOT / cgroup.lstrip("/")
+    if not directory.is_dir():
+        return True
+    try:
+        events = (directory / "cgroup.events").read_text(encoding="utf-8-sig")
+    except OSError:
+        return False
+    for line in events.splitlines():
+        key, _, value = line.partition(" ")
+        if key == "populated":
+            return value.strip() == "0"
+    return False
+
+
+def _record_scope_reclaim(
+    conn: sqlite3.Connection, task_id: str, run_id: Optional[int], event: dict[str, Any],
+) -> None:
+    """Persist one bounded cleanup event against the attempt it belongs to.
+
+    Only actions taken are recorded. A refusal changes nothing on the host, and
+    writing one per live worker per tick would flood the board's own event trail;
+    a failed stop IS recorded, because that is the state an operator has to act
+    on.
+    """
+    with _kb().write_txn(conn):
+        _kb()._append_event(conn, task_id, WORKER_SCOPE_RECLAIM_EVENT, event, run_id=run_id)
+
+
+def _reconcile_worker_scope(
+    conn: sqlite3.Connection,
+    *,
+    unit: str,
+    cgroup: str,
+    owner: dict[str, Any],
+    workers_group: str,
+    apply: bool,
+    board: str = "",
+) -> dict[str, Any]:
+    """Decide one live scope: stop it, or say why not. Never stops on doubt."""
+    task_id = str(owner["task_id"])
+
+    def _event(
+        reason: str, outcome: str, *, run_id: Optional[int] = None,
+        pid: Optional[int] = None, slot_freed: bool = False, board: str = "",
+    ) -> dict[str, Any]:
+        event: dict[str, Any] = {
+            "unit": unit,
+            "cgroup": cgroup,
+            "task_id": task_id,
+            "run_id": run_id,
+            "reason": reason,
+            "outcome": outcome,
+            "slot_freed": slot_freed,
+        }
+        if owner.get("preparation_id"):
+            event["preparation_id"] = owner["preparation_id"]
+        if pid:
+            event["pid"] = pid
+        if board:
+            event["board"] = board
+        return event
+
+    if str(Path(cgroup).parent) != workers_group:
+        # A survivor outside the worker slice is a placement fault for the
+        # boundary check to report, not a slot this module may clear.
+        return _event("scope_not_in_worker_slice", "refused")
+    run = _orphan_scope_run(conn, owner)
+    if run is None:
+        return _event("run_not_recorded", "refused")
+    run_id = int(run["id"])
+    if run["ended_at"] is None or str(run["status"]) == "running":
+        return _event("run_not_terminal", "refused", run_id=run_id)
+    live_run = conn.execute(
+        "SELECT id FROM task_runs WHERE task_id = ? AND ended_at IS NULL LIMIT 1", (task_id,),
+    ).fetchone()
+    if live_run is not None:
+        return _event("newer_run_live", "refused", run_id=run_id)
+    pid, started_at = _run_worker_identity(run)
+    task_row = conn.execute(
+        "SELECT worker_pid, worker_started_at FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if task_row is not None and task_row["worker_pid"]:
+        if _dispatcher()._worker_alive(task_row["worker_pid"], task_row["worker_started_at"]):
+            # The card itself still holds a live worker: this scope may be a
+            # straggler's, but nothing here may prove whose, so it stays.
+            return _event(
+                "worker_alive", "refused", run_id=run_id, pid=int(task_row["worker_pid"]),
+            )
+    if not pid or pid == os.getpid():
+        return _event("worker_identity_unknown", "refused", run_id=run_id)
+    if _dispatcher()._worker_alive(pid, started_at):
+        # A card can finish before its agent does: the run is closed while the
+        # worker is still finalising its handoff. Its scope is still in use.
+        return _event("worker_alive", "refused", run_id=run_id, pid=pid)
+    run_epoch = str(_kb()._json_dict(run["metadata"]).get("host_epoch") or "")
+    if run_epoch and _dispatcher()._instantiation_changed(run_epoch, _current_host_epoch()):
+        # A transient scope cannot survive re-instantiation, so an attempt from a
+        # previous boot cannot own a live one: the name match is a coincidence.
+        return _event("stale_boot", "refused", run_id=run_id, pid=pid)
+    recorded_board = str(_kb()._json_dict(run["metadata"]).get("board") or "")
+    local_board = str(board or "")
+    if recorded_board and local_board and recorded_board != local_board:
+        # The attempt belongs to another board; its own dispatcher owns this scope.
+        return _event("foreign_board", "refused", run_id=run_id, pid=pid, board=recorded_board)
+    if not _scope_activation_is_inside(unit, run):
+        # The unit name carries a task and a run/preparation identity but no board,
+        # and board imports preserve those identities; the scope's own activation
+        # inside this attempt's lifetime is what makes it this attempt's to stop.
+        return _event("scope_not_from_attempt", "refused", run_id=run_id, pid=pid)
+    if not apply:
+        return _event(
+            "run_ended_worker_gone", "would_reap", run_id=run_id, pid=pid, board=recorded_board,
+        )
+
+    from tools import process_registry as registry
+
+    stopped = registry._stop_systemd_unit(unit)
+    slot_freed = _scope_slot_free(cgroup) if stopped else False
+    event = _event(
+        "run_ended_worker_gone",
+        "reaped" if stopped else "failed",
+        run_id=run_id,
+        pid=pid,
+        slot_freed=slot_freed,
+        board=recorded_board,
+    )
+    if not stopped:
+        _kb()._log.warning(
+            "kanban worker scopes: could not stop %s for task %s; the single worker "
+            "slot stays held until it is stopped by hand", unit, task_id,
+        )
+    elif not slot_freed:
+        _kb()._log.warning(
+            "kanban worker scopes: %s still populates its cgroup after a stop; the "
+            "worker slot is not free yet", unit,
+        )
+    else:
+        _kb()._log.info(
+            "kanban worker scopes: reaped orphaned scope %s (task %s, run %s) and freed "
+            "the worker slot", unit, task_id, run_id,
+        )
+    _record_scope_reclaim(conn, task_id, run_id, event)
+    return event
+
+
+def reconcile_orphan_worker_scopes(
+    conn: sqlite3.Connection, *, apply: bool = True, board: Optional[str] = None,
+) -> "list[dict[str, Any]]":
+    """Reap worker scopes left standing by an attempt that already ended (#57).
+
+    A transient ``systemd-run --scope`` unit stays ACTIVE while anything at all
+    remains in its cgroup -- ``--collect`` only removes it once the cgroup is
+    empty -- so a worker-owned descendant that outlives the worker (the detached
+    ``browser_harness`` daemon is the observed case) keeps its
+    ``autonomous-workers.slice`` slot after the run is over. That slot is the
+    sole admission authority (``ConcurrencyHardMax=1``), so every queued card
+    stalls behind it until an operator stops that exact scope by hand. Nothing in
+    the launch path tears the scope down, and a ``systemd-run`` client exits long
+    before its worker does, so the dispatcher reconciles here instead: it runs
+    where the slot is measured, which lets the same tick that frees a scope claim
+    the next eligible card.
+
+    Stopping a scope kills every process in it, so every gate must pass on
+    evidence: the unit must be a live ``hermes-worker-*.scope`` DIRECTLY in the
+    worker slice, name an attempt recorded on this board, and that attempt's run
+    must have ENDED while the worker identity recorded at spawn is provably gone
+    (a recycled PID, a fingerprint from another boot epoch, or a PID that is
+    simply absent all count as gone; an unreadable identity does not). The unit
+    name carries no board and a board import preserves task and run identities, so
+    the scope has to prove itself too: its own activation must fall inside that
+    attempt's lifetime window, an attempt recorded against another instantiation
+    or another board refuses, and neither an unreadable activation nor an
+    unreadable population is ever read in this module's favour. A live worker, a
+    closed run whose agent is still finalising its handoff, a newer live run for
+    the card, a scope outside the worker slice, and a suffix this module cannot
+    read all refuse instead: the scope is left exactly as found and reported, never
+    stopped. The stop is therefore never the first signal a LIVE parent receives
+    (``tools/AGENTS.md``): the recorded worker is already proven dead, recycled, or
+    from a previous boot before it can run. Failures are fail-closed and reported,
+    not retried with broader authority. One gap is deliberate: a launch that died
+    during pre-claim preparation has no run row and no recorded identity, so its
+    scope is refused as ``run_not_recorded`` rather than reaped on evidence that
+    does not exist. That is an operator's stop of the exact unit named in the
+    refusal, not a rule this module is entitled to widen -- a scope's only process
+    could be the worker itself, and nothing in unit or cgroup metadata
+    distinguishes the two.
+
+    Returns bounded, sanitized events -- exact unit, cgroup, task, run, reason,
+    outcome, and whether the slot came free -- for the dispatch result and the
+    board's event trail. Nothing here reads command lines, arguments,
+    credentials or browser data.
+    """
+    from tools import process_registry as registry
+
+    try:
+        inventory = registry.autonomous_boundary_inventory()
+    except Exception as exc:
+        # Unreadable boundary is not this scan's failure: no scope is stopped on
+        # evidence that could not be gathered. The launch path refuses separately
+        # with the operator-facing diagnostic.
+        _kb()._log.debug("kanban worker scopes: boundary inventory unavailable (%s)", exc)
+        return []
+    workers_group = str((inventory.get("workers") or {}).get("cgroup") or "")
+    try:
+        local_board = _kb()._normalize_board_slug(board or _kb().get_current_board())
+    except Exception:
+        local_board = ""
+    events: list[dict[str, Any]] = []
+    for cgroup in inventory.get("worker_scopes") or []:
+        unit = Path(str(cgroup)).name
+        owner = _kanban_scope_owner(unit)
+        if owner is None:
+            continue  # not a Kanban worker scope: not ours to stop
+        try:
+            event = _reconcile_worker_scope(
+                conn, unit=unit, cgroup=str(cgroup), owner=owner,
+                workers_group=workers_group, apply=apply, board=local_board,
+            )
+        except Exception:
+            # One unreadable scope must not cost the tick its other work.
+            _kb()._log.debug("kanban worker scopes: reconciliation failed for %s", unit, exc_info=True)
+            continue
+        if event["outcome"] == "refused":
+            if event["reason"] == "worker_identity_unknown":
+                # A populated scope whose attempt is gone but whose worker identity
+                # cannot be read is a slot only an operator can clear.
+                _kb()._log.warning(
+                    "kanban worker scopes: %s (task %s) holds the worker slot with an "
+                    "unverifiable worker identity; stop that exact unit by hand",
+                    unit, event["task_id"],
+                )
+            else:
+                _kb()._log.debug(
+                    "kanban worker scopes: leaving %s alone (%s)", unit, event["reason"],
+                )
+        events.append(event)
+    return events
 
 
 def _worker_project_plugins_enabled(env: dict[str, str]) -> bool:
