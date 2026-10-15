@@ -33,7 +33,10 @@ verifier imports it by file path without booting Hermes.  It must not import
 """
 from __future__ import annotations
 
+import os
+import stat
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional
@@ -317,6 +320,45 @@ class _Snapshot:
     oomd_active: bool = False
 
 
+def _user_manager_env() -> Dict[str, str]:
+    """Reach the same owned user bus as scoped spawns from a system service.
+
+    This verifier is imported standalone by the CTO host check, so it cannot
+    import process_registry's equivalent bus derivation. Revalidate the socket
+    on each read; an inaccessible bus still fails closed at the systemctl check.
+    """
+    env = dict(os.environ)
+    if sys.platform != "linux":
+        return env
+
+    def owned_runtime(path: Path) -> bool:
+        try:
+            info = path.lstat()
+            return (
+                path.is_absolute() and stat.S_ISDIR(info.st_mode)
+                and info.st_uid == os.getuid() and info.st_mode & 0o022 == 0
+            )
+        except OSError:
+            return False
+
+    configured = env.get("XDG_RUNTIME_DIR")
+    runtime = (
+        Path(configured) if configured and owned_runtime(Path(configured))
+        else Path(f"/run/user/{os.getuid()}")
+    )
+    if not owned_runtime(runtime):
+        return env
+    bus = runtime / "bus"
+    try:
+        info = bus.lstat()
+    except OSError:
+        return env
+    if stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid():
+        env["XDG_RUNTIME_DIR"] = str(runtime)
+        env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
+    return env
+
+
 def _show_units(names, *, system: bool = False) -> Dict[str, Dict[str, str]]:
     """Read *names*' properties from the user manager, or the system one.
 
@@ -332,6 +374,7 @@ def _show_units(names, *, system: bool = False) -> Dict[str, Dict[str, str]]:
                 ["systemctl", *(("show",) if system else ("--user", "show")), name,
                  "--property=" + ",".join(UNIT_PROPERTIES)],
                 capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+                env=None if system else _user_manager_env(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             _fail(f"cannot read {name} from the user manager ({exc})")
@@ -349,6 +392,7 @@ def _known_gateway_units(contract: _Contract) -> List[str]:
             ["systemctl", "--user", "list-units", "--all", "--no-legend", "--plain",
              f"{contract.gateway_unit_prefix}*"],
             capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+            env=_user_manager_env(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         _fail(f"cannot enumerate {contract.gateway_unit_prefix}* units ({exc})")

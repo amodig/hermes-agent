@@ -548,6 +548,37 @@ def test_real_native_slot_refuses_the_third_worker_and_releases_one(tmp_path):
                 if proc.poll() is None:
                     proc.terminate()
                     proc.wait(timeout=10)
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.live_system_guard_bypass  # creates a disposable transient slice
+def test_user_manager_inventory_derives_bus_without_changing_system_manager(monkeypatch):
+    """A scrubbed test or system-level launcher still reads its user manager."""
+    fixture.require_user_bus()
+    with fixture.disposable_boundary(concurrency_hard_max=ar.WORKERS_CONCURRENCY_HARD_MAX) as boundary:
+        monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+        monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+        original_run = subprocess.run
+        calls = []
+
+        def observed_run(argv, **kwargs):
+            calls.append((argv, kwargs.get("env")))
+            return original_run(argv, **kwargs)
+
+        monkeypatch.setattr(ar.subprocess, "run", observed_run)
+        properties = ar._show_units([boundary.aggregate_unit, boundary.workers_unit])
+        assert properties[boundary.aggregate_unit]["ControlGroup"] == boundary.aggregate_group
+        assert properties[boundary.workers_unit]["ConcurrencyHardMax"] == str(ar.WORKERS_CONCURRENCY_HARD_MAX)
+        # The system manager is still the owner of shared ancestors; do not
+        # route its request through the user manager just to make this pass.
+        assert ar._show_units(["user.slice"], system=True)["user.slice"]["LoadState"] == "loaded"
+        assert isinstance(ar._known_gateway_units(boundary.contract()), list)
+        expected_bus = fixture.user_bus_env()["DBUS_SESSION_BUS_ADDRESS"]
+        assert all(env and env.get("DBUS_SESSION_BUS_ADDRESS") == expected_bus
+                   for argv, env in calls if "--user" in argv)
+        assert all(env is None for argv, env in calls if "--user" not in argv)
+
+
 def test_ancestor_units_refuse_when_no_manager_reports_the_ancestor(monkeypatch):
     """Unknown policy is incomplete visibility, not a clean bill of health.
 
