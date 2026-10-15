@@ -89,13 +89,16 @@ def require_free_boundary() -> None:
     """Skip unless the host presents a FREE autonomous boundary.
 
     Autonomous dispatch refuses unless the caller is inside a deployed aggregate
-    whose single worker slot is free -- on CI, and on any undeployed or held host,
-    that is the product working correctly, not a test failure. Scenarios that drive
-    a real dispatcher (or a manual gateway with an embedded one) therefore state the
-    precondition instead of asserting against a boundary the host does not have.
+    whose worker capacity matches the current runtime -- on CI, and on any
+    undeployed or mismatched host, that is the product working correctly, not a
+    test failure. Scenarios that drive a real dispatcher (or a manual gateway
+    with an embedded one) therefore state the precondition instead of asserting
+    against a boundary the host does not have.
     """
     if sys.platform != "linux":
         pytest.skip("the autonomous boundary is Linux-only")
+    from tools.autonomous_resources import WORKERS_CONCURRENCY_HARD_MAX
+
     properties = {}
     try:
         completed = _run([
@@ -108,7 +111,8 @@ def require_free_boundary() -> None:
         properties = dict(
             line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line
         )
-    if properties.get("LoadState") != "loaded" or properties.get("ConcurrencyHardMax") != "1":
+    if (properties.get("LoadState") != "loaded" or
+            properties.get("ConcurrencyHardMax") != str(WORKERS_CONCURRENCY_HARD_MAX)):
         pytest.skip(
             "no free autonomous boundary on this host (LoadState="
             f"{properties.get('LoadState')!r}, ConcurrencyHardMax="

@@ -341,6 +341,33 @@ gateway docs). Without a running gateway, `ready` tasks stay where they are
 until one comes up — `hermes kanban create` warns about this at creation
 time.
 
+#### Two-worker trial (systemd user manager)
+
+On a host using the reviewed `autonomous.slice` boundary, the worker child slice
+`autonomous-workers.slice` has `ConcurrencyHardMax=2` and
+`ConcurrencySoftMax=unlimited`. The runtime checks the *loaded* systemd policy,
+not merely the unit file: if the installed hard maximum is still 1 (or any
+other value), it refuses new workers with the observed value and a drain/align
+remedy. Do not edit the installed unit, reload the manager, or restart the
+gateway mid-trial without an operator-approved deployment. First drain active
+worker scopes; deploy the matching unit and runtime together, then verify the
+loaded property with `systemctl --user show autonomous-workers.slice
+--property=ConcurrencyHardMax,ConcurrencySoftMax` and observe two distinct
+populated scopes. The two-worker ceiling is shared by Kanban, cron, and
+background workers, not two slots per board. A third launch is refused by the
+native manager even if two dispatchers race past their read-only precheck.
+
+For a two-profile Kanban trial, keep `kanban.max_in_progress: 2` (host-wide,
+across boards) and `kanban.max_in_progress_per_profile: 1` (per-board policy).
+The native worker-slice ceiling remains the final authority across boards and
+non-Kanban autonomous callers. To roll back, drain both workers before
+switching runtime and installed slice policy back to 1 together. Mismatched
+runtime/unit versions intentionally refuse new launches rather than silently
+running with the wrong capacity. Memory ceilings remain shared by the two
+workers; two simultaneous jobs can each consume resources within that same
+aggregate, so monitor pressure and stop the trial if the interactive host is
+impacted.
+
 #### Workers and systemd cgroups
 
 Workers are fire-and-forget processes that outlive the dispatcher tick, so

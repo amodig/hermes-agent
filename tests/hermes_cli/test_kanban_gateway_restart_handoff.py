@@ -1077,11 +1077,12 @@ def test_occupied_native_slot_refuses_dispatch_without_charging_retries(tmp_path
 def test_losing_the_native_admission_race_is_infrastructure(monkeypatch):
     """The loser of a native admission race must not spend the card's retry.
 
-    Two dispatchers can pass the capacity precheck before either scope activates;
-    systemd admits exactly one, and the loser's launcher exits before bootstrap --
-    which looks exactly like a crash. The manager's own state separates them: OUR
-    scope absent while the slot is held is a refused activation, our scope
-    populated is a real bootstrap failure, and an empty slice is a real failure.
+    Racing dispatchers can pass the capacity precheck before scopes activate;
+    systemd admits up to two, and the third launcher's exit before bootstrap
+    looks like a crash. The manager's own state separates them: OUR scope
+    absent while two other scopes hold capacity is a refused activation, our
+    scope populated is a real bootstrap failure, and remaining capacity is
+    insufficient evidence of a refusal.
     """
     from hermes_cli import kanban_worker_runtime as kwr
     from tools import process_registry as process_registry_mod
@@ -1090,7 +1091,10 @@ def test_losing_the_native_admission_race_is_infrastructure(monkeypatch):
 
     def _held_by_another(**_kwargs):
         return {
-            "worker_scopes": ["/fixture/hermes-worker-someone-else.scope"],
+            "worker_scopes": [
+                "/fixture/hermes-worker-someone-else.scope",
+                "/fixture/hermes-worker-another.scope",
+            ],
             "worker_slot_occupied": True,
         }
 
@@ -1101,10 +1105,10 @@ def test_losing_the_native_admission_race_is_infrastructure(monkeypatch):
         kwr._raise_if_launch_refused(scope, 1)
 
     # Inventory, not admission: a populated scope of OURS means the child really did
-    # start and really did fail, so it is not infrastructure. Admission would refuse
-    # here too -- on the caller's own scope -- which is why the two are separate.
+    # start and really did fail, so it is not infrastructure even if the slice
+    # later filled. Admission would refuse once full, but inventory keeps ownership.
     def _our_scope_is_live(**_kwargs):
-        return {"worker_scopes": [f"/fixture/{scope}"], "worker_slot_occupied": True}
+        return {"worker_scopes": [f"/fixture/{scope}"], "worker_slot_occupied": False}
 
     monkeypatch.setattr(
         process_registry_mod, "autonomous_boundary_inventory", _our_scope_is_live,
@@ -1112,6 +1116,15 @@ def test_losing_the_native_admission_race_is_infrastructure(monkeypatch):
     assert kwr._raise_if_launch_refused(scope, 1) is None, (
         "a populated scope of ours means the bootstrap really failed"
     )
+
+    def _one_slot_free(**_kwargs):
+        return {
+            "worker_scopes": ["/fixture/hermes-worker-someone-else.scope"],
+            "worker_slot_occupied": False,
+        }
+
+    monkeypatch.setattr(process_registry_mod, "autonomous_boundary_inventory", _one_slot_free)
+    assert kwr._raise_if_launch_refused(scope, 1) is None
 
     def _slot_free(**_kwargs):
         return {"worker_scopes": [], "worker_slot_occupied": False}

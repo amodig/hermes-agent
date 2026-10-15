@@ -69,7 +69,7 @@ class Host:
             self.add_cgroup(relative, values)
         self.units[ar.AUTONOMOUS_SLICE] = _unit(LIMITS, AGGREGATE)
         self.units[ar.AUTONOMOUS_WORKERS_SLICE] = _unit(
-            LIMITS, WORKERS, ConcurrencyHardMax=1,
+            LIMITS, WORKERS, ConcurrencyHardMax=ar.WORKERS_CONCURRENCY_HARD_MAX,
         )
         self.units[GATEWAY] = _unit(
             LIMITS, GATEWAY_GROUP, MainPID="5000", OOMPolicy="kill",
@@ -201,11 +201,12 @@ def test_policy_drift_refuses(host, unit, key, value):
     assert str(excinfo.value).startswith(ar.BOUNDARY_DIAGNOSTIC)
 
 
-@pytest.mark.parametrize("hard_max", [str(ar.UNLIMITED), "0", "2"])
-def test_native_slot_must_be_exactly_one(host, hard_max):
+@pytest.mark.parametrize("hard_max", [str(ar.UNLIMITED), "0", "1", "3"])
+def test_native_slot_must_match_the_reviewed_capacity(host, hard_max):
     host.units[ar.AUTONOMOUS_WORKERS_SLICE]["ConcurrencyHardMax"] = hard_max
-    with pytest.raises(ar.AutonomousResourceUnavailable, match="ConcurrencyHardMax"):
+    with pytest.raises(ar.AutonomousResourceUnavailable, match="drain workers and align") as excinfo:
         host.admit(None)
+    assert f"must be {ar.WORKERS_CONCURRENCY_HARD_MAX}, got {hard_max!r}" in str(excinfo.value)
 
 
 def test_soft_limit_must_not_queue_a_second_launch(host):
@@ -301,21 +302,39 @@ def test_active_gateway_with_a_migrated_main_pid_refuses(host):
         host.admit(None)
 
 
-def test_live_worker_scope_occupies_the_slot(host):
-    host.add_scope(f"{WORKERS}/hermes-worker-kanban-t-run-7.scope", 6100)
+def test_worker_scopes_admit_up_to_capacity_then_release_one_slot(host):
+    first = f"{WORKERS}/hermes-worker-kanban-t-run-7.scope"
+    second = f"{WORKERS}/hermes-worker-kanban-t-run-8.scope"
     launcher = host.add_process(6000, AGGREGATE)
+    host.add_scope(first, 6100)
+    host.add_process(6100, first)
+    report = host.admit(launcher)
+    assert report["worker_slot_occupied"] is False
+    assert report["worker_scopes"] == [first]
+    assert host.verify_worker(6100)["worker_cgroup"] == first
+
+    host.add_scope(second, 6200)
+    host.add_process(6200, second)
+    assert host.verify_worker(6100)["worker_cgroup"] == first
+    assert host.verify_worker(6200)["worker_cgroup"] == second
     with pytest.raises(ar.AutonomousWorkerBusy) as excinfo:
         host.admit(launcher)
     assert str(excinfo.value).startswith(ar.SLOT_DIAGNOSTIC)
-    # Inventory still reports it instead of raising, and says the slot is taken.
-    report = host.admit(None)
-    assert report["worker_slot_occupied"] is True
-    assert report["worker_scopes"] == [f"{WORKERS}/hermes-worker-kanban-t-run-7.scope"]
+    assert host.admit(None)["worker_scopes"] == [first, second]
+    assert host.admit(None)["worker_slot_occupied"] is True
+
+    # Only the completed scope empties; the second remains accounted and valid.
+    host.add_scope(first, None, populated=False)
+    report = host.admit(launcher)
+    assert report["worker_scopes"] == [second]
+    assert report["worker_slot_occupied"] is False
+    assert host.verify_worker(6200)["worker_cgroup"] == second
 
 
 def test_scope_with_only_a_nested_descendant_still_occupies_the_slot(host):
     """An empty ``cgroup.procs`` on the scope is not proof the slot is free."""
     host.add_scope(f"{WORKERS}/hermes-worker-run-7.scope", None, nested_pid=6200)
+    host.add_scope(f"{WORKERS}/hermes-worker-run-8.scope", 6300)
     report = host.admit(None)
     assert report["worker_slot_occupied"] is True
     with pytest.raises(ar.AutonomousWorkerBusy):
@@ -374,12 +393,12 @@ def test_worker_verification_refuses_any_other_placement(host, group, match):
         host.verify_worker(pid)
 
 
-def test_worker_verification_refuses_a_second_live_scope(host):
-    for run, pid in ((7, 6400), (8, 6401)):
+def test_worker_verification_refuses_more_than_the_native_capacity(host):
+    for run, pid in ((7, 6400), (8, 6401), (9, 6402)):
         scope = f"{WORKERS}/hermes-worker-kanban-t-run-{run}.scope"
         host.add_scope(scope, pid)
         host.add_process(pid, scope)
-    with pytest.raises(ar.AutonomousResourceUnavailable, match="expected exactly"):
+    with pytest.raises(ar.AutonomousResourceUnavailable, match="within capacity"):
         host.verify_worker(6400)
 
 
@@ -434,7 +453,16 @@ def test_real_transient_slices_satisfy_the_boundary_for_a_real_launcher(tmp_path
     tree, and the launcher is really inside the aggregate.
     """
     fixture.require_user_bus()
-    with fixture.disposable_boundary() as boundary:
+    # A worker executing the test is itself a real scope outside the disposable
+    # aggregate, so the isolation validator correctly refuses this fixture.
+    if "hermes-worker-" in Path("/proc/self/cgroup").read_text(encoding="utf-8"):
+        pytest.skip("the test runner is an autonomous worker outside the fixture slice")
+    with fixture.disposable_boundary(concurrency_hard_max=ar.WORKERS_CONCURRENCY_HARD_MAX) as boundary:
+        # The hermetic runner strips the user-bus environment. The production
+        # validator reads ambient env while the fixture's setup passes it explicitly.
+        for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+            if key in fixture.user_bus_env():
+                monkeypatch.setenv(key, fixture.user_bus_env()[key])
         boundary.install(monkeypatch)
         report = ar.check_autonomous_boundary(pid=None)
         assert report["aggregate"]["cgroup"] == boundary.aggregate_group
@@ -460,70 +488,66 @@ def test_real_transient_slices_satisfy_the_boundary_for_a_real_launcher(tmp_path
 
 @pytest.mark.platforms("linux")
 @pytest.mark.live_system_guard_bypass  # creates disposable transient slices
-def test_real_native_slot_refuses_the_second_worker(tmp_path):
-    """``ConcurrencyHardMax`` on the REAL worker slice is the admission authority.
+def test_real_native_slot_refuses_the_third_worker_and_releases_one(tmp_path):
+    """The real manager admits two scoped workers, then refuses a third.
 
-    A read-only precheck can be raced; the kernel-level limit cannot. This is the
-    decisive property of the design, so it is proven against real systemd rather
-    than asserted from documentation.
+    The read-only precheck can be raced; native systemd capacity cannot. After
+    one scope empties, another starts while the surviving scope remains live.
     """
     fixture.require_user_bus()
-    with fixture.disposable_boundary() as boundary:
+    with fixture.disposable_boundary(concurrency_hard_max=ar.WORKERS_CONCURRENCY_HARD_MAX) as boundary:
+        def start(name: str, command: list[str]) -> subprocess.Popen[bytes]:
+            return subprocess.Popen(
+                ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+                 f"--slice={boundary.workers_unit}", "--unit", name,
+                 "--", *command],
+                env=fixture.user_bus_env(), start_new_session=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            )
+
         first_unit = f"hermes-worker-{boundary.token}-first.scope"
-        first = subprocess.Popen(
-            ["systemd-run", "--user", "--scope", "--quiet", "--collect",
-             f"--slice={boundary.workers_unit}", "--unit", first_unit,
-             "--", sys.executable, "-c", "import time; time.sleep(5)"],
-            env=fixture.user_bus_env(), start_new_session=True,
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        )
+        second_unit = f"hermes-worker-{boundary.token}-second.scope"
+        holders = [
+            start(name, [sys.executable, "-c", "import time; time.sleep(60)"])
+            for name in (first_unit, second_unit)
+        ]
         try:
-            # The first launch must actually be admitted before the second is
-            # attempted, or a refusal here would be misread as the slot working.
+            for unit, proc in zip((first_unit, second_unit), holders):
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    if proc.poll() is not None:
+                        assert proc.stderr is not None
+                        pytest.fail(f"{unit} was refused: " + proc.stderr.read().decode(errors="replace"))
+                    if os.path.exists(f"/sys/fs/cgroup{boundary.workers_group}/{unit}"):
+                        break
+                    time.sleep(0.05)
+                else:
+                    pytest.fail(f"{unit} never entered its scope")
+
+            third = start(f"hermes-worker-{boundary.token}-third.scope", ["/bin/true"])
+            assert third.wait(timeout=30) != 0, "native capacity admitted a third worker"
+            assert third.stderr is not None
+            assert b"Concurrency limit" in third.stderr.read()
+
+            holders[0].terminate()
+            holders[0].wait(timeout=10)
+            # Scope collection is asynchronous. Retry only a disposable launch;
+            # the surviving worker must remain live throughout.
             deadline = time.monotonic() + 20
             while time.monotonic() < deadline:
-                if first.poll() is not None:
-                    pytest.fail(
-                        "the first worker was refused before the slot race: "
-                        + first.stderr.read().decode(errors="replace")
-                    )
-                if os.path.exists(
-                    f"/sys/fs/cgroup{boundary.workers_group}/{first_unit}"
-                ):
+                assert holders[1].poll() is None, "releasing one scope killed the other"
+                replacement = start(f"hermes-worker-{boundary.token}-replacement.scope", ["/bin/true"])
+                if replacement.wait(timeout=30) == 0:
                     break
-                time.sleep(0.05)
+                time.sleep(0.1)
             else:
-                pytest.fail("the first worker never entered its scope")
-            second = subprocess.run(
-                ["systemd-run", "--user", "--scope", "--quiet", "--collect",
-                 f"--slice={boundary.workers_unit}",
-                 "--unit", f"hermes-worker-{boundary.token}-second.scope",
-                 "--", "/bin/true"],
-                capture_output=True, text=True, timeout=30, env=fixture.user_bus_env(),
-            )
-            assert second.returncode != 0, "the native slot admitted a second worker"
-            assert "Concurrency limit" in second.stderr, second.stderr
+                pytest.fail("native capacity did not reopen after one scope emptied")
+            assert holders[1].poll() is None
         finally:
-            first.terminate()
-            first.wait(timeout=10)
-
-        # Only after the whole scope has emptied does the slot come back: the
-        # first scope is torn down asynchronously, so wait for it rather than
-        # assuming the signal was already accounted for.
-        deadline = time.monotonic() + 20
-        third = None
-        while time.monotonic() < deadline:
-            third = subprocess.run(
-                ["systemd-run", "--user", "--scope", "--quiet", "--collect",
-                 f"--slice={boundary.workers_unit}",
-                 "--unit", f"hermes-worker-{boundary.token}-third.scope",
-                 "--", "/bin/true"],
-                capture_output=True, text=True, timeout=30, env=fixture.user_bus_env(),
-            )
-            if third.returncode == 0:
-                break
-            time.sleep(0.1)
-        assert third is not None and third.returncode == 0, third.stderr
+            for proc in holders:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=10)
 def test_ancestor_units_refuse_when_no_manager_reports_the_ancestor(monkeypatch):
     """Unknown policy is incomplete visibility, not a clean bill of health.
 

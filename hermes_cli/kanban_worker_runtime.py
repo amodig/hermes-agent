@@ -551,13 +551,14 @@ def _worker_scope_suffix(task: Task, *, preparation_id: Optional[str]) -> str:
 def _raise_if_launch_refused(scope_unit: str, returncode: Optional[int]) -> None:
     """Raise infrastructure when the launcher died because its scope was refused.
 
-    Two dispatchers can pass the capacity precheck before either scope activates;
-    systemd admits exactly one, and the loser's launcher exits non-zero before
-    bootstrap. That card never ran, so it must not spend a retry -- but the same
-    exit code also describes a genuine bootstrap crash, which must still be a real
-    failure. The difference is the manager's own state: a refused activation leaves
-    OUR scope absent while the slot is held by the winner, whereas a real crash
-    leaves our scope populated. Nothing here reads the exit code or stderr text.
+    Racing dispatchers can pass the capacity precheck before scopes activate;
+    systemd admits only up to the slice's hard limit. A loser's launcher exits
+    non-zero before bootstrap. That card never ran, so it must not spend a retry;
+    the same exit code also describes a genuine bootstrap crash. A refused
+    activation leaves OUR scope absent while the slice is full, whereas a real
+    crash leaves our scope populated. If capacity has since freed, the evidence
+    is ambiguous and the normal failure path handles it. Neither exit code nor
+    stderr text is treated as proof of admission.
     """
     from tools import autonomous_resources as resources
     from tools.process_registry import _IS_LINUX, autonomous_boundary_inventory
@@ -931,12 +932,11 @@ def reconcile_orphan_worker_scopes(
     empty -- so a worker-owned descendant that outlives the worker (the detached
     ``browser_harness`` daemon is the observed case) keeps its
     ``autonomous-workers.slice`` slot after the run is over. That slot is the
-    sole admission authority (``ConcurrencyHardMax=1``), so every queued card
-    stalls behind it until an operator stops that exact scope by hand. Nothing in
-    the launch path tears the scope down, and a ``systemd-run`` client exits long
-    before its worker does, so the dispatcher reconciles here instead: it runs
-    where the slot is measured, which lets the same tick that frees a scope claim
-    the next eligible card.
+    native admission authority (``ConcurrencyHardMax=2``); two occupied slots
+    stall queued cards until a scope empties. Nothing in the launch path tears
+    the scope down, and a ``systemd-run`` client exits long before its worker
+    does, so the dispatcher reconciles here instead: it runs where capacity is
+    measured, which lets the same tick that frees a scope claim the next card.
 
     Stopping a scope kills every process in it, so every gate must pass on
     evidence: the unit must be a live ``hermes-worker-*.scope`` DIRECTLY in the

@@ -1,24 +1,23 @@
 """Reaping the worker scope an ended attempt leaves standing (issue #57).
 
-Two invariants, per the repository's 1–2 tests-per-fix rule:
+Three independently observable contracts:
 
 * ``test_scope_is_reaped_only_when_its_own_attempt_ended_and_its_worker_is_gone``
   pins the decision: a scope is stopped exactly when this board recorded that
   attempt, the attempt ended, and the worker identity recorded at spawn is
   provably gone — and in every other case it is left exactly as found and the
   refusal is reported.
-* ``test_a_stranded_child_blocks_the_next_worker_until_it_is_reconciled`` pins the
-  behaviour on REAL transient scopes: a stranded descendant of a finished attempt
-  holds the slice's single slot, a second worker cannot start beside it, the
-  reconciliation releases the slot, and the next worker really does start — while
-  a live scope is refused and left running.
+* ``test_reaping_completed_scope_does_not_touch_a_live_second_worker`` pins
+  two-slot cleanup: the ended scope is reaped without stopping its live sibling.
+* ``test_a_stranded_child_blocks_the_next_worker_until_it_is_reconciled`` pins
+  the legacy one-slot fixture on REAL transient scopes: a stranded descendant
+  of a finished attempt holds its slot, reconciliation releases it, and the
+  next worker starts while a live scope remains protected.
 
 Why a scope at all: a transient ``systemd-run --scope`` unit stays ACTIVE while
 anything at all remains in its cgroup (``--collect`` only removes it once the
-cgroup is empty), and ``ConcurrencyHardMax=1`` on ``autonomous-workers.slice`` is
-the sole admission authority. A worker-owned descendant that outlives the worker
-kept the only slot after the run was over, so every queued card stalled while the
-board showed no running task.
+cgroup is empty). A worker-owned descendant that outlives the worker still
+consumes one native capacity slot after the run ends.
 """
 
 from __future__ import annotations
@@ -34,6 +33,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_worker_runtime as kwr
+from tools import autonomous_resources as ar
 from tools import process_registry as registry
 
 WORKERS_GROUP = "/stub/autonomous.slice/autonomous-workers.slice"
@@ -71,7 +71,7 @@ def _inventory(*cgroups: str) -> dict:
         "workers": {"cgroup": WORKERS_GROUP},
         "worker_scopes": list(cgroups),
         "misplaced_worker_scopes": [],
-        "worker_slot_occupied": bool(cgroups),
+        "worker_slot_occupied": len(cgroups) >= ar.WORKERS_CONCURRENCY_HARD_MAX,
     }
 
 
@@ -144,6 +144,39 @@ def _reclaim_events(conn, task_id) -> list[dict]:
             (task_id, kwr.WORKER_SCOPE_RECLAIM_EVENT),
         )
     ]
+
+
+def test_reaping_completed_scope_does_not_touch_a_live_second_worker(conn, monkeypatch):
+    ended_task = kb.create_task(conn, title="ended worker", assignee="implementer")
+    live_task = kb.create_task(conn, title="live worker", assignee="implementer")
+    ended_unit = _unit_name(ended_task, preparation_id=PREPARATION_ID)
+    live_unit = _unit_name(live_task, preparation_id=PREPARATION_ID)
+    dead_pid = _dead_pid()
+    _insert_run(
+        conn, ended_task, 367,
+        metadata=_metadata(pid=dead_pid, fingerprint=f"boot:1|{dead_pid}"),
+    )
+    live = subprocess.Popen(["sleep", "60"])
+    try:
+        _insert_run(
+            conn, live_task, 368, status="running", ended=False,
+            metadata=_metadata(pid=live.pid, fingerprint=kbd._process_fingerprint(live.pid)),
+        )
+        stopped = _stub(
+            monkeypatch, f"{WORKERS_GROUP}/{ended_unit}", f"{WORKERS_GROUP}/{live_unit}",
+        )
+        assert _inventory(f"{WORKERS_GROUP}/{ended_unit}", f"{WORKERS_GROUP}/{live_unit}")[
+            "worker_slot_occupied"
+        ]
+        events = kwr.reconcile_orphan_worker_scopes(conn)
+        assert stopped == [ended_unit]
+        assert any(e["outcome"] == "reaped" and e["unit"] == ended_unit for e in events)
+        assert any(e["outcome"] == "refused" and e["unit"] == live_unit for e in events)
+        assert live.poll() is None
+        assert _reclaim_events(conn, live_task) == []
+    finally:
+        live.terminate()
+        live.wait(timeout=10)
 
 
 def test_scope_is_reaped_only_when_its_own_attempt_ended_and_its_worker_is_gone(conn, monkeypatch):
