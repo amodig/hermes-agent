@@ -175,9 +175,10 @@ def test_worker_generation_scopes_profile_board_and_secrets_before_grant(
     assert not generation.exists()
 
 
+@pytest.mark.live_system_guard_bypass  # private transient worker slice on Linux
 @pytest.mark.parametrize("profile_change", ["mutate", "remove"])
 def test_worker_captures_assigned_profile_plugins_before_child_imports(
-    worker_setup, monkeypatch, profile_change,
+    worker_setup, worker_boot_boundary, monkeypatch, profile_change,
 ):
     workspace, task = worker_setup
     source = workspace.parent / "install"
@@ -246,9 +247,10 @@ value = {
         _finish_launch(launch)
 
 
+@pytest.mark.live_system_guard_bypass  # private transient worker slice on Linux
 @pytest.mark.parametrize("source_change", ["mutate", "remove"])
 def test_worker_captures_assigned_profile_memory_loaders_and_resources(
-    worker_setup, monkeypatch, source_change,
+    worker_setup, worker_boot_boundary, monkeypatch, source_change,
 ):
     workspace, task = worker_setup
     source = workspace.parent / "install"
@@ -323,7 +325,9 @@ value = {
         _finish_launch(launch)
 
 
-@pytest.mark.parametrize(("dispatcher_gate", "scope", "encoding", "profile_env", "enabled"), [
+# Split the expensive real worker boot matrix across files: the per-file CI
+# watchdog is shorter than the aggregate runtime of all encoding cases.
+_PROJECT_PLUGIN_CAPTURE_CASES = [
     ("0", "profile", "utf-8", "HERMES_ENABLE_PROJECT_PLUGINS=1\n", True),
     ("1", "profile", "utf-8", "HERMES_ENABLE_PROJECT_PLUGINS=0\n", False),
     ("0", "profile", "utf-8", "WORKER_PROJECT_GATE=on\nHERMES_ENABLE_PROJECT_PLUGINS=${WORKER_PROJECT_GATE}\n", True),
@@ -339,9 +343,11 @@ value = {
     ("0", "managed", "utf-16-le", "HERMES_ENABLE_PROJECT_PLUGINS=1\n", True),
     ("1", "managed", "utf-16-le", "HERMES_ENABLE_PROJECT_PLUGINS=0\n", False),
     ("0", "managed", "utf-8-sig", "HERMES_ENABLE_PROJECT_PLUGINS=1\n", True),
-])
-def test_worker_project_plugin_capture_matches_profile_dotenv(
-    worker_setup, monkeypatch, dispatcher_gate, scope, encoding, profile_env, enabled,
+]
+
+
+def _assert_worker_project_plugin_capture_matches_profile_dotenv(
+    worker_setup, worker_boot_boundary, monkeypatch, dispatcher_gate, scope, encoding, profile_env, enabled,
 ):
     workspace, task = worker_setup
     source = workspace.parent / "install"
@@ -473,7 +479,8 @@ def test_managed_gateway_scope_builder_fails_closed_if_binary_disappears(
         kbd._default_spawn(task, str(workspace))
 
 
-def test_generation_ignores_workspace_and_pythonpath_before_any_import(worker_setup, monkeypatch):
+@pytest.mark.live_system_guard_bypass  # private transient worker slice on Linux
+def test_generation_ignores_workspace_and_pythonpath_before_any_import(worker_setup, worker_boot_boundary, monkeypatch):
     workspace, task = worker_setup
     marker = workspace / "untrusted-import"
     for name in ("fixture_early", "fixture_lazy", "third_party_early", "third_party_dynamic"):
@@ -493,7 +500,8 @@ def test_generation_ignores_workspace_and_pythonpath_before_any_import(worker_se
         _finish_launch(launch)
 
 
-def test_launcher_exit_does_not_delete_live_worker_generation(worker_setup, monkeypatch):
+@pytest.mark.live_system_guard_bypass  # private transient worker slice on Linux
+def test_launcher_exit_does_not_delete_live_worker_generation(worker_setup, worker_boot_boundary, monkeypatch):
     workspace, task = worker_setup
     launch = kbd._default_spawn(task, str(workspace), defer_grant=True)
     generation = kbd._worker_runtime_snapshots[launch.launcher_pid]
@@ -513,7 +521,8 @@ def test_launcher_exit_does_not_delete_live_worker_generation(worker_setup, monk
     assert not generation.exists()
 
 
-def test_explicit_current_install_entrypoint_is_sealed_and_custom_wrapper_is_refused(worker_setup, monkeypatch):
+@pytest.mark.live_system_guard_bypass  # private transient worker slice on Linux
+def test_explicit_current_install_entrypoint_is_sealed_and_custom_wrapper_is_refused(worker_setup, worker_boot_boundary, monkeypatch):
     workspace, task = worker_setup
     entrypoint = Path(sysconfig.get_path("scripts")) / ("hermes.exe" if os.name == "nt" else "hermes")
     monkeypatch.setenv("HERMES_BIN", str(entrypoint))
@@ -608,9 +617,7 @@ def test_real_user_systemd_scope_preserves_worker_context(worker_setup, monkeypa
             _finish_launch(launch)
 
 
-@pytest.mark.platforms("linux")
-@pytest.mark.live_system_guard_bypass  # cleanup signals our start-time-verified, reparented worker
-def test_worker_and_claim_survive_dispatcher_exit_and_shared_install_replacement(worker_setup, monkeypatch):
+def _assert_worker_and_claim_survive_dispatcher_exit_and_shared_install_replacement(worker_setup, monkeypatch):
     workspace, _task = worker_setup
     base = workspace.parent
     database = base / "restart.db"
@@ -628,8 +635,17 @@ def test_worker_and_claim_survive_dispatcher_exit_and_shared_install_replacement
     assert kb.get_task(conn, task_id).status == "ready"
     release = base / "release"
     monkeypatch.setenv("HERMES_TEST_RUNTIME_RELEASE", str(release))
+    # Build the sealed cache before the short-lived dispatcher exits. The child
+    # should exercise the same immutable generation, not spend its bootstrap
+    # deadline copying/hashing the test interpreter under a busy shared host.
+    warm = generations.prepare_runtime_generation(
+        None, workspace=str(workspace),
+        profile_home=str(base / ".hermes" / "profiles" / "coder"),
+        project_plugins_enabled=False,
+    )
+    generations.cleanup_runtime_generation(warm.root, force=True)
     script = """
-import json, os, sqlite3, sys
+import faulthandler, json, os, sqlite3, sys
 from pathlib import Path
 from unittest.mock import patch
 from hermes_cli import kanban_runtime_generation as generations
@@ -642,6 +658,8 @@ from tools import autonomous_resources as _ar, process_registry as _pr
 _pr.require_autonomous_boundary = lambda **_kw: {'aggregate': {'cgroup': '/fixture/autonomous.slice'}}
 _ar.check_autonomous_worker = lambda pid, **_kw: {'worker_cgroup': '/fixture/hermes-worker-%d.scope' % pid}
 base = Path(sys.argv[1])
+stack_log = open(base / 'dispatcher-stack.log', 'w')
+faulthandler.dump_traceback_later(20, file=stack_log)
 conn = sqlite3.connect(base / 'restart.db')
 conn.row_factory = sqlite3.Row
 with patch.object(kbd, '_profile_exists_fn', return_value=None), patch.object(
@@ -655,10 +673,19 @@ os._exit(0)
     launch_env = {**os.environ, "PYTHONPATH": str(Path(kbd.__file__).resolve().parents[1])}
     # This child also materializes the sealed interpreter; a cold copy can
     # consume the old 30-second deadline before the dispatch being exercised.
-    completed = subprocess.run(
-        [sys.executable, "-c", script, str(base), str(generations._runtime_storage_root())],
-        env=launch_env, timeout=60,
-    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", script, str(base), str(generations._runtime_storage_root())],
+            env=launch_env, timeout=60,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stack = base / "dispatcher-stack.log"
+        worker_log = base / ".hermes" / "kanban" / "logs" / f"{task_id}.log"
+        diagnostic = [
+            stack.read_text(encoding="utf-8") if stack.exists() else "no child stack recorded",
+            worker_log.read_text(encoding="utf-8")[-4000:] if worker_log.exists() else "no worker log recorded",
+        ]
+        raise AssertionError("\n".join(diagnostic)) from exc
     assert completed.returncode == 0
     claimed = kb.get_task(conn, task_id)
     assert claimed.status == "running"
@@ -731,6 +758,12 @@ def test_worker_survives_a_real_user_service_restart(tmp_path, monkeypatch):
     from tests._fixtures import autonomous_slice as fixture
 
     fixture.require_user_bus()
+    # The runtime deliberately inventories every worker scope in the user manager.
+    # An unrelated live worker is misplaced relative to our disposable slice;
+    # a restart then cannot pass admission without weakening the real validator.
+    manager = autonomous_resources.user_manager_root(fixture.cgroup_of(os.getpid()))
+    if autonomous_resources.live_worker_scope_cgroups(autonomous_resources.CGROUP_ROOT, manager):
+        pytest.skip("real restart admission needs a host without other live Hermes worker scopes")
     bus_env = fixture.user_bus_env()
     for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
         if key in bus_env:
