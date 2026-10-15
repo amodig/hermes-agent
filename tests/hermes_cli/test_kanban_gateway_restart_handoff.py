@@ -80,13 +80,16 @@ def worker_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("HERMES_TEST_RUNTIME_RECEIPT", str(tmp_path / "receipt.json"))
     workspace = tmp_path / "candidate-worktree"
     workspace.mkdir()
+    # Files in the per-file runner share the user manager. The scope unit must
+    # not alias another file's concurrent candidate (or a prior test's teardown).
+    candidate_id = f"t_candidate_{uuid.uuid4().hex}"
     task = kb.Task(
-        id="t_candidate_restart", title="activate candidate", body=None,
+        id=candidate_id, title="activate candidate", body=None,
         assignee="coder", status="running", priority=0, created_by="test",
         created_at=1, started_at=1, completed_at=None,
         workspace_kind="worktree", workspace_path=str(workspace),
         claim_lock="host:dispatcher", claim_expires=999, tenant=None,
-        branch_name="wt/t_candidate_restart", current_run_id=23,
+        branch_name=f"wt/{candidate_id}", current_run_id=23,
     )
     with tempfile.TemporaryDirectory(prefix="runtime-storage-", dir=tmp_path) as storage:
         monkeypatch.setattr(generations, "_runtime_storage_root", lambda: Path(storage))

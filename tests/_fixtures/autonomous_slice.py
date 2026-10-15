@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import subprocess
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -154,6 +155,16 @@ def _start_transient_slice(name: str, properties: List[Tuple[str, str, str]]) ->
     assert completed.returncode == 0, (
         f"StartTransientUnit {name} failed: {completed.stderr.strip()}"
     )
+    # StartTransientUnit returns a job, not a completed activation. Concurrent
+    # per-file bootstraps can observe a loaded but inactive unit without a cgroup.
+    # Await this exact disposable unit before starting its child or verifying it.
+    deadline = time.monotonic() + 10
+    while True:
+        state = show(name)
+        if state.get("ActiveState") == "active" and state.get("ControlGroup"):
+            break
+        assert time.monotonic() < deadline, f"{name} did not activate: {state}"
+        time.sleep(0.05)
 
 
 def show(unit: str) -> Dict[str, str]:

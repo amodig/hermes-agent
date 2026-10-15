@@ -29,6 +29,23 @@ GATEWAY_GROUP = f"{AGGREGATE}/{GATEWAY}"
 LIMITS = {"MemoryHigh": 2 * ar.GIB, "MemoryMax": 3 * ar.GIB, "MemorySwapMax": 1 * ar.GIB}
 
 
+def test_transient_slice_waits_for_active_cgroup(monkeypatch):
+    """A successful StartTransientUnit returns a job, not an active cgroup."""
+    unit = "fixture-test-workers.slice"
+    states = iter([
+        {"ActiveState": "inactive", "ControlGroup": ""},
+        {"ActiveState": "active", "ControlGroup": ""},
+        {"ActiveState": "active", "ControlGroup": "/fixture/workers"},
+    ])
+    observed = []
+    monkeypatch.setattr(fixture, "_run", lambda _argv: subprocess.CompletedProcess([], 0, "", ""))
+    monkeypatch.setattr(fixture, "show", lambda name: observed.append(name) or next(states))
+    monkeypatch.setattr(fixture.time, "sleep", lambda _seconds: None)
+
+    fixture._start_transient_slice(unit, [])
+    assert observed == [unit, unit, unit]
+
+
 def _unit(limits, group, *, active="active", reload_state="no", **extra):
     properties = {key: str(value) for key, value in limits.items()}
     properties.update({
