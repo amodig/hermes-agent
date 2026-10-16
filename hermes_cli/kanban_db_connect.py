@@ -85,7 +85,8 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
             if admitted and _main_db_file(conn):
                 info = path.stat()
                 identity = (
-                    str(_kb.kanban_home().resolve(strict=True)), info.st_dev, info.st_ino,
+                    str(_kb.kanban_home().resolve(strict=True)),
+                    str(path.absolute()), info.st_dev, info.st_ino,
                 )
             # Reads remain available during contention; claims require an open
             # attested under admission, not a later guess at a replaced path.
@@ -261,17 +262,28 @@ def _dispatch_admission_lock(*, allow_nested: bool = False):
 
 
 def _claim_connection_is_current(conn: sqlite3.Connection) -> bool:
-    """Under admission, reject moved/replaced or unattested disk connections."""
+    """Under admission, verify both the logical board path and physical file."""
     path = _main_db_file(conn)
     if not path:
         return True  # In-memory databases cannot be archived or replaced.
+    captured = getattr(conn, "_hermes_kanban_file_identity", None)
     try:
-        physical = Path(path).resolve(strict=True)
-        if not physical.is_relative_to((_kb.boards_root() / "_archived").resolve()):
-            info = physical.stat()
-            identity = (str(_kb.kanban_home().resolve(strict=True)), info.st_dev, info.st_ino)
-            if getattr(conn, "_hermes_kanban_file_identity", None) == identity:
-                return True
+        if captured is not None:
+            logical = Path(captured[1])
+            physical = Path(path).resolve(strict=True)
+            archived = _kb.boards_root() / "_archived"
+            if (
+                not logical.is_relative_to(archived.absolute())
+                and not physical.is_relative_to(archived.resolve())
+                and logical.resolve(strict=True) == physical
+            ):
+                info = physical.stat()
+                identity = (
+                    str(_kb.kanban_home().resolve(strict=True)),
+                    str(logical), info.st_dev, info.st_ino,
+                )
+                if captured == identity:
+                    return True
     except OSError:
         pass
     _kb._log.warning("kanban admission: board connection moved, replaced or unattested; reopen %s", path)

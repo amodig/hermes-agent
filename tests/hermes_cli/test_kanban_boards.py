@@ -246,18 +246,30 @@ class TestBoardCRUD:
         assert kb.get_current_board() == "default"
 
     @pytest.mark.platforms("posix")
-    @pytest.mark.parametrize("action,archive,recreate", [
-        ("ready", True, False),
-        ("review", True, True),
-        ("ready", False, True),
-        ("dispatch", True, True),
+    @pytest.mark.parametrize("action,archive,recreate,backing", [
+        ("ready", True, False, "file"),
+        ("review", True, True, "file"),
+        ("ready", False, True, "file"),
+        ("dispatch", True, True, "file"),
+        ("ready", True, False, "db-symlink"),
+        ("dispatch", True, False, "dir-symlink"),
     ])
     def test_removed_connection_cannot_claim_old_board(
-        self, fresh_home, monkeypatch, action, archive, recreate,
+        self, fresh_home, monkeypatch, action, archive, recreate, backing,
     ):
         from hermes_cli import kanban_db_dispatch as dispatch
 
         kb.create_board("stale")
+        external = fresh_home.parent / "external"
+        if backing == "db-symlink":
+            external.mkdir()
+            database = kb.kanban_db_path(board="stale")
+            database.rename(external / "kanban.db")
+            database.symlink_to(external / "kanban.db")
+        elif backing == "dir-symlink":
+            directory = kb.board_dir("stale")
+            directory.rename(external)
+            directory.symlink_to(external, target_is_directory=True)
         with kbc.connect_closing(board="stale") as old:
             task_id = kb.create_task(old, title="old board", assignee="dev")
             lane = "review" if action == "review" else "ready"
