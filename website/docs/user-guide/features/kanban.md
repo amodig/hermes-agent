@@ -200,6 +200,10 @@ it never initializes, migrates or repairs a database to make it appear idle.
 Hard deletion of a directory-symlink board unlinks only the logical entry;
 external files remain untouched. Current-board selection and the init cache
 change only after the filesystem operation succeeds.
+If current-selection cleanup then fails, removal still returns its receipt
+(including the archive recovery path) with a warning, also printed by the CLI.
+The stale selection falls back to `default` while the board is absent. Fix the
+selection-file permissions and switch boards before reusing the removed slug.
 
 Board resolution order (highest precedence first):
 

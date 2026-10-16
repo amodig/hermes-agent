@@ -876,7 +876,16 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         # Publish metadata changes only after the filesystem operation succeeds.
         _INITIALIZED_PATHS.discard(initialized_path)
         if was_current:
-            clear_current_board()
+            try:
+                clear_current_board()
+            except OSError as exc:
+                # get_current_board() already ignores markers for missing boards.
+                warning = (
+                    f"Board {normed!r} was {result['action']}, but current-board cleanup failed: {exc}. "
+                    "Fix the selection before reusing this slug."
+                )
+                _log.warning("%s", warning)
+                result["warnings"] = [warning]
         return result
 
 

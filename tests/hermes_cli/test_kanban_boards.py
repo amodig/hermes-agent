@@ -335,6 +335,39 @@ class TestBoardCRUD:
         assert kb.get_current_board() == "unknown"
         assert not database.exists()
 
+    @pytest.mark.parametrize("archive", [True, False])
+    def test_completed_removal_survives_selection_cleanup_failure(
+        self, fresh_home, monkeypatch, caplog, archive,
+    ):
+        import sqlite3
+        from contextlib import closing
+
+        kb.create_board("finished")
+        kb.set_current_board("finished")
+        with kbc.connect_closing(board="finished") as conn:
+            task_id = kb.create_task(conn, title="recoverable work", assignee="dev")
+        current = kb.current_board_path()
+        original_unlink = Path.unlink
+
+        def refuse_current_unlink(path, *args, **kwargs):
+            if path == current:
+                raise PermissionError("fixture selection cleanup refused")
+            return original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", refuse_current_unlink)
+        caplog.clear()
+        result = kb.remove_board("finished", archive=archive)
+        assert result["action"] == ("archived" if archive else "deleted")
+        assert not kb.board_exists("finished")
+        assert kb.get_current_board() == "default"
+        assert current.read_text().strip() == "finished"
+        assert any(record.levelname == "WARNING" for record in caplog.records)
+        if archive:
+            with closing(sqlite3.connect(Path(result["new_path"]) / "kanban.db")) as recovered:
+                assert recovered.execute(
+                    "SELECT title FROM tasks WHERE id = ?", (task_id,),
+                ).fetchone() == ("recoverable work",)
+
 
 
 
