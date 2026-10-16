@@ -826,6 +826,7 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
 def remove_board(slug: str, *, archive: bool = True) -> dict:
     """Remove an idle named board; active claims must finish at their pinned path."""
     from hermes_cli import kanban_db_connect as _kbc
+    from hermes_cli.sqlite_safe_read import connect_tracked
 
     _assert_not_delegated_child_mutation()
     normed = _require_slug(slug)
@@ -838,18 +839,22 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         d = board_dir(normed)
         if not d.exists():
             raise ValueError(f"board {normed!r} does not exist")
-        with _kbc.connect_closing(d / "kanban.db") as conn:
-            active = conn.execute(
-                "SELECT 1 FROM tasks WHERE status = 'running' "
-                "OR claim_lock IS NOT NULL OR current_run_id IS NOT NULL LIMIT 1"
-            ).fetchone()
+        try:
+            database = (d / "kanban.db").resolve(strict=True)
+            with contextlib.closing(connect_tracked(
+                database.as_uri() + "?mode=ro", tracking_path=database, uri=True, timeout=1.0,
+            )) as conn:
+                active = conn.execute(
+                    "SELECT 1 FROM tasks WHERE status = 'running' "
+                    "OR claim_lock IS NOT NULL OR current_run_id IS NOT NULL LIMIT 1"
+                ).fetchone()
+        except (OSError, sqlite3.Error) as exc:
+            raise ValueError(f"cannot inspect board {normed!r}; restore its database before removal") from exc
         if active:
             raise ValueError(f"board {normed!r} has active claims; wait for them to finish before removal")
 
-        if get_current_board() == normed:
-            clear_current_board()
-        # Drop the cache before removal so a later connect initializes its new DB.
-        _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
+        was_current = get_current_board() == normed
+        initialized_path = str(database)
         if archive:
             archive_root = boards_root() / "_archived"
             archive_root.mkdir(parents=True, exist_ok=True)
@@ -860,10 +865,19 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
                 target = archive_root / f"{normed}-{ts}-{suffix}"
                 suffix += 1
             d.rename(target)
-            return {"slug": normed, "action": "archived", "new_path": str(target)}
-        import shutil
-        shutil.rmtree(d)
-        return {"slug": normed, "action": "deleted", "new_path": ""}
+            result = {"slug": normed, "action": "archived", "new_path": str(target)}
+        else:
+            if d.is_symlink():
+                d.unlink()
+            else:
+                import shutil
+                shutil.rmtree(d)
+            result = {"slug": normed, "action": "deleted", "new_path": ""}
+        # Publish metadata changes only after the filesystem operation succeeds.
+        _INITIALIZED_PATHS.discard(initialized_path)
+        if was_current:
+            clear_current_board()
+        return result
 
 
 # --- Data classes ---

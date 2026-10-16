@@ -253,6 +253,7 @@ class TestBoardCRUD:
         ("dispatch", True, True, "file"),
         ("ready", True, False, "db-symlink"),
         ("dispatch", True, False, "dir-symlink"),
+        ("ready", False, False, "dir-symlink"),
     ])
     def test_removed_connection_cannot_claim_old_board(
         self, fresh_home, monkeypatch, action, archive, recreate, backing,
@@ -260,6 +261,7 @@ class TestBoardCRUD:
         from hermes_cli import kanban_db_dispatch as dispatch
 
         kb.create_board("stale")
+        kb.set_current_board("stale")
         external = fresh_home.parent / "external"
         if backing == "db-symlink":
             external.mkdir()
@@ -275,6 +277,7 @@ class TestBoardCRUD:
             lane = "review" if action == "review" else "ready"
             old.execute("UPDATE tasks SET status = ? WHERE id = ?", (lane, task_id))
             kb.remove_board("stale", archive=archive)
+            assert kb.get_current_board() == "default"
             if recreate:
                 kb.create_board("stale")
             calls = []
@@ -292,6 +295,8 @@ class TestBoardCRUD:
             assert calls == []
             assert kb.get_task(old, task_id).status == lane
             assert old.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+        if backing != "file":
+            assert (external / "kanban.db").is_file()
         if recreate:
             with kbc.connect_closing(board="stale") as new:
                 assert kb.get_task(new, task_id) is None
@@ -299,6 +304,37 @@ class TestBoardCRUD:
                 assert kb.claim_task(new, replacement) is not None
         else:
             assert not kb.board_exists("stale")
+
+    def test_failed_delete_preserves_selection_and_init_cache(self, fresh_home, monkeypatch):
+        import shutil
+
+        kb.create_board("keep")
+        kb.set_current_board("keep")
+        database = kb.kanban_db_path(board="keep")
+        cache_key = str(database.resolve())
+        assert cache_key in kb._INITIALIZED_PATHS
+
+        def refuse_delete(*args, **kwargs):
+            raise PermissionError("fixture deletion refused")
+
+        monkeypatch.setattr(shutil, "rmtree", refuse_delete)
+        with pytest.raises(PermissionError, match="fixture deletion refused"):
+            kb.remove_board("keep", archive=False)
+        assert kb.get_current_board() == "keep"
+        assert cache_key in kb._INITIALIZED_PATHS
+        assert database.is_file()
+
+    def test_remove_does_not_initialize_a_missing_database(self, fresh_home):
+        kb.create_board("unknown")
+        kb.set_current_board("unknown")
+        database = kb.kanban_db_path(board="unknown")
+        database.unlink()
+        with pytest.raises(ValueError, match="inspect"):
+            kb.remove_board("unknown")
+        assert kb.board_exists("unknown")
+        assert kb.get_current_board() == "unknown"
+        assert not database.exists()
+
 
 
 

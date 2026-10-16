@@ -185,7 +185,7 @@ hermes kanban boards rename atm10-server "ATM10 (Prod)"
 # Recoverable by moving the dir back.
 hermes kanban boards rm atm10-server
 
-# Hard delete — `rm -rf` the board dir. No recovery.
+# Hard delete — bypasses the archive.
 hermes kanban boards rm atm10-server --delete
 ```
 
@@ -193,6 +193,13 @@ Board archive and deletion require an idle board. They take the dispatch
 admission gate and refuse running tasks or open claims before moving/removing
 the database, so workers retain their pinned path and frozen run identity.
 Let work finish naturally; board removal never kills or reclaims it.
+
+The idle-state probe is read-only. Missing or unreadable state blocks removal;
+it never initializes, migrates or repairs a database to make it appear idle.
+
+Hard deletion of a directory-symlink board unlinks only the logical entry;
+external files remain untouched. Current-board selection and the init cache
+change only after the filesystem operation succeeds.
 
 Board resolution order (highest precedence first):
 
