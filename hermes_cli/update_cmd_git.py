@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_platform.resolver.known_dirs import windows_git_core_candidates
 
 logger = logging.getLogger("hermes_cli.update_cmd")  # log-record parity with the origin module
 
@@ -448,28 +449,9 @@ def _git_is_trampoline(git_cmd: list) -> bool:
     report False so a probe failure can't block an update.
 
     Git for Windows ships two ~46KB shims (``bin\\git.exe``, ``cmd\\git.exe``) that re-exec the real
-    ``mingw64\\libexec\\git-core\\git.exe``. See #87876.
+    ``<toolchain>\\libexec\\git-core\\git.exe``. See #87876.
     """
     return _probe_fork_bomb(git_cmd) is True
-
-
-def _portable_git_candidates() -> list:
-    """PortableGit candidates: shared root first (where the managed tree actually lives, not the
-    profile-scoped HERMES_HOME), then profile home as a fallback for custom layouts.
-
-    The Hermes-managed PortableGit tree lives under the SHARED root (``<root>/git/...``), not the
-    profile-scoped HERMES_HOME (``<root>/profiles/<name>``), so a profile-scoped ``hermes update`` must look
-    there (monerostar review, #87876).
-    """
-    from hermes_constants import get_default_hermes_root, get_hermes_home
-    candidates = []
-    with suppress(Exception):
-        candidates += [
-            root / "git" / arch / "libexec" / "git-core" / "git.exe"
-            for root in (get_default_hermes_root(), Path(get_hermes_home()))
-            for arch in ("ucrt64", "mingw64")
-        ]
-    return candidates
 
 
 def _locate_real_git() -> Optional[Path]:
@@ -478,14 +460,15 @@ def _locate_real_git() -> Optional[Path]:
     fetch-failure ZIP fallback handle it. A failed probe (None) disqualifies a candidate like a guard hit.
 
     The trampoline symptom is PATH-level: ``bin\\git.exe`` / ``cmd\\git.exe`` (both ~46KB shims) fail to
-    re-exec git-core, while the real binary under ``ucrt64`` (Git for Windows 2.56+) or
-    ``mingw64`` works when invoked directly (#87876).
+    re-exec git-core, while the real binary at ``<toolchain>\\libexec\\git-core\\git.exe`` works when
+    invoked directly (#87876).
     """
-    candidates = [
-        Path(base) / "Git" / arch / "libexec" / "git-core" / "git.exe"
-        for base in (r"C:\Program Files", r"C:\Program Files (x86)")
-        for arch in ("clangarm64", "ucrt64", "mingw64", "mingw32")
-    ] + _portable_git_candidates()
+    from hermes_constants import get_default_hermes_root, get_hermes_home
+
+    managed_roots = ()
+    with suppress(Exception):
+        managed_roots = (get_default_hermes_root(), Path(get_hermes_home()))
+    candidates = windows_git_core_candidates(managed_roots)
     return next((c for c in candidates if c.exists() and _probe_fork_bomb([str(c)]) is False), None)
 
 

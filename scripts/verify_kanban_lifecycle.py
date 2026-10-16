@@ -7,6 +7,9 @@ The ordered canonical and upgrade suites run in every source or installed
 context.  Installed runs execute the same fixtures against an explicitly
 selected runtime root.  Active verification is intentionally read-only and
 requires a later control-plane probe from the layered verifier.
+Dispatcher materialization has a 600-second deadline for cold installed
+environments. Timeout receipts retain bounded partial stdout/stderr, including
+flushed elapsed-time phase markers, instead of just the exception class.
 """
 
 from __future__ import annotations
@@ -151,11 +154,22 @@ import threading
 import time
 import uuid
 
+started = time.monotonic()
+
+
+def _phase(name):
+    print(f"dispatcher probe +{time.monotonic() - started:.1f}s: {name}",
+          file=sys.stderr, flush=True)
+
+
+_phase("importing runtime")
+
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect
 from hermes_cli import kanban_db_dispatch as dispatcher
 from hermes_cli import kanban_runtime as runtime
 from hermes_cli import kanban_runtime_generation as generations
+_phase("runtime imported; preparing isolated profiles")
 for finder in tuple(sys.meta_path):
     if getattr(finder, "__module__", "").startswith("__editable__"):
         sys.meta_path.remove(finder)
@@ -443,10 +457,12 @@ try:
             generations.cleanup_runtime_generation = _defer_generation_cleanup
             try:
                 try:
+                    _phase("materializing runtime and bootstrapping worker")
                     launch = native_default_spawn(
                         task, workspace, board=board, defer_grant=True,
                         should_stop=should_stop,
                     )
+                    _phase("worker bootstrap returned")
                 except Exception as exc:
                     proof["worker_bootstrap"] = False
                     proof["diagnostics"].append(
@@ -566,6 +582,7 @@ try:
                 raise
 
         dispatcher._default_spawn = instrumented_default_spawn
+        _phase("dispatching isolated candidate")
         try:
             result = dispatcher.dispatch_once(
                 conn,
@@ -577,7 +594,9 @@ try:
         proof["dispatcher_spawned"] = any(
             entry[0] == task_id for entry in result.spawned
         )
+        _phase("dispatch finished")
     finally:
+        _phase("cleaning runtime generations")
         dispatcher._default_spawn = native_default_spawn
         conn.close()
         for root, _force in deferred_cleanup:
@@ -681,10 +700,22 @@ def _dispatcher_materialization_check(
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=180,
+                timeout=600,
             )
         except (OSError, subprocess.SubprocessError) as exc:
-            diagnostics.append(f"dispatcher materialization probe raised {type(exc).__name__}")
+            detail = (
+                f"after {exc.timeout}s" if isinstance(exc, subprocess.TimeoutExpired)
+                else str(exc)
+            )
+            diagnostics.append(
+                f"dispatcher materialization probe raised {type(exc).__name__}: {detail}"
+            )
+            for stream in ("stderr", "stdout"):
+                partial = getattr(exc, stream, None)
+                if isinstance(partial, bytes):
+                    partial = partial.decode("utf-8", errors="replace")
+                if partial and partial.strip():
+                    diagnostics.append(f"probe {stream}: {partial.strip()[-4000:]}")
             return {
                 "status": "failed",
                 "diagnostics": diagnostics,

@@ -29,6 +29,8 @@ import shutil
 import subprocess
 from collections.abc import Mapping
 
+from hermes_platform.resolver.known_dirs import windows_git_roots
+
 from pm import paths
 from pm.lock import Facts
 
@@ -70,16 +72,10 @@ def windows_bash_candidates(on_path: str | None, env: Mapping[str, str]) -> list
     explicit override and Git for Windows roots first, then ``on_path``
     (the ``shutil.which("bash")`` result) unless it is a stub. System32
     precedes Git on most PATHs (#116818)."""
-    programfiles = env.get("ProgramFiles", r"C:\Program Files")
     candidates = []
     if env.get("HERMES_GIT_BASH_PATH"):
         candidates.append(env["HERMES_GIT_BASH_PATH"])
-    roots = [ntpath.join(programfiles, "Git")]
-    if env.get("ProgramFiles(x86)"):
-        roots.append(ntpath.join(env["ProgramFiles(x86)"], "Git"))
-    if env.get("LOCALAPPDATA"):
-        roots.extend((ntpath.join(env["LOCALAPPDATA"], "hermes", "git"),
-                      ntpath.join(env["LOCALAPPDATA"], "Programs", "Git")))
+    roots = windows_git_roots(env)
     for root in roots:
         candidates.extend((ntpath.join(root, "bin", "bash.exe"),
                            ntpath.join(root, "usr", "bin", "bash.exe")))

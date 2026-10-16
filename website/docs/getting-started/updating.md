@@ -33,6 +33,13 @@ hermes update
 Source installs track `main`, the only valid source channel. The update
 prepares dependencies through PM and reports configuration changes and process-restart results.
 
+On Windows, source updates recover from a broken Git launcher by probing the real
+Git executable in system-wide, per-user (`%LOCALAPPDATA%\Programs\Git`), and
+Hermes-managed PortableGit installations. Recovery
+supports the `ucrt64` layout introduced by Git for Windows 2.56 as well as older
+`mingw64`, `mingw32`, and ARM64 `clangarm64` layouts. If no working executable is
+found, the existing ZIP fallback handles the Git failure.
+
 ### Bundled desktop updates
 
 On Windows, the sideload app checks the registered App Installer source. Apply
