@@ -107,9 +107,10 @@ class TestGitTrampolineSelfHeal:
         run.assert_not_called()
 
     @pytest.mark.parametrize("arch", ["ucrt64", "clangarm64", "mingw64", "mingw32"])
-    @pytest.mark.parametrize("location", ["standard", "shared", "profile"])
+    @pytest.mark.parametrize("location", ["standard", "user", "shared", "profile"])
     def test_locator_finds_supported_layout(self, tmp_path, monkeypatch, arch, location):
         from pathlib import Path
+        import ntpath
 
         import hermes_constants
         from hermes_cli import update_cmd_git
@@ -118,8 +119,11 @@ class TestGitTrampolineSelfHeal:
         profile = root / "profiles" / "foo"
         monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda: root)
         monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: profile)
+        local_app_data = tmp_path / "LocalAppData"
+        monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
         base = {
-            "standard": Path(r"C:\Program Files") / "Git",
+            "standard": Path(ntpath.join(r"C:\Program Files", "Git")),
+            "user": Path(ntpath.join(str(local_app_data), "Programs", "Git")),
             "shared": root / "git",
             "profile": profile / "git",
         }[location]

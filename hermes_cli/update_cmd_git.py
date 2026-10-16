@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_platform.resolver.known_dirs import windows_git_core_candidates
 
 logger = logging.getLogger("hermes_cli.update_cmd")  # log-record parity with the origin module
 
@@ -453,29 +454,6 @@ def _git_is_trampoline(git_cmd: list) -> bool:
     return _probe_fork_bomb(git_cmd) is True
 
 
-# Git for Windows 2.56 moved x64 from mingw64 to ucrt64; older installs remain supported.
-_GIT_WINDOWS_TOOLCHAINS = ("ucrt64", "clangarm64", "mingw64", "mingw32")
-
-
-def _portable_git_candidates() -> list:
-    """PortableGit candidates: shared root first (where the managed tree actually lives, not the
-    profile-scoped HERMES_HOME), then profile home as a fallback for custom layouts.
-
-    The Hermes-managed PortableGit tree lives under the SHARED root (``<root>/git/...``), not the
-    profile-scoped HERMES_HOME (``<root>/profiles/<name>``), so a profile-scoped ``hermes update`` must look
-    there (monerostar review, #87876).
-    """
-    from hermes_constants import get_default_hermes_root, get_hermes_home
-    candidates = []
-    with suppress(Exception):
-        candidates += [
-            root / "git" / arch / "libexec" / "git-core" / "git.exe"
-            for root in (get_default_hermes_root(), Path(get_hermes_home()))
-            for arch in _GIT_WINDOWS_TOOLCHAINS
-        ]
-    return candidates
-
-
 def _locate_real_git() -> Optional[Path]:
     """Find a real Git-for-Windows ``git-core/git.exe`` (standard locations + managed PortableGit) that runs
     without the trampoline guard. None when nothing suits — callers keep the broken command and let the
@@ -485,11 +463,12 @@ def _locate_real_git() -> Optional[Path]:
     re-exec git-core, while the real binary at ``<toolchain>\\libexec\\git-core\\git.exe`` works when
     invoked directly (#87876).
     """
-    candidates = [
-        Path(base) / "Git" / arch / "libexec" / "git-core" / "git.exe"
-        for base in (r"C:\Program Files", r"C:\Program Files (x86)")
-        for arch in _GIT_WINDOWS_TOOLCHAINS
-    ] + _portable_git_candidates()
+    from hermes_constants import get_default_hermes_root, get_hermes_home
+
+    managed_roots = ()
+    with suppress(Exception):
+        managed_roots = (get_default_hermes_root(), Path(get_hermes_home()))
+    candidates = windows_git_core_candidates(managed_roots)
     return next((c for c in candidates if c.exists() and _probe_fork_bomb([str(c)]) is False), None)
 
 
