@@ -197,6 +197,15 @@ Let work finish naturally; board removal never kills or reclaims it.
 The idle-state probe is read-only. Missing or unreadable state blocks removal;
 it never initializes, migrates or repairs a database to make it appear idle.
 
+Legacy archives with running tasks or open claims require recovery before
+finite per-profile admission can continue. The dispatcher reports the archived
+database and asks for restoration; it does not count those rows as permanent
+live capacity, delete them, or infer safe reclamation from their age.
+With dispatch drained, restore the original directory/database at its frozen
+board path without overwriting another board. Let live work finish, or let
+native stale/crash reconciliation verify dead runs after restoration.
+Closed archives remain historical data and consume no capacity.
+
 Hard deletion of a directory-symlink board unlinks only the logical entry;
 external files remain untouched. Current-board selection and the init cache
 change only after the filesystem operation succeeds.

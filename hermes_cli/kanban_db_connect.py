@@ -293,9 +293,9 @@ def _claim_connection_is_current(conn: sqlite3.Connection) -> bool:
 def _other_board_running_counts(conn: sqlite3.Connection) -> Counter:
     """Strict read-only inventory under the shared admission lock.
 
-    Scan physical board paths, not pin-collapsed slugs. Include archived boards
-    because archiving does not stop their workers. Unknown inventory raises;
-    never initialize, migrate or repair a sibling DB just to measure capacity.
+    Scan physical board paths, not pin-collapsed slugs. Legacy archives with
+    unresolved claims require restoration, not permanent live-capacity counts.
+    Never initialize, migrate or repair a sibling DB to measure capacity.
     """
     from hermes_cli.sqlite_safe_read import connect_tracked
 
@@ -309,6 +309,8 @@ def _other_board_running_counts(conn: sqlite3.Connection) -> Counter:
     if pin:
         candidates.append(Path(pin).expanduser())
     root = _kb.boards_root()
+    archived_root = root / "_archived"
+    archived_physical = archived_root.resolve()
     try:
         root.lstat()
     except FileNotFoundError:
@@ -345,20 +347,35 @@ def _other_board_running_counts(conn: sqlite3.Connection) -> Counter:
         resolved = path.resolve(strict=True)
         info = resolved.stat()
         key = (info.st_dev, info.st_ino)
+        archived = (
+            path.absolute().is_relative_to(archived_root.absolute())
+            or resolved.is_relative_to(archived_physical)
+        )
         if key in seen:
             # Hard links can have different live WAL sidecars. Choosing one
             # spelling could miss running rows; symlink/pin aliases resolve alike.
             if seen[key] != resolved:
                 raise OSError(f"board database has ambiguous hard-link aliases: {resolved}")
-            continue
+            if not archived:
+                continue
         seen[key] = resolved
         with contextlib.closing(connect_tracked(
             resolved.as_uri() + "?mode=ro", tracking_path=resolved,
             uri=True, timeout=1.0,
         )) as other:
-            counts.update(dict(other.execute(
-                "SELECT assignee, COUNT(*) FROM tasks WHERE status = 'running' GROUP BY assignee"
-            )))
+            if archived:
+                if other.execute(
+                    "SELECT 1 FROM tasks WHERE status = 'running' "
+                    "OR claim_lock IS NOT NULL OR current_run_id IS NOT NULL LIMIT 1"
+                ).fetchone():
+                    raise OSError(
+                        f"archived board has unresolved claims; restore its original board path "
+                        f"before dispatch: {path}"
+                    )
+            else:
+                counts.update(dict(other.execute(
+                    "SELECT assignee, COUNT(*) FROM tasks WHERE status = 'running' GROUP BY assignee"
+                )))
     return counts
 
 

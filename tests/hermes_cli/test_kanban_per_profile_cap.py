@@ -118,7 +118,7 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
 def test_shared_root_profile_admission_and_release(
     isolated_kanban_home_with_profiles, monkeypatch, failure,
 ):
-    """Pins/aliases/archiving cannot hide or multiply another board's worker."""
+    """Pins/aliases cannot hide or multiply another live board's worker."""
     kb = isolated_kanban_home_with_profiles
     from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_db_dispatch as kbd
@@ -129,11 +129,7 @@ def test_shared_root_profile_admission_and_release(
     with kbc.connect_closing(board="board-a") as first:
         running = kb.create_task(first, title="running alpha", assignee="alpha")
         assert kb.claim_task(first, running) is not None
-    # Simulate a legacy archive created before active-board removal was guarded.
-    archived = kb.boards_root() / "_archived" / "board-a-legacy"
-    archived.parent.mkdir()
-    kb.board_dir("board-a").rename(archived)
-    first_path = archived / "kanban.db"
+    first_path = kb.kanban_db_path(board="board-a")
     alias_dir = kb.boards_root() / "alias"
     alias_dir.mkdir()
     (alias_dir / "kanban.db").symlink_to(first_path)
@@ -211,7 +207,8 @@ def test_shared_root_profile_admission_and_release(
                     assert refused.skipped_locked == failure.startswith("lock_")
                 finally:
                     if failure in {"dangling_alias", "hardlink_alias"}:
-                        (bad_alias / "kanban.db").unlink()
+                        for entry in bad_alias.iterdir():
+                            entry.unlink()  # Include SQLite sidecars owned by this fixture.
                         bad_alias.rmdir()
 
         eligible = dispatch()
@@ -232,6 +229,66 @@ def test_shared_root_profile_admission_and_release(
         assert released.skipped_per_profile_capped == []
         assert calls == [beta, alpha]
         assert kb.get_task(second, alpha).status == "running"
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("backing", ["file", "db-symlink", "dir-symlink"])
+def test_legacy_archive_requires_restoration_before_admission(
+    isolated_kanban_home_with_profiles, monkeypatch, caplog, backing,
+):
+    kb = isolated_kanban_home_with_profiles
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    kb.create_board("legacy")
+    kb.create_board("board-b")
+    original = kb.board_dir("legacy")
+    external = kb.kanban_home() / "external-legacy"
+    if backing == "db-symlink":
+        external.mkdir()
+        (original / "kanban.db").rename(external / "kanban.db")
+        (original / "kanban.db").symlink_to(external / "kanban.db")
+    elif backing == "dir-symlink":
+        original.rename(external)
+        original.symlink_to(external, target_is_directory=True)
+    with kbc.connect_closing(board="legacy") as first:
+        running = kb.create_task(first, title="legacy owned work", assignee="alpha")
+        owned = kb.claim_task(first, running)
+        assert owned is not None
+    archived = kb.boards_root() / "_archived" / "legacy-old"
+    archived.parent.mkdir()
+    original.rename(archived)
+    physical = (archived / "kanban.db").resolve()
+    inode = physical.stat().st_ino
+    # An external pin may inventory the same inode before its archived alias.
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(physical))
+    with kbc.connect_closing(board="board-b") as second:
+        waiting = kb.create_task(second, title="waiting beta", assignee="beta")
+        caplog.clear()
+        refused = kbd.dispatch_once(
+            second, board="board-b", spawn_fn=_fake_spawn, reconcile_orphans=False,
+            max_in_progress=2, max_in_progress_per_profile=1,
+        )
+        assert refused.spawned == []
+        assert kb.get_task(second, waiting).current_run_id is None
+        assert any(record.levelname == "WARNING" for record in caplog.records)
+        with closing(sqlite3.connect(physical)) as frozen:
+            assert frozen.execute(
+                "SELECT status, claim_lock, current_run_id FROM tasks WHERE id = ?", (running,),
+            ).fetchone() == ("running", owned.claim_lock, owned.current_run_id)
+        archived.rename(original)
+        assert (original / "kanban.db").resolve().stat().st_ino == inode
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board="legacy")))
+        with kbc.connect_closing(board="legacy") as restored:
+            assert kb.complete_task(
+                restored, running, expected_run_id=owned.current_run_id,
+                summary="restored legacy work completed",
+            )
+        resumed = kbd.dispatch_once(
+            second, board="board-b", spawn_fn=_fake_spawn, reconcile_orphans=False,
+            max_in_progress=2, max_in_progress_per_profile=1,
+        )
+        assert [task for task, *_ in resumed.spawned] == [waiting]
 
 
 def _competing_dispatch(home, board, hold_preparation, prepared, release, output):
