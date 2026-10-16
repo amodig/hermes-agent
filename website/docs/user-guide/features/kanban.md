@@ -1163,6 +1163,13 @@ same gate through transaction commit. A busy/unavailable gate refuses the
 claim without opening a run. Only claims may reuse a gate already owned by
 their process/thread/root; nested dispatch and board removal remain exclusive.
 
+Disk connections capture their shared-root and file identity while opening
+under admission. Dispatch and direct claims revalidate that identity before
+any claim-capable writes; archived, deleted or replaced handles cannot start
+work, even if the slug has been recreated. Reads may open during contention,
+but those unattested connections must be reopened before claiming. Archived
+databases are inventoried read-only; new claims require their original live path.
+
 Omitted dispatcher limits inherit configuration. Explicit limits passed by a
 running gateway remain its startup snapshot, including `None` (unlimited);
 editing configuration does not silently change that cached setting.

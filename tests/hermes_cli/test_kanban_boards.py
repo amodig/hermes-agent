@@ -245,6 +245,49 @@ class TestBoardCRUD:
         assert not kb.board_exists("busy")
         assert kb.get_current_board() == "default"
 
+    @pytest.mark.platforms("posix")
+    @pytest.mark.parametrize("action,archive,recreate", [
+        ("ready", True, False),
+        ("review", True, True),
+        ("ready", False, True),
+        ("dispatch", True, True),
+    ])
+    def test_removed_connection_cannot_claim_old_board(
+        self, fresh_home, monkeypatch, action, archive, recreate,
+    ):
+        from hermes_cli import kanban_db_dispatch as dispatch
+
+        kb.create_board("stale")
+        with kbc.connect_closing(board="stale") as old:
+            task_id = kb.create_task(old, title="old board", assignee="dev")
+            lane = "review" if action == "review" else "ready"
+            old.execute("UPDATE tasks SET status = ? WHERE id = ?", (lane, task_id))
+            kb.remove_board("stale", archive=archive)
+            if recreate:
+                kb.create_board("stale")
+            calls = []
+            if action == "dispatch":
+                monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
+                monkeypatch.setattr(dispatch, "_memory_pressure_level", lambda: "ok")
+                result = dispatch.dispatch_once(
+                    old, board="stale", reconcile_orphans=False,
+                    spawn_fn=lambda task, workspace, **kw: calls.append(task.id),
+                )
+                assert result.skipped_locked and not result.spawned
+            else:
+                claim = kb.claim_review_task if action == "review" else kb.claim_task
+                assert claim(old, task_id) is None
+            assert calls == []
+            assert kb.get_task(old, task_id).status == lane
+            assert old.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+        if recreate:
+            with kbc.connect_closing(board="stale") as new:
+                assert kb.get_task(new, task_id) is None
+                replacement = kb.create_task(new, title="new board", assignee="dev")
+                assert kb.claim_task(new, replacement) is not None
+        else:
+            assert not kb.board_exists("stale")
+
 
 
 # ---------------------------------------------------------------------------

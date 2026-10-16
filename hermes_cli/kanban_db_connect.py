@@ -73,23 +73,28 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     from hermes_cli.sqlite_safe_read import connect_tracked
 
     busy_timeout_ms = _resolve_busy_timeout_ms()
-    conn = connect_tracked(
-        path,
-        connect_fn=sqlite3.connect,
-        isolation_level=None,
-        timeout=busy_timeout_ms / 1000.0,
-    )
-    try:
-        # Explicit PRAGMA (besides connect(timeout=)) so it is observable and
-        # survives wrapper changes; PRAGMA assignments can't bind parameters.
-        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
-    except BaseException:
-        # A half-open connection would leak its fd AND leave a stale entry in the
-        # connect_tracked registry (cleared only on close), permanently blocking
-        # byte-level probes of this file.
-        with contextlib.suppress(Exception):
-            conn.close()
-        raise
+    with _dispatch_admission_lock(allow_nested=True) as admitted:
+        conn = connect_tracked(
+            path,
+            connect_fn=sqlite3.connect,
+            isolation_level=None,
+            timeout=busy_timeout_ms / 1000.0,
+        )
+        try:
+            identity = None
+            if admitted and _main_db_file(conn):
+                info = path.stat()
+                identity = (
+                    str(_kb.kanban_home().resolve(strict=True)), info.st_dev, info.st_ino,
+                )
+            # Reads remain available during contention; claims require an open
+            # attested under admission, not a later guess at a replaced path.
+            setattr(conn, "_hermes_kanban_file_identity", identity)
+            conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+        except BaseException:
+            with contextlib.suppress(Exception):
+                conn.close()
+            raise
     return conn
 
 
@@ -253,6 +258,24 @@ def _dispatch_admission_lock(*, allow_nested: bool = False):
                     _unlock(handle)
             finally:
                 handle.close()
+
+
+def _claim_connection_is_current(conn: sqlite3.Connection) -> bool:
+    """Under admission, reject moved/replaced or unattested disk connections."""
+    path = _main_db_file(conn)
+    if not path:
+        return True  # In-memory databases cannot be archived or replaced.
+    try:
+        physical = Path(path).resolve(strict=True)
+        if not physical.is_relative_to((_kb.boards_root() / "_archived").resolve()):
+            info = physical.stat()
+            identity = (str(_kb.kanban_home().resolve(strict=True)), info.st_dev, info.st_ino)
+            if getattr(conn, "_hermes_kanban_file_identity", None) == identity:
+                return True
+    except OSError:
+        pass
+    _kb._log.warning("kanban admission: board connection moved, replaced or unattested; reopen %s", path)
+    return False
 
 
 def _other_board_running_counts(conn: sqlite3.Connection) -> Counter:

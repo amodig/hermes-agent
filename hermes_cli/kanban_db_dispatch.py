@@ -2556,7 +2556,7 @@ def dispatch_once(
     # ponytail: serialize preparation across boards; use durable reservations
     # only if preparation throughput becomes a measured bottleneck.
     with _kbc._dispatch_admission_lock() as admitted:
-        if not admitted:
+        if not admitted or not _kbc._claim_connection_is_current(conn):
             result = DispatchResult(skipped_locked=True)
         else:
             db_path = _kbc._main_db_file(conn)

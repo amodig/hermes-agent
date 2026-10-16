@@ -5,7 +5,7 @@ import sqlite3
 import time
 from typing import Any, Optional
 
-from hermes_cli.kanban_db_connect import _dispatch_admission_lock
+from hermes_cli.kanban_db_connect import _claim_connection_is_current, _dispatch_admission_lock
 from hermes_cli.kanban_db_lazy import _kb
 from hermes_cli import kanban_runtime as _kr
 from hermes_cli.kanban_db_lifecycle_evidence import (
@@ -228,7 +228,7 @@ def claim_task(
     lock = claimer or _kb._claimer_id()
     expires = now + _kb._resolve_claim_ttl_seconds(ttl_seconds)
     with _dispatch_admission_lock(allow_nested=True) as acquired:
-        if not acquired:
+        if not acquired or not _claim_connection_is_current(conn):
             return None
         with _kb.write_txn(conn):
             handoff_error = _parent_handoff_start_error(conn, task_id)
@@ -298,7 +298,7 @@ def claim_review_task(
     lock = claimer or _kb._claimer_id()
     expires = now + _kb._resolve_claim_ttl_seconds(ttl_seconds)
     with _dispatch_admission_lock(allow_nested=True) as acquired:
-        if not acquired:
+        if not acquired or not _claim_connection_is_current(conn):
             return None
         with _kb.write_txn(conn):
             handoff_error = _parent_handoff_start_error(conn, task_id)
