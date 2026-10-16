@@ -1367,6 +1367,7 @@ def _drive_gateway_ticks(
     from gateway.run import GatewayRunner
     import hermes_cli.kanban_db as _kb
     import gateway.kanban_watchers as _kw
+    from gateway.kanban_watchers_dispatcher import _DispatcherSettings
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
@@ -1407,7 +1408,8 @@ def _drive_gateway_ticks(
 
     monkeypatch.setattr(_kw, "_KanbanDispatcher", _FakeDispatcher)
     monkeypatch.setattr(
-        _kw, "_resolve_dispatcher_settings", lambda cfg, kb: SimpleNamespace(interval=1.0),
+        _kw, "_resolve_dispatcher_settings",
+        lambda cfg, kb: _DispatcherSettings(1.0, None, None, 2, 0, True, None, None),
     )
     monkeypatch.setattr(
         runner, "_kanban_dispatcher_boot", lambda: (lambda: {"kanban": {}}, _kb, {}),
