@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import os
 import random
 import re
 import secrets
 import shutil
 import sqlite3
+import stat
 import threading
 import time
+from collections import Counter
 from contextvars import ContextVar
 from dataclasses import dataclass
 from dataclasses import field
@@ -211,6 +214,105 @@ def _dispatch_tick_lock(db_path: Path):
                 pass
             finally:
                 handle.close()
+
+
+@contextlib.contextmanager
+def _dispatch_admission_lock():
+    """Strict, nonblocking shared-root gate; False means no tick may run.
+
+    Unlike the best-effort board lock, an unavailable lock is never permission
+    to admit work. Every dispatcher participates, including uncapped callers.
+    """
+    handle = None
+    acquired = False
+    try:
+        lock_path = _kb.kanban_home().resolve(strict=True) / "kanban" / ".dispatch-admission.lock"
+        lock_path.parent.mkdir(exist_ok=True)
+        handle = lock_path.open("a+b")
+        acquired = _try_lock_nb(handle)
+    except (OSError, AttributeError, ImportError) as exc:
+        _kb._log.warning("kanban dispatch: shared admission lock unavailable; deferring tick: %s", exc)
+    try:
+        yield acquired
+    finally:
+        if handle is not None:
+            try:
+                if acquired:
+                    _unlock(handle)
+            finally:
+                handle.close()
+
+
+def _other_board_running_counts(conn: sqlite3.Connection) -> Counter:
+    """Strict read-only inventory under the shared admission lock.
+
+    Scan physical board paths, not pin-collapsed slugs. Include archived boards
+    because archiving does not stop their workers. Unknown inventory raises;
+    never initialize, migrate or repair a sibling DB just to measure capacity.
+    """
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
+    current = _main_db_file(conn)
+    if not current:
+        raise OSError("cannot identify the current board database")
+    current_stat = Path(current).stat()
+    seen = {(current_stat.st_dev, current_stat.st_ino): Path(current).resolve(strict=True)}
+    candidates = [_kb.kanban_home() / "kanban.db"]
+    pin = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if pin:
+        candidates.append(Path(pin).expanduser())
+    root = _kb.boards_root()
+    try:
+        root.lstat()
+    except FileNotFoundError:
+        pass  # A fresh default-only root need not have named boards yet.
+    else:
+        for child in root.iterdir():
+            if stat.S_ISDIR(child.stat().st_mode):
+                if child.name == _kb.DEFAULT_BOARD:
+                    continue  # Default metadata lives here; its DB is at the root.
+                if child.name == "_archived":
+                    candidates.extend(
+                        archived / "kanban.db" for archived in child.iterdir()
+                        if stat.S_ISDIR(archived.stat().st_mode)
+                    )
+                else:
+                    candidates.append(child / "kanban.db")
+    counts: Counter = Counter()
+    for path in candidates:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            if pin and path == Path(pin).expanduser():
+                raise OSError(f"pinned board database unavailable: {path}")
+            metadata = (
+                root / "default" / "board.json"
+                if path == _kb.kanban_home() / "kanban.db"
+                else path.parent / "board.json"
+            )
+            try:
+                metadata.lstat()
+            except FileNotFoundError:
+                continue  # No board has been created at this path.
+            raise OSError(f"board database unavailable: {path}")
+        resolved = path.resolve(strict=True)
+        info = resolved.stat()
+        key = (info.st_dev, info.st_ino)
+        if key in seen:
+            # Hard links can have different live WAL sidecars. Choosing one
+            # spelling could miss running rows; symlink/pin aliases resolve alike.
+            if seen[key] != resolved:
+                raise OSError(f"board database has ambiguous hard-link aliases: {resolved}")
+            continue
+        seen[key] = resolved
+        with contextlib.closing(connect_tracked(
+            resolved.as_uri() + "?mode=ro", tracking_path=resolved,
+            uri=True, timeout=1.0,
+        )) as other:
+            counts.update(dict(other.execute(
+                "SELECT assignee, COUNT(*) FROM tasks WHERE status = 'running' GROUP BY assignee"
+            )))
+    return counts
 
 
 # Periodic explicit WAL checkpoint from the dispatcher tick: a passive

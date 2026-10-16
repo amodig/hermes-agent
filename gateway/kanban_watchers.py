@@ -377,7 +377,11 @@ class GatewayKanbanWatchersMixin:
         last_stuck_warn_at = 0
         results: Optional[list] = None
 
-        logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
+        logger.info(
+            "kanban dispatcher: embedded in gateway (interval=%.1fs, "
+            "max_in_progress=%s, max_in_progress_per_profile=%s)",
+            interval, settings.max_in_progress, settings.max_in_progress_per_profile,
+        )
         while self._running:
             try:
                 # Reap zombies before per-board work so a board DB failure

@@ -169,8 +169,8 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
     skipped_locked: bool = False
-    """True when another process held the board's dispatch lock: this tick did
-    no DB writes; the lock holder is making progress on the same board."""
+    """True when the board/shared-root dispatch lock was busy or the strict
+    shared admission lock was unavailable; this tick did no DB writes."""
     memory_pressure: Optional[str] = None
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
@@ -2504,13 +2504,12 @@ def dispatch_once(
     should_stop: Optional[Callable[[], bool]] = None,
     grant_guard: Optional[Callable[[], Any]] = None,
 ) -> DispatchResult:
-    """Run one dispatcher tick under the board's single-writer lock.
+    """Run one dispatcher tick under shared-root admission and board locks.
 
-    Wraps :func:`_dispatch_once_locked` in the non-blocking :func:`_dispatch_tick_lock`
-    so two dispatchers on one ``kanban.db`` never race a write tick on WAL
-    frames. The loser returns an empty ``DispatchResult`` with
-    ``skipped_locked=True`` and writes nothing; the lock is keyed on the
-    resolved DB path so unrelated boards tick in parallel.
+    Every caller participates in the strict, nonblocking admission gate, so
+    competing boards cannot both measure a free profile slot and grant it.
+    The loser returns ``skipped_locked=True`` without DB writes. The native
+    autonomous-worker boundary remains the final resource admission authority.
 
     ``should_stop`` lets the owning gateway/daemon cancel in-flight launches as
     soon as it starts draining, so no worker is handed a card by a process that
@@ -2518,6 +2517,22 @@ def dispatch_once(
     """
     _freeze_runtime_identity()
     def _locked_tick() -> DispatchResult:
+        nonlocal max_in_progress, max_in_progress_per_profile
+        if max_in_progress is None:
+            max_in_progress = resolve_max_in_progress(configured_max_in_progress())
+        if max_in_progress_per_profile is None:
+            # Daemon/dashboard callers omit this argument; omission must not
+            # bypass the same configured profile policy used by the gateway.
+            try:
+                from hermes_cli.config import load_config_readonly
+
+                cfg = (load_config_readonly() or {}).get("kanban", {})
+                max_in_progress_per_profile = _positive_int(
+                    cfg.get("max_in_progress_per_profile"), None,
+                )
+            except Exception as exc:
+                _kb._log.warning("kanban dispatch: profile capacity config unavailable; deferring tick: %s", exc)
+                return DispatchResult()
         return _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
@@ -2535,20 +2550,21 @@ def dispatch_once(
             grant_guard=grant_guard,
         )
 
-    try:
-        db_path = _kb.kanban_db_path(board=board)
-    except Exception:
-        # Must not lose the tick — fall through to an unguarded dispatch.
-        result = _locked_tick()
-        _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
-        return result
-    with _kbc._dispatch_tick_lock(db_path) as held:
-        if not held:
+    # ponytail: serialize preparation across boards; use durable reservations
+    # only if preparation throughput becomes a measured bottleneck.
+    with _kbc._dispatch_admission_lock() as admitted:
+        if not admitted:
             result = DispatchResult(skipped_locked=True)
         else:
-            result = _locked_tick()
-            # Still under the dispatch lock: periodic PASSIVE WAL checkpoint.
-            _kbc._maybe_checkpoint_wal(conn, db_path)
+            db_path = _kbc._main_db_file(conn)
+            db_path = Path(db_path) if db_path else _kb.kanban_db_path(board=board)
+            with _kbc._dispatch_tick_lock(db_path) as held:
+                if not held:
+                    result = DispatchResult(skipped_locked=True)
+                else:
+                    result = _locked_tick()
+                    # Still under the dispatch lock: periodic PASSIVE WAL checkpoint.
+                    _kbc._maybe_checkpoint_wal(conn, db_path)
     # Lock released. Fire the tick observer strictly OUTSIDE the critical
     # section: a slow subscriber must never stall a sibling dispatcher's tick.
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
@@ -3123,6 +3139,7 @@ def _tick_spawn_budget(
     max_spawn: Optional[int],
     max_in_progress: Optional[int],
     board: Optional[str],
+    other_running_count: Optional[int] = None,
 ) -> tuple[bool, Optional[int]]:
     """``(may_spawn, spawn_budget)`` for this tick; ``budget None`` = uncapped.
 
@@ -3147,7 +3164,9 @@ def _tick_spawn_budget(
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
-        total_running = running_count + count_running_tasks_other_boards(board)
+        if other_running_count is None:
+            other_running_count = count_running_tasks_other_boards(board)
+        total_running = running_count + other_running_count
         if total_running >= max_in_progress:
             return False, None
         remaining = max_in_progress - total_running
@@ -3201,9 +3220,7 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
     return name
 
 
-# The dispatch lock has been released here. Fire the tick observer strictly OUTSIDE the single-writer
-# critical section (#56066 sweeper finding / #64231 disposition): a slow subscriber must never extend the
-# lock hold and stall a sibling dispatcher's tick.
+# Both dispatch locks remain held through preparation, claim commit and grant.
 def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
@@ -3232,16 +3249,9 @@ def _dispatch_once_locked(
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
         dry_run=dry_run,
     )
-    may_spawn, spawn_budget = _tick_spawn_budget(
-        conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
-    )
-    if not may_spawn:
-        return result
-
-    ready_rows = _lane_rows(conn, "ready")
-    review_rows = iter(_lane_rows(conn, "review") if review_dispatch_enabled() else [])
-    # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
-    # skipped_unassigned — "busy, retry later" differs from "needs routing".
+    # Per-profile policy requires a complete shared-root inventory. Read once
+    # under the admission lock: sibling dispatchers cannot add workers until
+    # this tick commits its claims and grants. Completions can only free slots.
     per_profile_cap = max_in_progress_per_profile if (
         # Per-profile concurrency cap (#21582): when set, track how many workers each assignee already has
         # in flight, and refuse to spawn when this would push that assignee past the cap. Prevents fan-out
@@ -3250,6 +3260,23 @@ def _dispatch_once_locked(
         isinstance(max_in_progress_per_profile, int)
         and max_in_progress_per_profile > 0
     ) else None
+    other_counts: Counter = Counter()
+    if per_profile_cap is not None:
+        try:
+            other_counts = _kbc._other_board_running_counts(conn)
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            _kb._log.warning("kanban dispatch: shared capacity inventory unavailable; deferring admission: %s", exc)
+            return result
+    other_running_count = sum(other_counts.values()) if per_profile_cap is not None else None
+    may_spawn, spawn_budget = _tick_spawn_budget(
+        conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
+        other_running_count=other_running_count,
+    )
+    if not may_spawn:
+        return result
+
+    ready_rows = _lane_rows(conn, "ready")
+    review_rows = iter(_lane_rows(conn, "review") if review_dispatch_enabled() else [])
     per_profile_running: dict[str, int] = {}
 
     def refresh_profile_counts() -> None:
@@ -3262,6 +3289,8 @@ def _dispatch_once_locked(
                     "WHERE status = 'running' AND assignee IS NOT NULL GROUP BY assignee"
                 )
             )
+            for assignee, count in other_counts.items():
+                per_profile_running[assignee] = per_profile_running.get(assignee, 0) + count
 
     refresh_profile_counts()
     lane_kwargs: dict[str, Any] = dict(
@@ -3290,7 +3319,7 @@ def _dispatch_once_locked(
                 # Refresh before trying another row, not only before the READY pass.
                 may_spawn, remaining = _tick_spawn_budget(
                     conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress,
-                    board=board,
+                    board=board, other_running_count=other_running_count,
                 )
                 if not may_spawn:
                     spawn_budget = spawned
