@@ -1158,6 +1158,11 @@ through preparation, claim commit, and grant. Contention or an unavailable
 shared lock defers the whole tick without board writes. This serializes
 preparation, not worker execution; it does not replace native worker admission.
 
+Direct `ready` and `review` claims, including `hermes kanban claim`, take the
+same gate through transaction commit. A busy/unavailable gate refuses the
+claim without opening a run. Only claims may reuse a gate already owned by
+their process/thread/root; nested dispatch and board removal remain exclusive.
+
 Omitted dispatcher limits inherit configuration. Explicit limits passed by a
 running gateway remain its startup snapshot, including `None` (unlimited);
 editing configuration does not silently change that cached setting.

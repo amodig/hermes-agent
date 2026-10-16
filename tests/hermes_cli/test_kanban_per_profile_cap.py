@@ -281,6 +281,13 @@ def test_cross_process_gate_covers_preparation_until_claim_and_grant(
         kb.create_board(board)
         with kbc.connect_closing(board=board) as conn:
             tasks[board] = kb.create_task(conn, title=board, assignee="alpha")
+    kb.create_board("direct-claims")
+    direct = {}
+    with kbc.connect_closing(board="direct-claims") as conn:
+        for lane in ("ready", "review"):
+            task_id = kb.create_task(conn, title=lane, assignee="alpha")
+            conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (lane, task_id))
+            direct[lane] = task_id
     ctx = multiprocessing.get_context("spawn")
     prepared, release, output = ctx.Event(), ctx.Event(), ctx.Queue()
     processes = [
@@ -295,6 +302,14 @@ def test_cross_process_gate_covers_preparation_until_claim_and_grant(
         assert prepared.wait(30), "first dispatcher never reached preparation"
         with kbc.connect_closing(board="board-a") as conn:
             assert kb.get_task(conn, tasks["board-a"]).claim_lock is None
+        with kbc.connect_closing(board="direct-claims") as conn:
+            for lane, claim in (("ready", kb.claim_task), ("review", kb.claim_review_task)):
+                assert claim(conn, direct[lane]) is None
+                task = kb.get_task(conn, direct[lane])
+                assert task.status == lane and task.claim_lock is None
+                assert conn.execute(
+                    "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (direct[lane],),
+                ).fetchone()[0] == 0
         processes[1].start()
         losing_board, locked, spawned, grants = output.get(timeout=30)
         assert losing_board == "board-b"

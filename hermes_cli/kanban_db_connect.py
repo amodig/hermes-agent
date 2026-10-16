@@ -41,6 +41,7 @@ _POST_COMMIT_ACTIONS: ContextVar[Optional[list[Callable[[], Any]]]] = ContextVar
 )
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
+_ADMISSION_OWNERS = threading.local()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
 
@@ -217,27 +218,38 @@ def _dispatch_tick_lock(db_path: Path):
 
 
 @contextlib.contextmanager
-def _dispatch_admission_lock():
-    """Strict, nonblocking shared-root gate; False means no tick may run.
+def _dispatch_admission_lock(*, allow_nested: bool = False):
+    """Strict, nonblocking shared-root gate for dispatch and direct claims.
 
-    Unlike the best-effort board lock, an unavailable lock is never permission
-    to admit work. Every dispatcher participates, including uncapped callers.
+    Claims may reuse their process/thread/root's gate through commit. Ticks
+    and board removal remain exclusive, including against their own caller.
     """
     handle = None
     acquired = False
+    owners = getattr(_ADMISSION_OWNERS, "roots", None)
+    if owners is None:
+        owners = set()
+        _ADMISSION_OWNERS.roots = owners
     try:
-        lock_path = _kb.kanban_home().resolve(strict=True) / "kanban" / ".dispatch-admission.lock"
-        lock_path.parent.mkdir(exist_ok=True)
-        handle = lock_path.open("a+b")
-        acquired = _try_lock_nb(handle)
-    except (OSError, AttributeError, ImportError) as exc:
-        _kb._log.warning("kanban dispatch: shared admission lock unavailable; deferring tick: %s", exc)
-    try:
+        try:
+            lock_path = _kb.kanban_home().resolve(strict=True) / "kanban" / ".dispatch-admission.lock"
+            key = (os.getpid(), lock_path)
+            if allow_nested and key in owners:
+                acquired = True
+            else:
+                lock_path.parent.mkdir(exist_ok=True)
+                handle = lock_path.open("a+b")
+                acquired = _try_lock_nb(handle)
+                if acquired:
+                    owners.add(key)
+        except (OSError, AttributeError, ImportError) as exc:
+            _kb._log.warning("kanban dispatch: shared admission lock unavailable; deferring admission: %s", exc)
         yield acquired
     finally:
         if handle is not None:
             try:
                 if acquired:
+                    owners.discard(key)
                     _unlock(handle)
             finally:
                 handle.close()

@@ -5,6 +5,7 @@ import sqlite3
 import time
 from typing import Any, Optional
 
+from hermes_cli.kanban_db_connect import _dispatch_admission_lock
 from hermes_cli.kanban_db_lazy import _kb
 from hermes_cli import kanban_runtime as _kr
 from hermes_cli.kanban_db_lifecycle_evidence import (
@@ -217,8 +218,8 @@ def claim_task(
 ) -> Optional[_kb.Task]:
     """Atomically transition ``ready -> running``.
 
-    Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``ready`` status).
+    Returns the claimed ``Task`` on success, ``None`` if the task is not
+    claimable or shared admission is busy/unavailable.
     """
     runtime_claim = _runtime_claim_metadata(
         runtime_identity, worker_pid, worker_start_time, preparation_id,
@@ -226,50 +227,53 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _kb._claimer_id()
     expires = now + _kb._resolve_claim_ttl_seconds(ttl_seconds)
-    with _kb.write_txn(conn):
-        handoff_error = _parent_handoff_start_error(conn, task_id)
-        if handoff_error is not None:
-            _record_parent_handoff_start_error(conn, task_id, handoff_error)
+    with _dispatch_admission_lock(allow_nested=True) as acquired:
+        if not acquired:
             return None
-        dependencies = evaluate_dependencies(conn, task_id)
-        # Single enforcement point: never ready -> running with an undone
-        # parent, whichever writer set 'ready'. Demote to 'todo';
-        if not dependencies["satisfied"] and not (
-            _forced_promotion_active(conn, task_id)
-            and _forceable_dependency_override(dependencies)
-        ):
-            conn.execute(
-                "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'ready'", (task_id,),
+        with _kb.write_txn(conn):
+            handoff_error = _parent_handoff_start_error(conn, task_id)
+            if handoff_error is not None:
+                _record_parent_handoff_start_error(conn, task_id, handoff_error)
+                return None
+            dependencies = evaluate_dependencies(conn, task_id)
+            # Single enforcement point: never ready -> running with an undone
+            # parent, whichever writer set 'ready'. Demote to 'todo';
+            if not dependencies["satisfied"] and not (
+                _forced_promotion_active(conn, task_id)
+                and _forceable_dependency_override(dependencies)
+            ):
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' "
+                    "WHERE id = ? AND status = 'ready'", (task_id,),
+                )
+                _kb._append_event(
+                    conn,
+                    task_id,
+                    "claim_rejected",
+                    {"reason": "dependencies_unsatisfied", "blockers": dependencies["blockers"]},
+                )
+                return None
+            # PR fence (#39): the pre-claim guard can pass and an unauthorized PR URL
+            # can still arrive while a deferred worker is being prepared, so the
+            # acknowledgment is re-checked here, in the same transaction that would
+            # open the run. A hold is not a worker failure — no run, no grant, no
+            # failure counter.
+            continuation = _kb._pr_continuation(conn, task_id)
+            if _kb._active_pr_guard_reason(conn, task_id) is not None:
+                _kb._append_event(conn, task_id, "claim_rejected", {"reason": "active_pr"})
+                return None
+            # Close a leaked prior run so the CAS below doesn't strand it.
+            _kb._reclaim_dangling_run(
+                conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
             )
-            _kb._append_event(
-                conn,
-                task_id,
-                "claim_rejected",
-                {"reason": "dependencies_unsatisfied", "blockers": dependencies["blockers"]},
+            run_id = _claim_and_open_run(
+                conn, task_id, "ready", lock, expires, now,
+                runtime_claim=runtime_claim, expected_task=expected_task,
+                pr_continuation=continuation,
             )
-            return None
-        # PR fence (#39): the pre-claim guard can pass and an unauthorized PR URL
-        # can still arrive while a deferred worker is being prepared, so the
-        # acknowledgment is re-checked here, in the same transaction that would
-        # open the run. A hold is not a worker failure — no run, no grant, no
-        # failure counter.
-        continuation = _kb._pr_continuation(conn, task_id)
-        if _kb._active_pr_guard_reason(conn, task_id) is not None:
-            _kb._append_event(conn, task_id, "claim_rejected", {"reason": "active_pr"})
-            return None
-        # Close a leaked prior run so the CAS below doesn't strand it.
-        _kb._reclaim_dangling_run(
-            conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
-        )
-        run_id = _claim_and_open_run(
-            conn, task_id, "ready", lock, expires, now,
-            runtime_claim=runtime_claim, expected_task=expected_task,
-            pr_continuation=continuation,
-        )
-        if run_id is None:
-            return None
-        claimed = _kb.get_task(conn, task_id)
+            if run_id is None:
+                return None
+            claimed = _kb.get_task(conn, task_id)
     if fire_hook:
         _kb._fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
     return claimed
@@ -282,54 +286,59 @@ def claim_review_task(
     expected_task: Any = None,
     fire_hook: bool = True,
 ) -> Optional[_kb.Task]:
-    """Atomic ``review -> running`` (None when lost). Parents are re-checked
-    (one may have reopened meanwhile) and a NEW run tracks the reviewer
-    separately from the implementer."""
+    """Atomic ``review -> running`` (None when lost or admission is unavailable).
+
+    Parents are re-checked (one may have reopened meanwhile) and a NEW run
+    tracks the reviewer separately from the implementer.
+    """
     runtime_claim = _runtime_claim_metadata(
         runtime_identity, worker_pid, worker_start_time, preparation_id,
     )
     now = int(time.time())
     lock = claimer or _kb._claimer_id()
     expires = now + _kb._resolve_claim_ttl_seconds(ttl_seconds)
-    with _kb.write_txn(conn):
-        handoff_error = _parent_handoff_start_error(conn, task_id)
-        if handoff_error is not None:
-            _record_parent_handoff_start_error(conn, task_id, handoff_error)
+    with _dispatch_admission_lock(allow_nested=True) as acquired:
+        if not acquired:
             return None
-        dependencies = evaluate_dependencies(conn, task_id)
-        if not dependencies["satisfied"] and not (
-            _forced_promotion_active(conn, task_id)
-            and _forceable_dependency_override(dependencies)
-        ):
-            demoted = conn.execute(
-                "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'review' AND claim_lock IS NULL", (task_id,),
-            )
-            if demoted.rowcount == 1:
-                _kb._append_event(
-                    conn,
-                    task_id,
-                    "dependency_wait",
-                    {
-                        "reason": "dependencies_unsatisfied",
-                        "blockers": dependencies["blockers"],
-                        "source_status": "review",
-                    },
+        with _kb.write_txn(conn):
+            handoff_error = _parent_handoff_start_error(conn, task_id)
+            if handoff_error is not None:
+                _record_parent_handoff_start_error(conn, task_id, handoff_error)
+                return None
+            dependencies = evaluate_dependencies(conn, task_id)
+            if not dependencies["satisfied"] and not (
+                _forced_promotion_active(conn, task_id)
+                and _forceable_dependency_override(dependencies)
+            ):
+                demoted = conn.execute(
+                    "UPDATE tasks SET status = 'todo' "
+                    "WHERE id = ? AND status = 'review' AND claim_lock IS NULL", (task_id,),
                 )
-            return None
-        run_id = _claim_and_open_run(
-            conn, task_id, "review", lock, expires, now,
-            event_extra={"source_status": "review"},
-            runtime_claim=runtime_claim, expected_task=expected_task,
-            # The review lane stays exempt from the PR *fence* (a PR is the input
-            # to a review), but a live continuation still binds: on a same-card
-            # review the reviewer is reviewing the already-published PR, and must
-            # be told to keep reviewing it rather than open a replacement.
-            pr_continuation=_kb._pr_continuation(conn, task_id),
-        )
-        if run_id is None:
-            return None
-        claimed = _kb.get_task(conn, task_id)
+                if demoted.rowcount == 1:
+                    _kb._append_event(
+                        conn,
+                        task_id,
+                        "dependency_wait",
+                        {
+                            "reason": "dependencies_unsatisfied",
+                            "blockers": dependencies["blockers"],
+                            "source_status": "review",
+                        },
+                    )
+                return None
+            run_id = _claim_and_open_run(
+                conn, task_id, "review", lock, expires, now,
+                event_extra={"source_status": "review"},
+                runtime_claim=runtime_claim, expected_task=expected_task,
+                # The review lane stays exempt from the PR *fence* (a PR is the input
+                # to a review), but a live continuation still binds: on a same-card
+                # review the reviewer is reviewing the already-published PR, and must
+                # be told to keep reviewing it rather than open a replacement.
+                pr_continuation=_kb._pr_continuation(conn, task_id),
+            )
+            if run_id is None:
+                return None
+            claimed = _kb.get_task(conn, task_id)
     if fire_hook:
         _kb._fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
     return claimed
