@@ -1,10 +1,10 @@
 """Autonomous-boundary verdict for tests that are not a deployed host.
 
 The runtime refuses every autonomous launch unless the host really presents the
-reviewed boundary: the caller inside ``autonomous.slice``, the single
-``ConcurrencyHardMax=1`` slot free, and no misplaced worker scope. That refusal is
-the point of the change, and no test runner -- least of all a CI host -- satisfies
-it.
+reviewed boundary: the caller inside ``autonomous.slice``, worker capacity
+available under ``ConcurrencyHardMax``, and no misplaced worker scope. That
+refusal is the point of the change, and no test runner -- least of all a CI
+host -- satisfies it.
 
 Tests that drive the dispatcher, the runtime-generation bootstrap or the scope
 routing are exercising that PLUMBING, not host policy, so they get an explicit

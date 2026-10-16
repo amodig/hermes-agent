@@ -120,7 +120,7 @@ class DispatchResult:
     reconciled_worker_scopes: list[dict] = field(default_factory=list)
     """Sanitized events from :func:`reconcile_orphan_worker_scopes` (#57) for the
     scopes this tick ACTED on: exact unit, task, run, reason, outcome, board and
-    whether the single worker slot came free. A refusal changes nothing on the
+    whether native worker capacity became available. A refusal changes nothing on the
     host, so it is logged rather than reported as activity — a live worker's scope
     is refused on every tick while it runs."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
@@ -3101,7 +3101,7 @@ def _run_reclaim_phase(
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
     # A transient worker scope stays active while any of its cgroup remains, so a
-    # descendant of an ended worker keeps the single slot (#57). This runs after
+    # descendant of an ended worker still consumes capacity (#57). This runs after
     # every path above that can CLOSE a run -- a worker that died with its run
     # still open is only provably an orphan once that sweep has ended it -- and
     # still before this tick measures capacity, so the tick that discovers it can

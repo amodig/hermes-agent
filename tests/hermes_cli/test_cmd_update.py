@@ -125,7 +125,7 @@ class TestGitTrampolineSelfHeal:
         }[location]
         real = base / arch / "libexec" / "git-core" / "git.exe"
         monkeypatch.setattr(Path, "exists", lambda path: path == real)
-        monkeypatch.setattr(update_cmd_git, "_probe_fork_bomb", lambda argv: False)
+        monkeypatch.setattr(update_cmd_git.subprocess, "run", self._fake_run_healthy)
 
         assert update_cmd_git._locate_real_git() == real
 
@@ -142,6 +142,6 @@ class TestGitTrampolineSelfHeal:
         for binary in (shared, scoped):
             binary.parent.mkdir(parents=True)
             binary.touch()
-        monkeypatch.setattr(update_cmd_git, "_probe_fork_bomb", lambda argv: False)
+        monkeypatch.setattr(update_cmd_git.subprocess, "run", self._fake_run_healthy)
 
         assert update_cmd_git._locate_real_git() == shared

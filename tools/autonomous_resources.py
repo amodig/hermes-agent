@@ -3,9 +3,9 @@
 
 An interactive OMP session and its agent controls share one memory cgroup, so a
 runaway autonomous worker inside that cgroup can OOM the editor and the desktop
-app next to it (amodig/hermes-cto#50).  Autonomy therefore gets its own
+app next to it (amodig/hermes-cto#50). Autonomy therefore gets its own
 aggregate, placed as a *sibling* of the interactive slices directly under the
-user manager, and exactly one worker may run in it at a time.
+user manager, with at most two workers in the aggregate.
 
 This module is the single decision point:
 
@@ -17,9 +17,9 @@ This module is the single decision point:
 
 Both read real systemd properties and real cgroup membership; neither trusts
 ``Slice=``, a cached capability probe, or a unit-file declaration.  The slot
-itself is enforced by systemd (``ConcurrencyHardMax=1``), not here: this module
-refuses a launch when the slot is already busy, but the atomic authority that
-makes two racing launchers resolve to exactly one worker is the kernel-level
+itself is enforced by systemd (``ConcurrencyHardMax=2``), not here: this module
+refuses a launch when both slots are busy, but the atomic authority that
+resolves racing launchers at the capacity boundary is systemd's native
 concurrency limit on the slice.
 
 Failure policy is fail-closed.  A missing unit, a pending daemon reload, an
@@ -33,7 +33,10 @@ verifier imports it by file path without booting Hermes.  It must not import
 """
 from __future__ import annotations
 
+import os
+import stat
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional
@@ -59,9 +62,10 @@ AUTONOMOUS_WORKERS_SLICE = "autonomous-workers.slice"
 AUTONOMOUS_LIMITS = {"MemoryHigh": 2 * GIB, "MemoryMax": 3 * GIB, "MemorySwapMax": 1 * GIB}
 WORKER_SLICE_LIMITS = dict(AUTONOMOUS_LIMITS)
 GATEWAY_LIMITS = dict(AUTONOMOUS_LIMITS)
-#: One autonomous worker at a time.  Soft stays unlimited so a second launch
-#: fails immediately instead of queueing behind a claimed board card.
-WORKERS_CONCURRENCY_HARD_MAX = 1
+#: Trial capacity: two autonomous workers total, one per profile under the
+#: dispatcher cap. Soft stays unlimited so a full slice refuses immediately
+#: instead of queueing behind an already claimed board card.
+WORKERS_CONCURRENCY_HARD_MAX = 2
 WORKERS_CONCURRENCY_SOFT_MAX = UNLIMITED
 #: Human-readable form of the soft-limit requirement, for diagnostics.
 SOFT_MAX_UNLIMITED_LABEL = f"unlimited ({WORKERS_CONCURRENCY_SOFT_MAX})"
@@ -214,7 +218,7 @@ def _cgroup_populated(directory: Path) -> Optional[bool]:
 
     ``cgroup.procs`` alone cannot answer this: a scope whose only processes sit in
     a nested child reports an empty ``cgroup.procs`` while it is still busy, and
-    treating that as "empty" would hand the single slot to a second worker.
+    treating that as "empty" would hand the same slot to another worker.
     ``cgroup.events`` reports ``populated`` for the whole subtree.
 
     ``None`` means the question could not be answered at all. Callers must treat
@@ -316,6 +320,45 @@ class _Snapshot:
     oomd_active: bool = False
 
 
+def _user_manager_env() -> Dict[str, str]:
+    """Reach the same owned user bus as scoped spawns from a system service.
+
+    This verifier is imported standalone by the CTO host check, so it cannot
+    import process_registry's equivalent bus derivation. Revalidate the socket
+    on each read; an inaccessible bus still fails closed at the systemctl check.
+    """
+    env = dict(os.environ)
+    if sys.platform != "linux":
+        return env
+
+    def owned_runtime(path: Path) -> bool:
+        try:
+            info = path.lstat()
+            return (
+                path.is_absolute() and stat.S_ISDIR(info.st_mode)
+                and info.st_uid == os.getuid() and info.st_mode & 0o022 == 0  # windows-footgun: ok — behind the Linux-only return above
+            )
+        except OSError:
+            return False
+
+    configured = env.get("XDG_RUNTIME_DIR")
+    runtime = (
+        Path(configured) if configured and owned_runtime(Path(configured))
+        else Path(f"/run/user/{os.getuid()}")  # windows-footgun: ok — behind the Linux-only return above
+    )
+    if not owned_runtime(runtime):
+        return env
+    bus = runtime / "bus"
+    try:
+        info = bus.lstat()
+    except OSError:
+        return env
+    if stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid():  # windows-footgun: ok — behind the Linux-only return above
+        env["XDG_RUNTIME_DIR"] = str(runtime)
+        env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
+    return env
+
+
 def _show_units(names, *, system: bool = False) -> Dict[str, Dict[str, str]]:
     """Read *names*' properties from the user manager, or the system one.
 
@@ -331,6 +374,7 @@ def _show_units(names, *, system: bool = False) -> Dict[str, Dict[str, str]]:
                 ["systemctl", *(("show",) if system else ("--user", "show")), name,
                  "--property=" + ",".join(UNIT_PROPERTIES)],
                 capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+                env=None if system else _user_manager_env(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             _fail(f"cannot read {name} from the user manager ({exc})")
@@ -348,6 +392,7 @@ def _known_gateway_units(contract: _Contract) -> List[str]:
             ["systemctl", "--user", "list-units", "--all", "--no-legend", "--plain",
              f"{contract.gateway_unit_prefix}*"],
             capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+            env=_user_manager_env(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         _fail(f"cannot enumerate {contract.gateway_unit_prefix}* units ({exc})")
@@ -596,7 +641,8 @@ def _validate_policy(snapshot: _Snapshot, contract: _Contract = _LIVE_CONTRACT) 
     _require(
         workers_unit.get("ConcurrencyHardMax") == str(contract.workers_concurrency_hard_max),
         "autonomous worker slice: ConcurrencyHardMax must be "
-        f"{contract.workers_concurrency_hard_max}, got {workers_unit.get('ConcurrencyHardMax')!r}",
+        f"{contract.workers_concurrency_hard_max}, got {workers_unit.get('ConcurrencyHardMax')!r}; "
+        "drain workers and align the runtime and installed slice policy before resuming dispatch",
     )
     _require(
         workers_unit.get("ConcurrencySoftMax") == str(WORKERS_CONCURRENCY_SOFT_MAX),
@@ -663,7 +709,9 @@ def _validate_boundary(
         "Hermes worker scope(s) outside the autonomous worker slice: "
         f"{report['misplaced_worker_scopes']}",
     )
-    report["worker_slot_occupied"] = bool(report["worker_scopes"])
+    report["worker_slot_occupied"] = (
+        len(report["worker_scopes"]) >= contract.workers_concurrency_hard_max
+    )
     report["launcher_cgroup"] = None
     if pid is None:
         return report
@@ -677,8 +725,9 @@ def _validate_boundary(
     report["launcher_cgroup"] = group
     if report["worker_slot_occupied"]:
         _fail(
-            f"{report['workers']['cgroup']} already holds {report['worker_scopes']}; "
-            "wait for the running worker's whole scope to empty",
+            f"{report['workers']['cgroup']} already holds {report['worker_scopes']} "
+            f"(capacity {contract.workers_concurrency_hard_max}); "
+            "wait for a running worker's whole scope to empty",
             slot=True,
         )
     return report
@@ -718,8 +767,9 @@ def _validate_worker(
     )
     scopes = report["worker_scopes"]
     _require(
-        scopes == [group],
-        f"expected exactly the admitted worker scope {group}, found {scopes}",
+        group in scopes and len(scopes) <= contract.workers_concurrency_hard_max,
+        f"expected worker scope {group} within capacity "
+        f"{contract.workers_concurrency_hard_max}, found {scopes}",
     )
     report["worker_cgroup"] = group
     report["worker_pid"] = pid
