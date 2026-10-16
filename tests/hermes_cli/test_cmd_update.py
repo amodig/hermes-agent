@@ -106,24 +106,31 @@ class TestGitTrampolineSelfHeal:
         assert result == git_cmd
         run.assert_not_called()
 
-    def test_portable_git_candidates_check_shared_root_first(self, tmp_path, monkeypatch):
-        # Profile-scoped layout: HERMES_HOME = <root>/profiles/foo, but the
-        # PortableGit tree lives under the SHARED root (monerostar review on
-        # #88136). The candidate list must check get_default_hermes_root()
-        # before the profile home.
+    @pytest.mark.parametrize("arch", ["ucrt64", "mingw64"])
+    @pytest.mark.parametrize("location", ["system", "shared", "profile"])
+    def test_locate_real_git_in_current_and_legacy_layouts(
+        self, tmp_path, monkeypatch, location, arch,
+    ):
+        from pathlib import Path
+
         import hermes_constants
-        from hermes_cli.update_cmd_git import _portable_git_candidates
+        from hermes_cli import update_cmd_git
 
         root = tmp_path / "root"
-        profile_home = root / "profiles" / "foo"
-
+        profile = root / "profiles" / "foo"
         monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda: root)
-        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: profile_home)
-
-        candidates = _portable_git_candidates()
-        assert candidates[0] == (
-            root / "git" / "mingw64" / "libexec" / "git-core" / "git.exe"
-        )
-        assert candidates[1] == (
-            profile_home / "git" / "mingw64" / "libexec" / "git-core" / "git.exe"
-        )
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: profile)
+        base = {
+            "system": Path(r"C:\Program Files") / "Git",
+            "shared": root / "git",
+            "profile": profile / "git",
+        }[location]
+        real = base / arch / "libexec" / "git-core" / "git.exe"
+        with (
+            patch.object(Path, "exists", lambda path: path == real),
+            patch.object(
+                update_cmd_git.subprocess, "run",
+                side_effect=self._fake_run_healthy,
+            ),
+        ):
+            assert update_cmd_git._locate_real_git() == real

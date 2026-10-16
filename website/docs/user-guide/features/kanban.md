@@ -341,6 +341,43 @@ gateway docs). Without a running gateway, `ready` tasks stay where they are
 until one comes up — `hermes kanban create` warns about this at creation
 time.
 
+#### Two-worker trial (systemd user manager)
+
+On a host using the reviewed `autonomous.slice` boundary, the worker child slice
+`autonomous-workers.slice` has `ConcurrencyHardMax=2` and
+`ConcurrencySoftMax=unlimited`. The runtime checks the *loaded* systemd policy,
+not merely the unit file: if the installed hard maximum is still 1 (or any
+other value), it refuses new workers with the observed value and a drain/align
+remedy. This source change does not deploy the trial. Do not edit the
+installed unit, reload the manager, or restart the gateway without an
+operator-approved deployment. For rollout, first pause dispatch and drain all
+active worker scopes. Before resuming, align **all three sources** to the
+approved two-worker contract: this runtime, the dotfiles systemd policy, and
+the CTO source that manages/reapplies the host configuration. Install the
+matching slice policy only as part of that approved deployment; reload the
+user manager and verify the **loaded** `autonomous-workers.slice` with
+`systemctl --user show autonomous-workers.slice
+--property=ConcurrencyHardMax,ConcurrencySoftMax` (hard max 2, soft max
+unlimited). Only then resume dispatch and verify two distinct populated worker
+scopes. The two-worker ceiling is shared by Kanban, cron, and background
+workers, not two slots per board. A third launch is refused by the native
+manager even if two dispatchers race past their read-only precheck.
+
+For a two-profile Kanban trial, keep `kanban.max_in_progress: 2` (host-wide,
+across boards) and `kanban.max_in_progress_per_profile: 1` (per-board policy).
+The native worker-slice ceiling remains the final authority across boards and
+non-Kanban autonomous callers. For rollback, pause dispatch and drain both
+workers; restore the one-worker contract in the runtime, dotfiles policy, and
+CTO source, install/reload the matching slice policy, and verify its **loaded**
+hard max 1 and soft max unlimited before resuming. A mixed version across
+these sources or the loaded unit must not resume: mismatched runtime/unit
+versions intentionally refuse new launches rather than silently running with
+the wrong capacity. After rollout, observe host memory/swap pressure and
+interactive responsiveness under two workers; memory ceilings remain shared
+by both workers (high 2 GiB, max 3 GiB, swap max 1 GiB). Stop the trial if the
+interactive host is impacted. No step here changes the installed policy or
+foreign repositories automatically.
+
 #### Workers and systemd cgroups
 
 Workers are fire-and-forget processes that outlive the dispatcher tick, so

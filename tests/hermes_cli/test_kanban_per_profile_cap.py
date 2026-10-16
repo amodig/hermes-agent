@@ -27,6 +27,10 @@ def isolated_kanban_home_with_profiles(monkeypatch):
         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
             del sys.modules[mod]
     from hermes_cli import kanban_db
+    from hermes_cli import kanban_db_dispatch
+    # The per-profile cap is independent of host memory pressure; a busy CI
+    # host must not silently turn this scheduling test into a one-spawn tick.
+    monkeypatch.setattr(kanban_db_dispatch, "_memory_pressure_level", lambda: "ok")
     yield kanban_db
 
 

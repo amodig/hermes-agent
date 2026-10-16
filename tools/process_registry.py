@@ -412,7 +412,7 @@ def autonomous_worker_scope_argv(
 ) -> tuple[List[str], str]:
     """``(argv, unit_name)`` placing one top-level autonomous worker in its slice.
 
-    The single slot is :data:`AUTONOMOUS_WORKERS_SLICE`'s ``ConcurrencyHardMax``;
+    The capacity is :data:`AUTONOMOUS_WORKERS_SLICE`'s ``ConcurrencyHardMax``;
     this only builds the argv that asks for it. Callers run
     ``tools.autonomous_resources.check_autonomous_boundary`` first so a hopeless
     launch is refused before any preparation, and MUST treat a missing scope
@@ -485,7 +485,7 @@ def require_autonomous_boundary(*, standalone_dispatch: bool = False) -> dict:
     Called before any autonomous launch prepares work, so a dispatcher that
     started in the interactive slice (a hand-run `hermes kanban dispatch`, a
     terminal-started gateway) fails fast instead of placing autonomy next to the
-    editor.  Raises :class:`AutonomousWorkerBusy` when the single worker slot is
+    editor. Raises :class:`AutonomousWorkerBusy` when worker capacity is
     already held, and :class:`AutonomousResourceUnavailable` for any boundary
     drift; both are infrastructure, never a property of the work being launched.
 
@@ -568,7 +568,7 @@ def restart_safe_gateway_child_argv(
     A systemd-supervised gateway restart kills every process in the service
     cgroup, so children that must survive it run in a transient user scope.
     Autonomy gets a stricter contract than restart-safety alone: the child lands
-    in ``autonomous-workers.slice``, whose single ``ConcurrencyHardMax`` slot is
+    in ``autonomous-workers.slice``, whose native ``ConcurrencyHardMax`` is
     what actually admits it, and the caller must already be inside
     ``autonomous.slice`` -- see :func:`require_autonomous_boundary`. Nothing on
     this path may route the child back into the gateway's own cgroup, the
@@ -1460,7 +1460,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
         gateway and its messaging control plane).
 
         A top-level executor in the supervised gateway is autonomous work: it must sit
-        in ``autonomous-workers.slice`` and it consumes that slice's single slot. A job
+        in ``autonomous-workers.slice`` and it consumes one of its native slots. A job
         inside an already admitted worker inherits the worker's scope and never reaches
         this branch, because the gateway identity check below is what distinguishes
         them. Interactive sessions are untouched."""
