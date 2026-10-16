@@ -151,3 +151,33 @@ def test_policy_digest_rejects_malformed_owner_digest(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="scripts/verify_lifecycle.py"):
         verify_kanban_lifecycle._policy_digest(tmp_path)
+
+
+def test_dispatcher_timeout_preserves_partial_phase_output(tmp_path, monkeypatch):
+    import subprocess
+
+    real_run = subprocess.run
+
+    def short_deadline(*args, **kwargs):
+        kwargs["timeout"] = 0.2
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(verify_kanban_lifecycle.subprocess, "run", short_deadline)
+    monkeypatch.setattr(
+        verify_kanban_lifecycle, "_dispatcher_probe_script",
+        lambda: (
+            "import os, time\n"
+            "os.write(2, b'dispatcher probe: materializing runtime\\xff\\n')\n"
+            "os.write(1, b'worker preparation started\\n')\n"
+            "time.sleep(30)\n"
+        ),
+    )
+    result = verify_kanban_lifecycle._dispatcher_materialization_check(
+        "installed", tmp_path, sys.executable, {}, temp_root=tmp_path,
+    )
+    assert result["status"] == "failed"
+    diagnostics = "\n".join(result["diagnostics"])
+    assert "TimeoutExpired: after 0.2s" in diagnostics
+    assert "probe stderr: dispatcher probe: materializing runtime\ufffd" in diagnostics
+    assert "probe stdout: worker preparation started" in diagnostics
+    assert result["evidence"]["worker_bootstrap"] is False
