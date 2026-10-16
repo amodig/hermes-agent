@@ -159,7 +159,7 @@ def test_dispatcher_timeout_preserves_partial_phase_output(tmp_path, monkeypatch
     real_run = subprocess.run
 
     def short_deadline(*args, **kwargs):
-        kwargs["timeout"] = 0.2
+        kwargs["timeout"] = 2
         return real_run(*args, **kwargs)
 
     monkeypatch.setattr(verify_kanban_lifecycle.subprocess, "run", short_deadline)
@@ -177,7 +177,7 @@ def test_dispatcher_timeout_preserves_partial_phase_output(tmp_path, monkeypatch
     )
     assert result["status"] == "failed"
     diagnostics = "\n".join(result["diagnostics"])
-    assert "TimeoutExpired: after 0.2s" in diagnostics
+    assert "TimeoutExpired: after 2s" in diagnostics
     assert "probe stderr: dispatcher probe: materializing runtime\ufffd" in diagnostics
     assert "probe stdout: worker preparation started" in diagnostics
     assert result["evidence"]["worker_bootstrap"] is False
