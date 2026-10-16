@@ -84,7 +84,8 @@ def dispatcher_boards(tmp_path, monkeypatch):
                 conn, title=f"{slug} triage", assignee="default", triage=True,
             )
     kb.set_current_board("beta")
-    settings = kwd._DispatcherSettings(60.0, 1, 10, 2, 0, True, None, 1)
+    # Isolate board traversal from the separately tested cross-board profile cap.
+    settings = kwd._DispatcherSettings(60.0, 1, 10, 2, 0, True, None, None)
     return kwd._KanbanDispatcher(kb, settings), ready, triage
 
 

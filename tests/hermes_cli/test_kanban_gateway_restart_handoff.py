@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_runtime_generation as generations
 from hermes_cli.kanban_runtime import process_start_time
@@ -1090,11 +1091,7 @@ def test_occupied_slot_dispatch_preserves_retry_budget_across_homes(tmp_path, mo
         (home / "profiles" / "coder" / "config.yaml").write_text("{}\n", encoding="utf-8")
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
-        with sqlite3.connect(home / "kanban.db") as conn:
-            conn.row_factory = sqlite3.Row
-            conn.executescript(kb.SCHEMA_SQL)
-            kb._ensure_lifecycle_schema(conn)
-            kb._ensure_goal_revision_schema(conn)
+        with kbc.connect_closing(home / "kanban.db") as conn:
             task_id = kb.create_task(
                 conn, title=f"blocked by the slot {home.name}", assignee="coder",
                 initial_status="blocked", workspace_kind="scratch", workspace_path=str(home),
