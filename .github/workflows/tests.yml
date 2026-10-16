@@ -360,7 +360,9 @@ jobs:
   lifecycle-conformance:
     name: Kanban lifecycle conformance
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Allow setup plus the 10-minute materialization probe, 5-minute suite
+    # and optional 5-minute scenario recovery to finish and emit diagnostics.
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
