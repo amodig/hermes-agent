@@ -342,6 +342,14 @@ Consequence: any codepath that said "check if this PID is alive" via `os.kill(pi
 **`hermes: command not found` right after install.**
 Open a new PowerShell window. The installer added `%LOCALAPPDATA%\hermes\bin` to User PATH, but existing shells need to be restarted to pick it up. In the meantime you can run `& "$env:LOCALAPPDATA\hermes\bin\hermes.exe"`.
 
+**Git reports `BUG (fork bomb)` during `hermes update`.**
+The updater probes for a working `git-core/git.exe` to bypass the broken
+Git-for-Windows launcher. It searches standard installations and the shared
+or profile-local PortableGit tree, including the `ucrt64` layout introduced
+in Git for Windows 2.56 and the older `mingw64` layout. If no candidate can
+be probed, it keeps the original command so the ZIP fallback can handle the
+fetch failure.
+
 **`WinError 193: %1 is not a valid Win32 application` when running a tool.**
 You hit a shebang-script invocation that bypassed the `.cmd` shim. Hermes resolves commands through `shutil.which(cmd, path=local_bin)` so PATHEXT picks up `.CMD` — if you're invoking the tool via a hardcoded path instead, switch to the `.cmd` variant (e.g., `npx.cmd`, not `npx`).
 

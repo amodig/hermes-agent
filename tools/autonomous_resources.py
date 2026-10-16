@@ -336,7 +336,7 @@ def _user_manager_env() -> Dict[str, str]:
             info = path.lstat()
             return (
                 path.is_absolute() and stat.S_ISDIR(info.st_mode)
-                and info.st_uid == os.getuid() and info.st_mode & 0o022 == 0
+                and info.st_uid == os.getuid() and info.st_mode & 0o022 == 0  # windows-footgun: ok — behind the Linux-only return above
             )
         except OSError:
             return False
@@ -344,7 +344,7 @@ def _user_manager_env() -> Dict[str, str]:
     configured = env.get("XDG_RUNTIME_DIR")
     runtime = (
         Path(configured) if configured and owned_runtime(Path(configured))
-        else Path(f"/run/user/{os.getuid()}")
+        else Path(f"/run/user/{os.getuid()}")  # windows-footgun: ok — behind the Linux-only return above
     )
     if not owned_runtime(runtime):
         return env
@@ -353,7 +353,7 @@ def _user_manager_env() -> Dict[str, str]:
         info = bus.lstat()
     except OSError:
         return env
-    if stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid():
+    if stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid():  # windows-footgun: ok — behind the Linux-only return above
         env["XDG_RUNTIME_DIR"] = str(runtime)
         env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
     return env
