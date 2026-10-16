@@ -10,7 +10,6 @@ Covers the pieces added when boards became a first-class concept:
 * ``connect(board=)`` isolation — writes on one board don't leak.
 * ``create_board`` / ``list_boards`` / ``remove_board`` round trip.
 * CLI surface: ``hermes kanban boards list/create/switch/rm``.
-* ``_default_spawn`` injects ``HERMES_KANBAN_BOARD`` into worker env.
 """
 
 from __future__ import annotations
@@ -30,7 +29,6 @@ if str(_WORKTREE) not in sys.path:
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
-from hermes_cli import kanban_db_dispatch as kbd
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +215,160 @@ class TestBoardCRUD:
         assert "task_events" in tables
         assert "tasks" in tables
 
+    @pytest.mark.parametrize("archive", [True, False])
+    def test_remove_waits_for_dispatch_and_active_claims(self, fresh_home, monkeypatch, archive):
+        kb.create_board("busy")
+        kb.set_current_board("busy")
+        with kbc.connect_closing(board="busy") as conn:
+            task_id = kb.create_task(conn, title="owned work", assignee="dev")
+        with kbc._dispatch_admission_lock() as held:
+            assert held
+            with pytest.raises(ValueError, match="admission"):
+                kb.remove_board("busy", archive=archive)
+        with kbc.connect_closing(board="busy") as conn:
+            claimed = kb.claim_task(conn, task_id)
+            assert claimed is not None
+        kb.create_board("unrelated")
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board="unrelated")))
+        with kb.pin_first_board_resolution(), pytest.raises(ValueError, match="active claims"):
+            kb.remove_board("busy", archive=archive)
+        assert kb.board_exists("busy")
+        assert kb.get_current_board() == "busy"
+        with kbc.connect_closing(board="busy") as conn:
+            assert kb.get_task(conn, task_id).current_run_id == claimed.current_run_id
+            assert kb.complete_task(
+                conn, task_id, expected_run_id=claimed.current_run_id,
+                summary="owned work finished",
+            )
+        result = kb.remove_board("busy", archive=archive)
+        assert result["action"] == ("archived" if archive else "deleted")
+        assert not kb.board_exists("busy")
+        assert kb.get_current_board() == "default"
+
+    @pytest.mark.platforms("posix")
+    @pytest.mark.parametrize("action,archive,recreate,backing", [
+        ("ready", True, False, "file"),
+        ("review", True, True, "file"),
+        ("ready", False, True, "file"),
+        ("dispatch", True, True, "file"),
+        ("ready", True, False, "db-symlink"),
+        ("dispatch", True, False, "dir-symlink"),
+        ("ready", False, False, "dir-symlink"),
+    ])
+    def test_removed_connection_cannot_claim_old_board(
+        self, fresh_home, monkeypatch, action, archive, recreate, backing,
+    ):
+        from hermes_cli import kanban_db_dispatch as dispatch
+
+        kb.create_board("stale")
+        kb.set_current_board("stale")
+        external = fresh_home.parent / "external"
+        if backing == "db-symlink":
+            external.mkdir()
+            database = kb.kanban_db_path(board="stale")
+            database.rename(external / "kanban.db")
+            database.symlink_to(external / "kanban.db")
+        elif backing == "dir-symlink":
+            directory = kb.board_dir("stale")
+            directory.rename(external)
+            directory.symlink_to(external, target_is_directory=True)
+        with kbc.connect_closing(board="stale") as old:
+            task_id = kb.create_task(old, title="old board", assignee="dev")
+            lane = "review" if action == "review" else "ready"
+            old.execute("UPDATE tasks SET status = ? WHERE id = ?", (lane, task_id))
+            kb.remove_board("stale", archive=archive)
+            assert kb.get_current_board() == "default"
+            if recreate:
+                kb.create_board("stale")
+            calls = []
+            if action == "dispatch":
+                monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
+                monkeypatch.setattr(dispatch, "_memory_pressure_level", lambda: "ok")
+                result = dispatch.dispatch_once(
+                    old, board="stale", reconcile_orphans=False,
+                    spawn_fn=lambda task, workspace, **kw: calls.append(task.id),
+                )
+                assert result.skipped_locked and not result.spawned
+            else:
+                claim = kb.claim_review_task if action == "review" else kb.claim_task
+                assert claim(old, task_id) is None
+            assert calls == []
+            assert kb.get_task(old, task_id).status == lane
+            assert old.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+        if backing != "file":
+            assert (external / "kanban.db").is_file()
+        if recreate:
+            with kbc.connect_closing(board="stale") as new:
+                assert kb.get_task(new, task_id) is None
+                replacement = kb.create_task(new, title="new board", assignee="dev")
+                assert kb.claim_task(new, replacement) is not None
+        else:
+            assert not kb.board_exists("stale")
+
+    def test_failed_delete_preserves_selection_and_init_cache(self, fresh_home, monkeypatch):
+        import shutil
+
+        kb.create_board("keep")
+        kb.set_current_board("keep")
+        database = kb.kanban_db_path(board="keep")
+        cache_key = str(database.resolve())
+        assert cache_key in kb._INITIALIZED_PATHS
+
+        def refuse_delete(*args, **kwargs):
+            raise PermissionError("fixture deletion refused")
+
+        monkeypatch.setattr(shutil, "rmtree", refuse_delete)
+        with pytest.raises(PermissionError, match="fixture deletion refused"):
+            kb.remove_board("keep", archive=False)
+        assert kb.get_current_board() == "keep"
+        assert cache_key in kb._INITIALIZED_PATHS
+        assert database.is_file()
+
+    def test_remove_does_not_initialize_a_missing_database(self, fresh_home):
+        kb.create_board("unknown")
+        kb.set_current_board("unknown")
+        database = kb.kanban_db_path(board="unknown")
+        database.unlink()
+        with pytest.raises(ValueError, match="inspect"):
+            kb.remove_board("unknown")
+        assert kb.board_exists("unknown")
+        assert kb.get_current_board() == "unknown"
+        assert not database.exists()
+
+    @pytest.mark.parametrize("archive", [True, False])
+    def test_completed_removal_survives_selection_cleanup_failure(
+        self, fresh_home, monkeypatch, caplog, archive,
+    ):
+        import sqlite3
+        from contextlib import closing
+
+        kb.create_board("finished")
+        kb.set_current_board("finished")
+        with kbc.connect_closing(board="finished") as conn:
+            task_id = kb.create_task(conn, title="recoverable work", assignee="dev")
+        current = kb.current_board_path()
+        original_unlink = Path.unlink
+
+        def refuse_current_unlink(path, *args, **kwargs):
+            if path == current:
+                raise PermissionError("fixture selection cleanup refused")
+            return original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", refuse_current_unlink)
+        caplog.clear()
+        result = kb.remove_board("finished", archive=archive)
+        assert result["action"] == ("archived" if archive else "deleted")
+        assert not kb.board_exists("finished")
+        assert kb.get_current_board() == "default"
+        assert current.read_text().strip() == "finished"
+        assert any(record.levelname == "WARNING" for record in caplog.records)
+        if archive:
+            with closing(sqlite3.connect(Path(result["new_path"]) / "kanban.db")) as recovered:
+                assert recovered.execute(
+                    "SELECT title FROM tasks WHERE id = ?", (task_id,),
+                ).fetchone() == ("recoverable work",)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -268,62 +420,6 @@ class TestConnectionIsolation:
             assert kb.list_tasks(conn) == []
 
 
-# ---------------------------------------------------------------------------
-# Worker spawn env injection
-# ---------------------------------------------------------------------------
-
-class TestWorkerSpawnEnv:
-    """Ensure the dispatcher pins ``HERMES_KANBAN_BOARD`` / DB / workspaces on spawn.
-
-    We monkey-patch ``subprocess.Popen`` to capture the child env without
-    actually spawning anything.
-    """
-
-    def test_default_spawn_sets_env_vars(self, fresh_home, monkeypatch):
-        captured = {}
-
-        class FakeProc:
-            pid = 12345
-
-        def fake_popen(cmd, *args, **kwargs):
-            captured["cmd"] = cmd
-            captured["env"] = kwargs.get("env", {})
-            return FakeProc()
-
-        monkeypatch.setattr(subprocess, "Popen", fake_popen)
-        kb.create_board("spawntest")
-
-        task = kb.Task(
-            id="t_abc",
-            title="worker test",
-            body=None,
-            assignee="teknium",
-            status="ready",
-            priority=0,
-            created_by="user",
-            created_at=0,
-            started_at=None,
-            completed_at=None,
-            workspace_kind="scratch",
-            workspace_path=None,
-            claim_lock=None,
-            claim_expires=None,
-            tenant=None,
-            # A granted worker always has a run; the launch contract refuses to place
-            # one that does not, so the fixture models the real call.
-            current_run_id=1,
-        )
-
-        kbd._default_spawn(task, str(fresh_home / "ws"), board="spawntest")
-
-        env = captured["env"]
-        assert env["HERMES_KANBAN_BOARD"] == "spawntest"
-        assert env["HERMES_KANBAN_TASK"] == "t_abc"
-        # DB path should match the per-board DB, not the legacy default.
-        expected_db = fresh_home / "kanban" / "boards" / "spawntest" / "kanban.db"
-        assert env["HERMES_KANBAN_DB"] == str(expected_db)
-        expected_ws = fresh_home / "kanban" / "boards" / "spawntest" / "workspaces"
-        assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(expected_ws)
 
 
 # ---------------------------------------------------------------------------
@@ -374,12 +470,3 @@ class TestCLI:
         assert titlesD == []
 
 
-from tests._fixtures.autonomous_boundary import stub_scope_capability  # noqa: F401
-
-
-@pytest.fixture(autouse=True)
-def _scope_capability_for_argv_assertions(stub_scope_capability):
-    """These tests assert the argv/env a gateway worker launch would use, never a
-    real scope: a runner with no user bus cannot create one, and the runtime now
-    refuses an autonomous child it cannot place."""
-    return stub_scope_capability

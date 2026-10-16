@@ -185,9 +185,34 @@ hermes kanban boards rename atm10-server "ATM10 (Prod)"
 # Recoverable by moving the dir back.
 hermes kanban boards rm atm10-server
 
-# Hard delete — `rm -rf` the board dir. No recovery.
+# Hard delete — bypasses the archive.
 hermes kanban boards rm atm10-server --delete
 ```
+
+Board archive and deletion require an idle board. They take the dispatch
+admission gate and refuse running tasks or open claims before moving/removing
+the database, so workers retain their pinned path and frozen run identity.
+Let work finish naturally; board removal never kills or reclaims it.
+
+The idle-state probe is read-only. Missing or unreadable state blocks removal;
+it never initializes, migrates or repairs a database to make it appear idle.
+
+Legacy archives with running tasks or open claims require recovery before
+finite per-profile admission can continue. The dispatcher reports the archived
+database and asks for restoration; it does not count those rows as permanent
+live capacity, delete them, or infer safe reclamation from their age.
+With dispatch drained, restore the original directory/database at its frozen
+board path without overwriting another board. Let live work finish, or let
+native stale/crash reconciliation verify dead runs after restoration.
+Closed archives remain historical data and consume no capacity.
+
+Hard deletion of a directory-symlink board unlinks only the logical entry;
+external files remain untouched. Current-board selection and the init cache
+change only after the filesystem operation succeeds.
+If current-selection cleanup then fails, removal still returns its receipt
+(including the archive recovery path) with a warning, also printed by the CLI.
+The stale selection falls back to `default` while the board is absent. Fix the
+selection-file permissions and switch boards before reusing the removed slug.
 
 Board resolution order (highest precedence first):
 
@@ -363,9 +388,12 @@ scopes. The two-worker ceiling is shared by Kanban, cron, and background
 workers, not two slots per board. A third launch is refused by the native
 manager even if two dispatchers race past their read-only precheck.
 
-For a two-profile Kanban trial, keep `kanban.max_in_progress: 2` (host-wide,
-across boards) and `kanban.max_in_progress_per_profile: 1` (per-board policy).
-The native worker-slice ceiling remains the final authority across boards and
+For a two-profile Kanban trial, keep `kanban.max_in_progress: 2` and
+`kanban.max_in_progress_per_profile: 1`, both across boards in the shared Kanban
+root, not per board. Configure the same limits in every dispatcher's launch
+home. One running `alpha` task on board A defers `alpha` on board B while
+`beta` can use the second total slot. The native worker-slice ceiling remains
+the final authority across boards and
 non-Kanban autonomous callers. For rollback, pause dispatch and drain both
 workers; restore the one-worker contract in the runtime, dotfiles policy, and
 CTO source, install/reload the matching slice policy, and verify its **loaded**
@@ -1135,11 +1163,58 @@ All commands are also available as a slash command in the interactive CLI and in
 
 | Config key | Default | What it does |
 |------------|---------|--------------|
-| `kanban.max_in_progress` | unset (unlimited) | Caps the number of simultaneously running tasks. When the board already has N running, the dispatcher skips spawning more — useful for slow workers (local LLMs, resource-constrained hosts) so they finish what they have before more pile up and time out. Invalid or below-1 values log a warning and behave as unlimited. |
-| `kanban.max_in_progress_per_profile` | unset (unlimited) | Per-profile variant of `max_in_progress` — caps how many tasks any single assignee profile may run concurrently. Useful when one profile is slow or rate-limited but others should keep flowing. Applies alongside the board-wide `max_in_progress`; both must allow a spawn for it to proceed. |
+| `kanban.max_in_progress` | unset (memory-derived when available) | Caps simultaneously running tasks across boards in the shared Kanban root. Explicit positive values override the memory-derived default. Applies alongside the per-profile cap; `max_spawn` / CLI `--max` retains its separate per-board concurrency meaning. |
+| `kanban.max_in_progress_per_profile` | unset (unlimited) | Caps running tasks for each assignee across the shared Kanban root, not separately per board. A busy profile is deferred while other profiles can use remaining total capacity. CLI, gateway, daemon, and dashboard dispatch use this policy; an omitted dispatcher argument resolves the configured value. |
 | `kanban.dispatch_profiles` | unset (any existing profile) | Per-home claim allowlist for boards shared across Hermes homes. When the key is present, this home's dispatcher only claims cards whose assignee is listed — fail-closed: an empty list, `null` or a bare `dispatch_profiles:` claims nothing, and a config read that fails logs a warning and claims nothing; other assignees land in `skipped_nonspawnable`. Only omitting the key means "any existing profile". `hermes kanban diagnostics` prints the resolved value for this home (`any`, the listed names, or `none (fail-closed: …)`). See [Shared boards across homes](#shared-boards-across-homes). |
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
 | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
+
+Dispatchers coordinate through the nonblocking
+`<kanban-root>/kanban/.dispatch-admission.lock`, using the existing native file
+locking primitives. The shared root is `HERMES_KANBAN_HOME` when set, otherwise
+the default Hermes root; it is not each assignee's profile home. All dispatchers,
+including uncapped ones, take this gate before the board lock and hold it
+through preparation, claim commit, and grant. Contention or an unavailable
+shared lock defers the whole tick without board writes. This serializes
+preparation, not worker execution; it does not replace native worker admission.
+
+Direct `ready` and `review` claims, including `hermes kanban claim`, take the
+same gate through transaction commit. A busy/unavailable gate refuses the
+claim without opening a run. Only claims may reuse a gate already owned by
+their process/thread/root; nested dispatch and board removal remain exclusive.
+
+Disk connections capture their shared root, original logical open path, and
+physical file identity under admission. Dispatch and direct claims revalidate
+that binding before writes. The logical board path must still resolve to the
+same live database, including when the DB file or board directory is a symlink
+to an external database. Archival cannot leave a claimable handle merely because
+the external inode survives; deletion and same-slug replacement also refuse
+stale handles. Reads may open during contention, but those unattested connections
+must reopen before claiming. Archived databases are inventoried read-only; new
+claims require their original live path.
+
+Omitted dispatcher limits inherit configuration. Explicit limits passed by a
+running gateway remain its startup snapshot, including `None` (unlimited);
+editing configuration does not silently change that cached setting.
+
+With a finite per-profile cap, capacity reads are strict and read-only across
+the physical default/named boards, moved archives under `boards/_archived/`,
+and the current/pinned database. A pin cannot hide the other root boards;
+resolved symlink/pin aliases count once. Hard-link aliases defer admission
+because their SQLite WAL sidecars can differ. An unreadable inventory, broken
+database, or missing known board database defers new admission with a warning,
+without charging task failures; existing reclaim/promotion bookkeeping can
+still run. Once a running task finishes, its profile slot is eligible again.
+Legacy archives with unresolved running rows remain conservative capacity
+holds. Restore the archived board to its original path and use normal lifecycle
+recovery before admission; never discard identities or ignore the inventory to
+manufacture a free slot.
+Keep all boards sharing a policy discoverable under that root (a symlink to an
+external database is sufficient); unrelated external pinned databases cannot
+be discovered from another dispatcher's private environment. Use the same
+limits in each launch home. Without a finite profile cap, the legacy
+best-effort sibling count remains, and the native worker ceiling is still the
+final resource authority.
 
 ```yaml
 kanban:

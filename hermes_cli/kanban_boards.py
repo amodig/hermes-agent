@@ -105,6 +105,8 @@ def _cmd_boards_rm(args: argparse.Namespace) -> int:
               "Recover by moving the directory back to <root>/kanban/boards/<slug>/.")
     else:
         print(f"Board {res['slug']!r} deleted.")
+    for warning in res.get("warnings", ()):
+        print(f"  Note:  {warning}")
     return 0
 
 

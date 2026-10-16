@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import os
 import random
 import re
 import secrets
 import shutil
 import sqlite3
+import stat
 import threading
 import time
+from collections import Counter
 from contextvars import ContextVar
 from dataclasses import dataclass
 from dataclasses import field
@@ -38,6 +41,7 @@ _POST_COMMIT_ACTIONS: ContextVar[Optional[list[Callable[[], Any]]]] = ContextVar
 )
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
+_ADMISSION_OWNERS = threading.local()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
 
@@ -69,23 +73,29 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     from hermes_cli.sqlite_safe_read import connect_tracked
 
     busy_timeout_ms = _resolve_busy_timeout_ms()
-    conn = connect_tracked(
-        path,
-        connect_fn=sqlite3.connect,
-        isolation_level=None,
-        timeout=busy_timeout_ms / 1000.0,
-    )
-    try:
-        # Explicit PRAGMA (besides connect(timeout=)) so it is observable and
-        # survives wrapper changes; PRAGMA assignments can't bind parameters.
-        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
-    except BaseException:
-        # A half-open connection would leak its fd AND leave a stale entry in the
-        # connect_tracked registry (cleared only on close), permanently blocking
-        # byte-level probes of this file.
-        with contextlib.suppress(Exception):
-            conn.close()
-        raise
+    with _dispatch_admission_lock(allow_nested=True) as admitted:
+        conn = connect_tracked(
+            path,
+            connect_fn=sqlite3.connect,
+            isolation_level=None,
+            timeout=busy_timeout_ms / 1000.0,
+        )
+        try:
+            identity = None
+            if admitted and _main_db_file(conn):
+                info = path.stat()
+                identity = (
+                    str(_kb.kanban_home().resolve(strict=True)),
+                    str(path.absolute()), info.st_dev, info.st_ino,
+                )
+            # Reads remain available during contention; claims require an open
+            # attested under admission, not a later guess at a replaced path.
+            setattr(conn, "_hermes_kanban_file_identity", identity)
+            conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+        except BaseException:
+            with contextlib.suppress(Exception):
+                conn.close()
+            raise
     return conn
 
 
@@ -211,6 +221,162 @@ def _dispatch_tick_lock(db_path: Path):
                 pass
             finally:
                 handle.close()
+
+
+@contextlib.contextmanager
+def _dispatch_admission_lock(*, allow_nested: bool = False):
+    """Strict, nonblocking shared-root gate for dispatch and direct claims.
+
+    Claims may reuse their process/thread/root's gate through commit. Ticks
+    and board removal remain exclusive, including against their own caller.
+    """
+    handle = None
+    acquired = False
+    owners = getattr(_ADMISSION_OWNERS, "roots", None)
+    if owners is None:
+        owners = set()
+        _ADMISSION_OWNERS.roots = owners
+    try:
+        try:
+            lock_path = _kb.kanban_home().resolve(strict=True) / "kanban" / ".dispatch-admission.lock"
+            key = (os.getpid(), lock_path)
+            if allow_nested and key in owners:
+                acquired = True
+            else:
+                lock_path.parent.mkdir(exist_ok=True)
+                handle = lock_path.open("a+b")
+                acquired = _try_lock_nb(handle)
+                if acquired:
+                    owners.add(key)
+        except (OSError, AttributeError, ImportError) as exc:
+            _kb._log.warning("kanban dispatch: shared admission lock unavailable; deferring admission: %s", exc)
+        yield acquired
+    finally:
+        if handle is not None:
+            try:
+                if acquired:
+                    owners.discard(key)
+                    _unlock(handle)
+            finally:
+                handle.close()
+
+
+def _claim_connection_is_current(conn: sqlite3.Connection) -> bool:
+    """Under admission, verify both the logical board path and physical file."""
+    path = _main_db_file(conn)
+    if not path:
+        return True  # In-memory databases cannot be archived or replaced.
+    captured = getattr(conn, "_hermes_kanban_file_identity", None)
+    try:
+        if captured is not None:
+            logical = Path(captured[1])
+            physical = Path(path).resolve(strict=True)
+            archived = _kb.boards_root() / "_archived"
+            if (
+                not logical.is_relative_to(archived.absolute())
+                and not physical.is_relative_to(archived.resolve())
+                and logical.resolve(strict=True) == physical
+            ):
+                info = physical.stat()
+                identity = (
+                    str(_kb.kanban_home().resolve(strict=True)),
+                    str(logical), info.st_dev, info.st_ino,
+                )
+                if captured == identity:
+                    return True
+    except OSError:
+        pass
+    _kb._log.warning("kanban admission: board connection moved, replaced or unattested; reopen %s", path)
+    return False
+
+
+def _other_board_running_counts(conn: sqlite3.Connection) -> Counter:
+    """Strict read-only inventory under the shared admission lock.
+
+    Scan physical board paths, not pin-collapsed slugs. Legacy archives with
+    unresolved claims require restoration, not permanent live-capacity counts.
+    Never initialize, migrate or repair a sibling DB to measure capacity.
+    """
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
+    current = _main_db_file(conn)
+    if not current:
+        raise OSError("cannot identify the current board database")
+    current_stat = Path(current).stat()
+    seen = {(current_stat.st_dev, current_stat.st_ino): Path(current).resolve(strict=True)}
+    candidates = [_kb.kanban_home() / "kanban.db"]
+    pin = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if pin:
+        candidates.append(Path(pin).expanduser())
+    root = _kb.boards_root()
+    archived_root = root / "_archived"
+    archived_physical = archived_root.resolve()
+    try:
+        root.lstat()
+    except FileNotFoundError:
+        pass  # A fresh default-only root need not have named boards yet.
+    else:
+        for child in root.iterdir():
+            if stat.S_ISDIR(child.stat().st_mode):
+                if child.name == _kb.DEFAULT_BOARD:
+                    continue  # Default metadata lives here; its DB is at the root.
+                if child.name == "_archived":
+                    candidates.extend(
+                        archived / "kanban.db" for archived in child.iterdir()
+                        if stat.S_ISDIR(archived.stat().st_mode)
+                    )
+                else:
+                    candidates.append(child / "kanban.db")
+    counts: Counter = Counter()
+    for path in candidates:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            if pin and path == Path(pin).expanduser():
+                raise OSError(f"pinned board database unavailable: {path}")
+            metadata = (
+                root / "default" / "board.json"
+                if path == _kb.kanban_home() / "kanban.db"
+                else path.parent / "board.json"
+            )
+            try:
+                metadata.lstat()
+            except FileNotFoundError:
+                continue  # No board has been created at this path.
+            raise OSError(f"board database unavailable: {path}")
+        resolved = path.resolve(strict=True)
+        info = resolved.stat()
+        key = (info.st_dev, info.st_ino)
+        archived = (
+            path.absolute().is_relative_to(archived_root.absolute())
+            or resolved.is_relative_to(archived_physical)
+        )
+        if key in seen:
+            # Hard links can have different live WAL sidecars. Choosing one
+            # spelling could miss running rows; symlink/pin aliases resolve alike.
+            if seen[key] != resolved:
+                raise OSError(f"board database has ambiguous hard-link aliases: {resolved}")
+            if not archived:
+                continue
+        seen[key] = resolved
+        with contextlib.closing(connect_tracked(
+            resolved.as_uri() + "?mode=ro", tracking_path=resolved,
+            uri=True, timeout=1.0,
+        )) as other:
+            if archived:
+                if other.execute(
+                    "SELECT 1 FROM tasks WHERE status = 'running' "
+                    "OR claim_lock IS NOT NULL OR current_run_id IS NOT NULL LIMIT 1"
+                ).fetchone():
+                    raise OSError(
+                        f"archived board has unresolved claims; restore its original board path "
+                        f"before dispatch: {path}"
+                    )
+            else:
+                counts.update(dict(other.execute(
+                    "SELECT assignee, COUNT(*) FROM tasks WHERE status = 'running' GROUP BY assignee"
+                )))
+    return counts
 
 
 # Periodic explicit WAL checkpoint from the dispatcher tick: a passive

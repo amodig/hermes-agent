@@ -824,38 +824,69 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
 
 
 def remove_board(slug: str, *, archive: bool = True) -> dict:
-    """Archive (to ``boards/_archived/<slug>-<ts>/``) or delete a board;
-    ``default`` cannot be removed. Returns ``{"slug", "action", "new_path"}``."""
+    """Remove an idle named board; active claims must finish at their pinned path."""
+    from hermes_cli import kanban_db_connect as _kbc
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
     _assert_not_delegated_child_mutation()
     normed = _require_slug(slug)
     if normed == DEFAULT_BOARD:
         raise ValueError("the 'default' board cannot be removed")
-    d = board_dir(normed)
-    if not d.exists():
-        raise ValueError(f"board {normed!r} does not exist")
+    # Share admission with dispatch so preparation cannot race the idle check.
+    with _kbc._dispatch_admission_lock() as held:
+        if not held:
+            raise ValueError("board admission is busy or unavailable; retry after dispatch drains")
+        d = board_dir(normed)
+        if not d.exists():
+            raise ValueError(f"board {normed!r} does not exist")
+        try:
+            database = (d / "kanban.db").resolve(strict=True)
+            with contextlib.closing(connect_tracked(
+                database.as_uri() + "?mode=ro", tracking_path=database, uri=True, timeout=1.0,
+            )) as conn:
+                active = conn.execute(
+                    "SELECT 1 FROM tasks WHERE status = 'running' "
+                    "OR claim_lock IS NOT NULL OR current_run_id IS NOT NULL LIMIT 1"
+                ).fetchone()
+        except (OSError, sqlite3.Error) as exc:
+            raise ValueError(f"cannot inspect board {normed!r}; restore its database before removal") from exc
+        if active:
+            raise ValueError(f"board {normed!r} has active claims; wait for them to finish before removal")
 
-    # If the user removed the currently-active board, revert to default.
-    if get_current_board() == normed:
-        clear_current_board()
-
-    # A concurrent connect() after the rename recreates an empty DB file; drop
-    # the init cache first so the schema pass re-runs on it.
-    _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
-
-    if archive:
-        archive_root = boards_root() / "_archived"
-        archive_root.mkdir(parents=True, exist_ok=True)
-        ts = int(time.time())
-        target = archive_root / f"{normed}-{ts}"
-        suffix = 1
-        while target.exists():  # rapid double-archive
-            target = archive_root / f"{normed}-{ts}-{suffix}"
-            suffix += 1
-        d.rename(target)
-        return {"slug": normed, "action": "archived", "new_path": str(target)}
-    import shutil
-    shutil.rmtree(d)
-    return {"slug": normed, "action": "deleted", "new_path": ""}
+        was_current = get_current_board() == normed
+        initialized_path = str(database)
+        if archive:
+            archive_root = boards_root() / "_archived"
+            archive_root.mkdir(parents=True, exist_ok=True)
+            ts = int(time.time())
+            target = archive_root / f"{normed}-{ts}"
+            suffix = 1
+            while target.exists():
+                target = archive_root / f"{normed}-{ts}-{suffix}"
+                suffix += 1
+            d.rename(target)
+            result = {"slug": normed, "action": "archived", "new_path": str(target)}
+        else:
+            if d.is_symlink():
+                d.unlink()
+            else:
+                import shutil
+                shutil.rmtree(d)
+            result = {"slug": normed, "action": "deleted", "new_path": ""}
+        # Publish metadata changes only after the filesystem operation succeeds.
+        _INITIALIZED_PATHS.discard(initialized_path)
+        if was_current:
+            try:
+                clear_current_board()
+            except OSError as exc:
+                # get_current_board() already ignores markers for missing boards.
+                warning = (
+                    f"Board {normed!r} was {result['action']}, but current-board cleanup failed: {exc}. "
+                    "Fix the selection before reusing this slug."
+                )
+                _log.warning("%s", warning)
+                result["warnings"] = [warning]
+        return result
 
 
 # --- Data classes ---
