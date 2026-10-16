@@ -189,6 +189,11 @@ hermes kanban boards rm atm10-server
 hermes kanban boards rm atm10-server --delete
 ```
 
+Board archive and deletion require an idle board. They take the dispatch
+admission gate and refuse running tasks or open claims before moving/removing
+the database, so workers retain their pinned path and frozen run identity.
+Let work finish naturally; board removal never kills or reclaims it.
+
 Board resolution order (highest precedence first):
 
 1. Explicit `--board <slug>` on the CLI call.
@@ -1153,6 +1158,10 @@ through preparation, claim commit, and grant. Contention or an unavailable
 shared lock defers the whole tick without board writes. This serializes
 preparation, not worker execution; it does not replace native worker admission.
 
+Omitted dispatcher limits inherit configuration. Explicit limits passed by a
+running gateway remain its startup snapshot, including `None` (unlimited);
+editing configuration does not silently change that cached setting.
+
 With a finite per-profile cap, capacity reads are strict and read-only across
 the physical default/named boards, moved archives under `boards/_archived/`,
 and the current/pinned database. A pin cannot hide the other root boards;
@@ -1161,6 +1170,10 @@ because their SQLite WAL sidecars can differ. An unreadable inventory, broken
 database, or missing known board database defers new admission with a warning,
 without charging task failures; existing reclaim/promotion bookkeeping can
 still run. Once a running task finishes, its profile slot is eligible again.
+Legacy archives with unresolved running rows remain conservative capacity
+holds. Restore the archived board to its original path and use normal lifecycle
+recovery before admission; never discard identities or ignore the inventory to
+manufacture a free slot.
 Keep all boards sharing a policy discoverable under that root (a symlink to an
 external database is sufficient); unrelated external pinned databases cannot
 be discovered from another dispatcher's private environment. Use the same

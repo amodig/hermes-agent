@@ -36,6 +36,9 @@ from hermes_platform.host import facts as host_facts
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
 
+# Omission inherits configuration; explicit None preserves cached unlimited settings.
+_CONFIGURED_LIMIT: Any = object()
+
 
 # After this many consecutive non-success attempts on a task/profile the
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
@@ -2494,12 +2497,12 @@ def dispatch_once(
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
     max_spawn: Optional[int] = None,
-    max_in_progress: Optional[int] = None,
+    max_in_progress: Optional[int] = _CONFIGURED_LIMIT,
     failure_limit: int = DEFAULT_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
-    max_in_progress_per_profile: Optional[int] = None,
+    max_in_progress_per_profile: Optional[int] = _CONFIGURED_LIMIT,
     reconcile_orphans: bool = True,
     should_stop: Optional[Callable[[], bool]] = None,
     grant_guard: Optional[Callable[[], Any]] = None,
@@ -2518,9 +2521,9 @@ def dispatch_once(
     _freeze_runtime_identity()
     def _locked_tick() -> DispatchResult:
         nonlocal max_in_progress, max_in_progress_per_profile
-        if max_in_progress is None:
+        if max_in_progress is _CONFIGURED_LIMIT:
             max_in_progress = resolve_max_in_progress(configured_max_in_progress())
-        if max_in_progress_per_profile is None:
+        if max_in_progress_per_profile is _CONFIGURED_LIMIT:
             # Daemon/dashboard callers omit this argument; omission must not
             # bypass the same configured profile policy used by the gateway.
             try:

@@ -824,38 +824,46 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
 
 
 def remove_board(slug: str, *, archive: bool = True) -> dict:
-    """Archive (to ``boards/_archived/<slug>-<ts>/``) or delete a board;
-    ``default`` cannot be removed. Returns ``{"slug", "action", "new_path"}``."""
+    """Remove an idle named board; active claims must finish at their pinned path."""
+    from hermes_cli import kanban_db_connect as _kbc
+
     _assert_not_delegated_child_mutation()
     normed = _require_slug(slug)
     if normed == DEFAULT_BOARD:
         raise ValueError("the 'default' board cannot be removed")
-    d = board_dir(normed)
-    if not d.exists():
-        raise ValueError(f"board {normed!r} does not exist")
+    # Share admission with dispatch so preparation cannot race the idle check.
+    with _kbc._dispatch_admission_lock() as held:
+        if not held:
+            raise ValueError("board admission is busy or unavailable; retry after dispatch drains")
+        d = board_dir(normed)
+        if not d.exists():
+            raise ValueError(f"board {normed!r} does not exist")
+        with _kbc.connect_closing(d / "kanban.db") as conn:
+            active = conn.execute(
+                "SELECT 1 FROM tasks WHERE status = 'running' "
+                "OR claim_lock IS NOT NULL OR current_run_id IS NOT NULL LIMIT 1"
+            ).fetchone()
+        if active:
+            raise ValueError(f"board {normed!r} has active claims; wait for them to finish before removal")
 
-    # If the user removed the currently-active board, revert to default.
-    if get_current_board() == normed:
-        clear_current_board()
-
-    # A concurrent connect() after the rename recreates an empty DB file; drop
-    # the init cache first so the schema pass re-runs on it.
-    _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
-
-    if archive:
-        archive_root = boards_root() / "_archived"
-        archive_root.mkdir(parents=True, exist_ok=True)
-        ts = int(time.time())
-        target = archive_root / f"{normed}-{ts}"
-        suffix = 1
-        while target.exists():  # rapid double-archive
-            target = archive_root / f"{normed}-{ts}-{suffix}"
-            suffix += 1
-        d.rename(target)
-        return {"slug": normed, "action": "archived", "new_path": str(target)}
-    import shutil
-    shutil.rmtree(d)
-    return {"slug": normed, "action": "deleted", "new_path": ""}
+        if get_current_board() == normed:
+            clear_current_board()
+        # Drop the cache before removal so a later connect initializes its new DB.
+        _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
+        if archive:
+            archive_root = boards_root() / "_archived"
+            archive_root.mkdir(parents=True, exist_ok=True)
+            ts = int(time.time())
+            target = archive_root / f"{normed}-{ts}"
+            suffix = 1
+            while target.exists():
+                target = archive_root / f"{normed}-{ts}-{suffix}"
+                suffix += 1
+            d.rename(target)
+            return {"slug": normed, "action": "archived", "new_path": str(target)}
+        import shutil
+        shutil.rmtree(d)
+        return {"slug": normed, "action": "deleted", "new_path": ""}
 
 
 # --- Data classes ---

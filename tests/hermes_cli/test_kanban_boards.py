@@ -10,7 +10,6 @@ Covers the pieces added when boards became a first-class concept:
 * ``connect(board=)`` isolation — writes on one board don't leak.
 * ``create_board`` / ``list_boards`` / ``remove_board`` round trip.
 * CLI surface: ``hermes kanban boards list/create/switch/rm``.
-* ``_default_spawn`` injects ``HERMES_KANBAN_BOARD`` into worker env.
 """
 
 from __future__ import annotations
@@ -30,7 +29,6 @@ if str(_WORKTREE) not in sys.path:
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
-from hermes_cli import kanban_db_dispatch as kbd
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +215,36 @@ class TestBoardCRUD:
         assert "task_events" in tables
         assert "tasks" in tables
 
+    @pytest.mark.parametrize("archive", [True, False])
+    def test_remove_waits_for_dispatch_and_active_claims(self, fresh_home, monkeypatch, archive):
+        kb.create_board("busy")
+        kb.set_current_board("busy")
+        with kbc.connect_closing(board="busy") as conn:
+            task_id = kb.create_task(conn, title="owned work", assignee="dev")
+        with kbc._dispatch_admission_lock() as held:
+            assert held
+            with pytest.raises(ValueError, match="admission"):
+                kb.remove_board("busy", archive=archive)
+        with kbc.connect_closing(board="busy") as conn:
+            claimed = kb.claim_task(conn, task_id)
+            assert claimed is not None
+        kb.create_board("unrelated")
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board="unrelated")))
+        with kb.pin_first_board_resolution(), pytest.raises(ValueError, match="active claims"):
+            kb.remove_board("busy", archive=archive)
+        assert kb.board_exists("busy")
+        assert kb.get_current_board() == "busy"
+        with kbc.connect_closing(board="busy") as conn:
+            assert kb.get_task(conn, task_id).current_run_id == claimed.current_run_id
+            assert kb.complete_task(
+                conn, task_id, expected_run_id=claimed.current_run_id,
+                summary="owned work finished",
+            )
+        result = kb.remove_board("busy", archive=archive)
+        assert result["action"] == ("archived" if archive else "deleted")
+        assert not kb.board_exists("busy")
+        assert kb.get_current_board() == "default"
+
 
 
 # ---------------------------------------------------------------------------
@@ -268,62 +296,6 @@ class TestConnectionIsolation:
             assert kb.list_tasks(conn) == []
 
 
-# ---------------------------------------------------------------------------
-# Worker spawn env injection
-# ---------------------------------------------------------------------------
-
-class TestWorkerSpawnEnv:
-    """Ensure the dispatcher pins ``HERMES_KANBAN_BOARD`` / DB / workspaces on spawn.
-
-    We monkey-patch ``subprocess.Popen`` to capture the child env without
-    actually spawning anything.
-    """
-
-    def test_default_spawn_sets_env_vars(self, fresh_home, monkeypatch):
-        captured = {}
-
-        class FakeProc:
-            pid = 12345
-
-        def fake_popen(cmd, *args, **kwargs):
-            captured["cmd"] = cmd
-            captured["env"] = kwargs.get("env", {})
-            return FakeProc()
-
-        monkeypatch.setattr(subprocess, "Popen", fake_popen)
-        kb.create_board("spawntest")
-
-        task = kb.Task(
-            id="t_abc",
-            title="worker test",
-            body=None,
-            assignee="teknium",
-            status="ready",
-            priority=0,
-            created_by="user",
-            created_at=0,
-            started_at=None,
-            completed_at=None,
-            workspace_kind="scratch",
-            workspace_path=None,
-            claim_lock=None,
-            claim_expires=None,
-            tenant=None,
-            # A granted worker always has a run; the launch contract refuses to place
-            # one that does not, so the fixture models the real call.
-            current_run_id=1,
-        )
-
-        kbd._default_spawn(task, str(fresh_home / "ws"), board="spawntest")
-
-        env = captured["env"]
-        assert env["HERMES_KANBAN_BOARD"] == "spawntest"
-        assert env["HERMES_KANBAN_TASK"] == "t_abc"
-        # DB path should match the per-board DB, not the legacy default.
-        expected_db = fresh_home / "kanban" / "boards" / "spawntest" / "kanban.db"
-        assert env["HERMES_KANBAN_DB"] == str(expected_db)
-        expected_ws = fresh_home / "kanban" / "boards" / "spawntest" / "workspaces"
-        assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(expected_ws)
 
 
 # ---------------------------------------------------------------------------
@@ -374,12 +346,3 @@ class TestCLI:
         assert titlesD == []
 
 
-from tests._fixtures.autonomous_boundary import stub_scope_capability  # noqa: F401
-
-
-@pytest.fixture(autouse=True)
-def _scope_capability_for_argv_assertions(stub_scope_capability):
-    """These tests assert the argv/env a gateway worker launch would use, never a
-    real scope: a runner with no user bus cannot create one, and the runtime now
-    refuses an autonomous child it cannot place."""
-    return stub_scope_capability

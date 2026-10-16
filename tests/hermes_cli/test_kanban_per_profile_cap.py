@@ -129,9 +129,11 @@ def test_shared_root_profile_admission_and_release(
     with kbc.connect_closing(board="board-a") as first:
         running = kb.create_task(first, title="running alpha", assignee="alpha")
         assert kb.claim_task(first, running) is not None
-    # An archive still owns its running task, even after the DB moves.
-    archived = kb.remove_board("board-a", archive=True)
-    first_path = Path(archived["new_path"]) / "kanban.db"
+    # Simulate a legacy archive created before active-board removal was guarded.
+    archived = kb.boards_root() / "_archived" / "board-a-legacy"
+    archived.parent.mkdir()
+    kb.board_dir("board-a").rename(archived)
+    first_path = archived / "kanban.db"
     alias_dir = kb.boards_root() / "alias"
     alias_dir.mkdir()
     (alias_dir / "kanban.db").symlink_to(first_path)
@@ -330,3 +332,31 @@ def test_cross_process_gate_covers_preparation_until_claim_and_grant(
                 process.join(timeout=30)
         output.close()
         output.join_thread()
+
+
+@pytest.mark.parametrize("limits,expected", [
+    ({}, {"alpha": 0, "beta": 1}),
+    ({"max_in_progress": None, "max_in_progress_per_profile": None}, {"alpha": 2, "beta": 2}),
+    ({"max_in_progress": 3, "max_in_progress_per_profile": 2}, {"alpha": 1, "beta": 1}),
+])
+def test_omitted_limits_inherit_config_but_explicit_cached_limits_do_not(
+    isolated_kanban_home_with_profiles, limits, expected,
+):
+    kb = isolated_kanban_home_with_profiles
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    kb.create_board("busy")
+    kb.create_board("ready")
+    with kbc.connect_closing(board="busy") as conn:
+        task = kb.create_task(conn, title="running alpha", assignee="alpha")
+        assert kb.claim_task(conn, task) is not None
+    (kb.kanban_home() / "config.yaml").write_text(
+        "kanban:\n  max_in_progress: 2\n  max_in_progress_per_profile: 1\n",
+    )
+    with kbc.connect_closing(board="ready") as conn:
+        for profile in ("alpha", "alpha", "beta", "beta"):
+            kb.create_task(conn, title=profile, assignee=profile)
+        result = kbd.dispatch_once(conn, board="ready", dry_run=True, **limits)
+    assignees = [profile for _, profile, _ in result.spawned]
+    assert {profile: assignees.count(profile) for profile in expected} == expected
