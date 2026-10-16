@@ -106,24 +106,42 @@ class TestGitTrampolineSelfHeal:
         assert result == git_cmd
         run.assert_not_called()
 
-    def test_portable_git_candidates_check_shared_root_first(self, tmp_path, monkeypatch):
-        # Profile-scoped layout: HERMES_HOME = <root>/profiles/foo, but the
-        # PortableGit tree lives under the SHARED root (monerostar review on
-        # #88136). The candidate list must check get_default_hermes_root()
-        # before the profile home.
+    @pytest.mark.parametrize("arch", ["ucrt64", "clangarm64", "mingw64", "mingw32"])
+    @pytest.mark.parametrize("location", ["standard", "shared", "profile"])
+    def test_locator_finds_supported_layout(self, tmp_path, monkeypatch, arch, location):
+        from pathlib import Path
+
         import hermes_constants
-        from hermes_cli.update_cmd_git import _portable_git_candidates
+        from hermes_cli import update_cmd_git
 
         root = tmp_path / "root"
-        profile_home = root / "profiles" / "foo"
-
+        profile = root / "profiles" / "foo"
         monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda: root)
-        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: profile_home)
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: profile)
+        base = {
+            "standard": Path(r"C:\Program Files") / "Git",
+            "shared": root / "git",
+            "profile": profile / "git",
+        }[location]
+        real = base / arch / "libexec" / "git-core" / "git.exe"
+        monkeypatch.setattr(Path, "exists", lambda path: path == real)
+        monkeypatch.setattr(update_cmd_git, "_probe_fork_bomb", lambda argv: False)
 
-        candidates = _portable_git_candidates()
-        assert candidates[0] == (
-            root / "git" / "mingw64" / "libexec" / "git-core" / "git.exe"
-        )
-        assert candidates[1] == (
-            profile_home / "git" / "mingw64" / "libexec" / "git-core" / "git.exe"
-        )
+        assert update_cmd_git._locate_real_git() == real
+
+    def test_portable_git_prefers_shared_root(self, tmp_path, monkeypatch):
+        import hermes_constants
+        from hermes_cli import update_cmd_git
+
+        root = tmp_path / "root"
+        profile = root / "profiles" / "foo"
+        monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda: root)
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: profile)
+        shared = root / "git" / "mingw64" / "libexec" / "git-core" / "git.exe"
+        scoped = profile / "git" / "ucrt64" / "libexec" / "git-core" / "git.exe"
+        for binary in (shared, scoped):
+            binary.parent.mkdir(parents=True)
+            binary.touch()
+        monkeypatch.setattr(update_cmd_git, "_probe_fork_bomb", lambda argv: False)
+
+        assert update_cmd_git._locate_real_git() == shared

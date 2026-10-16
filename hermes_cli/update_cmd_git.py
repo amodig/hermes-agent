@@ -448,9 +448,13 @@ def _git_is_trampoline(git_cmd: list) -> bool:
     report False so a probe failure can't block an update.
 
     Git for Windows ships two ~46KB shims (``bin\\git.exe``, ``cmd\\git.exe``) that re-exec the real
-    ``mingw64\\libexec\\git-core\\git.exe``. See #87876.
+    ``<toolchain>\\libexec\\git-core\\git.exe``. See #87876.
     """
     return _probe_fork_bomb(git_cmd) is True
+
+
+# Git for Windows 2.56 moved x64 from mingw64 to ucrt64; older installs remain supported.
+_GIT_WINDOWS_TOOLCHAINS = ("ucrt64", "clangarm64", "mingw64", "mingw32")
 
 
 def _portable_git_candidates() -> list:
@@ -464,7 +468,11 @@ def _portable_git_candidates() -> list:
     from hermes_constants import get_default_hermes_root, get_hermes_home
     candidates = []
     with suppress(Exception):
-        candidates += [root / "git" / "mingw64" / "libexec" / "git-core" / "git.exe" for root in (get_default_hermes_root(), Path(get_hermes_home()))]
+        candidates += [
+            root / "git" / arch / "libexec" / "git-core" / "git.exe"
+            for root in (get_default_hermes_root(), Path(get_hermes_home()))
+            for arch in _GIT_WINDOWS_TOOLCHAINS
+        ]
     return candidates
 
 
@@ -474,13 +482,13 @@ def _locate_real_git() -> Optional[Path]:
     fetch-failure ZIP fallback handle it. A failed probe (None) disqualifies a candidate like a guard hit.
 
     The trampoline symptom is PATH-level: ``bin\\git.exe`` / ``cmd\\git.exe`` (both ~46KB shims) fail to
-    re-exec git-core, while the real binary at ``mingw64\\libexec\\git-core\\git.exe`` (≈4.4MB) works when
+    re-exec git-core, while the real binary at ``<toolchain>\\libexec\\git-core\\git.exe`` works when
     invoked directly (#87876).
     """
     candidates = [
         Path(base) / "Git" / arch / "libexec" / "git-core" / "git.exe"
         for base in (r"C:\Program Files", r"C:\Program Files (x86)")
-        for arch in ("clangarm64", "mingw64", "mingw32")
+        for arch in _GIT_WINDOWS_TOOLCHAINS
     ] + _portable_git_candidates()
     return next((c for c in candidates if c.exists() and _probe_fork_bomb([str(c)]) is False), None)
 
