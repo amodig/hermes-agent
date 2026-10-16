@@ -7,7 +7,6 @@ import json
 import os
 import signal
 import shutil
-import sqlite3
 import subprocess
 import sys
 import sysconfig
@@ -625,11 +624,7 @@ def _assert_worker_and_claim_survive_dispatcher_exit_and_shared_install_replacem
     workspace, _task = worker_setup
     base = workspace.parent
     database = base / "restart.db"
-    conn = sqlite3.connect(database)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(kb.SCHEMA_SQL)
-    kb._ensure_lifecycle_schema(conn)
-    kb._ensure_goal_revision_schema(conn)
+    conn = kbc.connect(database)
     task_id = kb.create_task(
         conn, title="restart survivor", assignee="coder", initial_status="blocked",
         workspace_kind="scratch", workspace_path=str(workspace),
@@ -649,12 +644,13 @@ def _assert_worker_and_claim_survive_dispatcher_exit_and_shared_install_replacem
     )
     generations.cleanup_runtime_generation(warm.root, force=True)
     script = """
-import faulthandler, json, os, sqlite3, sys
+import faulthandler, json, os, sys
 from pathlib import Path
 from unittest.mock import patch
 from hermes_cli import kanban_runtime_generation as generations
 generations._runtime_storage_root = lambda: Path(sys.argv[2])
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_connect as kbc
 from tests.hermes_cli.kanban_conformance_fixture import _prepare_fixture_generation
 from tools import autonomous_resources as _ar, process_registry as _pr
 # Host policy is stubbed in this child for the same reason as the parent fixture:
@@ -664,8 +660,7 @@ _ar.check_autonomous_worker = lambda pid, **_kw: {'worker_cgroup': '/fixture/her
 base = Path(sys.argv[1])
 stack_log = open(base / 'dispatcher-stack.log', 'w')
 faulthandler.dump_traceback_later(20, file=stack_log)
-conn = sqlite3.connect(base / 'restart.db')
-conn.row_factory = sqlite3.Row
+conn = kbc.connect(base / 'restart.db')
 with patch.object(kbd, '_profile_exists_fn', return_value=None), patch.object(
     kbd, '_restart_safe_worker_argv', side_effect=lambda task, command, preparation_id=None: command,
 ), patch.object(generations, 'prepare_runtime_generation', side_effect=lambda expected, workspace=None, profile_home=None, project_plugins_enabled=None: _prepare_fixture_generation(base / 'install', workspace=workspace, profile_home=profile_home, project_plugins_enabled=project_plugins_enabled)):
@@ -894,11 +889,7 @@ def test_worker_survives_a_real_user_service_restart(tmp_path, monkeypatch):
             # Claim the card BEFORE the restart so the assertion below is about a
             # claim that genuinely spans it, not a claim created afterwards.
             monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
-            conn = sqlite3.connect(base / "restart.db")
-            conn.row_factory = sqlite3.Row
-            conn.executescript(kb.SCHEMA_SQL)
-            kb._ensure_lifecycle_schema(conn)
-            kb._ensure_goal_revision_schema(conn)
+            conn = kbc.connect(base / "restart.db")
             task_id = kb.create_task(
                 conn, title="granted worker", assignee="coder", initial_status="blocked",
                 workspace_kind="scratch", workspace_path=str(base),
