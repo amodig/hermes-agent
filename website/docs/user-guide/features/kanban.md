@@ -829,6 +829,24 @@ hermes kanban set-model t_abcd none    # clear the override
 
 The dispatcher spawns the worker with the pinned model (`--provider <name>` is passed when set; `--provider` requires a model). The dashboard's per-task model dropdown drives the same `model_override` field. With no override, the worker uses its profile's configured model.
 
+### Per-task reasoning effort
+
+Pin a card's worker to a specific reasoning depth, independent of the assignee profile's own setting and of any per-model `reasoning_overrides` entry:
+
+```bash
+# At creation
+hermes kanban create "hard refactor" --assignee coder --reasoning xhigh
+
+# Or later — takes effect on the next dispatch
+hermes kanban update t_abcd --expected-version 3 --reason "pin depth" --reasoning xhigh
+hermes kanban update t_abcd --expected-version 4 --reason "think less" --reasoning none
+hermes kanban update t_abcd --expected-version 5 --reason "inherit again" --clear-reasoning
+```
+
+Accepted levels are `none` (thinking off), `minimal`, `low`, `medium`, `high`, `xhigh`, `max` and `ultra`, case-insensitive; any other value is refused before the card changes. `none` is a real level rather than a clear, which is why clearing has its own flag — the `kanban_update` tool takes `clear_reasoning_effort: true`, and `reasoning_effort: null` also means inherit. The dispatcher passes the pin to the worker as `--reasoning <level>`, which outranks both the profile-wide and per-model reasoning settings; a provider that cannot express the level may still clamp it in transport.
+
+Pinning effort is routing, not a goal change: it never creates a goal revision, and the same atomic rules apply — a stale `--expected-version` or a card claimed by a running worker is refused. The `claimed` event records the level requested at that claim (bound to the run), so later card edits or completion metadata cannot rewrite what a finished run asked for.
+
 ### Cost strategy: frontier orchestrator, inexpensive workers
 
 Kanban's per-profile configs make the planner/worker cost split natural. Decomposing a project into well-scoped cards takes frontier-level judgment; executing a card that already carries a clear goal, context, and handoff evidence usually doesn't — and the workers are where the vast majority of tokens are spent, so the worker model is where the cost lives. Run your orchestrator/dispatcher profile on a frontier model and point worker profiles at inexpensive models. Each profile has its own `config.yaml` under `~/.hermes/profiles/<name>/`, and the dispatcher injects the profile-scoped `HERMES_HOME` when it spawns `hermes -p <assignee>`, so each worker reads its own profile's model settings:
@@ -1100,6 +1118,7 @@ hermes kanban create "<title>" [--body ...] [--assignee <profile>]
                                 [--priority N] [--triage] [--idempotency-key KEY]
                                 [--max-runtime 30m|2h|1d|<seconds>]
                                 [--max-retries N]
+                                [--reasoning none|minimal|low|medium|high|xhigh|max|ultra]
                                 [--goal] [--goal-max-turns N]
                                 [--skill <name>]...
                                 [--json]
