@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import threading
 from pathlib import Path
@@ -574,3 +575,150 @@ def test_supersede_candidate_cli_rejects_worker_context(
         assert list(conn.iterdump()) == quarantined
 
 
+
+# ---------------------------------------------------------------------------
+# Per-task reasoning effort (#58): native create/update/readback + provenance
+# ---------------------------------------------------------------------------
+
+
+def test_create_reasoning_flag_pins_effort_and_audits_it(kanban_home):
+    payload = json.loads(
+        kc.run_slash("create 'pin effort' --assignee alice --reasoning XHIGH --json")
+    )
+    assert payload["reasoning_effort"] == "xhigh"
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, payload["id"])
+        created = [e for e in kb.list_events(conn, task.id) if e.kind == "created"]
+    assert task.reasoning_effort == "xhigh"
+    assert created[-1].payload["reasoning_effort"] == "xhigh"
+
+
+def test_update_reasoning_is_audited_cas_without_a_goal_revision(kanban_home):
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="effort card", assignee="alice")
+        before = kb.get_task(conn, tid)
+
+    kc.run_slash(
+        f"update {tid} --expected-version {before.version} "
+        "--reason 'pin task effort' --reasoning xhigh"
+    )
+
+    with kbc.connect_closing() as conn:
+        after = kb.get_task(conn, tid)
+        event = [e for e in kb.list_events(conn, tid) if e.kind == "updated"][-1]
+    assert after.reasoning_effort == "xhigh"
+    assert after.version == before.version + 1
+    # Routing, not the goal: no new immutable goal revision.
+    assert after.goal_revision_id == before.goal_revision_id
+    assert event.payload["old"]["reasoning_effort"] is None
+    assert event.payload["new"]["reasoning_effort"] == "xhigh"
+    assert "reasoning_effort" in event.payload["changed_fields"]
+
+
+def test_update_reasoning_stores_the_normalized_level(kanban_home):
+    """A caller's spelling must land canonically, and not read as a change."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="effort card", assignee="alice")
+
+    with kbc.connect_closing() as conn:
+        version = kb.get_task(conn, tid).version
+    kc.run_slash(f"update {tid} --expected-version {version} --reason pin --reasoning ' XHIGH '")
+    with kbc.connect_closing() as conn:
+        after = kb.get_task(conn, tid)
+        event = [e for e in kb.list_events(conn, tid) if e.kind == "updated"][-1]
+    assert after.reasoning_effort == "xhigh"
+    assert event.payload["new"]["reasoning_effort"] == "xhigh"
+
+    # Repinning the same canonical level is not a change of that field.
+    kc.run_slash(
+        f"update {tid} --expected-version {after.version} --reason repin --reasoning xhigh"
+    )
+    with kbc.connect_closing() as conn:
+        repeat = [e for e in kb.list_events(conn, tid) if e.kind == "updated"][-1]
+    assert "reasoning_effort" not in repeat.payload["changed_fields"]
+
+
+def test_update_reasoning_none_is_a_level_and_clear_is_explicit(kanban_home):
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(
+            conn, title="effort card", assignee="alice", reasoning_effort="high",
+        )
+
+    def effort_after(*flags):
+        with kbc.connect_closing() as conn:
+            version = kb.get_task(conn, tid).version
+        kc.run_slash(f"update {tid} --expected-version {version} --reason route {' '.join(flags)}")
+        with kbc.connect_closing() as conn:
+            return kb.get_task(conn, tid).reasoning_effort
+
+    assert effort_after("--reasoning", "none") == "none"
+    # Omission keeps the stored pin; the model pin stays an independent field.
+    assert effort_after("--title", "renamed") == "none"
+    # Explicit clear wins over a supplied level.
+    assert effort_after("--reasoning", "xhigh", "--clear-reasoning") is None
+
+
+def test_update_reasoning_refusals_leave_the_card_untouched(kanban_home):
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(
+            conn, title="effort card", assignee="alice", reasoning_effort="high",
+        )
+        version = kb.get_task(conn, tid).version
+
+    invalid = kc.run_slash(
+        f"update {tid} --expected-version {version} --reason r --reasoning turbo"
+    )
+    assert "reasoning_effort" in invalid
+    stale = kc.run_slash(
+        f"update {tid} --expected-version {version + 5} --reason r --reasoning xhigh"
+    )
+    assert "conflict" in stale
+    with kbc.connect_closing() as conn:
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+    claimed = kc.run_slash(
+        f"update {tid} --expected-version {version} --reason r --reasoning xhigh"
+    )
+    assert "claimed by a worker" in claimed
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).reasoning_effort == "high"
+
+
+def test_claimed_event_records_requested_effort_and_stays_frozen(kanban_home):
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(
+            conn, title="claim pin", assignee="alice", reasoning_effort="xhigh",
+        )
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        run_id = kb.get_task(conn, tid).current_run_id
+        claimed = [e for e in kb.list_events(conn, tid) if e.kind == "claimed"][-1]
+        assert (claimed.run_id, claimed.payload["reasoning_effort"]) == (run_id, "xhigh")
+        assert kb.complete_task(
+            conn, tid, result="finished", metadata={"reasoning_effort": "low"},
+        )
+        version = kb.get_task(conn, tid).version
+        assert kb.update_task(
+            conn, tid, expected_version=version, reason="later edit",
+            reasoning_effort="low",
+        )
+        frozen = [e for e in kb.list_events(conn, tid) if e.kind == "claimed"][-1]
+        task = kb.get_task(conn, tid)
+    # The later card edit moved the pin; the run-bound claim record did not.
+    assert task.reasoning_effort == "low"
+    assert (frozen.id, frozen.run_id) == (claimed.id, run_id)
+    assert frozen.payload["reasoning_effort"] == "xhigh"
+
+
+def test_effort_is_part_of_the_claim_snapshot_fence(kanban_home):
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="fence", assignee="alice")
+        preflight = kb.get_task(conn, tid)
+        # The card is pinned between the dispatcher's preflight read and its claim.
+        stale = dataclasses.replace(preflight, reasoning_effort="xhigh")
+        assert kb.claim_task(conn, tid, claimer="worker", expected_task=stale) is None
+        rejected = [e for e in kb.list_events(conn, tid) if e.kind == "claim_rejected"]
+        assert rejected[-1].payload["reason"] == "dispatch_snapshot_changed"
+        assert kb.get_task(conn, tid).current_run_id is None
+        current = kb.get_task(conn, tid)
+        assert current.status == "ready"
+        # The same claim against the current card is granted.
+        assert kb.claim_task(conn, tid, claimer="worker", expected_task=current) is not None

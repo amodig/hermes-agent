@@ -202,3 +202,39 @@ def _scope_capability_for_argv_assertions(stub_scope_capability):
     real scope: a runner with no user bus cannot create one, and the runtime now
     refuses an autonomous child it cannot place."""
     return stub_scope_capability
+
+
+def test_worker_effort_pin_reaches_the_real_cli_parser(monkeypatch, tmp_path):
+    """#58: a card's pinned effort must survive profile-wide and per-model settings.
+
+    The reported route (``openai-codex/gpt-6-astra/xhigh``) inherited ``high`` because the
+    spawn argv omitted ``--reasoning``; the profile carries ``high`` both globally and for
+    that model, so only the card's own pin can produce ``xhigh``.
+    """
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    profile.joinpath("config.yaml").write_text(
+        "agent:\n"
+        "  reasoning_effort: high\n"
+        "  reasoning_overrides:\n"
+        "    gpt-6-astra: high\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli._parser import build_top_level_parser
+
+    task = _make_task(kb, assignee="elias")
+    task.model_override = "gpt-6-astra"
+    task.provider_override = "openai-codex"
+    task.reasoning_effort = "xhigh"
+    argv = kbd._worker_argv(task, "elias", profile)
+
+    assert argv[argv.index("--reasoning") + 1] == "xhigh"
+    parser, _subparsers, _chat_parser = build_top_level_parser()
+    args = parser.parse_args(argv[2:])
+    assert (args.model, args.provider, args.reasoning) == ("gpt-6-astra", "openai-codex", "xhigh")

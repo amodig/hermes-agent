@@ -434,12 +434,13 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override version revision goal_revision_id goal_mode lifecycle_contract "
-    "candidate_run_id completion_contract last_failure_error".split())
+    "provider_override reasoning_effort version revision goal_revision_id goal_mode "
+    "lifecycle_contract candidate_run_id completion_contract last_failure_error".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
     "created_at started_at completed_at current_run_id model_override provider_override "
-    "version revision goal_revision_id goal_mode lifecycle_contract candidate_run_id".split())
+    "reasoning_effort version revision goal_revision_id goal_mode lifecycle_contract "
+    "candidate_run_id".split())
 _RUN_FIELDS = tuple("id profile status outcome summary error metadata started_at ended_at".split())
 _COMMENT_FIELDS = ("author", "body", "created_at")
 _EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")
@@ -1244,6 +1245,11 @@ def _handle_create(args: dict, **kw) -> str:
         _parse_bool_arg(args, "goal_mode"))
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
+    reasoning_effort = args.get("reasoning_effort")
+    # ``normalize_reasoning_effort`` stringifies, so a falsey non-string (false, 0, [])
+    # would silently mean "inherit" instead of being refused at the boundary.
+    _check(reasoning_effort is None or isinstance(reasoning_effort, str),
+           "'reasoning_effort' must be a string such as 'xhigh' (omit it to inherit)")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
     with _board(args.get("board")) as (kb, conn):
         from gateway.session_context import get_session_env
@@ -1275,6 +1281,7 @@ def _handle_create(args: dict, **kw) -> str:
             idempotency_key=args.get("idempotency_key"),
             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
             model_override=model_override, provider_override=provider_override,
+            reasoning_effort=reasoning_effort,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             lifecycle_contract=args.get("lifecycle_contract"),
             completion_contract=args.get("completion_contract"),
@@ -1435,6 +1442,11 @@ def _handle_update(args: dict, **kw) -> str:
                  "authorized_pr_urls"):
         if name in args:
             kwargs[name] = args[name]
+    if "clear_reasoning_effort" in args and _parse_bool_arg(args, "clear_reasoning_effort"):
+        kwargs["reasoning_effort"] = None
+    elif "reasoning_effort" in args:
+        # "none" is a real level (thinking off); clearing has its own flag.
+        kwargs["reasoning_effort"] = args["reasoning_effort"]
     if "goal_mode" in args:
         kwargs["goal_mode"] = _parse_bool_arg(args, "goal_mode")
     if "lifecycle_contract" in args:
