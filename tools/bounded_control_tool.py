@@ -627,9 +627,13 @@ def _diagnostics() -> Dict[str, Any]:
     payload["control_service"] = properties
     if properties is None:
         payload["reads"]["control_service"] = f"{CONTROL_UNIT} properties are unreadable"
+    workers_effective = ((payload.get("effective_limits") or {}).get("workers") or {})
+    memory_high, memory_max = _memory_bounds(workers_effective)
     payload["limits"] = {
-        "memory_high": MEMORY_BYTES, "memory_max": MEMORY_BYTES, "memory_swap_max": 0,
+        "memory_high": memory_high, "memory_max": memory_max, "memory_swap_max": 0,
         "tasks_max": TASKS_MAX, "runtime_max_seconds": RUNTIME_MAX_SECONDS,
+        "nominal_memory_bytes": MEMORY_BYTES,
+        "clamped": memory_max != MEMORY_BYTES,
     }
     payload["runtime"] = _runtime_fields()
     payload["next"] = (

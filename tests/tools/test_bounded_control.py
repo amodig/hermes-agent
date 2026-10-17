@@ -364,6 +364,48 @@ def test_bounded_output_and_grant_on_a_proven_launch(monkeypatch):
     assert result["unit"] is None or result["unit"] == bc.CONTROL_UNIT
 
 
+def test_configurator_can_switch_it_on_without_enabling_it(monkeypatch, tmp_path):
+    """Opt-in means reachable from `hermes tools`, never on by default."""
+    from hermes_cli.config import load_config
+    from hermes_cli.tools_config import (
+        CONFIGURABLE_TOOLSETS, _DEFAULT_OFF_TOOLSETS, _get_platform_tools,
+    )
+
+    assert "bounded_control" in {key for key, _label, _desc in CONFIGURABLE_TOOLSETS}
+    assert "bounded_control" in _DEFAULT_OFF_TOOLSETS
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    enabled = _get_platform_tools(load_config(), "cli", include_default_mcp_servers=False)
+    assert "bounded_control" not in enabled
+
+
+def test_diagnostics_report_the_clamped_budget(monkeypatch):
+    """A slice bounded below 512MiB must be reported, not the nominal figure."""
+    bound = 96 * 1024 * 1024
+    monkeypatch.setattr(bc, "check_autonomous_placement", lambda pid=None: {
+        "aggregate": {"unit": "autonomous.slice", "cgroup": "/user.slice/autonomous.slice"},
+        "workers": {"unit": "autonomous-workers.slice",
+                    "cgroup": "/user.slice/autonomous.slice/autonomous-workers.slice"},
+        "worker_slot_occupied": True,
+        "concurrency_hard_max": 2,
+        "worker_scopes": [],
+        "launcher_cgroup": "/user.slice/autonomous.slice/launcher.scope",
+        "aggregate_effective_limits": {"memory.high": bound, "memory.max": bound,
+                                       "memory.swap.max": 0},
+        "workers_effective_limits": {"memory.high": bound, "memory.max": bound,
+                                     "memory.swap.max": 0},
+    })
+    payload = json.loads(bc._handle({"operation": "runtime_diagnostics"}))
+    assert payload["ok"] is True
+    assert payload["limits"]["memory_high"] == bound
+    assert payload["limits"]["memory_max"] == bound
+    assert payload["limits"]["clamped"] is True
+    assert payload["limits"]["nominal_memory_bytes"] == bc.MEMORY_BYTES
+
+
 def test_pre_tool_call_hook_denial_prevents_execution(monkeypatch):
     """A denied mutation never reaches the wrapper: the standard guard runs first."""
     from hermes_cli import plugins as plugin_mod

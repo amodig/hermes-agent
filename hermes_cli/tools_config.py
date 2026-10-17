@@ -80,6 +80,7 @@ CONFIGURABLE_TOOLSETS = [
     ("skills",          "📚 Skills",                    "list, view, manage"),
     ("todo",            "📋 Task Planning",             "todo_list"),
     ("kanban",          "📌 Kanban",                    "opt-in task board tools for this platform"),
+    ("bounded_control", "🎛️  Bounded Control",          "one fixed control operation per call in its own transient service; no worker slot"),
     ("memory",          "💾 Memory",                    "persistent memory across sessions"),
     ("context_engine",  "🧩 Context Engine",            "runtime tools from the active context engine"),
     ("session_search",  "🔎 Session Search",            "search past conversations"),
@@ -107,7 +108,12 @@ def gui_toolset_label(label: str) -> str:
 
 # OFF by default for new installs (still in _HERMES_CORE_TOOLS; the checklist won't pre-select them). x_search
 # auto-enables when xAI creds exist; its check_fn still gates the schema.
-_DEFAULT_OFF_TOOLSETS = {"spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a", "kanban"}
+_DEFAULT_OFF_TOOLSETS = {
+    "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a", "kanban",
+    # Opt-in only: a host without the reviewed autonomous boundary cannot run it, and no
+    # default surface should advertise a tool that always refuses there.
+    "bounded_control",
+}
 
 # Config-only capabilities: provider setup in `hermes tools` (TOOL_CATEGORIES) but not model toolsets — zero
 # schemas, own switch (``stt.enabled``), never in ``platform_toolsets`` or the per-platform checklist.
