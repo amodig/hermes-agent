@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import json
 import socket
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -36,8 +35,10 @@ from tests.fakes.providers.openai_responses import (
     Turn,
 )
 
+# The real boundary, /proc worker liveness and the transient units are Linux-only: route
+# the file through the marker the OS lanes select on, not a host-level skipif.
 pytestmark = [
-    pytest.mark.skipif(not sys.platform.startswith("linux"), reason="/proc worker liveness"),
+    pytest.mark.platforms("linux"),
     pytest.mark.live_system_guard_bypass,  # the harness SIGKILLs its own reparented workers
 ]
 
