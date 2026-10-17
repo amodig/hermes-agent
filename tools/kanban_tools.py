@@ -1246,6 +1246,10 @@ def _handle_create(args: dict, **kw) -> str:
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     reasoning_effort = args.get("reasoning_effort")
+    # ``normalize_reasoning_effort`` stringifies, so a falsey non-string (false, 0, [])
+    # would silently mean "inherit" instead of being refused at the boundary.
+    _check(reasoning_effort is None or isinstance(reasoning_effort, str),
+           "'reasoning_effort' must be a string such as 'xhigh' (omit it to inherit)")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
     with _board(args.get("board")) as (kb, conn):
         from gateway.session_context import get_session_env

@@ -1811,52 +1811,52 @@ def test_supersede_candidate_tool_refuses_missing_board_and_worker_context(
 # ---------------------------------------------------------------------------
 
 
-def test_create_reasoning_effort_reaches_the_card(worker_env):
+def test_effort_create_contract_through_registry(worker_env):
+    """The model-facing create surface: pinned, refused, and never silently inherited."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
-    from tools import kanban_tools as kt
+    from tools.registry import discover_builtin_tools, registry
 
-    out = json.loads(kt._handle_create(
-        {"title": "pinned child", "assignee": "peer", "reasoning_effort": "XHIGH"}))
-    assert out["ok"], out
+    discover_builtin_tools()
+    assert "reasoning_effort" in registry.get_schema(
+        "kanban_create")["parameters"]["properties"]
+
+    created = json.loads(registry.dispatch("kanban_create", {
+        "title": "pinned child", "assignee": "peer", "reasoning_effort": "XHIGH"}))
+    assert created["ok"], created
     with kbc.connect_closing() as conn:
-        assert kb.get_task(conn, out["task_id"]).reasoning_effort == "xhigh"
+        assert kb.get_task(conn, created["task_id"]).reasoning_effort == "xhigh"
 
-
-def test_create_reasoning_effort_rejects_an_invalid_level_without_a_card(worker_env):
-    from hermes_cli import kanban_db as kb
-    from hermes_cli import kanban_db_connect as kbc
-    from tools import kanban_tools as kt
-
-    out = kt._handle_create(
-        {"title": "bad effort", "assignee": "peer", "reasoning_effort": "turbo"})
-    assert "reasoning_effort" in out
+    # A falsey non-string and an unknown level are both refused before any card exists,
+    # so neither can quietly fall back to the profile's effort.
+    for bad in (False, "turbo"):
+        refused = json.loads(registry.dispatch("kanban_create", {
+            "title": "bad effort", "assignee": "peer", "reasoning_effort": bad}))
+        assert "reasoning_effort" in refused["error"], refused
     with kbc.connect_closing() as conn:
         assert [t.id for t in kb.list_tasks(conn) if t.title == "bad effort"] == []
 
 
-def test_update_reasoning_effort_contract_and_clear_precedence(worker_env, monkeypatch):
+def test_effort_update_contract_through_registry(worker_env, monkeypatch):
+    """The model-facing update surface: levels, clear precedence and refusals."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
-    from tools import kanban_tools as kt
-    from tools.registry import registry
+    from tools.registry import discover_builtin_tools, invalidate_check_fn_cache, registry
 
-    assert "reasoning_effort" in registry.get_schema(
-        "kanban_create")["parameters"]["properties"]
+    discover_builtin_tools()
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    invalidate_check_fn_cache()
     assert {"reasoning_effort", "clear_reasoning_effort"} <= set(
         registry.get_schema("kanban_update")["parameters"]["properties"])
 
     with kbc.connect_closing() as conn:
-        tid = kb.create_task(
-            conn, title="effort card", assignee="peer", reasoning_effort="high",
-        )
-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        tid = kb.create_task(conn, title="effort card", assignee="peer")
 
     def update(**args):
         with kbc.connect_closing() as conn:
             version = kb.get_task(conn, tid).version
-        result = json.loads(kt._handle_update(
-            {"task_id": tid, "expected_version": version, "reason": "route", **args}))
+        result = json.loads(registry.dispatch("kanban_update", {
+            "task_id": tid, "expected_version": version, "reason": "route", **args}))
         assert result["ok"], result
         with kbc.connect_closing() as conn:
             return kb.get_task(conn, tid).reasoning_effort
@@ -1867,21 +1867,13 @@ def test_update_reasoning_effort_contract_and_clear_precedence(worker_env, monke
     assert update(clear_reasoning_effort=True) is None
     assert update(reasoning_effort="low", clear_reasoning_effort=True) is None  # clear wins
 
-
-def test_kanban_reasoning_param_spellings_are_rejected_before_mutation(worker_env):
-    from hermes_cli import kanban_db as kb
-    from hermes_cli import kanban_db_connect as kbc
-    from tools.registry import registry
-
+    # An unknown spelling never reaches a mutation, and a falsey non-string is refused.
     with kbc.connect_closing() as conn:
-        tid = kb.create_task(conn, title="effort card", reasoning_effort="high")
         version = kb.get_task(conn, tid).version
-
-    out = registry.dispatch("kanban_update", {
-        "task_id": tid, "expected_version": version, "reason": "typo",
-        "reasoning": "xhigh",
-    })
-    assert "unknown parameter" in str(out), out
+    for payload in ({"reasoning": "xhigh"}, {"reasoning_effort": 0}):
+        out = registry.dispatch("kanban_update", {
+            "task_id": tid, "expected_version": version, "reason": "bad", **payload})
+        assert "error" in str(out), out
     with kbc.connect_closing() as conn:
         task = kb.get_task(conn, tid)
-    assert (task.reasoning_effort, task.version) == ("high", version)
+    assert (task.reasoning_effort, task.version) == (None, version)
