@@ -269,12 +269,20 @@ def _resolve(name: str) -> List[str]:
     return command
 
 
+#: ``check_ancestors`` reports kernel limits under the controller's own names.
+_EFFECTIVE_KEYS = {
+    "MemoryHigh": "memory.high",
+    "MemoryMax": "memory.max",
+    "MemorySwapMax": "memory.swap.max",
+}
+
+
 def _memory_bounds(workers_effective: Mapping[str, Any]) -> Tuple[int, int]:
     """512MiB, clamped down to whatever finite bound the worker slice already carries."""
     bound = MEMORY_BYTES
-    for key in ("MemoryHigh", "MemoryMax"):
+    for systemd_key in ("MemoryHigh", "MemoryMax"):
         try:
-            numeric = int(workers_effective.get(key))
+            numeric = int(workers_effective.get(_EFFECTIVE_KEYS[systemd_key]))
         except (TypeError, ValueError):
             continue
         bound = min(bound, numeric)
@@ -366,7 +374,7 @@ def _read_line(stream, timeout: float) -> Optional[str]:
 
 
 def _verify_launch(
-    readiness: Mapping[str, Any], *, nonce: str, slive: Mapping[str, Any],
+    readiness: Mapping[str, Any], *, nonce: str, placement: Mapping[str, Any],
     memory_high: int, memory_max: int,
 ) -> Optional[str]:
     """Return the refusal reason, or None when the service is exactly where it must be."""
@@ -394,7 +402,7 @@ def _verify_launch(
     if not properties.get("InvocationID"):
         return f"{CONTROL_UNIT} has no InvocationID"
 
-    expected_group = f"{slive['aggregate']['cgroup']}/{CONTROL_UNIT}"
+    expected_group = f"{placement['aggregate']['cgroup']}/{CONTROL_UNIT}"
     if properties.get("ControlGroup") != expected_group:
         return (
             f"{CONTROL_UNIT} runs in {properties.get('ControlGroup')!r}, "
@@ -413,8 +421,12 @@ def _verify_launch(
         return f"effective limits for {expected_group} are unreadable ({exc})"
     for key, expected in (("MemoryHigh", memory_high), ("MemoryMax", memory_max),
                           ("MemorySwapMax", 0)):
-        if int(effective.get(key) or 0) > expected:
-            return f"{CONTROL_UNIT} effective {key} {effective.get(key)} exceeds {expected}"
+        actual = effective.get(_EFFECTIVE_KEYS[key])
+        if actual is None or int(actual) > expected:
+            return (
+                f"{CONTROL_UNIT} effective {key} {actual!r} does not fit the "
+                f"requested {expected}"
+            )
     return None
 
 
@@ -488,7 +500,7 @@ def _run_operation(operation: str, clean: Mapping[str, Any]) -> Dict[str, Any]:
                 refusal = "the service announcement was not JSON"
             else:
                 refusal = _verify_launch(
-                    readiness, nonce=nonce, slive=placement,
+                    readiness, nonce=nonce, placement=placement,
                     memory_high=memory_high, memory_max=memory_max,
                 )
                 if refusal is None:

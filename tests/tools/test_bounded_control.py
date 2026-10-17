@@ -168,13 +168,17 @@ def _stub_launch(monkeypatch, build, *, properties=None, memory=bc.MEMORY_BYTES)
         "concurrency_hard_max": 2,
         "worker_scopes": ["/user.slice/fixture.slice/fixture-workers.slice/hermes-worker-a.scope"],
         "launcher_cgroup": "/user.slice/fixture.slice/launcher.scope",
-        "aggregate_effective_limits": {"MemoryHigh": memory, "MemoryMax": memory, "MemorySwapMax": 0},
-        "workers_effective_limits": {"MemoryHigh": memory, "MemoryMax": memory, "MemorySwapMax": 0},
+        # `check_ancestors` reports kernel limits under the controller's own names.
+        "aggregate_effective_limits": {"memory.high": memory, "memory.max": memory,
+                                       "memory.swap.max": 0},
+        "workers_effective_limits": {"memory.high": memory, "memory.max": memory,
+                                     "memory.swap.max": 0},
     })
     monkeypatch.setattr(bc, "_resolve", lambda name: ["/usr/bin/" + name])
     monkeypatch.setattr(bc, "_unit_properties", lambda: properties)
     monkeypatch.setattr(bc, "check_ancestors", lambda *a, **k: {
-        "effective_limits": {"MemoryHigh": memory, "MemoryMax": memory, "MemorySwapMax": 0},
+        "effective_limits": {"memory.high": memory, "memory.max": memory,
+                             "memory.swap.max": 0},
     })
     monkeypatch.setattr(bc.subprocess, "Popen", lambda argv, **k: build(argv))
     monkeypatch.setattr(bc, "live_contract", lambda: type("C", (), {"aggregate_unit": "fixture.slice"})())
@@ -183,15 +187,15 @@ def _stub_launch(monkeypatch, build, *, properties=None, memory=bc.MEMORY_BYTES)
     )
 
 
-def _properties(**overrides):
+def _properties(*, memory: int = bc.MEMORY_BYTES, **overrides):
     properties = {
         "LoadState": "loaded",
         "ActiveState": "active",
         "MainPID": "4242",
         "InvocationID": "inv-1",
         "ControlGroup": "/user.slice/fixture.slice/hermes-control.service",
-        "MemoryHigh": str(bc.MEMORY_BYTES),
-        "MemoryMax": str(bc.MEMORY_BYTES),
+        "MemoryHigh": str(memory),
+        "MemoryMax": str(memory),
         "MemorySwapMax": "0",
     }
     properties.update(overrides)
@@ -239,6 +243,45 @@ def test_lost_readiness_never_grants_the_payload(monkeypatch):
     result = bc._run_operation("github_status", {"operation": "github_status"})
     assert result["granted"] is False
     assert "never announced readiness" in result["error"]
+
+
+def test_memory_budget_clamps_down_to_a_lower_worker_bound(monkeypatch):
+    """A slice already bounded below 512MiB must not get a wider control service."""
+    fixture_bound = 128 * 1024 * 1024
+    seen = []
+    _stub_launch(
+        monkeypatch,
+        lambda argv: (seen.append(argv), _ready(argv))[1],
+        properties=_properties(memory=fixture_bound),
+        memory=fixture_bound,
+    )
+    result = bc._run_operation("github_status", {"operation": "github_status"})
+    assert result["ok"] is True, result
+    requested = {
+        item.split("=", 1)[0]: item.split("=", 1)[1]
+        for item in seen[0] if item.startswith(("MemoryHigh=", "MemoryMax="))
+    }
+    assert requested == {"MemoryHigh": str(fixture_bound), "MemoryMax": str(fixture_bound)}
+    assert "MemorySwapMax=0" in seen[0]
+
+
+def test_effective_ancestor_over_budget_is_refused(monkeypatch):
+    """A finite ancestor wider than the requested budget refuses the launch."""
+    monkeypatch.setattr(bc, "_unit_properties", lambda: _properties())
+    monkeypatch.setattr(bc, "check_ancestors", lambda *a, **k: {
+        "effective_limits": {"memory.high": bc.MEMORY_BYTES * 2,
+                             "memory.max": bc.MEMORY_BYTES * 2,
+                             "memory.swap.max": 0},
+    })
+    monkeypatch.setattr(
+        "hermes_cli.kanban_runtime.process_start_time", lambda pid: 77, raising=False,
+    )
+    refusal = bc._verify_launch(
+        {"nonce": "n", "pid": 4242, "start_time": 77}, nonce="n",
+        placement={"aggregate": {"cgroup": "/user.slice/fixture.slice"}},
+        memory_high=bc.MEMORY_BYTES, memory_max=bc.MEMORY_BYTES,
+    )
+    assert refusal is not None and "effective" in refusal, refusal
 
 
 def test_bounded_output_and_grant_on_a_proven_launch(monkeypatch):
@@ -415,7 +458,7 @@ def _start_worker_sleeper(boundary, index: int):
 @pytest.mark.live_system_guard_bypass
 def test_control_runs_beside_two_occupied_worker_slots(tmp_path, monkeypatch):
     from tests._fixtures.autonomous_slice import (
-        disposable_boundary, require_free_boundary, require_user_bus,
+        HIGH_BYTES, disposable_boundary, require_free_boundary, require_user_bus,
     )
 
     require_user_bus()
@@ -463,7 +506,10 @@ def test_control_runs_beside_two_occupied_worker_slots(tmp_path, monkeypatch):
             cgroup = next(line.split(" ", 1)[1] for line in lines if line.startswith("cgroup "))
             assert f"/{unit}" in cgroup, cgroup
             memory = next(line.split(" ", 1)[1] for line in lines if line.startswith("memory-max "))
-            assert int(memory) == bc.MEMORY_BYTES, memory
+            # The fixture slice is bounded well below 512MiB, so the control service must
+            # be clamped to the tighter of its high/max bounds rather than widening either.
+            expected_memory = min(bc.MEMORY_BYTES, HIGH_BYTES)
+            assert int(memory) == expected_memory, (memory, expected_memory)
             # The two worker sleepers are untouched by the control operation.
             assert all(sleeper.poll() is None for sleeper in sleepers)
         finally:
