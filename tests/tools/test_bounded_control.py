@@ -382,6 +382,36 @@ def test_configurator_can_switch_it_on_without_enabling_it(monkeypatch, tmp_path
     assert "bounded_control" not in enabled
 
 
+def test_diagnostics_fallback_keeps_the_effective_limits(monkeypatch):
+    """A caller outside the aggregate still gets the slice's real bound, not 512MiB."""
+    bound = 72 * 1024 * 1024
+    inventory = {
+        "aggregate": {"unit": "autonomous.slice", "cgroup": "/user.slice/autonomous.slice"},
+        "workers": {"unit": "autonomous-workers.slice",
+                    "cgroup": "/user.slice/autonomous.slice/autonomous-workers.slice"},
+        "worker_slot_occupied": True,
+        "concurrency_hard_max": 2,
+        "worker_scopes": [],
+        "aggregate_effective_limits": {"memory.high": bound, "memory.max": bound,
+                                       "memory.swap.max": 0},
+        "workers_effective_limits": {"memory.high": bound, "memory.max": bound,
+                                     "memory.swap.max": 0},
+    }
+
+    def _placement(*, pid=None):
+        if pid is None:
+            return inventory
+        raise __import__("tools.autonomous_resources", fromlist=["x"]).AutonomousResourceUnavailable(
+            "launcher is outside the aggregate")
+
+    monkeypatch.setattr(bc, "check_autonomous_placement", _placement)
+    payload = json.loads(bc._handle({"operation": "runtime_diagnostics"}))
+    assert payload["ok"] is True
+    assert payload["caller"]["placement_ok"] is False
+    assert payload["limits"]["memory_max"] == bound
+    assert payload["limits"]["clamped"] is True
+
+
 def test_diagnostics_report_the_clamped_budget(monkeypatch):
     """A slice bounded below 512MiB must be reported, not the nominal figure."""
     bound = 96 * 1024 * 1024

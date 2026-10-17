@@ -620,6 +620,12 @@ def _diagnostics() -> Dict[str, Any]:
             payload["worker_slot_occupied"] = inventory["worker_slot_occupied"]
             payload["concurrency_hard_max"] = inventory["concurrency_hard_max"]
             payload["worker_scopes"] = list(inventory["worker_scopes"])[:10]
+            # The caller's own placement failed, but the host inventory still carries the
+            # effective limits the launcher would clamp to: report them, not the nominal.
+            payload["effective_limits"] = {
+                "aggregate": inventory["aggregate_effective_limits"],
+                "workers": inventory["workers_effective_limits"],
+            }
         except Exception as inventory_error:  # noqa: BLE001
             payload["reads"]["inventory"] = str(inventory_error)
 
