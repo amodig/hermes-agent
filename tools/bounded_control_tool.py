@@ -210,7 +210,7 @@ def _wrapper() -> Path:
         raise _Refuse(f"{path} is unavailable ({exc}); refusing to fall back to plain gh") from exc
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
         raise _Refuse(f"{path} must be a regular file, never a symlink or special file")
-    if metadata.st_uid != os.getuid():
+    if metadata.st_uid != os.getuid():  # windows-footgun: ok — non-Linux is refused before launch
         raise _Refuse(f"{path} is not owned by the current user")
     if metadata.st_mode & 0o022:
         raise _Refuse(f"{path} must not be group/other writable")

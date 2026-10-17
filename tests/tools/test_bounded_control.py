@@ -103,11 +103,11 @@ def test_unsafe_wrapper_is_refused(shape, tmp_path, monkeypatch):
     (home / ".local" / "bin").mkdir(parents=True)
     wrapper = home / ".local" / "bin" / "hermes-github"
     if shape == "symlink":
-        (home / ".local" / "bin" / "gh-real").write_text("#!/bin/sh\nexit 0\n")
+        (home / ".local" / "bin" / "gh-real").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         os.chmod(home / ".local" / "bin" / "gh-real", 0o755)
         wrapper.symlink_to(home / ".local" / "bin" / "gh-real")
     elif shape == "group-writable":
-        wrapper.write_text("#!/bin/sh\nexit 0\n")
+        wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         os.chmod(wrapper, 0o775)
     monkeypatch.setattr(bc.Path, "home", classmethod(lambda cls: home))
     if shape == "missing":
@@ -560,10 +560,10 @@ def test_control_runs_beside_two_occupied_worker_slots(tmp_path, monkeypatch):
             )
             _, caller_err = caller.communicate(timeout=180)
             assert caller.returncode == 0, caller_err
-            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result = json.loads(result_path.read_text(encoding="utf-8-sig"))
             assert result["ok"] is True, result
             assert result["granted"] is True
-            lines = witness.read_text(encoding="utf-8").splitlines()
+            lines = witness.read_text(encoding="utf-8-sig").splitlines()
             assert any(line.startswith("start ") for line in lines), lines
             cgroup = next(line.split(" ", 1)[1] for line in lines if line.startswith("cgroup "))
             assert f"/{unit}" in cgroup, cgroup
@@ -607,9 +607,9 @@ def test_single_flight_withheld_grant_and_native_teardown(tmp_path, monkeypatch)
             )
             _, err = caller.communicate(timeout=120)
             assert withheld.exists(), err.decode("utf-8", "replace")[-2000:]
-            result = json.loads(withheld.read_text(encoding="utf-8"))
+            result = json.loads(withheld.read_text(encoding="utf-8-sig"))
             assert result["granted"] is False and result["ok"] is False, result
-            assert not witness.exists(), witness.read_text(encoding="utf-8")
+            assert not witness.exists(), witness.read_text(encoding="utf-8-sig")
             assert _await_terminal(unit) in TERMINAL_STATES
 
             # 2. A race admits exactly one wrapper; the loser never disturbs the winner.
@@ -625,9 +625,9 @@ def test_single_flight_withheld_grant_and_native_teardown(tmp_path, monkeypatch)
                 ))
             for racer in racers:
                 racer.communicate(timeout=180)
-            results = [json.loads((tmp_path / f"race-{i}.json").read_text(encoding="utf-8"))
+            results = [json.loads((tmp_path / f"race-{i}.json").read_text(encoding="utf-8-sig"))
                        for i in (1, 2)]
-            starts = [line for line in witness.read_text(encoding="utf-8").splitlines()
+            starts = [line for line in witness.read_text(encoding="utf-8-sig").splitlines()
                       if line.startswith("start ")]
             assert len(starts) == 1, (starts, results)
             assert sum(1 for r in results if r["ok"]) == 1, results
@@ -645,14 +645,14 @@ def test_single_flight_withheld_grant_and_native_teardown(tmp_path, monkeypatch)
             )
             _, err = caller.communicate(timeout=180)
             assert detached_result.exists(), err.decode("utf-8", "replace")[-2000:]
-            assert json.loads(detached_result.read_text(encoding="utf-8"))["ok"] is True
-            lines = witness.read_text(encoding="utf-8").splitlines()
+            assert json.loads(detached_result.read_text(encoding="utf-8-sig"))["ok"] is True
+            lines = witness.read_text(encoding="utf-8-sig").splitlines()
             child = int(next(line.split(" ", 1)[1] for line in lines
                              if line.startswith("detached ")))
 
             def _gone() -> bool:
                 try:
-                    os.kill(child, 0)
+                    os.kill(child, 0)  # windows-footgun: ok — Linux-gated live test
                 except ProcessLookupError:
                     return True
                 return False
@@ -688,7 +688,7 @@ def test_single_flight_withheld_grant_and_native_teardown(tmp_path, monkeypatch)
                     and properties.get("ActiveState") == "active"
                     and properties.get("ControlGroup")), properties
             assert pid_path.exists(), "caller never announced its pid"
-            caller_pid = int(pid_path.read_text(encoding="utf-8"))
+            caller_pid = int(pid_path.read_text(encoding="utf-8-sig"))
             os.kill(caller_pid, 9)
             caller.wait(timeout=30)
             state = _await_terminal(unit, timeout=60)
