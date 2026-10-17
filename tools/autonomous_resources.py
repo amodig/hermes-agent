@@ -700,8 +700,24 @@ def check_autonomous_boundary(*, pid: Optional[int] = None) -> dict:
     return _validate_boundary(_live_snapshot(contract), pid=pid, contract=contract)
 
 
+def check_autonomous_placement(*, pid: Optional[int] = None) -> dict:
+    """Validate the boundary and the caller's own placement WITHOUT a free worker slot.
+
+    Bounded control work is legally placed beside full workers: it runs inside the
+    same aggregate, under its own bounded transient service, and consumes no
+    ``ConcurrencyHardMax`` slot.  It therefore must not borrow the launch-only slot
+    refusal -- but it must still refuse a missing policy, wrong placement, unreadable
+    cgroups or drifted limits, exactly like a launch.  ``pid=None`` is inventory only.
+    """
+    contract = live_contract()
+    return _validate_boundary(
+        _live_snapshot(contract), pid=pid, contract=contract, require_free_slot=False,
+    )
+
+
 def _validate_boundary(
     snapshot: _Snapshot, *, pid: Optional[int], contract: _Contract = _LIVE_CONTRACT,
+    require_free_slot: bool = True,
 ) -> dict:
     report = _validate_policy(snapshot, contract)
     _require(
@@ -723,7 +739,7 @@ def _validate_boundary(
         f"launcher PID {pid} is in {group}, outside {report['aggregate']['cgroup']}",
     )
     report["launcher_cgroup"] = group
-    if report["worker_slot_occupied"]:
+    if require_free_slot and report["worker_slot_occupied"]:
         _fail(
             f"{report['workers']['cgroup']} already holds {report['worker_scopes']} "
             f"(capacity {contract.workers_concurrency_hard_max}); "
