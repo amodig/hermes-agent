@@ -558,7 +558,7 @@ def _start_worker_sleeper(boundary, index: int):
     )
 
 
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="real systemd scopes")
+@pytest.mark.platforms("linux")  # real transient units and /proc cgroup reads
 @pytest.mark.live_system_guard_bypass
 def test_control_runs_beside_two_occupied_worker_slots(tmp_path, monkeypatch):
     from tests._fixtures.autonomous_slice import (
@@ -621,7 +621,7 @@ def test_control_runs_beside_two_occupied_worker_slots(tmp_path, monkeypatch):
                 sleeper.kill()
 
 
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="real systemd scopes")
+@pytest.mark.platforms("linux")  # real transient units and /proc cgroup reads
 @pytest.mark.live_system_guard_bypass
 def test_single_flight_withheld_grant_and_native_teardown(tmp_path, monkeypatch):
     from tests._fixtures.autonomous_slice import (
