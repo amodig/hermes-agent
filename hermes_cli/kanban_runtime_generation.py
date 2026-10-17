@@ -36,7 +36,11 @@ if TYPE_CHECKING:
 _GENERATION_ENV = "HERMES_KANBAN_RUNTIME_GENERATION"
 _MANIFEST = "generation.json"
 _OWNER = ".hermes-kanban-runtime-owner.json"
-_TREE_EXCLUDES = {".git", ".hg", ".svn", "__pycache__"}
+# VCS metadata and checkout containers are never runtime inputs. ``.worktrees`` holds
+# per-task git checkouts (the dispatcher creates ``<repo>/.worktrees/<task>``); copying
+# them into a generation multiplies every spawn's payload and can push a worker past
+# its bootstrap deadline.
+_TREE_EXCLUDES = {".git", ".hg", ".svn", "__pycache__", ".worktrees"}
 _SOURCE_EXCLUDES = {"venv", ".venv", ".pytest_cache", ".ruff_cache", ".mypy_cache"}
 # Frontend/tooling workspaces are not worker dependencies. Do not apply this
 # exclusion to plugin/skill-owned node_modules or captured Python import roots.

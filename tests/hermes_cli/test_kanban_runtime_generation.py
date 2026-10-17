@@ -1001,3 +1001,29 @@ print(distribution('unseeded-sdk').locate_file('../share/fixture.txt').read_text
     assert output.strip() == "old installed resource"
 
 
+
+
+def test_worktree_checkouts_never_enter_the_runtime_payload(tmp_path):
+    """A checkout under `<source>/.worktrees` is VCS state, not runtime code.
+
+    The dispatcher creates per-task worktrees there, so without an exclusion every
+    later generation copies them: the sealed bootstrap then spends its whole 60 s
+    window verifying someone else's checkout.
+    """
+    source = tmp_path / "source"
+    _write(source / "hermes_cli" / "main.py", "VALUE = 1\n")
+    source.joinpath(".git", "HEAD").parent.mkdir(parents=True, exist_ok=True)
+    _write(source / ".git" / "HEAD", "a" * 40)
+    checkout = source / ".worktrees" / "t_deadbeef"
+    _write(checkout / "hermes_cli" / "main.py", "VALUE = 'a worker checkout'\n")
+    _write(checkout / ".git", "gitdir: /fixture/git\n")
+
+    names = {name for name, _ in generation._members(source, source=True)}
+    assert "hermes_cli/main.py" in names
+    assert not any(name.startswith(".worktrees") for name in names), names
+
+    before = generation._payload_digest(source)
+    _write(checkout / "hermes_cli" / "main.py", "VALUE = 'changed checkout'\n")
+    assert generation._payload_digest(source) == before
+    _write(source / "hermes_cli" / "main.py", "VALUE = 2\n")
+    assert generation._payload_digest(source) != before
