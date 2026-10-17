@@ -168,6 +168,13 @@ TOOLSETS = {
         "files, and (for orchestrators) list, unblock, and fan out tasks.",
         [t for t in _HERMES_CORE_TOOLS if t.startswith("kanban_")],
     ),
+    "bounded_control": _ts(
+        "Bounded typed CTO control operations (GitHub issue reads/comments and read-only "
+        "runtime inventory) executed in their own transient service inside the autonomous "
+        "boundary. Never consumes a worker slot, never runs arbitrary commands. Opt-in only: "
+        "not part of any default, coding or hermes-* bundle.",
+        ["bounded_control"],
+    ),
     "discord": _ts("Discord read and participate tools (fetch messages, search members, create threads)", ["discord"]),
     "discord_admin": _ts("Discord server management (list channels/roles, pin messages, assign roles)", ["discord_admin"]),
     "yuanbao": _ts("Yuanbao platform tools - group info, member queries, DM, stickers", _YUANBAO_TOOLS),

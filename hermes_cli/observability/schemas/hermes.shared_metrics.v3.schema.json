@@ -3225,6 +3225,7 @@
             "toolset": {
               "enum": [
                 "bot_room",
+                "bounded_control",
                 "browser",
                 "clarify",
                 "code_execution",
