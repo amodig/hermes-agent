@@ -615,6 +615,29 @@ def test_update_reasoning_is_audited_cas_without_a_goal_revision(kanban_home):
     assert "reasoning_effort" in event.payload["changed_fields"]
 
 
+def test_update_reasoning_stores_the_normalized_level(kanban_home):
+    """A caller's spelling must land canonically, and not read as a change."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="effort card", assignee="alice")
+
+    with kbc.connect_closing() as conn:
+        version = kb.get_task(conn, tid).version
+    kc.run_slash(f"update {tid} --expected-version {version} --reason pin --reasoning ' XHIGH '")
+    with kbc.connect_closing() as conn:
+        after = kb.get_task(conn, tid)
+        event = [e for e in kb.list_events(conn, tid) if e.kind == "updated"][-1]
+    assert after.reasoning_effort == "xhigh"
+    assert event.payload["new"]["reasoning_effort"] == "xhigh"
+
+    # Repinning the same canonical level is not a change of that field.
+    kc.run_slash(
+        f"update {tid} --expected-version {after.version} --reason repin --reasoning xhigh"
+    )
+    with kbc.connect_closing() as conn:
+        repeat = [e for e in kb.list_events(conn, tid) if e.kind == "updated"][-1]
+    assert "reasoning_effort" not in repeat.payload["changed_fields"]
+
+
 def test_update_reasoning_none_is_a_level_and_clear_is_explicit(kanban_home):
     with kbc.connect_closing() as conn:
         tid = kb.create_task(

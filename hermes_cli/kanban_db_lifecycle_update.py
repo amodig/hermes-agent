@@ -188,7 +188,10 @@ def _validate_update_request(
         assignee=assignee,
         model=model,
         provider=provider,
-        reasoning_effort=reasoning_effort,
+        # The canonical level, not the caller's spelling: the CAS update stores and
+        # audits exactly this value, so "XHIGH" and " high " must land as "xhigh"
+        # (and compare equal to an already-pinned xhigh, not as a change).
+        reasoning_effort=normalized_effort,
         goal_mode=goal_mode,
         lifecycle_contract=lifecycle_contract,
         lifecycle_json=lifecycle_json,
