@@ -36,6 +36,7 @@ class _UpdateRequest:
     assignee: Any
     model: Any
     provider: Any
+    reasoning_effort: Any
     goal_mode: Any
     lifecycle_contract: Any
     lifecycle_json: Any
@@ -53,6 +54,7 @@ class _UpdatePlan:
     new_assignee: Optional[str]
     new_model: Optional[str]
     new_provider: Optional[str]
+    new_reasoning_effort: Optional[str]
     new_goal_mode: bool
     new_lifecycle: Optional[dict]
     new_status: str
@@ -105,6 +107,7 @@ def _validate_update_request(
     assignee: Any,
     model: Any,
     provider: Any,
+    reasoning_effort: Any,
     goal_mode: Any,
     lifecycle_contract: Any,
     transition: Optional[str],
@@ -147,6 +150,14 @@ def _validate_update_request(
         )
     if goal_mode is not _kb._UPDATE_UNSET and not isinstance(goal_mode, bool):
         raise ValueError("goal_mode must be a boolean")
+    normalized_effort: Any = _kb._UPDATE_UNSET
+    if reasoning_effort is not _kb._UPDATE_UNSET:
+        # A non-string level (``True``, ``3``) would silently degrade to "inherit"
+        # under ``normalize_reasoning_effort``'s string coercion; refuse it here so
+        # an unparseable effort never reaches the mutation.
+        if reasoning_effort is not None and not isinstance(reasoning_effort, str):
+            raise ValueError("reasoning_effort must be a string or null")
+        normalized_effort = _kb.normalize_reasoning_effort(reasoning_effort)
     _kb._ensure_goal_revision_schema(conn)
 
     lifecycle_json = _kb._UPDATE_UNSET
@@ -177,6 +188,7 @@ def _validate_update_request(
         assignee=assignee,
         model=model,
         provider=provider,
+        reasoning_effort=reasoning_effort,
         goal_mode=goal_mode,
         lifecycle_contract=lifecycle_contract,
         lifecycle_json=lifecycle_json,
@@ -244,6 +256,7 @@ def _build_update_plan(
     old_assignee = row["assignee"]
     old_model = _kb._row_get(row, "model_override")
     old_provider = _kb._row_get(row, "provider_override")
+    old_reasoning_effort = _kb._row_get(row, "reasoning_effort")
     old_goal_mode = bool(_kb._row_get(row, "goal_mode"))
     try:
         old_lifecycle = decode_contract(_kb._row_get(row, "lifecycle_contract"))
@@ -255,6 +268,7 @@ def _build_update_plan(
     new_assignee = old_assignee
     new_model = old_model
     new_provider = old_provider
+    new_reasoning_effort = old_reasoning_effort
     new_goal_mode = old_goal_mode
     new_lifecycle = old_lifecycle
     if request.title is not _kb._UPDATE_UNSET:
@@ -280,6 +294,8 @@ def _build_update_plan(
         new_provider = None if request.provider is None else str(request.provider).strip() or None
     if new_provider and not new_model:
         raise ValueError("provider requires a model")
+    if request.reasoning_effort is not _kb._UPDATE_UNSET:
+        new_reasoning_effort = request.reasoning_effort
     if request.goal_mode is not _kb._UPDATE_UNSET:
         new_goal_mode = bool(request.goal_mode)
     if request.lifecycle_contract is not _kb._UPDATE_UNSET:
@@ -436,6 +452,7 @@ def _build_update_plan(
         "assignee": old_assignee,
         "model": old_model,
         "provider": old_provider,
+        "reasoning_effort": old_reasoning_effort,
         "goal_mode": old_goal_mode,
         "lifecycle_contract": old_lifecycle,
         "status": row["status"],
@@ -447,6 +464,7 @@ def _build_update_plan(
         "assignee": new_assignee,
         "model": new_model,
         "provider": new_provider,
+        "reasoning_effort": new_reasoning_effort,
         "goal_mode": new_goal_mode,
         "lifecycle_contract": new_lifecycle,
         "status": new_status,
@@ -454,8 +472,8 @@ def _build_update_plan(
     }
     changed_fields = [
         key for key in (
-            "title", "body", "assignee", "model", "provider", "goal_mode",
-            "lifecycle_contract", "status",
+            "title", "body", "assignee", "model", "provider", "reasoning_effort",
+            "goal_mode", "lifecycle_contract", "status",
         )
         if old_values[key] != new_values[key]
     ]
@@ -468,6 +486,7 @@ def _build_update_plan(
         new_assignee=new_assignee,
         new_model=new_model,
         new_provider=new_provider,
+        new_reasoning_effort=new_reasoning_effort,
         new_goal_mode=new_goal_mode,
         new_lifecycle=new_lifecycle,
         new_status=new_status,
@@ -564,7 +583,8 @@ def _persist_update(
         """
         UPDATE tasks SET
             version = ?, title = ?, body = ?, assignee = ?,
-            model_override = ?, provider_override = ?, goal_mode = ?,
+            model_override = ?, provider_override = ?, reasoning_effort = ?,
+            goal_mode = ?,
             status = ?, goal_revision_id = ?, lifecycle_contract = ?,
             candidate_run_id = ?
         WHERE id = ? AND version = ?
@@ -576,6 +596,7 @@ def _persist_update(
             plan.new_assignee,
             plan.new_model,
             plan.new_provider,
+            plan.new_reasoning_effort,
             int(plan.new_goal_mode),
             plan.new_status,
             goal_revision_id,
@@ -655,6 +676,7 @@ def update_task(
     assignee: Any = _UPDATE_UNSET,
     model: Any = _UPDATE_UNSET,
     provider: Any = _UPDATE_UNSET,
+    reasoning_effort: Any = _UPDATE_UNSET,
     goal_mode: Any = _UPDATE_UNSET,
     lifecycle_contract: Any = _UPDATE_UNSET,
     transition: Optional[str] = None,
@@ -671,6 +693,7 @@ def update_task(
         assignee=assignee,
         model=model,
         provider=provider,
+        reasoning_effort=reasoning_effort,
         goal_mode=goal_mode,
         lifecycle_contract=lifecycle_contract,
         transition=transition,

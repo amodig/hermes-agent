@@ -381,6 +381,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
             max_retries=max_retries, model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
+            reasoning_effort=getattr(args, "reasoning_effort", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
@@ -570,6 +571,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         field("model", f"{task.model_override}{_prov}")
+    if task.reasoning_effort:
+        field("reasoning", task.reasoning_effort)
     # Effective retry threshold (task > config > default) explains auto-blocks.
     if task.max_retries is not None:
         print(f"  max-retries: {task.max_retries} (task)")
@@ -637,6 +640,13 @@ def _cmd_update(args: argparse.Namespace) -> int:
         return value
 
     goal_mode = getattr(args, "goal_mode", None)
+    # Not ``optional()`` below: that helper reads "none" as "clear", but for effort
+    # "none" is a real level (thinking off). Clear is its own flag and wins.
+    reasoning_effort = kb._UPDATE_UNSET
+    if getattr(args, "clear_reasoning_effort", False):
+        reasoning_effort = None
+    elif getattr(args, "reasoning_effort", None) is not None:
+        reasoning_effort = args.reasoning_effort
     lifecycle_contract = kb._UPDATE_UNSET
     if getattr(args, "lifecycle_contract", None) is not None:
         lifecycle_contract, rc = _parse_object_flag(
@@ -655,6 +665,7 @@ def _cmd_update(args: argparse.Namespace) -> int:
             assignee=optional(args.assignee),
             model=optional(getattr(args, "model", None)),
             provider=optional(getattr(args, "provider", None)),
+            reasoning_effort=reasoning_effort,
             goal_mode=kb._UPDATE_UNSET if goal_mode is None else goal_mode,
             transition=getattr(args, "transition", None),
             authorized_pr_urls=getattr(args, "authorized_pr", None),

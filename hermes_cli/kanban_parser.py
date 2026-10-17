@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 
 from hermes_cli import kanban_db as kb
+from hermes_constants import VALID_REASONING_EFFORTS
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_notify as kbn
 
@@ -203,6 +204,11 @@ _SPECS = [
         _arg("--provider", dest="provider_override",
              help="Provider the --model belongs to (passed as --provider <name> to "
                   "the worker). Requires --model."),
+        _arg("--reasoning", dest="reasoning_effort", metavar="LEVEL",
+             help="Pin the worker's reasoning effort (passed as --reasoning <level>) "
+                  "instead of the profile's or the model's setting. One of "
+                  f"{', '.join(('none', *VALID_REASONING_EFFORTS))}; 'none' "
+                  "disables thinking. Omit to inherit the profile's effort."),
         _arg("--completion-contract", metavar="CONTRACT",
              help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
         _arg("--goal", action="store_true", dest="goal_mode",
@@ -259,6 +265,12 @@ _SPECS = [
         _arg("--assignee", help="Profile name, or 'none' to clear"),
         _arg("--model", help="Replacement model override, or 'none' to clear"),
         _arg("--provider", help="Replacement provider override, or 'none' to clear"),
+        _arg("--reasoning", dest="reasoning_effort", metavar="LEVEL",
+             help="Replacement reasoning effort, or 'none' to disable thinking "
+                  "(a real level, not a clear — use --clear-reasoning for that)"),
+        _arg("--clear-reasoning", dest="clear_reasoning_effort", action="store_true",
+             help="Clear the task's reasoning effort so the worker inherits the "
+                  "profile's setting (takes precedence over --reasoning)"),
         _arg("--goal-mode", dest="goal_mode", action="store_true", default=None,
              help="Enable goal-mode execution"),
         _arg("--no-goal-mode", dest="goal_mode", action="store_false", default=None,

@@ -152,7 +152,7 @@ def _claim_and_open_run(
         return None
     trow = conn.execute(
         "SELECT assignee, max_runtime_seconds, current_step_key, workspace_path, "
-        "branch_name, lifecycle_contract FROM tasks WHERE id = ?", (task_id,),
+        "branch_name, lifecycle_contract, reasoning_effort FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     run_metadata = dict(runtime_claim or {})
     host_epoch = _kr.current_host_epoch()
@@ -199,6 +199,10 @@ def _claim_and_open_run(
         {
             "lock": lock, "expires": expires, "run_id": run_id,
             **(event_extra or {}),
+            # Requested effort at the successful claim, bound to this run. Not the
+            # provider-effective effort (the transport may clamp) and never
+            # rewritten by later card updates or run-metadata merges.
+            "reasoning_effort": trow["reasoning_effort"] if trow else None,
             **(
                 {"pr_continuation_event_id": pr_continuation["event_id"]}
                 if pr_continuation else {}

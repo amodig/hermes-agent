@@ -621,6 +621,13 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "the profile's provider and will fail if it belongs "
                 "to a different one. Requires 'model'."
         )),
+        "reasoning_effort": _prop("string", (
+                "Pin the dispatched worker's reasoning depth instead of the "
+                "assignee profile's (or the model's) own setting: 'none' "
+                "(thinking off), 'minimal', 'low', 'medium', 'high', 'xhigh', "
+                "'max' or 'ultra', case-insensitive. Independent of "
+                "'model'/'provider'. Omit to inherit the profile's effort."
+        )),
         "lifecycle_contract": {
             **_LIFECYCLE_CONTRACT_SCHEMA,
             "description": (
@@ -654,6 +661,18 @@ KANBAN_UPDATE_SCHEMA = _schema(
         "assignee": _prop("string", "Replacement profile; empty clears the assignee."),
         "model": _prop("string", "Replacement model override; empty clears it."),
         "provider": _prop("string", "Provider for the model; empty clears it."),
+        "reasoning_effort": _prop("string", (
+            "Replacement reasoning depth for the next dispatch: 'none' "
+            "(thinking off), 'minimal', 'low', 'medium', 'high', 'xhigh', "
+            "'max' or 'ultra'. This is a real level, not a clear; use "
+            "'clear_reasoning_effort' to drop the pin. Omit to leave it "
+            "unchanged."
+        )),
+        "clear_reasoning_effort": _prop("boolean", (
+            "Drop the task's reasoning-effort pin so the worker inherits the "
+            "assignee profile's effort. Takes precedence over "
+            "'reasoning_effort'."
+        )),
         "goal_mode": _prop("boolean", "Enable or disable goal-mode execution."),
         "lifecycle_contract": {
             **_LIFECYCLE_CONTRACT_SCHEMA,
