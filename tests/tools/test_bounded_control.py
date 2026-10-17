@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -139,17 +140,42 @@ class _RecordingStdin:
         self.closed = True
 
 
-class _FakeProc:
-    """A real pipe for stdout plus a recording stdin, so the bounded drain runs for real."""
+class _BrokenStdin(_RecordingStdin):
+    """The service died before the grant: the pipe is gone."""
 
-    def __init__(self, output: bytes, exit_code: int = 0):
+    def write(self, data):
+        raise BrokenPipeError("service exited before the grant")
+
+
+class _FakeProc:
+    """Real pipes for stdout/stderr plus a recording stdin, so the drains run for real."""
+
+    def __init__(self, output: bytes, exit_code: int = 0, *, stderr_bytes: bytes = b"",
+                 stdin=None):
         read_fd, write_fd = os.pipe()
         os.write(write_fd, output)
         os.close(write_fd)
         self.stdout = os.fdopen(read_fd, "rb", 0)
-        self.stdin = _RecordingStdin()
+        self.stdin = stdin if stdin is not None else _RecordingStdin()
         self.stderr = None
+        self.stderr_done = threading.Event()
         self._exit = exit_code
+        if stderr_bytes:
+            err_read, err_write = os.pipe()
+            self.stderr = os.fdopen(err_read, "rb", 0)
+
+            def _writer() -> None:
+                try:
+                    view = memoryview(stderr_bytes)
+                    while view:
+                        view = view[os.write(err_write, view[:65536]):]
+                finally:
+                    os.close(err_write)
+                    self.stderr_done.set()
+
+            threading.Thread(target=_writer, daemon=True).start()
+        else:
+            self.stderr_done.set()
 
     def poll(self):
         return self._exit
@@ -207,10 +233,11 @@ def _nonce_of(argv) -> str:
     return argv[argv.index("-c") + 2]
 
 
-def _ready(argv, tail: bytes = b"", *, nonce=None, start_time: int = 77) -> _FakeProc:
+def _ready(argv, tail: bytes = b"", *, nonce=None, start_time: int = 77,
+           **proc_kwargs) -> _FakeProc:
     line = json.dumps({"nonce": nonce if nonce is not None else _nonce_of(argv),
                        "pid": 4242, "start_time": start_time}).encode() + b"\n"
-    return _FakeProc(line + tail)
+    return _FakeProc(line + tail, **proc_kwargs)
 
 
 def test_readiness_mismatch_never_grants_the_payload(monkeypatch):
@@ -282,6 +309,41 @@ def test_effective_ancestor_over_budget_is_refused(monkeypatch):
         memory_high=bc.MEMORY_BYTES, memory_max=bc.MEMORY_BYTES,
     )
     assert refusal is not None and "effective" in refusal, refusal
+
+
+def test_grant_failure_is_a_refusal_not_an_exception(monkeypatch):
+    """A service that dies before the grant must still be reaped and reported."""
+    recorded = {}
+    _stub_launch(
+        monkeypatch,
+        lambda argv: recorded.setdefault("proc", _ready(argv, stdin=_BrokenStdin())),
+        properties=_properties(),
+    )
+    result = bc._run_operation("github_status", {"operation": "github_status"})
+    assert result["ok"] is False
+    assert result["granted"] is False
+    assert "grant could not be delivered" in result["error"]
+    assert result["exit_code"] is not None, result
+    assert result["cleanup_complete"] is True
+
+
+def test_stderr_is_drained_past_the_retained_cap(monkeypatch):
+    """A noisy child must not block on a full stderr pipe; only the prefix is kept."""
+    window = 200_000
+    recorded = {}
+    _stub_launch(
+        monkeypatch,
+        lambda argv: recorded.setdefault(
+            "proc",
+            _ready(argv, stderr_bytes=b"e" * window, exit_code=1),
+        ),
+        properties=_properties(),
+    )
+    result = bc._run_operation("github_status", {"operation": "github_status"})
+    proc = recorded["proc"]
+    assert result["ok"] is False and result["exit_code"] == 1
+    assert len(result["error"]) <= bc.STDERR_CHARS, len(result["error"])
+    assert proc.stderr_done.wait(10), "the stderr writer blocked: the pipe was not drained to EOF"
 
 
 def test_bounded_output_and_grant_on_a_proven_launch(monkeypatch):

@@ -67,6 +67,8 @@ TIMEOUT_STOP_SECONDS = 5
 CLIENT_DEADLINE_SECONDS = 55
 READINESS_SECONDS = 6
 OUTPUT_CHARS = 20_000
+#: Retained stderr prefix; the stream itself is always drained to EOF.
+STDERR_CHARS = 8_192
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 _STATES = ("open", "closed", "all")
@@ -504,9 +506,15 @@ def _run_operation(operation: str, clean: Mapping[str, Any]) -> Dict[str, Any]:
                     memory_high=memory_high, memory_max=memory_max,
                 )
                 if refusal is None:
-                    proc.stdin.write(b"1")
-                    proc.stdin.flush()
-                    granted = True
+                    # The service can exit between the proof and the grant. A broken
+                    # pipe is a refusal -- not an exception that would skip the
+                    # drains and the reap below.
+                    try:
+                        proc.stdin.write(b"1")
+                        proc.stdin.flush()
+                        granted = True
+                    except (BrokenPipeError, OSError) as exc:
+                        refusal = f"the readiness grant could not be delivered ({exc})"
     finally:
         try:
             proc.stdin.close()
@@ -516,13 +524,24 @@ def _run_operation(operation: str, clean: Mapping[str, Any]) -> Dict[str, Any]:
     drain = _start_drain_thread(proc, output)
     errors: List[bytes] = []
 
+    stderr_kept = 0
+
     def _collect_stderr() -> None:
+        """Drain stderr to EOF, retaining only a bounded prefix.
+
+        Stopping the read at the cap would let a noisy child block in ``write(2)`` once
+        the pipe fills, turning a fast failure into a client timeout.
+        """
+        nonlocal stderr_kept
         try:
-            while len(b"".join(errors)) < 8192:
-                chunk = proc.stderr.read(1024) if proc.stderr is not None else b""
+            while proc.stderr is not None:
+                chunk = proc.stderr.read(1024)
                 if not chunk:
                     return
-                errors.append(chunk)
+                if stderr_kept < STDERR_CHARS:
+                    keep = chunk[: STDERR_CHARS - stderr_kept]
+                    errors.append(keep)
+                    stderr_kept += len(keep)
         except (OSError, ValueError):
             return
 
