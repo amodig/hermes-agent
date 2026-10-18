@@ -55,12 +55,14 @@ DEFAULT_LOG_BACKUP_COUNT = 1
 # publish (pre-import) or confirm (post-import) its identity, and each phase walks
 # it twice: the sealed bootstrap derives the generation digest and the identity
 # check re-verifies it, once before the import handshake and once after. The work
-# is therefore proportional to payload bytes times those passes. A sealed payload
-# carries interpreters and dependencies and is gigabytes; a fixed wall clock
-# therefore only fits a warm, idle host. Budget the bytes instead, at a
-# conservative cold-cache rate for a hash walk over many small files, plus a fixed
-# allowance for interpreter start and the scope/identity gates.
+# is therefore proportional to payload bytes _and_ member count times those passes:
+# a digest opens, reads and separates every member, so a tree of many tiny files
+# costs time that aggregate bytes do not describe. A sealed payload carries
+# interpreters and dependencies and is gigabytes; a fixed wall clock therefore only
+# fits a warm, idle host. Budget both terms at conservative cold-cache rates, plus a
+# fixed allowance for interpreter start and the scope/identity gates.
 _BOOTSTRAP_PAYLOAD_BYTES_PER_SECOND = 32 * 1024 * 1024
+_BOOTSTRAP_PAYLOAD_MEMBERS_PER_SECOND = 10_000
 _BOOTSTRAP_PHASE_DIGEST_PASSES = 2
 _BOOTSTRAP_FIXED_ALLOWANCE_SECONDS = 30.0
 _BOOTSTRAP_PHASE_FLOOR_SECONDS = 60.0
@@ -80,16 +82,16 @@ _BOOTSTRAP_PHASE_FLOOR_SECONDS = 60.0
 _SCOPE_ATTEMPT_WINDOW_SECONDS = 600
 # The scope gates between and after the phases run several sequential systemctl
 # calls, each of which may take tens of seconds and still succeed, so that time is
-# reserved out of the same window as the two phases.
-_SCOPE_GATE_ALLOWANCE_SECONDS = 120.0
+# reserved out of the same window as the two phases: two gates of 30+30+15 s.
+_SCOPE_GATE_ALLOWANCE_SECONDS = 150.0
 _BOOTSTRAP_PHASE_CEILING_SECONDS = (
     _SCOPE_ATTEMPT_WINDOW_SECONDS - _SCOPE_GATE_ALLOWANCE_SECONDS
 ) / 2
 _GRANT_TIMEOUT_SECONDS = 1.0
 
 
-def _payload_bytes(root: Path) -> int:
-    """Bytes the worker re-hashes per phase, walked once per launch.
+def _payload_scan(root: Path) -> tuple[int, int]:
+    """``(bytes, members)`` the worker re-hashes per phase, walked once per launch.
 
     Mirrors ``_payload_digest``'s member set (same excludes, same manifest and
     owner skip) so the budget counts what is actually read, and reuses that walk
@@ -99,25 +101,29 @@ def _payload_bytes(root: Path) -> int:
     from hermes_cli.kanban_runtime_generation import _MANIFEST, _OWNER, _members
 
     total = 0
+    members = 0
     for name, path in _members(root):
         if name in {_MANIFEST, _OWNER} or name.startswith(f".{_OWNER}."):
             continue
         if path.is_file():
+            members += 1
             with contextlib.suppress(OSError):
                 total += path.stat().st_size
-    return total
+    return total, members
 
 
 def _bootstrap_phase_timeout(generation_root: Optional[Path] = None) -> float:
     """Seconds each bootstrap phase may take, derived from what it must hash."""
     timeout = _BOOTSTRAP_PHASE_FLOOR_SECONDS
     if generation_root is not None:
+        payload_bytes, members = _payload_scan(Path(generation_root))
+        per_pass = (
+            payload_bytes / _BOOTSTRAP_PAYLOAD_BYTES_PER_SECOND
+            + members / _BOOTSTRAP_PAYLOAD_MEMBERS_PER_SECOND
+        )
         timeout = max(
             timeout,
-            _BOOTSTRAP_PHASE_DIGEST_PASSES
-            * _payload_bytes(Path(generation_root))
-            / _BOOTSTRAP_PAYLOAD_BYTES_PER_SECOND
-            + _BOOTSTRAP_FIXED_ALLOWANCE_SECONDS,
+            _BOOTSTRAP_PHASE_DIGEST_PASSES * per_pass + _BOOTSTRAP_FIXED_ALLOWANCE_SECONDS,
         )
     return float(min(timeout, _BOOTSTRAP_PHASE_CEILING_SECONDS))
 
