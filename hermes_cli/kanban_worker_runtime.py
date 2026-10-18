@@ -51,9 +51,41 @@ def _kb():
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024
 DEFAULT_LOG_BACKUP_COUNT = 1
 
-# Sealed-payload validation scales with installed dependency size in both phases.
-_BOOTSTRAP_PHASE_TIMEOUT_SECONDS = 60.0
+# Sealed-payload validation re-hashes the whole runtime in both bootstrap phases
+# (pre-import and post-import), so each phase's budget scales with payload bytes:
+# a 3.7 GiB / 171,589-file payload measured 30 s on an idle host and 74 s under
+# load against one 60 s phase, so a fixed wall clock only fit a warm idle cache.
+# Budget a third of the worst observed rate plus a fixed allowance for
+# interpreter start and the scope/identity gates.
+_BOOTSTRAP_PAYLOAD_BYTES_PER_SECOND = 24 * 1024 * 1024
+_BOOTSTRAP_FIXED_ALLOWANCE_SECONDS = 30.0
+_BOOTSTRAP_PHASE_FLOOR_SECONDS = 60.0
+# Both phases run under one claim lease; leave the rest of the TTL for reporting.
+_BOOTSTRAP_CLAIM_TTL_SHARE = 0.4
 _GRANT_TIMEOUT_SECONDS = 1.0
+
+
+def _payload_bytes(root: Path) -> int:
+    """Bytes the worker re-hashes per phase, walked once per launch."""
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            with contextlib.suppress(OSError):
+                total += os.stat(os.path.join(dirpath, name)).st_size
+    return total
+
+
+def _bootstrap_phase_timeout(generation_root: Optional[Path] = None) -> float:
+    """Seconds each bootstrap phase may take, derived from what it must hash."""
+    timeout = _BOOTSTRAP_PHASE_FLOOR_SECONDS
+    if generation_root is not None:
+        timeout = max(
+            timeout,
+            _payload_bytes(Path(generation_root)) / _BOOTSTRAP_PAYLOAD_BYTES_PER_SECOND
+            + _BOOTSTRAP_FIXED_ALLOWANCE_SECONDS,
+        )
+    claim_ttl = _kb()._resolve_claim_ttl_seconds()
+    return float(min(timeout, claim_ttl * _BOOTSTRAP_CLAIM_TTL_SHARE))
 
 
 def _set_windows_pipe_nonblocking(fd: int) -> None:
@@ -1190,6 +1222,8 @@ def _default_spawn(
         project_plugins_enabled=project_plugins_enabled,
     )
     expected_identity = generation.identity
+    # One walk per launch: both phases re-hash the same sealed payload.
+    phase_timeout = _bootstrap_phase_timeout(generation.root)
     env.update(generation.env)
     env["HERMES_KANBAN_EXPECTED_RUNTIME"] = encode_identity(expected_identity)
     proc = None
@@ -1269,7 +1303,7 @@ def _default_spawn(
         _worker_processes[proc.pid] = proc
         _worker_runtime_snapshots[proc.pid] = generation.root
         log_f.close()
-        deadline = time.monotonic() + _BOOTSTRAP_PHASE_TIMEOUT_SECONDS
+        deadline = time.monotonic() + phase_timeout
         payload = None
         while time.monotonic() < deadline:
             _check_not_stopping(should_stop, task.id)
@@ -1311,7 +1345,7 @@ def _default_spawn(
         }, sort_keys=True).encode("utf-8") + b"\n")
         proc.stdin.flush()
 
-        post_deadline = time.monotonic() + _BOOTSTRAP_PHASE_TIMEOUT_SECONDS
+        post_deadline = time.monotonic() + phase_timeout
         post_payload = None
         while time.monotonic() < post_deadline:
             _check_not_stopping(should_stop, task.id)
