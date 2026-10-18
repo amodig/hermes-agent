@@ -215,7 +215,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "gc", "update", "rework-review", "supersede-candidate",
+    "gc", "update", "rework-review", "supersede-candidate", "rebind-candidate",
     "request-review", "request-changes", "reopen-review",
 })
 

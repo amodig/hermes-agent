@@ -218,27 +218,35 @@ def rebind_candidate(
             f"run {run_id} runtime identity conflicts with its launch receipt; "
             "resolve the provenance before rebinding"
         )
-    bound = conn.execute(
-        "SELECT candidate_run_id FROM tasks WHERE id = ?", (task_id,),
-    ).fetchone()
-    current = bound[0] if bound else None
-    if current is not None and int(current) != int(run_id):
-        raise LifecycleEvidenceError(
-            f"{task_id} is already bound to candidate run {current}; recovering one "
-            "candidate must never replace another"
+    # Validation and write in one transaction: the fence that refuses delegated-child
+    # board mutations is enforced here, and the candidate read cannot go stale
+    # between the check and the update.
+    with _db.write_txn(conn):
+        bound = conn.execute(
+            "SELECT candidate_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        current = bound[0] if bound else None
+        if current is not None and int(current) != int(run_id):
+            raise LifecycleEvidenceError(
+                f"{task_id} is already bound to candidate run {current}; recovering one "
+                "candidate must never replace another"
+            )
+        updated = conn.execute(
+            "UPDATE tasks SET candidate_run_id = ? WHERE id = ? AND "
+            "(candidate_run_id IS NULL OR candidate_run_id = ?)",
+            (run_id, task_id, run_id),
         )
-    conn.execute(
-        "UPDATE tasks SET candidate_run_id = ? WHERE id = ? AND "
-        "(candidate_run_id IS NULL OR candidate_run_id = ?)",
-        (run_id, task_id, run_id),
-    )
-    payload = {
-        "candidate_run_id": run_id,
-        "head_sha": str(head_sha),
-        "receipt_generation": identity.get("receipt_generation"),
-        "author_verdict": identity.get("verdict"),
-        "reason": reason,
-    }
-    payload["author"] = author
-    _db._append_event(conn, task_id, "candidate_rebound", payload)
+        if updated.rowcount != 1:
+            raise LifecycleEvidenceError(
+                f"{task_id} candidate binding changed during the rebind; nothing written"
+            )
+        payload = {
+            "candidate_run_id": run_id,
+            "head_sha": str(head_sha),
+            "receipt_generation": identity.get("receipt_generation"),
+            "author_verdict": identity.get("verdict"),
+            "reason": reason,
+            "author": author,
+        }
+        _db._append_event(conn, task_id, "candidate_rebound", payload)
     return payload
