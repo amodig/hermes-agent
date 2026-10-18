@@ -47,24 +47,15 @@ def test_phase_budget_derives_from_the_sealed_payload(monkeypatch, tmp_path):
     )
 
     # A pathological payload is bounded instead of wedging a dispatcher tick, and
-    # the provenance-checked window exceeds the slowest possible pre-claim bootstrap.
+    # the phases alone stay inside the strict attribution window. The scope gates
+    # between them are not statically bounded, so the window is not derived from
+    # them or widened for it: a bootstrap slow enough to outrun the window leaves
+    # its scope to reconciliation.
     assert (
         _budget(monkeypatch, tmp_path, payload_bytes=400 * GIB)
         == runtime._BOOTSTRAP_PHASE_CEILING_SECONDS
     )
-    assert (
-        2 * runtime._BOOTSTRAP_PHASE_CEILING_SECONDS + runtime._BOOTSTRAP_SCOPE_GATE_RESERVE_SECONDS
-        < runtime._SCOPE_ATTEMPT_BOOTSTRAP_WINDOW_SECONDS
-    )
-
-    # Only a row that records its board gets that wider window; a row without
-    # provenance keeps the strict one, so an imported board cannot claim a scope.
-    monkeypatch.setattr(runtime, "_scope_activation_epoch", lambda unit: 1_000 - 700)
-    run = {"started_at": 1_000, "ended_at": 1_100}
-    assert not runtime._scope_activation_is_inside("u", run)
-    assert runtime._scope_activation_is_inside(
-        "u", run, window=runtime._SCOPE_ATTEMPT_BOOTSTRAP_WINDOW_SECONDS
-    )
+    assert 2 * runtime._BOOTSTRAP_PHASE_CEILING_SECONDS < runtime._SCOPE_ATTEMPT_WINDOW_SECONDS
 
     # Both phases run before any claim exists (the dispatcher spawns with
     # defer_grant and claims afterwards), so a short lease must not shrink them.
