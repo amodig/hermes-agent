@@ -74,6 +74,15 @@ def test_candidate_identity_reconciles_against_the_launch_receipt(conn):
     assert _verdict(conn, _spawned_run(conn, author={**RECEIPT, "code_sha": "d" * 40})) == "conflict"
     assert _verdict(conn, _spawned_run(conn, author={**RECEIPT, "generation": "c" * 64})) == "conflict"
 
+    # A record that will not decode is present and untrustworthy, not absent.
+    tid = _spawned_run(conn)
+    conn.execute("UPDATE task_runs SET metadata = ? WHERE task_id = ?", ("not json", tid))
+    conn.commit()
+    assert _verdict(conn, tid) == "author_malformed"
+    conn.execute("UPDATE task_runs SET metadata = ? WHERE task_id = ?", (json.dumps([1, 2]), tid))
+    conn.commit()
+    assert _verdict(conn, tid) == "author_malformed"
+
     # Runs without a receipt say so instead of guessing.
     assert _verdict(conn, _spawned_run(conn, receipt=None)) == "receipt_missing"
 

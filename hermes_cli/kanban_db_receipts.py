@@ -87,36 +87,6 @@ def receipt_runtime_identity(
             "is authoritative"
         )
     return receipt
-    author = supplied.get("runtime_identity")
-    if author is None:
-        return receipt  # explicitly absent: the receipt stands unchallenged
-    if not isinstance(author, dict):
-        raise LifecycleEvidenceError(
-            f"run {run_id} runtime_identity must be an object; the launch receipt "
-            "recorded in task_runs.metadata is authoritative"
-        )
-    generation = author.get("generation")
-    if generation is not None and not _GENERATION_DIGEST.fullmatch(str(generation)):
-        raise LifecycleEvidenceError(
-            f"run {run_id} runtime_identity.generation is not a 64-character digest; "
-            "the launch receipt recorded in task_runs.metadata is authoritative"
-        )
-    for field in ("generation", "code_sha"):
-        expected = receipt.get(field)
-        if not expected or field not in author:
-            continue
-        given = author.get(field)
-        if given in (None, ""):
-            raise LifecycleEvidenceError(
-                f"run {run_id} runtime_identity.{field} is empty; the launch receipt "
-                "recorded in task_runs.metadata is authoritative"
-            )
-        if str(expected) != str(given):
-            raise LifecycleEvidenceError(
-                f"run {run_id} runtime_identity.{field} does not match the launch "
-                "receipt; completion metadata may corroborate it, not replace it"
-            )
-    return receipt
 
 
 def candidate_identity(conn, task_id: str, run_id: Optional[int] = None) -> Optional[dict]:
@@ -174,8 +144,14 @@ def candidate_identity(conn, task_id: str, run_id: Optional[int] = None) -> Opti
     try:
         metadata = json.loads(row[0]) if row and row[0] else {}
     except (TypeError, ValueError):
-        metadata = {}
-    author = metadata.get("runtime_identity") if isinstance(metadata, dict) else None
+        metadata = None
+    if not isinstance(metadata, dict):
+        # A record that will not decode is present and untrustworthy, never absent:
+        # reporting it as "no copy" would verify exactly the corruption this exists
+        # to surface.
+        author = "corrupt"
+    else:
+        author = metadata.get("runtime_identity")
     disagreement = _identity_disagreement(receipt, author)
     verdict = disagreement[0] if disagreement else "verified"
     given = author.get("generation") if isinstance(author, dict) else None
