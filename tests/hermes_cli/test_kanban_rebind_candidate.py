@@ -52,6 +52,11 @@ def _candidate(conn):
         "UPDATE task_runs SET metadata = ? WHERE id = ?",
         (json.dumps({"head_sha": HEAD, "lifecycle": {"candidate_run_id": run_id}}), run_id),
     )
+    # A candidate is a *finished* implementation handoff, not an active attempt.
+    conn.execute(
+        "UPDATE task_runs SET status = 'review', outcome = 'review_requested' WHERE id = ?",
+        (run_id,),
+    )
     conn.execute("UPDATE tasks SET candidate_run_id = ? WHERE id = ?", (run_id, tid))
     conn.commit()
     return tid, run_id
@@ -72,6 +77,26 @@ def test_rebind_restores_the_candidate_on_proof(conn):
     assert _binding(conn, tid) == run_id
     kinds = [r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id = ?", (tid,))]
     assert "candidate_rebound" in kinds
+
+    # An existing binding is never overwritten by a recovery command.
+    other = run_id
+    conn.execute("UPDATE tasks SET candidate_run_id = ? WHERE id = ?", (other + 1, tid))
+    conn.commit()
+    with pytest.raises(LifecycleEvidenceError, match="already bound"):
+        rebind_candidate(conn, tid, run_id=run_id, head_sha=HEAD, reason="recovery")
+    conn.execute("UPDATE tasks SET candidate_run_id = ? WHERE id = ?", (other, tid))
+    conn.commit()
+
+    # An attempt that has not finished is not a candidate.
+    conn.execute("UPDATE task_runs SET status = 'running' WHERE id = ?", (run_id,))
+    conn.commit()
+    with pytest.raises(LifecycleEvidenceError, match="finished implementation handoff"):
+        rebind_candidate(conn, tid, run_id=run_id, head_sha=HEAD, reason="recovery")
+    conn.execute(
+        "UPDATE task_runs SET status = 'review', outcome = 'review_requested' WHERE id = ?",
+        (run_id,),
+    )
+    conn.commit()
 
     # A head the run never recorded is refused: a rebind restores, never redefines.
     with pytest.raises(LifecycleEvidenceError, match="recorded head"):

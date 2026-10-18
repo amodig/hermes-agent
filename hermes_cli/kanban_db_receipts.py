@@ -189,6 +189,15 @@ def rebind_candidate(
         metadata = json.loads(run["metadata"]) if run["metadata"] else {}
     except (TypeError, ValueError):
         metadata = {}
+    # Only a finished implementation handoff is a candidate: an active, blocked or
+    # failed attempt has produced nothing for a review to cover.
+    if str(run["status"]) == "running" or str(run["outcome"] or "") not in {
+        "review_requested", "completed",
+    }:
+        raise LifecycleEvidenceError(
+            f"run {run_id} is {run['status']}/{run['outcome'] or 'no outcome'}; "
+            "only a finished implementation handoff can be bound as a candidate"
+        )
     recorded = metadata.get("head_sha") if isinstance(metadata, dict) else None
     if not recorded:
         raise LifecycleEvidenceError(
@@ -209,8 +218,19 @@ def rebind_candidate(
             f"run {run_id} runtime identity conflicts with its launch receipt; "
             "resolve the provenance before rebinding"
         )
+    bound = conn.execute(
+        "SELECT candidate_run_id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    current = bound[0] if bound else None
+    if current is not None and int(current) != int(run_id):
+        raise LifecycleEvidenceError(
+            f"{task_id} is already bound to candidate run {current}; recovering one "
+            "candidate must never replace another"
+        )
     conn.execute(
-        "UPDATE tasks SET candidate_run_id = ? WHERE id = ?", (run_id, task_id),
+        "UPDATE tasks SET candidate_run_id = ? WHERE id = ? AND "
+        "(candidate_run_id IS NULL OR candidate_run_id = ?)",
+        (run_id, task_id, run_id),
     )
     payload = {
         "candidate_run_id": run_id,
