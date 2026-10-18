@@ -69,24 +69,22 @@ _BOOTSTRAP_PHASE_FLOOR_SECONDS = 60.0
 # A ceiling on the derivation itself, so a pathological or corrupt payload cannot
 # wedge a dispatcher tick. It is deliberately independent of the claim lease: the
 # pre-import phase runs before any claim exists, so shrinking this budget to fit a
-# short lease would reintroduce the timeout instead of protecting the run. It is
-# bounded by the scope-attribution window below instead: both phases and the scope
-# gates between them have to fit inside it, or a legitimately slow launch is
-# refused as scope_not_from_attempt and keeps its autonomous-worker slot.
+# short lease would reintroduce the timeout instead of protecting the run.
+_BOOTSTRAP_PHASE_CEILING_SECONDS = 240.0
 
 #: Slack around an attempt's own life when matching a LIVE scope to it, in seconds.
 #: The launch creates the scope before the claim (pre-claim preparation is bounded
 #: by the bootstrap phase timeouts) and a clock step is possible, so the window has
 #: to be generous -- and still far smaller than the age of any historical or
-#: imported run, which is what it exists to exclude.
-_SCOPE_ATTEMPT_WINDOW_SECONDS = 600
-# The scope gates between and after the phases run several sequential systemctl
-# calls, each of which may take tens of seconds and still succeed, so that time is
-# reserved out of the same window as the two phases: two gates of 30+30+15 s.
-_SCOPE_GATE_ALLOWANCE_SECONDS = 150.0
-_BOOTSTRAP_PHASE_CEILING_SECONDS = (
-    _SCOPE_ATTEMPT_WINDOW_SECONDS - _SCOPE_GATE_ALLOWANCE_SECONDS
-) / 2
+#: imported run, which is what it exists to exclude. The unit name already carries
+#: the attempt's run or preparation identity, so this window is a staleness bound,
+#: not a partition of the launch: it only has to exceed the slowest possible
+#: pre-claim bootstrap, both phases at their ceiling plus the scope gates between
+#: them, whose per-unit systemctl calls are not statically bounded in time.
+_BOOTSTRAP_SCOPE_GATE_RESERVE_SECONDS = 300.0
+_SCOPE_ATTEMPT_WINDOW_SECONDS = int(
+    2 * _BOOTSTRAP_PHASE_CEILING_SECONDS + _BOOTSTRAP_SCOPE_GATE_RESERVE_SECONDS + 60
+)
 _GRANT_TIMEOUT_SECONDS = 1.0
 
 

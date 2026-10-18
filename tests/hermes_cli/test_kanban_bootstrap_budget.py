@@ -47,14 +47,14 @@ def test_phase_budget_derives_from_the_sealed_payload(monkeypatch, tmp_path):
     )
 
     # A pathological payload is bounded instead of wedging a dispatcher tick, and
-    # both phases plus the scope gates still fit the attribution window.
+    # the attribution window exceeds the slowest possible pre-claim bootstrap.
     assert (
         _budget(monkeypatch, tmp_path, payload_bytes=400 * GIB)
         == runtime._BOOTSTRAP_PHASE_CEILING_SECONDS
     )
     assert (
-        2 * runtime._BOOTSTRAP_PHASE_CEILING_SECONDS + runtime._SCOPE_GATE_ALLOWANCE_SECONDS
-        <= runtime._SCOPE_ATTEMPT_WINDOW_SECONDS
+        2 * runtime._BOOTSTRAP_PHASE_CEILING_SECONDS + runtime._BOOTSTRAP_SCOPE_GATE_RESERVE_SECONDS
+        < runtime._SCOPE_ATTEMPT_WINDOW_SECONDS
     )
 
     # Both phases run before any claim exists (the dispatcher spawns with
