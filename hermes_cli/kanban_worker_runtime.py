@@ -64,8 +64,11 @@ _BOOTSTRAP_PHASE_FLOOR_SECONDS = 60.0
 # A ceiling on the derivation itself, so a pathological or corrupt payload cannot
 # wedge a dispatcher tick. It is deliberately independent of the claim lease: the
 # pre-import phase runs before any claim exists, so shrinking this budget to fit a
-# short lease would reintroduce the timeout instead of protecting the run.
-_BOOTSTRAP_PHASE_CEILING_SECONDS = 600.0
+# short lease would reintroduce the timeout instead of protecting the run. It is
+# bounded by `_SCOPE_ATTEMPT_WINDOW_SECONDS` below instead: two phases must fit
+# inside that window, or a legitimately slow launch is refused as
+# scope_not_from_attempt and keeps its autonomous-worker slot.
+_BOOTSTRAP_PHASE_CEILING_SECONDS = 240.0
 _GRANT_TIMEOUT_SECONDS = 1.0
 
 
