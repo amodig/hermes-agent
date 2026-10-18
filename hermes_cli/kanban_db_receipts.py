@@ -129,12 +129,10 @@ def candidate_identity(conn, task_id: str, run_id: Optional[int] = None) -> Opti
         ]
         if not candidates:
             return None
-        # Prefer the newest run that actually recorded an identity; a run whose only
-        # spawn record is the pid still reports ``receipt_missing`` rather than
-        # silently answering for an older run.
-        run_id = next(
-            (rid for rid in candidates if _receipt_for(rid) is not None), candidates[0],
-        )
+        # The newest attempt is the one being reconciled. If its spawn record holds
+        # only a pid, that is ``receipt_missing``: answering for an older run would
+        # report a previous attempt as verified and hide this one's missing receipt.
+        run_id = candidates[0]
     receipt = _receipt_for(int(run_id))
     if receipt is None:
         return {"run_id": int(run_id), "verdict": "receipt_missing"}
