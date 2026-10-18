@@ -1235,8 +1235,18 @@ def _default_spawn(
         project_plugins_enabled=project_plugins_enabled,
     )
     expected_identity = generation.identity
-    # One walk per launch: both phases re-hash the same sealed payload.
-    phase_timeout = _bootstrap_phase_timeout(generation.root)
+    try:
+        # One walk per launch: both phases re-hash the same sealed payload.
+        phase_timeout = _bootstrap_phase_timeout(generation.root)
+    except Exception:
+        # This process already owns the generation, so a sweep would retain it.
+        # A sizing walk that cannot finish would fail verification anyway; drop
+        # the tree on the same force path ``_cancel`` uses instead of leaking it.
+        from hermes_cli.kanban_runtime_generation import cleanup_runtime_generation
+
+        with contextlib.suppress(Exception):
+            cleanup_runtime_generation(generation.root, force=True)
+        raise
     env.update(generation.env)
     env["HERMES_KANBAN_EXPECTED_RUNTIME"] = encode_identity(expected_identity)
     proc = None
