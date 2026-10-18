@@ -51,12 +51,13 @@ def _kb():
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024
 DEFAULT_LOG_BACKUP_COUNT = 1
 
-# Sealed-payload validation re-hashes the whole runtime in both bootstrap phases
-# (pre-import and post-import), so each phase's budget scales with payload bytes:
-# a 3.7 GiB / 171,589-file payload measured 30 s on an idle host and 74 s under
-# load against one 60 s phase, so a fixed wall clock only fit a warm idle cache.
-# Budget a third of the worst observed rate plus a fixed allowance for
-# interpreter start and the scope/identity gates.
+# Each bootstrap phase re-hashes the whole sealed payload before the worker may
+# publish (pre-import) or confirm (post-import) its identity, so the work is
+# proportional to payload bytes. A sealed payload carries interpreters and
+# dependencies and is gigabytes; a fixed wall clock therefore only fits a warm,
+# idle host. Budget the bytes instead, at a conservative cold-cache rate for a
+# hash walk over many small files, plus a fixed allowance for interpreter start
+# and the scope/identity gates.
 _BOOTSTRAP_PAYLOAD_BYTES_PER_SECOND = 24 * 1024 * 1024
 _BOOTSTRAP_FIXED_ALLOWANCE_SECONDS = 30.0
 _BOOTSTRAP_PHASE_FLOOR_SECONDS = 60.0
@@ -73,9 +74,8 @@ def _payload_bytes(root: Path) -> int:
 
     Mirrors ``_payload_digest``'s member set (same excludes, same manifest and
     owner skip) so the budget counts what is actually read, and reuses that walk
-    instead of maintaining a second one. The walk costs ~4 s on a 171,589-file
-    generation against the 30-74 s of hashing one phase performs, so it stays
-    direct rather than cached.
+    instead of maintaining a second one. The walk is metadata-only and stays
+    small next to the hashing it sizes, so it is not cached.
     """
     from hermes_cli.kanban_runtime_generation import _MANIFEST, _OWNER, _members
 
