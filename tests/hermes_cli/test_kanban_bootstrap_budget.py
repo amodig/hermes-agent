@@ -67,10 +67,13 @@ def test_phase_budget_derives_from_the_sealed_payload(monkeypatch, tmp_path):
 
 
 def test_payload_scan_mirrors_the_digest_walk(tmp_path):
-    (tmp_path / "a").write_bytes(b"x" * 100)
-    nested = tmp_path / "sub"
+    payload = tmp_path / "payload"
+    payload.mkdir()
+    (payload / "a").write_bytes(b"x" * 100)
+    nested = payload / "sub"
     nested.mkdir()
     (nested / "b").write_bytes(b"y" * 250)
-    # The manifest is not part of the payload the worker re-hashes.
-    (tmp_path / "generation.json").write_bytes(b"z" * 999)
-    assert runtime._payload_scan(tmp_path) == (350, 2)
+    # The manifest is not part of the payload the worker re-hashes, and directories
+    # are members: the digest hashes a name and separators for each one.
+    (payload / "generation.json").write_bytes(b"z" * 999)
+    assert runtime._payload_scan(payload) == (350, 4)

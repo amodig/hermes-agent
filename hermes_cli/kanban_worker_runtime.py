@@ -103,8 +103,10 @@ def _payload_scan(root: Path) -> tuple[int, int]:
     for name, path in _members(root):
         if name in {_MANIFEST, _OWNER} or name.startswith(f".{_OWNER}."):
             continue
+        # ``_digest_members`` hashes a name and separators for every member, so a
+        # directory costs a member slot without contributing bytes.
+        members += 1
         if path.is_file():
-            members += 1
             with contextlib.suppress(OSError):
                 total += path.stat().st_size
     return total, members
