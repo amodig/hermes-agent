@@ -377,11 +377,17 @@ def _prepare_completion_handoff(
     dependent_children = _handoff_children(conn, task_id)
     effective_goal = _kb.get_effective_goal(conn, task_id)
     task_contract = task.lifecycle_contract or {}
+    is_review_card = task_contract.get("kind") == "review" or (
+        not task_contract
+        and str(task.assignee or "").strip().casefold() == "reviewer"
+    )
+    handoff_phase = phase or ("review" if is_review_card else None)
     contract_reason = _kb._completion_contract_reason(
         effective_goal,
         supplied.get("changed_files"),
         dependent_children,
         lifecycle_contract=task_contract,
+        phase=handoff_phase,
     )
     if contract_reason:
         raise _kb.CompletionContractError(
@@ -394,10 +400,6 @@ def _prepare_completion_handoff(
         and task_contract.get("kind") != "code"
     ):
         return metadata, supplied
-    is_review_card = task_contract.get("kind") == "review" or (
-        not task_contract
-        and str(task.assignee or "").strip().casefold() == "reviewer"
-    )
     if phase in {"review", "validation"}:
         handoff_error = _parent_handoff_start_error(conn, task_id, phase=phase)
         if handoff_error is not None:
@@ -456,6 +458,7 @@ def _prepare_completion_handoff(
                 merged_handoff.get("changed_files"),
                 dependent_children,
                 lifecycle_contract=task_contract,
+                phase=handoff_phase,
             )
             if contract_reason:
                 raise _kb.CompletionContractError(
