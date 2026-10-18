@@ -52,13 +52,16 @@ DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024
 DEFAULT_LOG_BACKUP_COUNT = 1
 
 # Each bootstrap phase re-hashes the whole sealed payload before the worker may
-# publish (pre-import) or confirm (post-import) its identity, so the work is
-# proportional to payload bytes. A sealed payload carries interpreters and
-# dependencies and is gigabytes; a fixed wall clock therefore only fits a warm,
-# idle host. Budget the bytes instead, at a conservative cold-cache rate for a
-# hash walk over many small files, plus a fixed allowance for interpreter start
-# and the scope/identity gates.
-_BOOTSTRAP_PAYLOAD_BYTES_PER_SECOND = 24 * 1024 * 1024
+# publish (pre-import) or confirm (post-import) its identity, and each phase walks
+# it twice: the sealed bootstrap derives the generation digest and the identity
+# check re-verifies it, once before the import handshake and once after. The work
+# is therefore proportional to payload bytes times those passes. A sealed payload
+# carries interpreters and dependencies and is gigabytes; a fixed wall clock
+# therefore only fits a warm, idle host. Budget the bytes instead, at a
+# conservative cold-cache rate for a hash walk over many small files, plus a fixed
+# allowance for interpreter start and the scope/identity gates.
+_BOOTSTRAP_PAYLOAD_BYTES_PER_SECOND = 32 * 1024 * 1024
+_BOOTSTRAP_PHASE_DIGEST_PASSES = 2
 _BOOTSTRAP_FIXED_ALLOWANCE_SECONDS = 30.0
 _BOOTSTRAP_PHASE_FLOOR_SECONDS = 60.0
 # A ceiling on the derivation itself, so a pathological or corrupt payload cannot
@@ -68,7 +71,7 @@ _BOOTSTRAP_PHASE_FLOOR_SECONDS = 60.0
 # bounded by `_SCOPE_ATTEMPT_WINDOW_SECONDS` below instead: two phases must fit
 # inside that window, or a legitimately slow launch is refused as
 # scope_not_from_attempt and keeps its autonomous-worker slot.
-_BOOTSTRAP_PHASE_CEILING_SECONDS = 240.0
+_BOOTSTRAP_PHASE_CEILING_SECONDS = 290.0
 _GRANT_TIMEOUT_SECONDS = 1.0
 
 
@@ -98,7 +101,9 @@ def _bootstrap_phase_timeout(generation_root: Optional[Path] = None) -> float:
     if generation_root is not None:
         timeout = max(
             timeout,
-            _payload_bytes(Path(generation_root)) / _BOOTSTRAP_PAYLOAD_BYTES_PER_SECOND
+            _BOOTSTRAP_PHASE_DIGEST_PASSES
+            * _payload_bytes(Path(generation_root))
+            / _BOOTSTRAP_PAYLOAD_BYTES_PER_SECOND
             + _BOOTSTRAP_FIXED_ALLOWANCE_SECONDS,
         )
     return float(min(timeout, _BOOTSTRAP_PHASE_CEILING_SECONDS))

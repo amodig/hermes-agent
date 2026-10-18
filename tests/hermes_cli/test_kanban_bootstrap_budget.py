@@ -31,6 +31,11 @@ def test_phase_budget_derives_from_the_sealed_payload(monkeypatch, tmp_path):
     assert budget > runtime._BOOTSTRAP_PHASE_FLOOR_SECONDS
     assert 2 * budget < runtime._kb()._resolve_claim_ttl_seconds()
 
+    # Each phase walks the payload twice, so the derivation covers both passes.
+    assert _budget(monkeypatch, tmp_path, GIB) >= (
+        2 * GIB / runtime._BOOTSTRAP_PAYLOAD_BYTES_PER_SECOND
+    )
+
     # A pathological payload is bounded instead of wedging a dispatcher tick, and
     # both phases still fit the scope-attribution window.
     assert _budget(monkeypatch, tmp_path, 400 * GIB) == runtime._BOOTSTRAP_PHASE_CEILING_SECONDS
