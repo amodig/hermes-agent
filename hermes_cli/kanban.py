@@ -27,6 +27,7 @@ from hermes_cli.kanban_output import (
     _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
     _task_to_dict,
 )
+from hermes_cli.kanban_db_receipts import candidate_identity
 from hermes_cli.kanban_boards import _dispatch_boards
 from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
@@ -523,6 +524,13 @@ def _cmd_show(args: argparse.Namespace) -> int:
         )
         # Live projection; must be read while this connection is still open.
         dispatch_guard = kb.get_dispatch_guard(conn, args.task_id, board=board)
+        # The launch receipt beside the author's copy, so reconciliation never has
+        # to depend on a swept cache manifest.
+        provenance = candidate_identity(
+            conn,
+            args.task_id,
+            (lifecycle or {}).get("candidate_run_id") if isinstance(lifecycle, dict) else None,
+        )
     if want_json:
         task_payload = _task_to_dict(task)
         task_payload.update({
@@ -536,6 +544,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "effective_goal": effective_goal,
             "lifecycle": lifecycle,
             "dispatch_guard": dispatch_guard,
+            "provenance": provenance,
             "latest_summary": latest_summary,
             "parents": parents,
             "children": children,
