@@ -47,14 +47,23 @@ def test_phase_budget_derives_from_the_sealed_payload(monkeypatch, tmp_path):
     )
 
     # A pathological payload is bounded instead of wedging a dispatcher tick, and
-    # the attribution window exceeds the slowest possible pre-claim bootstrap.
+    # the provenance-checked window exceeds the slowest possible pre-claim bootstrap.
     assert (
         _budget(monkeypatch, tmp_path, payload_bytes=400 * GIB)
         == runtime._BOOTSTRAP_PHASE_CEILING_SECONDS
     )
     assert (
         2 * runtime._BOOTSTRAP_PHASE_CEILING_SECONDS + runtime._BOOTSTRAP_SCOPE_GATE_RESERVE_SECONDS
-        < runtime._SCOPE_ATTEMPT_WINDOW_SECONDS
+        < runtime._SCOPE_ATTEMPT_BOOTSTRAP_WINDOW_SECONDS
+    )
+
+    # Only a row that records its board gets that wider window; a row without
+    # provenance keeps the strict one, so an imported board cannot claim a scope.
+    monkeypatch.setattr(runtime, "_scope_activation_epoch", lambda unit: 1_000 - 700)
+    run = {"started_at": 1_000, "ended_at": 1_100}
+    assert not runtime._scope_activation_is_inside("u", run)
+    assert runtime._scope_activation_is_inside(
+        "u", run, window=runtime._SCOPE_ATTEMPT_BOOTSTRAP_WINDOW_SECONDS
     )
 
     # Both phases run before any claim exists (the dispatcher spawns with

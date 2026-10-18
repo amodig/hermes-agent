@@ -73,16 +73,18 @@ _BOOTSTRAP_PHASE_FLOOR_SECONDS = 60.0
 _BOOTSTRAP_PHASE_CEILING_SECONDS = 240.0
 
 #: Slack around an attempt's own life when matching a LIVE scope to it, in seconds.
-#: The launch creates the scope before the claim (pre-claim preparation is bounded
-#: by the bootstrap phase timeouts) and a clock step is possible, so the window has
-#: to be generous -- and still far smaller than the age of any historical or
-#: imported run, which is what it exists to exclude. The unit name already carries
-#: the attempt's run or preparation identity, so this window is a staleness bound,
-#: not a partition of the launch: it only has to exceed the slowest possible
-#: pre-claim bootstrap, both phases at their ceiling plus the scope gates between
-#: them, whose per-unit systemctl calls are not statically bounded in time.
+#: The launch creates the scope before the claim and a clock step is possible, so
+#: the window has to be generous -- and still far smaller than the age of any
+#: historical or imported run, which is what it exists to exclude. Imports preserve
+#: task/run ids and timestamps but need not carry board provenance, so this strict
+#: window is what a row without it keeps.
+_SCOPE_ATTEMPT_WINDOW_SECONDS = 600
+# A row that records its board has already passed the board check, so its scope may
+# be attributed across a full slow bootstrap: both phases at their ceiling, a
+# generous reserve for the scope gates whose per-unit systemctl calls are not
+# statically bounded, and slack.
 _BOOTSTRAP_SCOPE_GATE_RESERVE_SECONDS = 300.0
-_SCOPE_ATTEMPT_WINDOW_SECONDS = int(
+_SCOPE_ATTEMPT_BOOTSTRAP_WINDOW_SECONDS = int(
     2 * _BOOTSTRAP_PHASE_CEILING_SECONDS + _BOOTSTRAP_SCOPE_GATE_RESERVE_SECONDS + 60
 )
 _GRANT_TIMEOUT_SECONDS = 1.0
@@ -732,7 +734,9 @@ def _scope_activation_epoch(unit_name: str) -> Optional[int]:
         return None
 
 
-def _scope_activation_is_inside(unit_name: str, run) -> bool:
+def _scope_activation_is_inside(
+    unit_name: str, run, *, window: int = _SCOPE_ATTEMPT_WINDOW_SECONDS,
+) -> bool:
     """Whether *unit_name* was activated inside *run*'s own lifetime window.
 
     A worker scope cannot exist before its launch or, for a scope still standing,
@@ -747,11 +751,7 @@ def _scope_activation_is_inside(unit_name: str, run) -> bool:
         # Legacy row with no attempt start: nothing to compare against, so no proof.
         return False
     ended = int(run["ended_at"] or started)
-    return (
-        int(started) - _SCOPE_ATTEMPT_WINDOW_SECONDS
-        <= activation
-        <= ended + _SCOPE_ATTEMPT_WINDOW_SECONDS
-    )
+    return int(started) - window <= activation <= ended + window
 
 
 def _kanban_scope_owner(unit_name: str) -> Optional[dict[str, Any]]:
@@ -946,7 +946,16 @@ def _reconcile_worker_scope(
     if recorded_board and local_board and recorded_board != local_board:
         # The attempt belongs to another board; its own dispatcher owns this scope.
         return _event("foreign_board", "refused", run_id=run_id, pid=pid, board=recorded_board)
-    if not _scope_activation_is_inside(unit, run):
+    # A row that records its board passed the board check above, so a full slow
+    # bootstrap may sit before its attempt start. A row without provenance keeps the
+    # strict window: imports preserve ids and timestamps, and the wider one could let
+    # an imported board claim a surviving scope.
+    window = (
+        _SCOPE_ATTEMPT_BOOTSTRAP_WINDOW_SECONDS
+        if recorded_board
+        else _SCOPE_ATTEMPT_WINDOW_SECONDS
+    )
+    if not _scope_activation_is_inside(unit, run, window=window):
         # The unit name carries a task and a run/preparation identity but no board,
         # and board imports preserve those identities; the scope's own activation
         # inside this attempt's lifetime is what makes it this attempt's to stop.
