@@ -526,10 +526,13 @@ def _cmd_show(args: argparse.Namespace) -> int:
         dispatch_guard = kb.get_dispatch_guard(conn, args.task_id, board=board)
         # The launch receipt beside the author's copy, so reconciliation never has
         # to depend on a swept cache manifest.
+        # A separate review or validation card names the implementation card as its
+        # candidate; reconciling against this card's own id would never find the run.
+        lifecycle_state = lifecycle if isinstance(lifecycle, dict) else {}
         provenance = candidate_identity(
             conn,
-            args.task_id,
-            (lifecycle or {}).get("candidate_run_id") if isinstance(lifecycle, dict) else None,
+            lifecycle_state.get("candidate_task_id") or args.task_id,
+            lifecycle_state.get("candidate_run_id"),
         )
     if want_json:
         task_payload = _task_to_dict(task)
