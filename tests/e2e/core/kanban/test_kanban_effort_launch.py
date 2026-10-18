@@ -144,7 +144,11 @@ def test_pinned_card_effort_reaches_the_worker_wire(tmp_path) -> None:
                 assert claimed[-1]["payload"]["reasoning_effort"] == "xhigh", board.diag(tid)
 
                 identity = json.loads(runs[0]["metadata"] or "{}").get("runtime_identity") or {}
-                assert identity.get("code") and identity.get("generation"), board.diag(tid)
+                # RuntimeIdentity.as_dict() exposes ``code_sha``/``generation``; an
+                # earlier ``code`` never existed, so this assertion could not pass
+                # once sealed dispatch actually reached it.
+                assert identity.get("code_sha"), board.diag(tid)
+                assert len(identity.get("generation") or "") == 64, board.diag(tid)
 
                 mains = srv.main_requests()
                 assert srv.invalid_requests() == [], srv.invalid_requests()

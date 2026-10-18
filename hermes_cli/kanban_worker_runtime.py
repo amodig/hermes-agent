@@ -51,9 +51,75 @@ def _kb():
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024
 DEFAULT_LOG_BACKUP_COUNT = 1
 
-# Sealed-payload validation scales with installed dependency size in both phases.
-_BOOTSTRAP_PHASE_TIMEOUT_SECONDS = 60.0
+# Each bootstrap phase re-hashes the whole sealed payload before the worker may
+# publish (pre-import) or confirm (post-import) its identity, and each phase walks
+# it twice: the sealed bootstrap derives the generation digest and the identity
+# check re-verifies it, once before the import handshake and once after. The work
+# is therefore proportional to payload bytes times those passes. A sealed payload
+# carries interpreters and dependencies and is gigabytes; a fixed wall clock
+# therefore only fits a warm, idle host. Budget the bytes instead, at a
+# conservative cold-cache rate for a hash walk over many small files, plus a fixed
+# allowance for interpreter start and the scope/identity gates.
+_BOOTSTRAP_PAYLOAD_BYTES_PER_SECOND = 32 * 1024 * 1024
+_BOOTSTRAP_PHASE_DIGEST_PASSES = 2
+_BOOTSTRAP_FIXED_ALLOWANCE_SECONDS = 30.0
+_BOOTSTRAP_PHASE_FLOOR_SECONDS = 60.0
+# A ceiling on the derivation itself, so a pathological or corrupt payload cannot
+# wedge a dispatcher tick. It is deliberately independent of the claim lease: the
+# pre-import phase runs before any claim exists, so shrinking this budget to fit a
+# short lease would reintroduce the timeout instead of protecting the run. It is
+# bounded by the scope-attribution window below instead: both phases and the scope
+# gates between them have to fit inside it, or a legitimately slow launch is
+# refused as scope_not_from_attempt and keeps its autonomous-worker slot.
+
+#: Slack around an attempt's own life when matching a LIVE scope to it, in seconds.
+#: The launch creates the scope before the claim (pre-claim preparation is bounded
+#: by the bootstrap phase timeouts) and a clock step is possible, so the window has
+#: to be generous -- and still far smaller than the age of any historical or
+#: imported run, which is what it exists to exclude.
+_SCOPE_ATTEMPT_WINDOW_SECONDS = 600
+# The scope gates between and after the phases run several sequential systemctl
+# calls, each of which may take tens of seconds and still succeed, so that time is
+# reserved out of the same window as the two phases.
+_SCOPE_GATE_ALLOWANCE_SECONDS = 120.0
+_BOOTSTRAP_PHASE_CEILING_SECONDS = (
+    _SCOPE_ATTEMPT_WINDOW_SECONDS - _SCOPE_GATE_ALLOWANCE_SECONDS
+) / 2
 _GRANT_TIMEOUT_SECONDS = 1.0
+
+
+def _payload_bytes(root: Path) -> int:
+    """Bytes the worker re-hashes per phase, walked once per launch.
+
+    Mirrors ``_payload_digest``'s member set (same excludes, same manifest and
+    owner skip) so the budget counts what is actually read, and reuses that walk
+    instead of maintaining a second one. The walk is metadata-only and stays
+    small next to the hashing it sizes, so it is not cached.
+    """
+    from hermes_cli.kanban_runtime_generation import _MANIFEST, _OWNER, _members
+
+    total = 0
+    for name, path in _members(root):
+        if name in {_MANIFEST, _OWNER} or name.startswith(f".{_OWNER}."):
+            continue
+        if path.is_file():
+            with contextlib.suppress(OSError):
+                total += path.stat().st_size
+    return total
+
+
+def _bootstrap_phase_timeout(generation_root: Optional[Path] = None) -> float:
+    """Seconds each bootstrap phase may take, derived from what it must hash."""
+    timeout = _BOOTSTRAP_PHASE_FLOOR_SECONDS
+    if generation_root is not None:
+        timeout = max(
+            timeout,
+            _BOOTSTRAP_PHASE_DIGEST_PASSES
+            * _payload_bytes(Path(generation_root))
+            / _BOOTSTRAP_PAYLOAD_BYTES_PER_SECOND
+            + _BOOTSTRAP_FIXED_ALLOWANCE_SECONDS,
+        )
+    return float(min(timeout, _BOOTSTRAP_PHASE_CEILING_SECONDS))
 
 
 def _set_windows_pipe_nonblocking(fd: int) -> None:
@@ -619,13 +685,6 @@ _SCOPE_RUN_COLUMNS = (
     "id, task_id, status, started_at, ended_at, worker_pid, worker_started_at, metadata"
 )
 
-#: Slack around an attempt's own life when matching a LIVE scope to it, in seconds.
-#: The launch creates the scope before the claim (pre-claim preparation is bounded
-#: by the bootstrap phase timeouts) and a clock step is possible, so the window has
-#: to be generous -- and still far smaller than the age of any historical or
-#: imported run, which is what it exists to exclude.
-_SCOPE_ATTEMPT_WINDOW_SECONDS = 600
-
 
 def _scope_activation_epoch(unit_name: str) -> Optional[int]:
     """When the manager activated *unit_name*, or ``None`` when unreadable.
@@ -1190,6 +1249,18 @@ def _default_spawn(
         project_plugins_enabled=project_plugins_enabled,
     )
     expected_identity = generation.identity
+    try:
+        # One walk per launch: both phases re-hash the same sealed payload.
+        phase_timeout = _bootstrap_phase_timeout(generation.root)
+    except Exception:
+        # This process already owns the generation, so a sweep would retain it.
+        # A sizing walk that cannot finish would fail verification anyway; drop
+        # the tree on the same force path ``_cancel`` uses instead of leaking it.
+        from hermes_cli.kanban_runtime_generation import cleanup_runtime_generation
+
+        with contextlib.suppress(Exception):
+            cleanup_runtime_generation(generation.root, force=True)
+        raise
     env.update(generation.env)
     env["HERMES_KANBAN_EXPECTED_RUNTIME"] = encode_identity(expected_identity)
     proc = None
@@ -1269,7 +1340,7 @@ def _default_spawn(
         _worker_processes[proc.pid] = proc
         _worker_runtime_snapshots[proc.pid] = generation.root
         log_f.close()
-        deadline = time.monotonic() + _BOOTSTRAP_PHASE_TIMEOUT_SECONDS
+        deadline = time.monotonic() + phase_timeout
         payload = None
         while time.monotonic() < deadline:
             _check_not_stopping(should_stop, task.id)
@@ -1311,7 +1382,7 @@ def _default_spawn(
         }, sort_keys=True).encode("utf-8") + b"\n")
         proc.stdin.flush()
 
-        post_deadline = time.monotonic() + _BOOTSTRAP_PHASE_TIMEOUT_SECONDS
+        post_deadline = time.monotonic() + phase_timeout
         post_payload = None
         while time.monotonic() < post_deadline:
             _check_not_stopping(should_stop, task.id)
