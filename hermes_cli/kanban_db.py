@@ -1710,6 +1710,7 @@ class GoalRevisionConflict(RuntimeError):
         )
 
 
+from hermes_cli.kanban_db_receipts import receipt_runtime_identity
 from hermes_cli.kanban_db_lazy import _UPDATE_UNSET
 
 
@@ -2383,6 +2384,14 @@ def _end_run(
         merged_metadata.update(metadata)
     elif metadata:
         merged_metadata = metadata
+    # The spawn receipt survives the close: this is the path every worker and CLI
+    # completion takes, so an author-supplied identity must be checked here, not only
+    # on a later edit.
+    receipt = receipt_runtime_identity(
+        open_metadata, metadata if isinstance(metadata, dict) else None, run_id=run_id,
+    )
+    if receipt is not None:
+        merged_metadata["runtime_identity"] = receipt
     conn.execute(
         """
         UPDATE task_runs

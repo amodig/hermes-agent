@@ -21,6 +21,7 @@ from hermes_cli.kanban_db_lifecycle_evidence import (
     _implementation_routing,
     _latest_lifecycle_run_id,
 )
+from hermes_cli.kanban_db_receipts import receipt_runtime_identity
 from hermes_cli.kanban_db_lifecycle_rework import _prior_reviewer
 from hermes_cli.kanban_lifecycle import LifecycleEvidenceError, get_lifecycle_state
 
@@ -1051,8 +1052,12 @@ def edit_completed_task_result(
             run_id = int(run["id"])
             conn.execute("UPDATE task_runs SET summary = ? WHERE id = ?", (handoff_summary, run_id))
             if metadata is not None:
-                merged_metadata = _kb._json_dict(_kb._row_get(run, "metadata"))
+                original_metadata = _kb._json_dict(_kb._row_get(run, "metadata"))
+                merged_metadata = dict(original_metadata)
                 merged_metadata.update(metadata)
+                receipt = receipt_runtime_identity(original_metadata, metadata, run_id=run_id)
+                if receipt is not None:
+                    merged_metadata["runtime_identity"] = receipt
                 conn.execute(
                     "UPDATE task_runs SET metadata = ? WHERE id = ?",
                     (json.dumps(merged_metadata, ensure_ascii=False), run_id),
