@@ -66,12 +66,23 @@ _GRANT_TIMEOUT_SECONDS = 1.0
 
 
 def _payload_bytes(root: Path) -> int:
-    """Bytes the worker re-hashes per phase, walked once per launch."""
+    """Bytes the worker re-hashes per phase, walked once per launch.
+
+    Mirrors ``_payload_digest``'s member set (same excludes, same manifest and
+    owner skip) so the budget counts what is actually read, and reuses that walk
+    instead of maintaining a second one. The walk costs ~4 s on a 171,589-file
+    generation against the 30-74 s of hashing one phase performs, so it stays
+    direct rather than cached.
+    """
+    from hermes_cli.kanban_runtime_generation import _MANIFEST, _OWNER, _members
+
     total = 0
-    for dirpath, _dirnames, filenames in os.walk(root):
-        for name in filenames:
+    for name, path in _members(root):
+        if name in {_MANIFEST, _OWNER} or name.startswith(f".{_OWNER}."):
+            continue
+        if path.is_file():
             with contextlib.suppress(OSError):
-                total += os.stat(os.path.join(dirpath, name)).st_size
+                total += path.stat().st_size
     return total
 
 
@@ -85,6 +96,8 @@ def _bootstrap_phase_timeout(generation_root: Optional[Path] = None) -> float:
             + _BOOTSTRAP_FIXED_ALLOWANCE_SECONDS,
         )
     claim_ttl = _kb()._resolve_claim_ttl_seconds()
+    # A degenerate lease (shorter than the floor) must still bound the phases:
+    # a worker that outlives its claim loses the run regardless of bootstrap.
     return float(min(timeout, claim_ttl * _BOOTSTRAP_CLAIM_TTL_SHARE))
 
 
