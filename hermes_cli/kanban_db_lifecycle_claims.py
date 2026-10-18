@@ -171,6 +171,14 @@ def _claim_and_open_run(
             "workspace_path": trow["workspace_path"],
             "branch_name": trow["branch_name"],
         }
+        # Remember what this claim displaces. An attempt that is then refused in the
+        # wrong phase restores it rather than silently destroying the binding (#72).
+        displaced = conn.execute(
+            "SELECT candidate_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        displaced_run = _kb._row_get(displaced, "candidate_run_id")
+        if displaced_run is not None:
+            run_metadata["superseded_candidate"] = {"run_id": int(displaced_run)}
         conn.execute("UPDATE tasks SET candidate_run_id = NULL WHERE id = ?", (task_id,))
     run_cur = conn.execute(
         """

@@ -27,7 +27,7 @@ from hermes_cli.kanban_output import (
     _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
     _task_to_dict,
 )
-from hermes_cli.kanban_db_receipts import candidate_identity
+from hermes_cli.kanban_db_receipts import candidate_identity, rebind_candidate
 from hermes_cli.kanban_boards import _dispatch_boards
 from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
@@ -701,6 +701,27 @@ def _cmd_update(args: argparse.Namespace) -> int:
     else:
         print(f"Updated {args.task_id}: version={task.version}, status={task.status}")
     return 0
+def _cmd_rebind_candidate(args: argparse.Namespace) -> int:
+    """Recover a cleared candidate binding onto the run that already carries the work."""
+    with kbc.connect_closing() as conn:
+        payload = rebind_candidate(
+            conn,
+            args.task_id,
+            run_id=args.candidate_run,
+            head_sha=args.head,
+            reason=args.reason,
+            author=getattr(args, "author", None) or _profile_author(),
+        )
+    if getattr(args, "json", False):
+        _print_json(payload)
+    else:
+        print(
+            f"Rebound {args.task_id} to candidate run {payload['candidate_run_id']} "
+            f"at {payload['head_sha']}"
+        )
+    return 0
+
+
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
     with kbc.connect_closing() as conn:
@@ -1644,6 +1665,7 @@ _HANDLERS = {
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "rework-review": _cmd_rework_review,
     "supersede-candidate": _cmd_supersede_candidate,
+    "rebind-candidate": _cmd_rebind_candidate,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
