@@ -31,12 +31,27 @@ def test_small_payloads_keep_the_floor(monkeypatch, tmp_path):
     assert runtime._bootstrap_phase_timeout(tmp_path) == runtime._BOOTSTRAP_PHASE_FLOOR_SECONDS
 
 
-def test_both_phases_still_fit_one_claim_lease(monkeypatch, tmp_path):
+def test_pathological_payloads_are_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(runtime, "_payload_bytes", lambda root: 400 * GIB)
     timeout = runtime._bootstrap_phase_timeout(tmp_path)
-    claim_ttl = runtime._kb()._resolve_claim_ttl_seconds()
-    assert 2 * timeout < claim_ttl, "the two phases must fit inside the claim lease"
+    assert timeout == runtime._BOOTSTRAP_PHASE_CEILING_SECONDS
     assert timeout < 400 * GIB / runtime._BOOTSTRAP_PAYLOAD_BYTES_PER_SECOND
+
+
+def test_short_claim_leases_do_not_shrink_the_budget(monkeypatch, tmp_path):
+    # The pre-import phase runs before any claim exists, so a short
+    # HERMES_KANBAN_CLAIM_TTL_SECONDS must not push the budget below the work.
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_TTL_SECONDS", "60")
+    monkeypatch.setattr(runtime, "_payload_bytes", lambda root: int(3.7 * GIB))
+    assert runtime._bootstrap_phase_timeout(tmp_path) >= MEASURED_WORST_PHASE_SECONDS
+
+
+def test_reference_payload_fits_the_default_claim_lease(monkeypatch, tmp_path):
+    # The surrounding window is asserted, not enforced by shrinking the budget.
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_TTL_SECONDS", raising=False)
+    monkeypatch.setattr(runtime, "_payload_bytes", lambda root: int(3.18 * GIB))
+    timeout = runtime._bootstrap_phase_timeout(tmp_path)
+    assert 2 * timeout < runtime._kb()._resolve_claim_ttl_seconds()
 
 
 def test_payload_bytes_sums_real_files(tmp_path):

@@ -60,8 +60,11 @@ DEFAULT_LOG_BACKUP_COUNT = 1
 _BOOTSTRAP_PAYLOAD_BYTES_PER_SECOND = 24 * 1024 * 1024
 _BOOTSTRAP_FIXED_ALLOWANCE_SECONDS = 30.0
 _BOOTSTRAP_PHASE_FLOOR_SECONDS = 60.0
-# Both phases run under one claim lease; leave the rest of the TTL for reporting.
-_BOOTSTRAP_CLAIM_TTL_SHARE = 0.4
+# A ceiling on the derivation itself, so a pathological or corrupt payload cannot
+# wedge a dispatcher tick. It is deliberately independent of the claim lease: the
+# pre-import phase runs before any claim exists, so shrinking this budget to fit a
+# short lease would reintroduce the timeout instead of protecting the run.
+_BOOTSTRAP_PHASE_CEILING_SECONDS = 600.0
 _GRANT_TIMEOUT_SECONDS = 1.0
 
 
@@ -95,10 +98,7 @@ def _bootstrap_phase_timeout(generation_root: Optional[Path] = None) -> float:
             _payload_bytes(Path(generation_root)) / _BOOTSTRAP_PAYLOAD_BYTES_PER_SECOND
             + _BOOTSTRAP_FIXED_ALLOWANCE_SECONDS,
         )
-    claim_ttl = _kb()._resolve_claim_ttl_seconds()
-    # A degenerate lease (shorter than the floor) must still bound the phases:
-    # a worker that outlives its claim loses the run regardless of bootstrap.
-    return float(min(timeout, claim_ttl * _BOOTSTRAP_CLAIM_TTL_SHARE))
+    return float(min(timeout, _BOOTSTRAP_PHASE_CEILING_SECONDS))
 
 
 def _set_windows_pipe_nonblocking(fd: int) -> None:
