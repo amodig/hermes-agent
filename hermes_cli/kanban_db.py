@@ -1710,6 +1710,7 @@ class GoalRevisionConflict(RuntimeError):
         )
 
 
+from hermes_cli.kanban_db_receipts import receipt_runtime_identity
 from hermes_cli.kanban_db_lazy import _UPDATE_UNSET
 
 
@@ -2357,57 +2358,6 @@ def _append_event(
     )
 
 
-_GENERATION_DIGEST = re.compile(r"[0-9a-f]{64}")
-
-
-def _receipt_runtime_identity(
-    original: dict, supplied: Optional[dict], *, run_id: int,
-) -> Optional[dict]:
-    """The launch receipt's ``runtime_identity``, or ``None`` when the run has none.
-
-    The dispatcher writes this identity when it spawns the worker and mirrors it in
-    the run's ``spawned`` event, so it is runtime-owned. Completion metadata is
-    author-supplied and must not redefine it: an author copy may only agree. A
-    malformed or differing value is a typed refusal naming the field and the
-    authoritative source, so it can never read as a provenance or head verdict.
-    """
-    receipt = original.get("runtime_identity")
-    if not isinstance(receipt, dict) or not receipt:
-        return None
-    if isinstance(supplied, dict) and "runtime_identity" in supplied:
-        author = supplied.get("runtime_identity")
-        if author is None:
-            pass  # explicitly absent: the receipt stands unchallenged
-        elif not isinstance(author, dict):
-            raise LifecycleEvidenceError(
-                f"run {run_id} runtime_identity must be an object; the launch receipt "
-                "recorded in task_runs.metadata is authoritative"
-            )
-        else:
-            generation = author.get("generation")
-            if generation is not None and not _GENERATION_DIGEST.fullmatch(str(generation)):
-                raise LifecycleEvidenceError(
-                    f"run {run_id} runtime_identity.generation is not a 64-character digest; "
-                    "the launch receipt recorded in task_runs.metadata is authoritative"
-                )
-            for field in ("generation", "code_sha"):
-                expected = receipt.get(field)
-                if not expected or field not in author:
-                    continue
-                given = author.get(field)
-                if given in (None, ""):
-                    raise LifecycleEvidenceError(
-                        f"run {run_id} runtime_identity.{field} is empty; the launch receipt "
-                        "recorded in task_runs.metadata is authoritative"
-                    )
-                if str(expected) != str(given):
-                    raise LifecycleEvidenceError(
-                        f"run {run_id} runtime_identity.{field} does not match the launch "
-                        "receipt; completion metadata may corroborate it, not replace it"
-                    )
-    return receipt
-
-
 def _end_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
@@ -2437,7 +2387,7 @@ def _end_run(
     # The spawn receipt survives the close: this is the path every worker and CLI
     # completion takes, so an author-supplied identity must be checked here, not only
     # on a later edit.
-    receipt = _receipt_runtime_identity(
+    receipt = receipt_runtime_identity(
         open_metadata, metadata if isinstance(metadata, dict) else None, run_id=run_id,
     )
     if receipt is not None:
