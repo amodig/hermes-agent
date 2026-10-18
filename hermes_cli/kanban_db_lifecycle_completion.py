@@ -24,6 +24,42 @@ from hermes_cli.kanban_db_lifecycle_evidence import (
 from hermes_cli.kanban_db_lifecycle_rework import _prior_reviewer
 from hermes_cli.kanban_lifecycle import LifecycleEvidenceError, get_lifecycle_state
 
+_GENERATION_DIGEST = re.compile(r"[0-9a-f]{64}")
+
+
+def _receipt_runtime_identity(
+    original: dict, supplied: Optional[dict], *, run_id: int,
+) -> Optional[dict]:
+    """The launch receipt's ``runtime_identity``, or ``None`` when the run has none.
+
+    The dispatcher writes this identity when it spawns the worker and mirrors it in
+    the run's ``spawned`` event, so it is runtime-owned. Completion metadata is
+    author-supplied and must not redefine it: an author copy may only agree. A
+    malformed or differing value is a typed refusal naming the field and the
+    authoritative source, so it can never read as a provenance or head verdict.
+    """
+    receipt = original.get("runtime_identity")
+    if not isinstance(receipt, dict) or not receipt:
+        return None
+    if isinstance(supplied, dict):
+        author = supplied.get("runtime_identity")
+        if isinstance(author, dict):
+            generation = author.get("generation")
+            if generation is not None and not _GENERATION_DIGEST.fullmatch(str(generation)):
+                raise LifecycleEvidenceError(
+                    f"run {run_id} runtime_identity.generation is not a 64-character digest; "
+                    "the launch receipt recorded in task_runs.metadata is authoritative"
+                )
+            for field in ("generation", "code_sha"):
+                expected, given = receipt.get(field), author.get(field)
+                if expected and given and str(expected) != str(given):
+                    raise LifecycleEvidenceError(
+                        f"run {run_id} runtime_identity.{field} does not match the launch "
+                        "receipt; completion metadata may corroborate it, not replace it"
+                    )
+    return receipt
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -1051,8 +1087,12 @@ def edit_completed_task_result(
             run_id = int(run["id"])
             conn.execute("UPDATE task_runs SET summary = ? WHERE id = ?", (handoff_summary, run_id))
             if metadata is not None:
-                merged_metadata = _kb._json_dict(_kb._row_get(run, "metadata"))
+                original_metadata = _kb._json_dict(_kb._row_get(run, "metadata"))
+                merged_metadata = dict(original_metadata)
                 merged_metadata.update(metadata)
+                receipt = _receipt_runtime_identity(original_metadata, metadata, run_id=run_id)
+                if receipt is not None:
+                    merged_metadata["runtime_identity"] = receipt
                 conn.execute(
                     "UPDATE task_runs SET metadata = ? WHERE id = ?",
                     (json.dumps(merged_metadata, ensure_ascii=False), run_id),
