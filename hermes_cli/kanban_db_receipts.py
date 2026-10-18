@@ -18,6 +18,35 @@ from hermes_cli.kanban_lifecycle import LifecycleEvidenceError
 _GENERATION_DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
+def _identity_disagreement(
+    receipt: dict, author,
+) -> Optional[tuple[str, str]]:
+    """``(verdict, field)`` when an author copy may not stand, else ``None``.
+
+    ``verdict`` is ``author_malformed`` when the copy is not an object, or a field is
+    empty or not a 64-character digest, and ``conflict`` when both sides are
+    well-formed and differ. One rule, because the writer refuses with it and the
+    reader reports it.
+    """
+    if author is None:
+        return None
+    if not isinstance(author, dict):
+        return ("author_malformed", "runtime_identity")
+    for field in ("generation", "code_sha"):
+        if field not in author:
+            continue
+        expected, given = receipt.get(field), author.get(field)
+        if not expected:
+            continue
+        if given in (None, ""):
+            return ("author_malformed", field)
+        if field == "generation" and not _GENERATION_DIGEST.fullmatch(str(given)):
+            return ("author_malformed", field)
+        if str(expected) != str(given):
+            return ("conflict", field)
+    return None
+
+
 def receipt_runtime_identity(
     original: dict, supplied: Optional[dict], *, run_id: int,
 ) -> Optional[dict]:
@@ -34,6 +63,30 @@ def receipt_runtime_identity(
         return None
     if not isinstance(supplied, dict) or "runtime_identity" not in supplied:
         return receipt
+    author = supplied.get("runtime_identity")
+    disagreement = _identity_disagreement(receipt, author)
+    if disagreement is not None:
+        verdict, field = disagreement
+        if field == "runtime_identity":
+            raise LifecycleEvidenceError(
+                f"run {run_id} runtime_identity must be an object; the launch receipt "
+                "recorded in task_runs.metadata is authoritative"
+            )
+        given = author.get(field) if isinstance(author, dict) else None
+        if given in (None, ""):
+            detail = f"runtime_identity.{field} is empty"
+        elif verdict == "conflict":
+            detail = (
+                f"runtime_identity.{field} does not match the launch receipt; "
+                "completion metadata may corroborate it, not replace it"
+            )
+        else:
+            detail = f"runtime_identity.{field} is not a 64-character digest"
+        raise LifecycleEvidenceError(
+            f"run {run_id} {detail}; the launch receipt recorded in task_runs.metadata "
+            "is authoritative"
+        )
+    return receipt
     author = supplied.get("runtime_identity")
     if author is None:
         return receipt  # explicitly absent: the receipt stands unchallenged
@@ -87,8 +140,11 @@ def candidate_identity(conn, task_id: str, run_id: Optional[int] = None) -> Opti
             (task_id, rid),
         ).fetchall()
         for row in rows:
-            payload = json.loads(row[0]) if row and row[0] else {}
-            identity = payload.get("runtime_identity")
+            try:
+                payload = json.loads(row[0]) if row and row[0] else {}
+            except (TypeError, ValueError):
+                continue  # a damaged event is no receipt; never fail the reader
+            identity = payload.get("runtime_identity") if isinstance(payload, dict) else None
             if isinstance(identity, dict) and identity:
                 return identity
         return None
@@ -115,17 +171,15 @@ def candidate_identity(conn, task_id: str, run_id: Optional[int] = None) -> Opti
     row = conn.execute(
         "SELECT metadata FROM task_runs WHERE id = ? AND task_id = ?", (run_id, task_id),
     ).fetchone()
-    author = (json.loads(row[0]) if row and row[0] else {}).get("runtime_identity")
-    expected = receipt.get("generation")
+    try:
+        metadata = json.loads(row[0]) if row and row[0] else {}
+    except (TypeError, ValueError):
+        metadata = {}
+    author = metadata.get("runtime_identity") if isinstance(metadata, dict) else None
+    disagreement = _identity_disagreement(receipt, author)
+    verdict = disagreement[0] if disagreement else "verified"
     given = author.get("generation") if isinstance(author, dict) else None
-    if not isinstance(author, dict) or given is None:
-        verdict = "verified"
-    elif not _GENERATION_DIGEST.fullmatch(str(given)):
-        verdict = "author_malformed"
-    elif expected and str(given) != str(expected):
-        verdict = "conflict"
-    else:
-        verdict = "verified"
+    expected = receipt.get("generation")
     return {
         "run_id": run_id,
         "verdict": verdict,

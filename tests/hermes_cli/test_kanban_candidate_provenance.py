@@ -2,7 +2,8 @@
 
 The sealed payload's ``generation.json`` is a cache the sweeper reclaims; the run's
 ``spawned`` event is written once and never rewritten, so it is the evidence a
-reviewer needs when the author's own copy is malformed or absent.
+reviewer needs when the author's own copy is malformed or absent. Retention keeps
+that receipt for the same reason it keeps the run row.
 """
 
 from __future__ import annotations
@@ -34,13 +35,13 @@ def conn(tmp_path, monkeypatch):
         yield c
 
 
-def _spawned_run(conn, *, author: dict | None = None, with_receipt: bool = True) -> str:
+def _spawned_run(conn, *, author=None, receipt=RECEIPT):
     tid = kb.create_task(conn, title="candidate", assignee="coder")
     assert kb.claim_task(conn, tid, claimer=kb._claimer_id()) is not None
     kbd._set_worker_pid(conn, tid, os.getpid())
     run_id = kb._current_run_id(conn, tid)
-    if with_receipt:
-        kb._append_event(conn, tid, "spawned", {"runtime_identity": RECEIPT}, run_id=run_id)
+    if receipt is not None:
+        kb._append_event(conn, tid, "spawned", {"runtime_identity": receipt}, run_id=run_id)
     if author is not None:
         conn.execute(
             "UPDATE task_runs SET metadata = ? WHERE id = ?",
@@ -50,27 +51,46 @@ def _spawned_run(conn, *, author: dict | None = None, with_receipt: bool = True)
     return tid
 
 
-def test_candidate_identity_reconciles_against_the_launch_receipt(conn):
-    # No author copy: the receipt alone answers.
-    tid = _spawned_run(conn)
-    verdict = candidate_identity(conn, tid)
-    assert verdict["verdict"] == "verified"
-    assert verdict["receipt_generation"] == "b" * 64
+def _verdict(conn, tid):
+    return candidate_identity(conn, tid)["verdict"]
 
-    # The truncated digest the incident carried is named as malformed, and the
-    # receipt still reports the authoritative 64-character value.
-    tid = _spawned_run(conn, author={**RECEIPT, "generation": "b" * 62})
-    verdict = candidate_identity(conn, tid)
+
+def test_candidate_identity_reconciles_against_the_launch_receipt(conn):
+    # No author copy, and an agreeing one: the receipt alone answers.
+    assert _verdict(conn, _spawned_run(conn)) == "verified"
+    assert _verdict(conn, _spawned_run(conn, author=dict(RECEIPT))) == "verified"
+
+    # The truncated digest the incident carried is malformed, and the receipt still
+    # reports the authoritative 64-character value.
+    verdict = candidate_identity(conn, _spawned_run(conn, author={**RECEIPT, "generation": "b" * 62}))
     assert verdict["verdict"] == "author_malformed"
     assert verdict["author_generation"] == "b" * 62
     assert verdict["receipt_generation"] == "b" * 64
 
-    # A different 64-character digest is a conflict, not a silent pass.
-    tid = _spawned_run(conn, author={**RECEIPT, "generation": "c" * 64})
-    assert candidate_identity(conn, tid)["verdict"] == "conflict"
+    # Corrupt shapes this path exists to diagnose are not silently "verified".
+    assert _verdict(conn, _spawned_run(conn, author="bogus")) == "author_malformed"
+    assert _verdict(conn, _spawned_run(conn, author={**RECEIPT, "code_sha": ""})) == "author_malformed"
+    # A partially conflicting copy is a conflict, not a pass.
+    assert _verdict(conn, _spawned_run(conn, author={**RECEIPT, "code_sha": "d" * 40})) == "conflict"
+    assert _verdict(conn, _spawned_run(conn, author={**RECEIPT, "generation": "c" * 64})) == "conflict"
 
-    # Agreeing copies verify, and a run with no receipt says so instead of guessing.
-    tid = _spawned_run(conn, author=dict(RECEIPT))
-    assert candidate_identity(conn, tid)["verdict"] == "verified"
-    tid = _spawned_run(conn, with_receipt=False)
-    assert candidate_identity(conn, tid)["verdict"] == "receipt_missing"
+    # Runs without a receipt say so instead of guessing.
+    assert _verdict(conn, _spawned_run(conn, receipt=None)) == "receipt_missing"
+
+
+def test_event_retention_keeps_the_launch_receipt(conn):
+    tid = _spawned_run(conn, author={**RECEIPT, "generation": "b" * 62})
+    conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (tid,))
+    conn.execute("UPDATE task_events SET created_at = 0 WHERE task_id = ?", (tid,))
+    conn.commit()
+
+    assert kb.gc_events(conn, older_than_seconds=60) > 0  # ordinary events go
+    kinds = {
+        row[0] for row in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ?", (tid,),
+        )
+    }
+    assert "spawned" in kinds, "the launch receipt must outlive event retention"
+    assert "claimed" not in kinds
+    # And it still reconciles after the sweep.
+    assert _verdict(conn, tid) == "author_malformed"
