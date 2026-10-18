@@ -2950,6 +2950,7 @@ def _completion_contract_reason(
     dependent_children: Iterable[tuple[str, str]],
     *,
     lifecycle_contract: Optional[dict],
+    phase: Optional[str] = None,
 ) -> Optional[str]:
     """Why a nonempty patch conflicts with the effective goal, or None.
 
@@ -2957,11 +2958,19 @@ def _completion_contract_reason(
     implementation card, so goal prose that only scopes out other work (or quotes
     this classifier) must not be read as a plan-only objective (#41). Prose still
     constrains *which* work is authorized; it just cannot reclassify the card.
+
+    A review or validation handoff cannot author implementation either: the patch it
+    carries is inherited evidence from the card under review, so plan-only prose in
+    that goal constrains the implementation, not this handoff (#68).
     """
-    if (
-        isinstance(lifecycle_contract, Mapping)
-        and lifecycle_contract.get("kind") == "code"
-    ):
+    kind = (
+        lifecycle_contract.get("kind")
+        if isinstance(lifecycle_contract, Mapping)
+        else None
+    )
+    if kind == "code":
+        return None
+    if kind in {"review", "validation"} or phase in {"review", "validation"}:
         return None
     if isinstance(changed_files, str):
         files = [changed_files] if changed_files.strip() else []
