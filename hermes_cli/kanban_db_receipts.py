@@ -120,19 +120,20 @@ def candidate_identity(conn, task_id: str, run_id: Optional[int] = None) -> Opti
         return None
 
     if run_id is None:
-        candidates = [
-            int(row[0]) for row in conn.execute(
-                "SELECT DISTINCT run_id FROM task_events WHERE task_id = ? "
-                "AND kind = 'spawned' AND run_id IS NOT NULL ORDER BY id DESC",
-                (task_id,),
-            )
-        ]
-        if not candidates:
+        # The attempt to describe is the run the card would report: the active run if
+        # there is one, else the newest run row. Selecting by "has a receipt" would
+        # skip an attempt that died before spawning and describe an older one instead.
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        run_id = int(row[0]) if row and row[0] is not None else None
+        if run_id is None:
+            row = conn.execute(
+                "SELECT MAX(id) FROM task_runs WHERE task_id = ?", (task_id,),
+            ).fetchone()
+            run_id = int(row[0]) if row and row[0] is not None else None
+        if run_id is None:
             return None
-        # The newest attempt is the one being reconciled. If its spawn record holds
-        # only a pid, that is ``receipt_missing``: answering for an older run would
-        # report a previous attempt as verified and hide this one's missing receipt.
-        run_id = candidates[0]
     receipt = _receipt_for(int(run_id))
     if receipt is None:
         return {"run_id": int(run_id), "verdict": "receipt_missing"}

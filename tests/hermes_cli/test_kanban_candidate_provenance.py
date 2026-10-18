@@ -86,11 +86,12 @@ def test_candidate_identity_reconciles_against_the_launch_receipt(conn):
     # Runs without a receipt say so instead of guessing.
     assert _verdict(conn, _spawned_run(conn, receipt=None)) == "receipt_missing"
 
-    # The newest attempt is the one described: an older run's identity must not answer
-    # for a newer attempt whose spawn record holds only its pid.
+    # The attempt described is the one the card reports. A newer attempt that died
+    # before spawning has no receipt of its own, and must not be answered for by an
+    # older run's identity.
     tid = _spawned_run(conn)
     run_id = kb._current_run_id(conn, tid)
-    kb._append_event(conn, tid, "spawned", {"pid": os.getpid()}, run_id=run_id + 1)
+    conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id + 1, tid))
     conn.commit()
     assert _verdict(conn, tid) == "receipt_missing"
 
