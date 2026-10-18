@@ -2374,9 +2374,16 @@ def _receipt_runtime_identity(
     receipt = original.get("runtime_identity")
     if not isinstance(receipt, dict) or not receipt:
         return None
-    if isinstance(supplied, dict):
+    if isinstance(supplied, dict) and "runtime_identity" in supplied:
         author = supplied.get("runtime_identity")
-        if isinstance(author, dict):
+        if author is None:
+            pass  # explicitly absent: the receipt stands unchallenged
+        elif not isinstance(author, dict):
+            raise LifecycleEvidenceError(
+                f"run {run_id} runtime_identity must be an object; the launch receipt "
+                "recorded in task_runs.metadata is authoritative"
+            )
+        else:
             generation = author.get("generation")
             if generation is not None and not _GENERATION_DIGEST.fullmatch(str(generation)):
                 raise LifecycleEvidenceError(

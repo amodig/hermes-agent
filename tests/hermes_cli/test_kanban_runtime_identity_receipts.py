@@ -67,6 +67,11 @@ def test_run_close_keeps_the_receipt_and_refuses_a_disagreeing_copy(conn):
     assert _stored_metadata(conn, run_id)["runtime_identity"] == RECEIPT
     assert kb._current_run_id(conn, tid) == run_id
 
+    # A value that is not an object is refused rather than replaced silently.
+    with pytest.raises(kb.LifecycleEvidenceError, match="must be an object"):
+        kb._end_run(conn, tid, outcome="completed", metadata={"runtime_identity": "bogus"})
+    assert _stored_metadata(conn, run_id)["runtime_identity"] == RECEIPT
+
     # A different digest conflicts with the receipt instead of replacing it.
     with pytest.raises(kb.LifecycleEvidenceError, match="does not match the launch receipt"):
         kb._end_run(
