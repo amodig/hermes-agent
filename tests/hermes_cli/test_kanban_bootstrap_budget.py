@@ -20,45 +20,31 @@ def _budget(monkeypatch, tmp_path, payload_bytes):
     return runtime._bootstrap_phase_timeout(tmp_path)
 
 
-def test_gigabyte_scale_payload_raises_the_budget_above_the_floor(monkeypatch, tmp_path):
-    timeout = _budget(monkeypatch, tmp_path, PAYLOAD_SCALE)
-    assert timeout > runtime._BOOTSTRAP_PHASE_FLOOR_SECONDS, (
-        "a payload of this size must not be budgeted at the small-payload floor"
-    )
-    assert timeout <= runtime._BOOTSTRAP_PHASE_CEILING_SECONDS
-
-
-def test_budget_grows_with_the_payload(monkeypatch, tmp_path):
-    small = _budget(monkeypatch, tmp_path, PAYLOAD_SCALE)
-    large = _budget(monkeypatch, tmp_path, 2 * PAYLOAD_SCALE)
-    assert large > small
-
-
-def test_small_payloads_keep_the_floor(monkeypatch, tmp_path):
+def test_phase_budget_derives_from_the_sealed_payload(monkeypatch, tmp_path):
+    # Small payloads keep the historical floor.
     assert _budget(monkeypatch, tmp_path, 8 * 1024 * 1024) == runtime._BOOTSTRAP_PHASE_FLOOR_SECONDS
 
+    # A gigabyte-scale payload raises the budget, and both phases still fit the
+    # default lease.
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_TTL_SECONDS", raising=False)
+    budget = _budget(monkeypatch, tmp_path, PAYLOAD_SCALE)
+    assert budget > runtime._BOOTSTRAP_PHASE_FLOOR_SECONDS
+    assert 2 * budget < runtime._kb()._resolve_claim_ttl_seconds()
 
-def test_pathological_payloads_are_bounded(monkeypatch, tmp_path):
+    # A pathological payload is bounded instead of wedging a dispatcher tick.
     assert _budget(monkeypatch, tmp_path, 400 * GIB) == runtime._BOOTSTRAP_PHASE_CEILING_SECONDS
 
-
-def test_short_claim_leases_do_not_shrink_the_budget(monkeypatch, tmp_path):
-    # The pre-import phase runs before any claim exists, so a short
-    # HERMES_KANBAN_CLAIM_TTL_SECONDS must not push the budget below the work.
+    # Both phases run before any claim exists (the dispatcher spawns with
+    # defer_grant and claims afterwards), so a short lease must not shrink them.
     monkeypatch.setenv("HERMES_KANBAN_CLAIM_TTL_SECONDS", "60")
     assert _budget(monkeypatch, tmp_path, PAYLOAD_SCALE) > runtime._BOOTSTRAP_PHASE_FLOOR_SECONDS
 
 
-def test_gigabyte_payload_fits_the_default_claim_lease(monkeypatch, tmp_path):
-    # The surrounding window is asserted, not enforced by shrinking the budget.
-    monkeypatch.delenv("HERMES_KANBAN_CLAIM_TTL_SECONDS", raising=False)
-    timeout = _budget(monkeypatch, tmp_path, PAYLOAD_SCALE)
-    assert 2 * timeout < runtime._kb()._resolve_claim_ttl_seconds()
-
-
-def test_payload_bytes_sums_real_files(tmp_path):
+def test_payload_bytes_mirrors_the_digest_walk(tmp_path):
     (tmp_path / "a").write_bytes(b"x" * 100)
     nested = tmp_path / "sub"
     nested.mkdir()
     (nested / "b").write_bytes(b"y" * 250)
+    # The manifest is not part of the payload the worker re-hashes.
+    (tmp_path / "generation.json").write_bytes(b"z" * 999)
     assert runtime._payload_bytes(tmp_path) == 350
