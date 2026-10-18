@@ -37,9 +37,12 @@ def test_phase_budget_derives_from_the_sealed_payload(monkeypatch, tmp_path):
     )
 
     # A pathological payload is bounded instead of wedging a dispatcher tick, and
-    # both phases still fit the scope-attribution window.
+    # both phases plus the scope gates still fit the attribution window.
     assert _budget(monkeypatch, tmp_path, 400 * GIB) == runtime._BOOTSTRAP_PHASE_CEILING_SECONDS
-    assert 2 * runtime._BOOTSTRAP_PHASE_CEILING_SECONDS < runtime._SCOPE_ATTEMPT_WINDOW_SECONDS
+    assert (
+        2 * runtime._BOOTSTRAP_PHASE_CEILING_SECONDS + runtime._SCOPE_GATE_ALLOWANCE_SECONDS
+        <= runtime._SCOPE_ATTEMPT_WINDOW_SECONDS
+    )
 
     # Both phases run before any claim exists (the dispatcher spawns with
     # defer_grant and claims afterwards), so a short lease must not shrink them.

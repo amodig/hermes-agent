@@ -68,10 +68,23 @@ _BOOTSTRAP_PHASE_FLOOR_SECONDS = 60.0
 # wedge a dispatcher tick. It is deliberately independent of the claim lease: the
 # pre-import phase runs before any claim exists, so shrinking this budget to fit a
 # short lease would reintroduce the timeout instead of protecting the run. It is
-# bounded by `_SCOPE_ATTEMPT_WINDOW_SECONDS` below instead: two phases must fit
-# inside that window, or a legitimately slow launch is refused as
-# scope_not_from_attempt and keeps its autonomous-worker slot.
-_BOOTSTRAP_PHASE_CEILING_SECONDS = 290.0
+# bounded by the scope-attribution window below instead: both phases and the scope
+# gates between them have to fit inside it, or a legitimately slow launch is
+# refused as scope_not_from_attempt and keeps its autonomous-worker slot.
+
+#: Slack around an attempt's own life when matching a LIVE scope to it, in seconds.
+#: The launch creates the scope before the claim (pre-claim preparation is bounded
+#: by the bootstrap phase timeouts) and a clock step is possible, so the window has
+#: to be generous -- and still far smaller than the age of any historical or
+#: imported run, which is what it exists to exclude.
+_SCOPE_ATTEMPT_WINDOW_SECONDS = 600
+# The scope gates between and after the phases run several sequential systemctl
+# calls, each of which may take tens of seconds and still succeed, so that time is
+# reserved out of the same window as the two phases.
+_SCOPE_GATE_ALLOWANCE_SECONDS = 120.0
+_BOOTSTRAP_PHASE_CEILING_SECONDS = (
+    _SCOPE_ATTEMPT_WINDOW_SECONDS - _SCOPE_GATE_ALLOWANCE_SECONDS
+) / 2
 _GRANT_TIMEOUT_SECONDS = 1.0
 
 
@@ -671,13 +684,6 @@ _KANBAN_SCOPE_SUFFIX_GRAMMAR = (
 _SCOPE_RUN_COLUMNS = (
     "id, task_id, status, started_at, ended_at, worker_pid, worker_started_at, metadata"
 )
-
-#: Slack around an attempt's own life when matching a LIVE scope to it, in seconds.
-#: The launch creates the scope before the claim (pre-claim preparation is bounded
-#: by the bootstrap phase timeouts) and a clock step is possible, so the window has
-#: to be generous -- and still far smaller than the age of any historical or
-#: imported run, which is what it exists to exclude.
-_SCOPE_ATTEMPT_WINDOW_SECONDS = 600
 
 
 def _scope_activation_epoch(unit_name: str) -> Optional[int]:
