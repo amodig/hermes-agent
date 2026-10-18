@@ -2391,8 +2391,16 @@ def _receipt_runtime_identity(
                     "the launch receipt recorded in task_runs.metadata is authoritative"
                 )
             for field in ("generation", "code_sha"):
-                expected, given = receipt.get(field), author.get(field)
-                if expected and given and str(expected) != str(given):
+                expected = receipt.get(field)
+                if not expected or field not in author:
+                    continue
+                given = author.get(field)
+                if given in (None, ""):
+                    raise LifecycleEvidenceError(
+                        f"run {run_id} runtime_identity.{field} is empty; the launch receipt "
+                        "recorded in task_runs.metadata is authoritative"
+                    )
+                if str(expected) != str(given):
                     raise LifecycleEvidenceError(
                         f"run {run_id} runtime_identity.{field} does not match the launch "
                         "receipt; completion metadata may corroborate it, not replace it"
