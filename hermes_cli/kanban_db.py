@@ -2416,6 +2416,24 @@ def _end_run(
         ),
     )
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+    if outcome == "blocked":
+        # A refused attempt restores the candidate binding its claim displaced: a
+        # wrong-phase claim must not leave the card with nothing left to review (#72).
+        displaced = (
+            merged_metadata.get("superseded_candidate")
+            if isinstance(merged_metadata, dict) else None
+        )
+        restored = displaced.get("run_id") if isinstance(displaced, dict) else None
+        if restored is not None:
+            conn.execute(
+                "UPDATE tasks SET candidate_run_id = ? WHERE id = ? "
+                "AND candidate_run_id IS NULL",
+                (int(restored), task_id),
+            )
+            _append_event(
+                conn, task_id, "candidate_binding_restored",
+                {"candidate_run_id": int(restored), "run_id": run_id},
+            )
     return run_id
 
 

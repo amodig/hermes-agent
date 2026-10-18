@@ -296,6 +296,17 @@ _SPECS = [
              help="JSON lifecycle contract to bind a historical NULL contract; "
                   "classification must be supplied at task creation."),
     ], help="Atomically revise a task with optimistic concurrency"),
+    _cmd("rebind-candidate", [
+        _TASK_ID,
+        _arg("--run", dest="candidate_run", required=True, type=int,
+             help="Existing implementation run to bind as this card's review candidate"),
+        _arg("--head", required=True,
+             help="Candidate head sha the review must cover; must equal the head that "
+                  "run recorded"),
+        _arg("--reason", required=True,
+             help="Why this recovery is being made (recorded on the audit event)"),
+        _json_flag(help="Emit JSON output"),
+    ], help="Re-bind a review candidate to an existing run after its binding was cleared"),
     _cmd("assign", [_TASK_ID, _arg("profile", help="Profile name (or 'none' to unassign)")],
          help="Assign or reassign a task"),
     _cmd("set-model", [

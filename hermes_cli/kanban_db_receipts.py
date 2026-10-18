@@ -162,3 +162,91 @@ def candidate_identity(conn, task_id: str, run_id: Optional[int] = None) -> Opti
         "author_generation": given,
         "code_sha": receipt.get("code_sha"),
     }
+
+
+def rebind_candidate(
+    conn, task_id: str, *, run_id: int, head_sha: str, reason: str,
+    author: Optional[str] = None,
+) -> dict:
+    """Bind a review candidate back to an existing run, on proof and with an audit row.
+
+    Recovery for a card whose candidate binding was cleared by an out-of-phase claim.
+    It re-binds the *existing* run rather than re-running the work, and it refuses
+    anything it cannot prove: the run must belong to this card, the requested head
+    must be the head that run recorded, and the run must carry a launch receipt
+    (a malformed author copy is tolerated; a missing or conflicting one is not).
+    Nothing here rewrites history or infers acceptance.
+    """
+    from hermes_cli import kanban_db as _db
+
+    run = conn.execute(
+        "SELECT id, status, outcome, metadata FROM task_runs WHERE id = ? AND task_id = ?",
+        (run_id, task_id),
+    ).fetchone()
+    if run is None:
+        raise LifecycleEvidenceError(f"run {run_id} does not belong to {task_id}")
+    try:
+        metadata = json.loads(run["metadata"]) if run["metadata"] else {}
+    except (TypeError, ValueError):
+        metadata = {}
+    # Only a finished implementation handoff is a candidate: an active, blocked or
+    # failed attempt has produced nothing for a review to cover.
+    if str(run["status"]) == "running" or str(run["outcome"] or "") not in {
+        "review_requested", "completed",
+    }:
+        raise LifecycleEvidenceError(
+            f"run {run_id} is {run['status']}/{run['outcome'] or 'no outcome'}; "
+            "only a finished implementation handoff can be bound as a candidate"
+        )
+    recorded = metadata.get("head_sha") if isinstance(metadata, dict) else None
+    if not recorded:
+        raise LifecycleEvidenceError(
+            f"run {run_id} recorded no candidate head; nothing to bind"
+        )
+    if str(recorded) != str(head_sha):
+        raise LifecycleEvidenceError(
+            f"run {run_id} recorded head {recorded}, not the requested {head_sha}; "
+            "a rebind may restore an existing candidate, never redefine it"
+        )
+    identity = candidate_identity(conn, task_id, run_id)
+    if not identity or identity.get("verdict") == "receipt_missing":
+        raise LifecycleEvidenceError(
+            f"run {run_id} has no launch receipt; it cannot be attested as a candidate"
+        )
+    if identity.get("verdict") == "conflict":
+        raise LifecycleEvidenceError(
+            f"run {run_id} runtime identity conflicts with its launch receipt; "
+            "resolve the provenance before rebinding"
+        )
+    # Validation and write in one transaction: the fence that refuses delegated-child
+    # board mutations is enforced here, and the candidate read cannot go stale
+    # between the check and the update.
+    with _db.write_txn(conn):
+        bound = conn.execute(
+            "SELECT candidate_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        current = bound[0] if bound else None
+        if current is not None and int(current) != int(run_id):
+            raise LifecycleEvidenceError(
+                f"{task_id} is already bound to candidate run {current}; recovering one "
+                "candidate must never replace another"
+            )
+        updated = conn.execute(
+            "UPDATE tasks SET candidate_run_id = ? WHERE id = ? AND "
+            "(candidate_run_id IS NULL OR candidate_run_id = ?)",
+            (run_id, task_id, run_id),
+        )
+        if updated.rowcount != 1:
+            raise LifecycleEvidenceError(
+                f"{task_id} candidate binding changed during the rebind; nothing written"
+            )
+        payload = {
+            "candidate_run_id": run_id,
+            "head_sha": str(head_sha),
+            "receipt_generation": identity.get("receipt_generation"),
+            "author_verdict": identity.get("verdict"),
+            "reason": reason,
+            "author": author,
+        }
+        _db._append_event(conn, task_id, "candidate_rebound", payload)
+    return payload
