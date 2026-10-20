@@ -4424,7 +4424,8 @@ class BasePlatformAdapter(ABC):
         a failing notice is logged, never raised). Returns the thread metadata used."""
         _thread_metadata = None
         try:
-            _thread_metadata = _thread_metadata_for_event(event)
+            _thread_metadata = dict(_thread_metadata_for_event(event) or {})
+            _thread_metadata["_turn_error"] = True
             error_detail = str(e)[:300] if str(e) else t("gateway.notify.turn_error_no_details")
             # Only the policy reads bind the routed profile; the send stays in the launch scope
             # as before, so delivery bookkeeping keeps landing where boot-time recovery reads it.

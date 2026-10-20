@@ -8,6 +8,8 @@ description: >
   (or DMs) and the Hermes agent.  No external dependencies — uses
   Python's stdlib asyncio for the IRC protocol.
 author: Nous Research
+provides_tools:
+  - irc_request
 # ``requires_env`` entries are surfaced in ``hermes config`` UI via the
 # platform-plugin env var injector in ``hermes_cli/config.py``.
 requires_env:
@@ -51,4 +53,24 @@ optional_env:
   - name: IRC_HOME_CHANNEL
     description: "Channel for cron / notification delivery (defaults to IRC_CHANNEL)"
     prompt: "Home channel (or empty)"
+    password: false
+  - name: IRC_SASL_ACCOUNT
+    description: "SASL PLAIN account (coordination requires nick equal to account)"
+    prompt: "SASL account"
+    password: false
+  - name: IRC_SASL_PASSWORD
+    description: "SASL PLAIN password; scoped to this profile"
+    prompt: "SASL password"
+    password: true
+  - name: IRC_SASL_REQUIRED
+    description: "Require SASL without PASS/NickServ downgrade"
+    prompt: "Require SASL? (true/false)"
+    password: false
+  - name: IRC_ALLOWED_ACCOUNTS
+    description: "Exact authenticated coordination accounts, comma-separated"
+    prompt: "Allowed authenticated accounts"
+    password: false
+  - name: IRC_PROXY_URL
+    description: "Optional HTTP CONNECT proxy URL (TLS remains verified end-to-end)"
+    prompt: "HTTP CONNECT proxy"
     password: false

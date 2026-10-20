@@ -19,6 +19,7 @@ import os
 import socket
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -207,7 +208,7 @@ class GatewayControlServer:
             with contextlib.suppress(OSError):
                 path.unlink(missing_ok=True)
 
-    def handle_request_line(self, raw: bytes) -> bytes:
+    def handle_request_line(self, raw: bytes, *, cancelled: Optional[threading.Event] = None) -> bytes:
         """One JSON request line -> one JSON response line. Never raises (shared by POSIX + pipe)."""
         request_id: Any = None
         try:
@@ -223,9 +224,11 @@ class GatewayControlServer:
                 # Verbs that carry arguments (e.g. migrate-profile-identity) declare a ``params``
                 # parameter; argument-less verbs (identify/status/rescan) keep their bare signature.
                 params = request.get("params") if isinstance(request.get("params"), dict) else {}
-                wants_params = "params" in inspect.signature(handler).parameters
-                response = {"ok": True, "protocol": CONTROL_PROTOCOL_VERSION,
-                            "result": handler(params) if wants_params else handler()}
+                parameters = inspect.signature(handler).parameters
+                kwargs = {"params": params} if "params" in parameters else {}
+                if "cancelled" in parameters:
+                    kwargs["cancelled"] = cancelled
+                response = {"ok": True, "protocol": CONTROL_PROTOCOL_VERSION, "result": handler(**kwargs)}
         except Exception as exc:
             response = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "protocol": CONTROL_PROTOCOL_VERSION}
         if request_id is not None:
@@ -239,21 +242,32 @@ class GatewayControlServer:
         return encoded + b"\n"
 
     async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        cancelled = threading.Event()
+        disconnect = None
         try:
             raw = await asyncio.wait_for(reader.readline(), timeout=_DEFAULT_CLIENT_TIMEOUT)
             if not raw or len(raw) > _MAX_REQUEST_BYTES:
                 return
             # Handlers read disk; keep that off the loop that drives every platform
             # adapter so a fast-polling consumer can't stall heartbeats.
-            response = await asyncio.get_running_loop().run_in_executor(
-                None, self.handle_request_line, raw.rstrip(b"\n"))
-            writer.write(response)
+            response_task = asyncio.get_running_loop().run_in_executor(
+                None, lambda: self.handle_request_line(raw.rstrip(b"\n"), cancelled=cancelled))
+            disconnect = asyncio.create_task(reader.read(1))
+            done, _ = await asyncio.wait({response_task, disconnect}, return_when=asyncio.FIRST_COMPLETED)
+            if disconnect in done:
+                cancelled.set()  # Long-running opt-in handlers stop; half-closed legacy clients still get a reply.
+            writer.write(await response_task)
             await writer.drain()
         except (asyncio.TimeoutError, ConnectionError, OSError):
             pass
         except Exception:
             logger.debug("Control socket connection handler error", exc_info=True)
         finally:
+            cancelled.set()
+            if disconnect is not None:
+                disconnect.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await disconnect
             with contextlib.suppress(Exception):
                 writer.close()
 

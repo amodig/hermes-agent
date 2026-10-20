@@ -481,3 +481,95 @@ def test_windows_pipe_query_is_bounded_when_the_peer_never_answers(home: Path, m
         assert time.monotonic() - start < 2.0
     finally:
         released.set()
+
+
+def test_irc_request_native_socket_profile_scope_and_disconnect(home, monkeypatch):
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+    from gateway.irc_coordination import irc_request_verb
+    from hermes_constants import get_hermes_home, set_hermes_home_override, reset_hermes_home_override
+    import gateway.run
+
+    @asynccontextmanager
+    async def scope(profile_home):
+        token = set_hermes_home_override(str(profile_home))
+        try:
+            yield
+        finally:
+            reset_hermes_home_override(token)
+
+    monkeypatch.setattr(gateway.run, "_async_profile_runtime_scope", scope)
+
+    async def scenario():
+        calls = []
+        started, unwound = asyncio.Event(), asyncio.Event()
+
+        async def request_peer(target, question, *, request_id):
+            calls.append((get_hermes_home(), target))
+            if question == "wait":
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    unwound.set()
+            return {"requestId": request_id, "account": target, "status": "ok", "text": "untrusted peer data"}
+
+        adapter = SimpleNamespace(coordination=True, is_connected=True, request_peer=request_peer)
+        homes = {name: home / name for name in ("alpha", "beta")}
+
+        def authorization_adapter(platform, profile):
+            assert platform.value == "irc"
+            assert get_hermes_home() == homes[profile]
+            return adapter
+
+        runner = SimpleNamespace(
+            served_profile_names=lambda: list(homes), _served_profile_homes=homes,
+            _primary_profile_name="alpha", _authorization_adapter=authorization_adapter,
+            _async_scope_or_null=lambda factory, path: factory(path))
+        handler = irc_request_verb(runner, asyncio.get_running_loop())
+        server = GatewayControlServer(home, verb_handlers={"irc-request": handler})
+        assert await server.start()
+        try:
+            for profile in ("alpha", "beta", "alpha"):
+                result = await asyncio.to_thread(
+                    query_gateway_control, home, "irc-request",
+                    params={"profile": profile, "target": "agent-jeeves", "question": "hello"}, timeout=3)
+                assert result["status"] == "ok" and result["account"] == "agent-jeeves"
+            assert [call[0] for call in calls] == [homes["alpha"], homes["beta"], homes["alpha"]]
+            for params, error in [
+                ({"profile": "other", "target": "agent-jeeves", "question": "hello"}, "unavailable"),
+                ({"profile": "alpha", "target": "agent-*", "question": "hello"}, "invalid-request"),
+                ({"profile": "alpha", "target": "agent-jeeves", "question": "x" * 1801}, "question-too-large"),
+            ]:
+                result = await asyncio.to_thread(query_gateway_control, home, "irc-request", params=params, timeout=3)
+                assert result["error"] == error
+            reader, writer = await asyncio.open_unix_connection(str(resolve_client_socket_path(home)))
+            writer.write(json.dumps({"protocol": 1, "verb": "irc-request", "params": {
+                "profile": "alpha", "target": "agent-jeeves", "question": "wait"}}).encode() + b"\n")
+            await writer.drain()
+            await asyncio.wait_for(started.wait(), 3)
+            writer.close()
+            await writer.wait_closed()
+            await asyncio.wait_for(unwound.wait(), 3)
+        finally:
+            await server.stop()
+
+    _run(scenario())
+
+
+def test_legacy_verb_answers_half_closed_client(home):
+    async def scenario():
+        server = GatewayControlServer(home, verb_handlers={"legacy": lambda: {"value": 1}})
+        assert await server.start()
+        try:
+            reader, writer = await asyncio.open_unix_connection(str(resolve_client_socket_path(home)))
+            writer.write(b'{"verb":"legacy","protocol":1}\n')
+            await writer.drain()
+            writer.write_eof()
+            response = json.loads(await asyncio.wait_for(reader.readline(), 3))
+            assert response["result"] == {"value": 1}
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await server.stop()
+    _run(scenario())

@@ -484,3 +484,189 @@ class TestMultiplexProfileScope:
         assert _env_enablement() is None
         assert is_connected(PlatformConfig(enabled=True, extra={})) is False
 
+
+def test_ircv3_tag_escaping_and_empty_trailing_parameter():
+    msg = _parse_irc_message(r"@account=amodig;label=a\:b\sc\\d\r\n;end=\\ :amodig!u@host PRIVMSG bot :")
+    assert msg["tags"] == {"account": "amodig", "label": "a;b c\\d\r\n", "end": "\\"}
+    assert msg["params"] == ["bot", ""]
+
+
+class _NegotiatingIRCConnection(_FakeIRCConnection):
+    """Script replies to client writes; feed deliberately split TCP frames."""
+
+    def __init__(self, *, reject=None):
+        super().__init__([])
+        self.reader = asyncio.StreamReader()
+        self.reject = reject
+        self.join_requested = asyncio.Event()
+
+    def feed(self, line):
+        encoded = (line + "\r\n").encode()
+        self.reader.feed_data(encoded[:7])
+        self.reader.feed_data(encoded[7:])
+
+    def write(self, data):
+        super().write(data)
+        line = data.decode().rstrip("\r\n")
+        if line == "CAP LS 302":
+            self.feed(":server CAP * LS * :sasl message-tags")
+            self.feed("PING :registration")
+            self.feed(":server CAP * LS :account-tag server-time batch")
+        elif line.startswith("CAP REQ"):
+            self.feed(f":server CAP * {self.reject or 'ACK'} :sasl message-tags account-tag server-time batch")
+        elif line == "AUTHENTICATE PLAIN":
+            self.feed("AUTHENTICATE +")
+        elif line.startswith("AUTHENTICATE "):
+            self.feed(":server 903 agent-hermes-cto :SASL success")
+        elif line == "CAP END":
+            self.feed(":server 001 agent-hermes-cto :Welcome")
+        elif line == "JOIN #agents":
+            self.join_requested.set()
+            # Suffixes/substrings are not membership proof.
+            self.feed(":server 353 agent-hermes-cto = #agents :@agent-hermes-cto-other")
+
+
+def _coordination_config():
+    from gateway.config import PlatformConfig
+    from gateway.irc_coordination import ALLOWED_ACCOUNTS
+    return PlatformConfig(enabled=True, extra={
+        "server": "irc.example", "channel": "#agents", "nickname": "agent-hermes-cto",
+        "sasl_account": "agent-hermes-cto", "sasl_password": "synthetic-only",
+        "coordination": True, "use_tls": True, "allowed_accounts": sorted(ALLOWED_ACCOUNTS),
+    })
+
+
+@pytest.mark.asyncio
+async def test_sasl_cap_multiline_ping_split_frames_and_confirmed_join(monkeypatch, caplog):
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    conn = _NegotiatingIRCConnection()
+    opened = []
+
+    async def open_connection(*args, **kwargs):
+        opened.append(kwargs)
+        return conn.reader, conn
+
+    monkeypatch.setattr(_irc_mod.asyncio, "open_connection", open_connection)
+    adapter = IRCAdapter(_coordination_config())
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *args: True)
+    connecting = asyncio.create_task(adapter.connect())
+    await asyncio.wait_for(conn.join_requested.wait(), 3)
+    assert not adapter.is_connected and not connecting.done()
+    conn.feed(":server 353 agent-hermes-cto = #agents :@agent-hermes-cto agent-jeeves")
+    assert await asyncio.wait_for(connecting, 3)
+    assert opened[0]["ssl"].check_hostname is True
+    import ssl
+    assert opened[0]["ssl"].verify_mode == ssl.CERT_REQUIRED
+    lines = [line.decode().strip() for line in conn.writes]
+    assert "PONG :registration" in lines
+    assert not any(line.startswith("PASS ") for line in lines)
+    assert lines.index("AUTHENTICATE PLAIN") < lines.index("CAP END") < lines.index("JOIN #agents")
+    assert "synthetic-only" not in caplog.text
+    assert not any(line in caplog.text for line in lines if line.startswith("AUTHENTICATE "))
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["tls", "NAK", "missing-cap", "auth", "early-welcome", "nick"])
+async def test_sasl_failures_never_join_or_downgrade(monkeypatch, failure):
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    conn = _NegotiatingIRCConnection(reject="NAK" if failure == "NAK" else None)
+    original_feed = conn.feed
+
+    def feed(line):
+        if failure == "missing-cap" and " LS :account-tag" in line:
+            line = line.replace("account-tag", "")
+        elif failure == "auth" and " 903 " in line:
+            line = ":server 904 agent-hermes-cto :authentication failed"
+        elif failure == "early-welcome" and line == "AUTHENTICATE +":
+            line = ":server 001 agent-hermes-cto :Welcome too early"
+        elif failure == "nick" and " 001 " in line:
+            line = ":server 001 someone-else :Welcome"
+        original_feed(line)
+
+    conn.feed = feed
+
+    async def open_connection(*args, **kwargs):
+        if failure == "tls":
+            import ssl
+            raise ssl.SSLCertVerificationError("synthetic certificate failure")
+        return conn.reader, conn
+
+    monkeypatch.setattr(_irc_mod.asyncio, "open_connection", open_connection)
+    adapter = IRCAdapter(_coordination_config())
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *args: True)
+    assert not await asyncio.wait_for(adapter.connect(), 3)
+    assert not adapter.is_connected
+    assert not any(line.startswith((b"JOIN ", b"PASS ")) for line in conn.writes)
+
+
+@pytest.mark.asyncio
+async def test_sasl_payload_waits_for_challenge_and_400_byte_terminator():
+    sent = []
+
+    async def send(line):
+        sent.append(line)
+
+    # a NUL a NUL plus 296 bytes = 300 bytes => exactly 400 base64 characters.
+    registration = _irc_mod._SASLRegistration(send, "a", "a", "x" * 296)
+    await registration.start()
+    await registration.feed(_parse_irc_message(":server CAP * LS :sasl"))
+    await registration.feed(_parse_irc_message(":server CAP * ACK :sasl"))
+    assert [line for line in sent if line.startswith("AUTHENTICATE")] == ["AUTHENTICATE PLAIN"]
+    await registration.feed(_parse_irc_message("AUTHENTICATE +"))
+    assert len(sent[-2].split()[1]) == 400
+    assert sent[-1] == "AUTHENTICATE +"
+    with pytest.raises(ValueError):
+        await registration.feed(_parse_irc_message(":server 001 a :premature"))
+
+
+@pytest.mark.asyncio
+async def test_invalid_coordination_stays_tool_free_and_forbids_standalone(monkeypatch):
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    config = _coordination_config()
+    config.extra["use_tls"] = False
+    adapter = IRCAdapter(config)
+    opened = AsyncMock()
+    monkeypatch.setattr(_irc_mod.asyncio, "open_connection", opened)
+    assert adapter.toolsets_for_source(None) == ["no_tools"]
+    assert not await adapter.connect()
+    assert not validate_config(config)
+    result = await _standalone_send(config, "#agents", "hello")
+    assert "already-connected" in result["error"]
+    opened.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_standalone_sasl_uses_shared_registration(monkeypatch):
+    conn = _FakeIRCConnection([
+        b":server CAP * LS :sasl", b":server CAP * ACK :sasl", b"AUTHENTICATE +",
+        b":server 903 bot-cron :success", b":server 001 bot-cron :welcome",
+    ])
+    result = await _irc_mod._sa_register(_irc_mod._StandaloneConn(conn, conn), "bot", "not-used",
+                                       sasl_account="account", sasl_password="synthetic")
+    assert result is None
+    assert not any(line.startswith(b"PASS ") for line in conn.writes)
+    assert b"CAP END\r\n" in conn.writes
+
+
+@pytest.mark.asyncio
+async def test_http_connect_requires_success_and_verified_tls(monkeypatch):
+    conn = _FakeIRCConnection([b"HTTP/1.1 200 Connection established\r\n\r\n"])
+    conn.start_tls = AsyncMock()
+    opened = []
+
+    async def open_connection(*args, **kwargs):
+        opened.append(args)
+        return conn, conn
+
+    monkeypatch.setattr(_irc_mod.asyncio, "open_connection", open_connection)
+    await _irc_mod._open_connection("irc.example", 6697, True, "http://proxy:3128")
+    assert opened == [("proxy", 3128)]
+    assert conn.writes[0] == b"CONNECT irc.example:6697 HTTP/1.1\r\nHost: irc.example:6697\r\n\r\n"
+    assert conn.start_tls.call_args.kwargs["server_hostname"] == "irc.example"
+    assert conn.start_tls.call_args.args[0].check_hostname
+    conn._scripted = [b"HTTP/1.1 403 Forbidden\r\n\r\n"]
+    with pytest.raises(ValueError, match="proxy-connect-failed"):
+        await _irc_mod._open_connection("irc.example", 6697, True, "http://proxy:3128")
+    assert conn._closed
+    assert opened == [("proxy", 3128), ("proxy", 3128)]  # no direct fallback
