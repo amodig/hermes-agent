@@ -3806,14 +3806,34 @@ def record_decompose_proposal(
         }
         # An unchanged graph proposes the same refusal on every dispatcher tick. The
         # event is evidence of a decision, not a heartbeat, so an identical proposal
-        # records nothing (#69).
+        # records nothing (#69). The fingerprint is taken from an UNCAPPED context:
+        # the display payload truncates descendants and comments, so comparing it
+        # would treat a change beyond the cap as no change at all.
+        uncapped = task_decomposition_context(
+            conn, task_id, max_descendants=1_000_000, max_comments=1_000_000,
+        )
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "reason": reason,
+                    "parents": uncapped["parents"],
+                    "children": uncapped["children"],
+                    "descendants": [row["id"] for row in uncapped["descendants"]],
+                    "comment_ids": [row["id"] for row in uncapped["comments"]],
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        payload["fingerprint"] = fingerprint
         last = conn.execute(
             "SELECT payload FROM task_events WHERE task_id = ? "
             "AND kind = 'decompose_proposed' ORDER BY id DESC LIMIT 1",
             (task_id,),
         ).fetchone()
-        if last is not None and _json_dict(_row_get(last, "payload")) == payload:
-            return False
+        if last is not None:
+            previous = _json_dict(_row_get(last, "payload"))
+            if isinstance(previous, dict) and previous.get("fingerprint") == fingerprint:
+                return False
         _append_event(
             conn,
             task_id,

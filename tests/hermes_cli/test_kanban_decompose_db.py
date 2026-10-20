@@ -322,11 +322,20 @@ def test_record_decompose_proposal_is_idempotent_until_the_graph_changes(kanban_
         events = [e for e in kb.list_events(conn, root) if e.kind == "decompose_proposed"]
         assert len(events) == 1, [e.payload for e in events]
 
-        # A changed graph is new evidence, and escalates exactly once.
+        # A change the display payload truncates still counts: the fingerprint is
+        # taken from an uncapped context, so a new DESCENDANT (not a direct child)
+        # is new evidence and records exactly once.
+        reviewer = kb.child_ids(conn, root)[0]
         kb.link_tasks(
-            conn, root, kb.create_task(conn, title="validate", assignee="tester"),
+            conn, reviewer, kb.create_task(conn, title="validate", assignee="tester"),
         )
         assert kb.record_decompose_proposal(conn, root, author="decomposer") is True
         assert kb.record_decompose_proposal(conn, root, author="decomposer") is False
         events = [e for e in kb.list_events(conn, root) if e.kind == "decompose_proposed"]
         assert len(events) == 2, [e.payload for e in events]
+        # A new direct child is new evidence too.
+        kb.link_tasks(
+            conn, root, kb.create_task(conn, title="second review", assignee="reviewer"),
+        )
+        assert kb.record_decompose_proposal(conn, root, author="decomposer") is True
+        assert len([e for e in kb.list_events(conn, root) if e.kind == "decompose_proposed"]) == 3
