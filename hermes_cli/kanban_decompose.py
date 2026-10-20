@@ -412,14 +412,18 @@ def decompose_task(
         )
     if context.get("nontrivial_graph"):
         with kbc.connect_closing() as conn:
-            kb.record_decompose_proposal(
+            recorded = kb.record_decompose_proposal(
                 conn,
                 task_id,
                 author=author,
                 reason="existing implementation/review/test graph",
             )
         return DecomposeOutcome(
-            task_id, False, "existing task graph; proposal recorded without mutation"
+            task_id,
+            False,
+            "existing task graph; proposal recorded without mutation"
+            if recorded
+            else "existing task graph; proposal already recorded for this state",
         )
 
     prompt_fields = _task_prompt_fields(task)
