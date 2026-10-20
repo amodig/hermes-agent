@@ -1177,6 +1177,28 @@ def test_no_tools_final_agent_surface_with_installed_plugin_mcp_and_engine(tmp_p
         assert agent.context_compressor is engine
         assert agent.enabled_toolsets == []
         assert agent.tools == [] and agent.valid_tool_names == set()
+        from tools.bot_mode_dm import ensure_message_agent_tool, message_agent_authorized, message_agent_tool_schema
+        from tools.bot_mode_probe import is_bot_mode_managed
+        from tools.mcp_tool_agent import _reinject_authorized_dynamic_tools
+
+        profile = home / "profiles" / "managed"
+        profile.mkdir(parents=True)
+        (profile / "profile.yaml").write_text("ui_meta:\n  hermes-bots:\n    shape: cloud\n")
+        agent._session_title_hint = "Bot Chat"
+        agent._bot_mode_protocol = True
+        agent._session_db = SimpleNamespace(db_path=str(home / "state.db"))
+        assert is_bot_mode_managed(str(home))
+        # Positive control: this same managed Bot Chat gets the tool absent an
+        # explicit empty selection, including after an MCP catalog rebuild.
+        agent.enabled_toolsets = None
+        assert message_agent_authorized(agent)
+        agent.enabled_toolsets = []
+        assert not message_agent_authorized(agent)
+        assert not ensure_message_agent_tool(agent)
+        assert agent.tools == [] and agent.valid_tool_names == set()
+        rebuilt, names = [message_agent_tool_schema()], {"message_agent"}
+        _reinject_authorized_dynamic_tools(agent, rebuilt, names)
+        assert rebuilt == [] and names == set()
     finally:
         registry.deregister("mcp__coord_test__write")
         registry.deregister("coord_plugin_write")
