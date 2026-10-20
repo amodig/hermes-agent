@@ -301,3 +301,32 @@ def test_decompose_db_proposes_for_existing_graph_without_mutation(kanban_home):
 
 
 
+
+
+def test_record_decompose_proposal_is_idempotent_until_the_graph_changes(kanban_home):
+    """An unchanged graph must not re-propose on every dispatcher tick (#69)."""
+    with kbc.connect() as conn:
+        root = _create_triage(
+            conn,
+            title="existing graph",
+            body="Do not recreate the implementation graph.",
+            assignee="implementer",
+        )
+        kb.link_tasks(
+            conn, root, kb.create_task(conn, title="review implementation", assignee="reviewer"),
+        )
+
+        assert kb.record_decompose_proposal(conn, root, author="decomposer") is True
+        for _ in range(3):
+            assert kb.record_decompose_proposal(conn, root, author="decomposer") is False
+        events = [e for e in kb.list_events(conn, root) if e.kind == "decompose_proposed"]
+        assert len(events) == 1, [e.payload for e in events]
+
+        # A changed graph is new evidence, and escalates exactly once.
+        kb.link_tasks(
+            conn, root, kb.create_task(conn, title="validate", assignee="tester"),
+        )
+        assert kb.record_decompose_proposal(conn, root, author="decomposer") is True
+        assert kb.record_decompose_proposal(conn, root, author="decomposer") is False
+        events = [e for e in kb.list_events(conn, root) if e.kind == "decompose_proposed"]
+        assert len(events) == 2, [e.payload for e in events]

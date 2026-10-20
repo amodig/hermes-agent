@@ -3792,22 +3792,33 @@ def record_decompose_proposal(
         if not context.get("nontrivial_graph"):
             return False
         ids = [comment["id"] for comment in context["comments"]]
+        payload = {
+            "dry_run": True,
+            "mutation": False,
+            "reason": reason,
+            "parents": context["parents"],
+            "children": context["children"],
+            "descendants": context["descendants"],
+            "comment_ids": ids,
+            "comment_ids_seen": ids,
+            "prior_purpose": context["prior_purpose"],
+            "author": str(author or "decomposer").strip() or "decomposer",
+        }
+        # An unchanged graph proposes the same refusal on every dispatcher tick. The
+        # event is evidence of a decision, not a heartbeat, so an identical proposal
+        # records nothing (#69).
+        last = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'decompose_proposed' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if last is not None and _json_dict(_row_get(last, "payload")) == payload:
+            return False
         _append_event(
             conn,
             task_id,
             "decompose_proposed",
-            {
-                "dry_run": True,
-                "mutation": False,
-                "reason": reason,
-                "parents": context["parents"],
-                "children": context["children"],
-                "descendants": context["descendants"],
-                "comment_ids": ids,
-                "comment_ids_seen": ids,
-                "prior_purpose": context["prior_purpose"],
-                "author": str(author or "decomposer").strip() or "decomposer",
-            },
+            payload,
         )
     return True
 
