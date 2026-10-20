@@ -3812,10 +3812,21 @@ def record_decompose_proposal(
         uncapped = task_decomposition_context(
             conn, task_id, max_descendants=1_000_000, max_comments=1_000_000,
         )
+        goal = get_effective_goal(conn, task_id) or {}
         fingerprint = hashlib.sha256(
             json.dumps(
                 {
                     "reason": reason,
+                    # The refusal is about this goal as much as this graph: a revised
+                    # title or body is new evidence even when the graph is identical.
+                    "goal_revision_id": goal.get("id"),
+                    "goal_revision_version": goal.get("version"),
+                    "goal_digest": hashlib.sha256(
+                        json.dumps(
+                            [str(goal.get("title") or ""), str(goal.get("body") or "")],
+                            sort_keys=True,
+                        ).encode()
+                    ).hexdigest(),
                     "parents": uncapped["parents"],
                     "children": uncapped["children"],
                     "descendants": [row["id"] for row in uncapped["descendants"]],

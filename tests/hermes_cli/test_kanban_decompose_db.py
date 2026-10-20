@@ -333,9 +333,20 @@ def test_record_decompose_proposal_is_idempotent_until_the_graph_changes(kanban_
         assert kb.record_decompose_proposal(conn, root, author="decomposer") is False
         events = [e for e in kb.list_events(conn, root) if e.kind == "decompose_proposed"]
         assert len(events) == 2, [e.payload for e in events]
+        # A revised goal is new evidence even with an identical graph.
+        assert kb.update_task(
+            conn, root,
+            expected_version=kb.get_task(conn, root).version,
+            reason="revise the goal the refusal is about",
+            body="Revised: still do not recreate the implementation graph.",
+        )
+        assert kb.record_decompose_proposal(conn, root, author="decomposer") is True
+        assert kb.record_decompose_proposal(conn, root, author="decomposer") is False
+        assert len([e for e in kb.list_events(conn, root) if e.kind == "decompose_proposed"]) == 3
+
         # A new direct child is new evidence too.
         kb.link_tasks(
             conn, root, kb.create_task(conn, title="second review", assignee="reviewer"),
         )
         assert kb.record_decompose_proposal(conn, root, author="decomposer") is True
-        assert len([e for e in kb.list_events(conn, root) if e.kind == "decompose_proposed"]) == 3
+        assert len([e for e in kb.list_events(conn, root) if e.kind == "decompose_proposed"]) == 4
