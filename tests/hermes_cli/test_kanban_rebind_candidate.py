@@ -234,6 +234,8 @@ def test_idle_card_with_review_resume_history_can_re_enter_review(conn, tmp_path
         (tid,),
     )
     kb._append_event(conn, tid, "unblocked", {"status": "review", "resume_status": "review"})
+    # A refused reviewer leaves the reviewer as the card's assignee.
+    conn.execute("UPDATE tasks SET assignee = 'reviewer' WHERE id = ?", (tid,))
     conn.commit()
 
     ok, reason = kb.request_review(
@@ -247,3 +249,10 @@ def test_idle_card_with_review_resume_history_can_re_enter_review(conn, tmp_path
     assert ok, f"an idle card was refused the review phase: {reason}"
     assert _binding(conn, tid) == run_id
     assert conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "review"
+    # The handoff still names the profile that did the work, not the reviewer.
+    handoff = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (tid,),
+    ).fetchone()
+    assert json.loads(handoff[0])["implementer"] == "coder", handoff[0]

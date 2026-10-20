@@ -1278,6 +1278,16 @@ def request_review(
                 implementer = arow["profile"] if arow else None
             if implementer is None and trow["assignee"] != reviewer:
                 implementer = trow["assignee"]
+            if implementer is None:
+                # An idle card can carry the reviewer as its assignee (that is what a
+                # refused review leaves behind), so the implementer comes from the
+                # candidate run that did the work.
+                candidate_row = conn.execute(
+                    "SELECT r.profile FROM task_runs r JOIN tasks t ON t.candidate_run_id = r.id "
+                    "WHERE t.id = ?",
+                    (task_id,),
+                ).fetchone()
+                implementer = candidate_row["profile"] if candidate_row else None
             if typed_code:
                 try:
                     metadata, _handoff = _kb._prepare_completion_handoff(
