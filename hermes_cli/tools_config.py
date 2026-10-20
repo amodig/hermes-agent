@@ -109,7 +109,7 @@ def gui_toolset_label(label: str) -> str:
 # OFF by default for new installs (still in _HERMES_CORE_TOOLS; the checklist won't pre-select them). x_search
 # auto-enables when xAI creds exist; its check_fn still gates the schema.
 _DEFAULT_OFF_TOOLSETS = {
-    "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a", "kanban",
+    "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a", "kanban", "irc_coord",
     # Opt-in only: a host without the reviewed autonomous boundary cannot run it, and no
     # default surface should advertise a tool that always refuses there.
     "bounded_control",
@@ -535,7 +535,8 @@ def _enabled_plugin_toolsets(config: dict, platform: str, toolset_names: List[st
     known_for_platform = set((config.get("known_plugin_toolsets", {}) or {}).get(platform, []) or [])
     return {
         pts for pts in plugin_ts_keys
-        if pts in toolset_names or (pts not in _DEFAULT_OFF_TOOLSETS and pts not in known_for_platform)
+        if _toolset_allowed_for_platform(pts, platform)
+        and (pts in toolset_names or (pts not in _DEFAULT_OFF_TOOLSETS and pts not in known_for_platform))
     }
 
 
@@ -580,6 +581,9 @@ def _get_platform_tools(config: dict, platform: str, *, include_default_mcp_serv
         toolset_names = [_platform_default_toolset(platform)]
     # YAML may parse bare numeric names (``12306:``) as int; normalise so sorted() never mixes types.
     toolset_names = [str(ts) for ts in toolset_names]
+    # A hard zero-tool route: do not recover native tools or merge plugin/MCP/context tools.
+    if "no_tools" in toolset_names:
+        return set()
 
     # Expand legacy toolset aliases.  Older Hermes versions and clients used
     # bare ``"hermes"`` as a composite toolset covering both the CLI and the
@@ -735,6 +739,9 @@ def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[
     )
     preserved_entries = {str(e) for e in (existing_toolsets if isinstance(existing_toolsets, list) else [])
                          if str(e) not in drop}
+    # Unlike no_mcp, no_tools is a policy sentinel; picker saves cannot clear it implicitly.
+    if isinstance(existing_toolsets, list) and "no_tools" in existing_toolsets:
+        preserved_entries.add("no_tools")
     config["platform_toolsets"][platform] = sorted(enabled_toolset_keys | preserved_entries)
     # Record which plugin toolsets this platform "knows" (distinguishes "new plugin, default enabled" from
     # "user disabled it"). _cfg_section normalizes a present-but-null key that setdefault alone would not replace.
