@@ -1160,10 +1160,16 @@ def request_review(
     # A typed review run may not hand off as implementation: the phase rubric
     # (and the implementation evidence stamp below) only fit the implementation
     # phase, so a reviewer must submit a review verdict instead.
+    #
+    # That guard is about a run that is handing off, so it needs a live run. An idle
+    # card can still report the review phase from a persisted verdict (its reviewer
+    # refused and the card was returned to the queue); refusing there made the review
+    # phase impossible to re-enter, so the same card could never be reviewed again.
     if (
         typed_code
         and typed_code.get("review_mode") == "same_card"
         and handoff_phase(conn, task_before) == "review"
+        and task_before.current_run_id is not None
     ):
         return _ret(False, "same-card review runs must submit a review verdict")
 
@@ -1221,7 +1227,10 @@ def request_review(
         # Re-read the card inside the txn: a review claim can land between the
         # preflight check above and the mutation below.
         if typed_code and typed_code.get("review_mode") == "same_card":
-            if handoff_phase(conn, _kb.get_task(conn, task_id)) == "review":
+            current = _kb.get_task(conn, task_id)
+            # Same rule as the preflight above: the verdict guard is about a run
+            # handing off, so it needs a live run - not a phase left over on an idle card.
+            if current.current_run_id is not None and handoff_phase(conn, current) == "review":
                 return _ret(False, "same-card review runs must submit a review verdict")
         if _completion_contract_snapshot(conn, task_id) != preflight_contract:
             contract_err = _kb.CompletionContractError(
