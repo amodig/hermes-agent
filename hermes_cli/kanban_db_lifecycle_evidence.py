@@ -587,6 +587,20 @@ def _prepare_completion_handoff(
         )
     return updated, normalized_handoff
 
+def _worktree_owner_repo(workspace: str) -> Optional[Path]:
+    """The repository that owns a task worktree path, when the checkout is gone.
+
+    ``<repo>/.worktrees/<task>`` is the only shape the dispatcher materializes, so the
+    owner is derivable. Anything else returns ``None`` and keeps the strict refusal.
+    """
+    path = Path(str(workspace or "")).expanduser()
+    if path.parent.name != ".worktrees":
+        return None
+    repo = path.parent.parent
+    git_path = repo / ".git"
+    return repo if git_path.is_dir() or git_path.is_file() else None
+
+
 def _parent_handoff_start_error(
     conn: sqlite3.Connection,
     task_id: str,
@@ -641,6 +655,14 @@ def _parent_handoff_start_error(
             branch = handoff.get("branch_name") or parent.branch_name
             workspace = handoff.get("workspace_path") or parent.workspace_path
         snapshot = _kb._git_snapshot(workspace, branch)
+        checkout_absent = snapshot is None
+        if checkout_absent:
+            # A reclaimed checkout is not missing evidence: the branch and the commit
+            # are the approval, so resolve them from the repository that owns the
+            # worktree path. Refusing here parked reviews with no board-visible reason.
+            owner = _worktree_owner_repo(workspace)
+            if owner is not None:
+                snapshot = _kb._git_snapshot(str(owner), branch)
         actual = snapshot["branch_head"] if snapshot else None
         if actual is None:
             return {
@@ -649,7 +671,7 @@ def _parent_handoff_start_error(
                 "expected_head_sha": expected,
                 "reason": "parent branch/worktree head is unavailable",
             }
-        if reviewed_parent and snapshot["dirty_files"]:
+        if reviewed_parent and not checkout_absent and snapshot["dirty_files"]:
             return {
                 "kind": "handoff_unverifiable",
                 "parent_id": parent_id,

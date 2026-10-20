@@ -1135,3 +1135,43 @@ def test_quarantine_racing_claim_preserves_winning_run(kanban_home, tmp_path, mo
         assert [tuple(row) for row in conn.execute(
             "SELECT * FROM task_events WHERE task_id = ?", (review,)
         )] == before_events
+
+
+def test_review_dispatches_after_the_candidate_checkout_is_reclaimed(kanban_home, tmp_path):
+    """A reclaimed worktree is not missing evidence: the branch and commit remain.
+
+    Reclamation removes the candidate's checkout while the review it verified is still
+    pending. The dispatcher resolved the parent head through that path, so the review
+    could not dispatch at all - and the board showed nothing (#73).
+    """
+    repo, base, branch = _repo(tmp_path)
+    with kbc.connect_closing() as conn:
+        parent, reviewer = _lane(conn, repo, branch)
+        head = _commit(repo)
+        # The dispatcher materializes the candidate under <repo>/.worktrees/<task>,
+        # leaving the repo itself on its own branch.
+        _git(repo, "checkout", "-q", "main")
+        worktree = repo / ".worktrees" / parent
+        worktree.parent.mkdir()
+        _git(repo, "worktree", "add", "-q", str(worktree), branch)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(worktree), parent),
+            )
+        assert kb.claim_task(conn, parent) is not None
+        assert kb.complete_task(
+            conn, parent, summary="candidate", metadata={"base_sha": base, "head_sha": head},
+        )
+
+        # Reclamation takes the checkout; the approval itself is the branch head.
+        _git(repo, "worktree", "remove", "--force", str(worktree))
+        assert not worktree.exists()
+        assert _git(repo, "rev-parse", branch) == head
+
+        # The parent's completion promotes the review card into the review lane.
+        kb.claim_task(conn, reviewer, claimer="reviewer:1")
+        assert kb.get_task(conn, reviewer).status == "review"
+        run = kb.claim_review_task(conn, reviewer, claimer="reviewer:1")
+        assert run is not None, [
+            (event.kind, event.payload) for event in kb.list_events(conn, reviewer)
+        ][-3:]
