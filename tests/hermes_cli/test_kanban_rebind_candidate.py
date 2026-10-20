@@ -199,3 +199,60 @@ def test_request_review_keeps_the_restored_candidate(conn, tmp_path):
     assert ok, f"request_review refused a restored candidate: {reason}"
     assert _binding(conn, tid) == run_id, "the restored candidate must survive the transition"
     assert conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "review"
+
+
+def test_idle_card_with_review_resume_history_can_re_enter_review(conn, tmp_path):
+    """A reviewer that refused must not make the review phase impossible to re-enter."""
+    import subprocess
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
+    }
+
+    def _git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=ws, capture_output=True, text=True, check=True, env=env,
+        ).stdout.strip()
+
+    _git("init", "-q")
+    (ws / "f.py").write_text("x = 1\n", encoding="utf-8")
+    _git("add", ".")
+    _git("commit", "-qm", "init")
+    head = _git("rev-parse", "HEAD")
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD")
+
+    tid, run_id = _candidate(conn, head=head)
+    # The card is idle, but its resume history still points at the review phase -
+    # exactly the shape a refused reviewer leaves behind.
+    conn.execute(
+        "UPDATE tasks SET status = 'ready', current_run_id = NULL, claim_lock = NULL, "
+        "claim_expires = NULL WHERE id = ?",
+        (tid,),
+    )
+    kb._append_event(conn, tid, "unblocked", {"status": "review", "resume_status": "review"})
+    # A refused reviewer leaves the reviewer as the card's assignee.
+    conn.execute("UPDATE tasks SET assignee = 'reviewer' WHERE id = ?", (tid,))
+    conn.commit()
+
+    ok, reason = kb.request_review(
+        conn, tid, summary="resubmit the intact repair for review", reviewer="reviewer",
+        with_reason=True,
+        metadata={
+            "base_sha": head, "head_sha": head, "changed_files": ["plugins/x.py"],
+            "branch_name": branch, "workspace_path": str(ws), "dirty_state": "clean",
+        },
+    )
+    assert ok, f"an idle card was refused the review phase: {reason}"
+    assert _binding(conn, tid) == run_id
+    assert conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "review"
+    # The handoff still names the profile that did the work, not the reviewer.
+    handoff = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (tid,),
+    ).fetchone()
+    assert json.loads(handoff[0])["implementer"] == "coder", handoff[0]
