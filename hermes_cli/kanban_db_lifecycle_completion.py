@@ -1230,7 +1230,13 @@ def request_review(
             current = _kb.get_task(conn, task_id)
             # Same rule as the preflight above: the verdict guard is about a run
             # handing off, so it needs a live run - not a phase left over on an idle card.
-            if current.current_run_id is not None and handoff_phase(conn, current) == "review":
+            # A row deleted between the two reads has no phase to compare, so it falls
+            # through to the normal typed failure instead of raising.
+            if (
+                current is not None
+                and current.current_run_id is not None
+                and handoff_phase(conn, current) == "review"
+            ):
                 return _ret(False, "same-card review runs must submit a review verdict")
         if _completion_contract_snapshot(conn, task_id) != preflight_contract:
             contract_err = _kb.CompletionContractError(
