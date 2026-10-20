@@ -126,10 +126,15 @@ failure never falls back to direct TCP.
 
 Additional supported environment aliases are `IRC_SASL_ACCOUNT`, `IRC_SASL_PASSWORD`,
 `IRC_SASL_REQUIRED`, `IRC_ALLOWED_ACCOUNTS` (comma-separated), and `IRC_PROXY_URL`.
-`coordination` is a YAML boolean only. Invalid coordination settings fail closed,
-including while disconnected; they never enable ordinary IRC intake.
+`coordination` is a YAML boolean only. Coordination pins the verified-TLS endpoint to
+`z300.barracuda-trout.ts.net:6697`; another host or port is rejected before credentials
+are sent. Invalid coordination settings fail closed, including while disconnected;
+they never enable ordinary IRC intake. Ordinary IRC endpoints remain configurable.
 
 The adapter requires `sasl`, `message-tags`, `account-tag`, `server-time`, and `batch`.
+Withdrawal of any required capability disconnects the adapter without automatic
+retry. Transport loss before registration remains retryable, unlike explicit
+authentication, capability, TLS-verification or identity failures.
 Both authenticated account and prefix nick must match an exact configured account.
 Nickname allowlists and central allow-all settings cannot widen this gate. The
 fixed roster above is required; adding identities is a reviewed contract change.
@@ -150,6 +155,8 @@ Incoming consultations run in independent UUID-keyed sessions with zero model to
 even with plugin, MCP and context-engine tools installed. `no_tools` is a hard empty
 selection preserved by the tool picker. Slash commands and clarify/approval handlers
 are disabled structurally; model MEDIA/file/TTS directives remain plain text.
+Explicitly empty tool selections also block managed Bot Chat's `message_agent`
+injection, including MCP catalog refreshes.
 This is not an extension sandbox: trusted provider/context/plugin hooks still run,
 and the bounds below are not a provider-token-spend guarantee. Do not send private
 questions to the channel unless all participants may read them. OMP peers expose
@@ -186,7 +193,10 @@ the IRC handler applies its own question/target bounds.
 Request UUIDs and optional msgids are deduplicated in process (1,024 entries, ten
 minutes), including adapter recreation on reconnect. Server timestamps must be valid,
 no earlier than connection start or the dedupe window. Future clock skew beyond five
-seconds is rejected and logged; fix the clocks rather than weakening the gate.
+seconds is rejected. Missing, malformed, timezone-naive, future and before-connection-start
+timestamps produce warnings containing only the authenticated account and failure
+category, at most once per category per minute per adapter. Fix clocks or server-time
+delivery rather than weakening the gate.
 Protocol logs contain IDs/accounts/outcomes, not passwords or conversation bodies.
 
 Rollout is gated on reviewed merges and separate live acceptance; offline tests are

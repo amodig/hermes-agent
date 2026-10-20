@@ -10,7 +10,7 @@ import pytest
 
 from gateway.config import PlatformConfig
 from gateway.irc_coordination import (
-    ALLOWED_ACCOUNTS, ResponseAssembly, format_request, normalize_body, parse_request,
+    ALLOWED_ACCOUNTS, REQUIRED_CAPS, ResponseAssembly, format_request, normalize_body, parse_request,
     parse_response, response_lines, truncate_body,
 )
 from gateway.platforms.helpers import carry_inbound_dedup, inbound_dedup_caches
@@ -45,7 +45,7 @@ class Writer:
 def adapter(monkeypatch):
     monkeypatch.setattr(irc, "_get_scoped_secret", lambda *args: "")
     config = PlatformConfig(enabled=True, extra={
-        "server": "irc.example", "channel": "#agents", "nickname": OWN,
+        "server": "z300.barracuda-trout.ts.net", "port": 6697, "channel": "#agents", "nickname": OWN,
         "sasl_account": OWN, "sasl_password": "synthetic-password", "use_tls": True,
         "coordination": True, "allowed_accounts": sorted(ALLOWED_ACCOUNTS),
     })
@@ -301,3 +301,87 @@ async def test_outbound_deadline_includes_blocked_transport_write(adapter, monke
     result = await asyncio.wait_for(adapter.request_peer(PEER, "hello"), 3)
     assert result["error"] == "timeout"
     assert adapter._outbound is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capability", sorted(REQUIRED_CAPS))
+async def test_required_capability_withdrawal_disconnects_and_stops_admission(adapter, capability):
+    adapter.handle_message = AsyncMock()
+    notified = AsyncMock()
+    adapter.set_fatal_error_handler(notified)
+    writer = adapter._writer
+    await adapter._handle_line(f":server CAP {OWN} DEL :unrelated-cap")
+    assert adapter.is_connected and not writer.closed
+    future = asyncio.get_running_loop().create_future()
+    adapter._outbound = (ResponseAssembly(str(uuid.uuid4()), PEER, "#agents"), future)
+    dispatch = asyncio.create_task(asyncio.Event().wait())
+    adapter._coord_dispatch_task = dispatch
+    await adapter._handle_line(f":server CAP {OWN} DEL :unrelated-cap {capability}")
+    assert not adapter.is_connected and writer.closed
+    assert adapter.fatal_error_code == "capability_removed"
+    assert adapter.fatal_error_retryable is False
+    assert future.cancelled() and dispatch.cancelled()
+    notified.assert_awaited_once_with(adapter)
+    await adapter._handle_line(frame(request()[1]))
+    adapter.handle_message.assert_not_awaited()
+    assert not any(line.startswith("PRIVMSG ") for line in writer.lines)
+
+
+@pytest.mark.asyncio
+async def test_timestamp_warnings_are_bounded_and_private(adapter, monkeypatch, caplog):
+    adapter.handle_message = AsyncMock()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    clock = [100.0]
+    monkeypatch.setattr(irc, "time", SimpleNamespace(time=lambda: now.timestamp(), monotonic=lambda: clock[0]))
+    adapter._connection_started = now.timestamp() - 1
+    stamps = {
+        "missing": None,
+        "malformed": "10000-01-01T00:00:00Z",
+        "naive": now.replace(tzinfo=None).isoformat(),
+        "future": (now + datetime.timedelta(seconds=6)).isoformat(),
+        "before-connection-start": (now - datetime.timedelta(seconds=2)).isoformat(),
+    }
+    body = request("private-question-not-for-logs")[1]
+    frames = [
+        f"@account={PEER}" + (f";time={stamp}" if stamp is not None else "")
+        + f" :{PEER}!u@host PRIVMSG #agents :{body}"
+        for stamp in stamps.values()
+    ]
+    for _ in range(100):
+        for raw in frames:
+            await adapter._handle_line(raw)
+    expected = {f"IRC: rejected server-time account={PEER} category={category}" for category in stamps}
+    warnings = [r.message for r in caplog.records if r.name == irc.logger.name]
+    assert len(warnings) == 5 and set(warnings) == expected
+    assert set(adapter._timestamp_warning_at) == set(stamps)
+    clock[0] += 59
+    for raw in frames:
+        await adapter._handle_line(raw)
+    assert len([r for r in caplog.records if r.name == irc.logger.name]) == 5
+    clock[0] += 1
+    for raw in frames:
+        await adapter._handle_line(raw)
+    assert len([r for r in caplog.records if r.name == irc.logger.name]) == 10
+    # Unauthenticated traffic does not produce even timestamp diagnostics.
+    await adapter._handle_line(frames[0].replace(PEER, "unknown"))
+    assert len([r for r in caplog.records if r.name == irc.logger.name]) == 10
+    assert "private-question-not-for-logs" not in caplog.text
+    adapter.handle_message.assert_not_awaited()
+    assert adapter._coord_dispatch_task is None and adapter._writer.lines == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [OverflowError, OSError])
+async def test_timestamp_conversion_failures_warn_without_dispatch(adapter, monkeypatch, caplog, error):
+    raw = frame(request("private-conversion-question")[1])
+
+    def timestamp():
+        raise error("private-platform-diagnostic")
+
+    stamp = SimpleNamespace(tzinfo=datetime.timezone.utc, timestamp=timestamp)
+    monkeypatch.setattr(irc, "datetime", SimpleNamespace(
+        datetime=SimpleNamespace(fromisoformat=lambda value: stamp)))
+    await adapter._handle_line(raw)
+    assert f"account={PEER} category=malformed" in caplog.text
+    assert "private-" not in caplog.text
+    assert adapter._coord_dispatch_task is None and adapter._writer.lines == []

@@ -12,6 +12,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
+COORDINATION_ENDPOINT = ("z300.barracuda-trout.ts.net", 6697)
 REQUIRED_CAPS = frozenset({"sasl", "message-tags", "account-tag", "server-time", "batch"})
 AGENT_ACCOUNTS = frozenset({"agent-hermes-cto", "agent-jeeves"} | {
     f"agent-omp-{host}-{slot:02d}" for host in ("loota", "z300") for slot in range(1, 5)})

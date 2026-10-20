@@ -28,7 +28,7 @@ from gateway.platforms.helpers import MessageDeduplicator, cancel_task
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.config import Platform
 from gateway.irc_coordination import (
-    AGENT_ACCOUNTS, ALLOWED_ACCOUNTS, REQUIRED_CAPS, DEDUPE_IDS, DEDUPE_SECONDS,
+    AGENT_ACCOUNTS, ALLOWED_ACCOUNTS, COORDINATION_ENDPOINT, REQUIRED_CAPS, DEDUPE_IDS, DEDUPE_SECONDS,
     REQUEST_TIMEOUT, REPLY_TIMEOUT, ResponseAssembly, format_request, normalize_body,
     parse_request, response_lines,
 )
@@ -273,6 +273,7 @@ class IRCAdapter(BasePlatformAdapter):
         self._coord_dispatch_task = None
         self._outbound = None
         self._batches = set()
+        self._timestamp_warning_at = {}
 
     def toolsets_for_source(self, source):
         return ["no_tools"] if self.coordination else None
@@ -280,6 +281,7 @@ class IRCAdapter(BasePlatformAdapter):
     def _config_error(self):
         if self.coordination and (
                 self.config.extra.get("coordination") is not True or self.use_tls is not True
+                or (self.server, self.port) != COORDINATION_ENDPOINT
                 or not isinstance(self.sasl_account, str)
                 or self.nickname != self.sasl_account or self.sasl_account not in AGENT_ACCOUNTS
                 or self.allowed_accounts != ALLOWED_ACCOUNTS or self.channel != "#agents"):
@@ -342,8 +344,9 @@ class IRCAdapter(BasePlatformAdapter):
             return self._fail("registration_timeout", "IRC registration timed out", retryable=not bool(self._sasl))
         if self._registration_error or not self._registered:
             error = self._registration_error or "registration-failed"
+            retryable = self._registration_error is None
             await self.disconnect()
-            return self._fail("registration_failed", error, retryable=False)
+            return self._fail("registration_failed", error, retryable=retryable)
         if self.nickserv_password and not self._sasl:
             await self._send_raw(f"PRIVMSG NickServ :IDENTIFY {self.nickserv_password}")
             await asyncio.sleep(2)  # Give NickServ time to process
@@ -352,7 +355,12 @@ class IRCAdapter(BasePlatformAdapter):
             await asyncio.wait_for(self._joined.wait(), timeout=15.0)
         except asyncio.TimeoutError:
             await self.disconnect()
+            if self.has_fatal_error:
+                return False
             return self._fail("join_timeout", "IRC membership not confirmed", retryable=True)
+        if self.has_fatal_error:
+            await self.disconnect()
+            return False
         self._mark_connected()
         logger.info("IRC: connected to %s:%s as %s, joined %s", self.server, self.port, self._current_nick, self.channel)
         self._wire_plugin_handlers(None)
@@ -488,7 +496,14 @@ class IRCAdapter(BasePlatformAdapter):
         if set(self.channel.split(",")) <= self._joined_channels:
             self._joined.set()
         if self.coordination:
-            if command == "BATCH" and params:
+            if command == "CAP" and len(params) >= 3 and params[1] == "DEL":
+                removed = {cap.lstrip("-").split("=", 1)[0] for cap in params[-1].split()}
+                if removed & REQUIRED_CAPS:
+                    self._registration_error = "required-capability-removed"
+                    self._set_fatal_error("capability_removed", "IRC required capability removed", retryable=False)
+                    await self.disconnect()
+                    await self._notify_fatal_error()
+            elif command == "BATCH" and params:
                 if params[0].startswith("+"):
                     self._batches.add(params[0][1:])
                 elif params[0].startswith("-"):
@@ -515,6 +530,12 @@ class IRCAdapter(BasePlatformAdapter):
         elif command == "NICK" and params and _extract_nick(msg["prefix"]).lower() == self._current_nick.lower():
             self._current_nick = params[0]  # track our own nick changes
 
+    def _warn_timestamp(self, account, category):
+        now = time.monotonic()
+        if now - self._timestamp_warning_at.get(category, float("-inf")) >= 60:
+            self._timestamp_warning_at[category] = now
+            logger.warning("IRC: rejected server-time account=%s category=%s", account, category)
+
     async def _handle_coordination(self, msg):
         tags, (destination, text) = msg["tags"], msg["params"]
         account, nick = tags.get("account"), _extract_nick(msg["prefix"])
@@ -522,18 +543,26 @@ class IRCAdapter(BasePlatformAdapter):
                 or "!" not in msg["prefix"] or "batch" in tags or self._batches
                 or destination not in {self.channel, self.sasl_account} or "\x01" in text):
             return
+        if "time" not in tags:
+            self._warn_timestamp(account, "missing")
+            return
         try:
             stamp = datetime.datetime.fromisoformat(tags["time"].replace("Z", "+00:00"))
             if stamp.tzinfo is None:
+                self._warn_timestamp(account, "naive")
                 return
             sent = stamp.timestamp()
-        except (KeyError, ValueError, TypeError, OverflowError):
+        except (ValueError, TypeError, OverflowError, OSError):
+            self._warn_timestamp(account, "malformed")
             return
         now = time.time()
         if sent > now + 5:
-            logger.warning("IRC: rejecting future server-time; check client/server clocks")
+            self._warn_timestamp(account, "future")
             return
-        if sent < max(self._connection_started, now - DEDUPE_SECONDS):
+        if sent < self._connection_started:
+            self._warn_timestamp(account, "before-connection-start")
+            return
+        if sent < now - DEDUPE_SECONDS:
             return
         if text.startswith("!res"):
             if self._outbound is not None:

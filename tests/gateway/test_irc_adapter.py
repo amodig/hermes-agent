@@ -528,9 +528,10 @@ class _NegotiatingIRCConnection(_FakeIRCConnection):
 
 def _coordination_config():
     from gateway.config import PlatformConfig
-    from gateway.irc_coordination import ALLOWED_ACCOUNTS
+    from gateway.irc_coordination import ALLOWED_ACCOUNTS, COORDINATION_ENDPOINT
     return PlatformConfig(enabled=True, extra={
-        "server": "irc.example", "channel": "#agents", "nickname": "agent-hermes-cto",
+        "server": COORDINATION_ENDPOINT[0], "port": COORDINATION_ENDPOINT[1],
+        "channel": "#agents", "nickname": "agent-hermes-cto",
         "sasl_account": "agent-hermes-cto", "sasl_password": "synthetic-only",
         "coordination": True, "use_tls": True, "allowed_accounts": sorted(ALLOWED_ACCOUNTS),
     })
@@ -597,6 +598,7 @@ async def test_sasl_failures_never_join_or_downgrade(monkeypatch, failure):
     monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *args: True)
     assert not await asyncio.wait_for(adapter.connect(), 3)
     assert not adapter.is_connected
+    assert adapter.fatal_error_retryable is False
     assert not any(line.startswith((b"JOIN ", b"PASS ")) for line in conn.writes)
 
 
@@ -670,3 +672,44 @@ async def test_http_connect_requires_success_and_verified_tls(monkeypatch):
         await _irc_mod._open_connection("irc.example", 6697, True, "http://proxy:3128")
     assert conn._closed
     assert opened == [("proxy", 3128), ("proxy", 3128)]  # no direct fallback
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("key", "value"), [("server", "irc.example"), ("port", 6698)])
+async def test_coordination_rejects_other_endpoints_before_opening_socket(monkeypatch, key, value):
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    config = _coordination_config()
+    config.extra[key] = value
+    open_connection = AsyncMock()
+    monkeypatch.setattr(_irc_mod, "_open_connection", open_connection)
+    adapter = IRCAdapter(config)
+    assert not await adapter.connect()
+    assert adapter.fatal_error_retryable is False
+    open_connection.assert_not_awaited()
+    # Ordinary SASL IRC still supports other verified-TLS endpoints.
+    config.extra["coordination"] = False
+    assert IRCAdapter(config)._config_error() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coordination", [False, True])
+@pytest.mark.parametrize("read_failure", [False, True])
+async def test_registration_transport_loss_is_retryable(monkeypatch, coordination, read_failure):
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    config = _coordination_config()
+    if not coordination:
+        config.extra["coordination"] = False
+        config.extra.pop("sasl_account")
+        config.extra.pop("sasl_password")
+    conn = _FakeIRCConnection([])
+    reader = asyncio.StreamReader()
+    if read_failure:
+        reader.set_exception(ConnectionResetError("synthetic disconnect"))
+    else:
+        reader.feed_eof()
+    monkeypatch.setattr(_irc_mod, "_open_connection", AsyncMock(return_value=(reader, conn)))
+    adapter = IRCAdapter(config)
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *args: True)
+    assert not await asyncio.wait_for(adapter.connect(), 3)
+    assert adapter.fatal_error_retryable is True
+    assert not any(line.startswith(b"JOIN ") for line in conn.writes)
