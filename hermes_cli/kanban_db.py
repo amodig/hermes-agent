@@ -3792,22 +3792,69 @@ def record_decompose_proposal(
         if not context.get("nontrivial_graph"):
             return False
         ids = [comment["id"] for comment in context["comments"]]
+        payload = {
+            "dry_run": True,
+            "mutation": False,
+            "reason": reason,
+            "parents": context["parents"],
+            "children": context["children"],
+            "descendants": context["descendants"],
+            "comment_ids": ids,
+            "comment_ids_seen": ids,
+            "prior_purpose": context["prior_purpose"],
+            "author": str(author or "decomposer").strip() or "decomposer",
+        }
+        # An unchanged graph proposes the same refusal on every dispatcher tick. The
+        # event is evidence of a decision, not a heartbeat, so an identical proposal
+        # records nothing (#69). The fingerprint is taken from an UNCAPPED context:
+        # the display payload truncates descendants and comments, so comparing it
+        # would treat a change beyond the cap as no change at all.
+        uncapped = task_decomposition_context(
+            conn, task_id, max_descendants=1_000_000, max_comments=1_000_000,
+        )
+        goal = get_effective_goal(conn, task_id) or {}
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "reason": reason,
+                    # The refusal is about this goal as much as this graph: a revised
+                    # title or body is new evidence even when the graph is identical.
+                    "goal_revision_id": goal.get("id"),
+                    "goal_revision_version": goal.get("version"),
+                    "goal_digest": hashlib.sha256(
+                        json.dumps(
+                            [str(goal.get("title") or ""), str(goal.get("body") or "")],
+                            sort_keys=True,
+                        ).encode()
+                    ).hexdigest(),
+                    "parents": uncapped["parents"],
+                    "children": uncapped["children"],
+                    # Identity AND state: a descendant that finished, was reassigned or
+                    # renamed is a different graph to refuse over.
+                    "descendants": [
+                        [row["id"], row["status"], row["assignee"], row["title"]]
+                        for row in uncapped["descendants"]
+                    ],
+                    "comment_ids": [row["id"] for row in uncapped["comments"]],
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        payload["fingerprint"] = fingerprint
+        last = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'decompose_proposed' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if last is not None:
+            previous = _json_dict(_row_get(last, "payload"))
+            if isinstance(previous, dict) and previous.get("fingerprint") == fingerprint:
+                return False
         _append_event(
             conn,
             task_id,
             "decompose_proposed",
-            {
-                "dry_run": True,
-                "mutation": False,
-                "reason": reason,
-                "parents": context["parents"],
-                "children": context["children"],
-                "descendants": context["descendants"],
-                "comment_ids": ids,
-                "comment_ids_seen": ids,
-                "prior_purpose": context["prior_purpose"],
-                "author": str(author or "decomposer").strip() or "decomposer",
-            },
+            payload,
         )
     return True
 
