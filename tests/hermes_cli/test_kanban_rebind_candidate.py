@@ -87,8 +87,15 @@ def test_rebind_restores_the_candidate_on_proof(conn):
     conn.commit()
     with pytest.raises(LifecycleEvidenceError, match="already bound"):
         rebind_candidate(conn, tid, run_id=run_id, head_sha=HEAD, reason="recovery")
+    # A substitution must name the run it displaces, or the premise may be stale.
+    with pytest.raises(LifecycleEvidenceError, match="not the run named for replacement"):
+        rebind_candidate(
+            conn, tid, run_id=run_id, head_sha=HEAD, reason="recovery",
+            replace=True, replaced_run=run_id,
+        )
     payload = rebind_candidate(
-        conn, tid, run_id=run_id, head_sha=HEAD, reason="recovery", replace=True,
+        conn, tid, run_id=run_id, head_sha=HEAD, reason="recovery",
+        replace=True, replaced_run=run_id + 1,
     )
     assert payload["replaced_candidate_run_id"] == run_id + 1
     assert _binding(conn, tid) == run_id

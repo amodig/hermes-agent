@@ -712,6 +712,7 @@ def _cmd_rebind_candidate(args: argparse.Namespace) -> int:
             reason=args.reason,
             author=getattr(args, "author", None) or _profile_author(),
             replace=getattr(args, "replace", False),
+            replaced_run=getattr(args, "replaced_run", None),
         )
     if getattr(args, "json", False):
         _print_json(payload)

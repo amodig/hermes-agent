@@ -167,6 +167,7 @@ def candidate_identity(conn, task_id: str, run_id: Optional[int] = None) -> Opti
 def rebind_candidate(
     conn, task_id: str, *, run_id: int, head_sha: str, reason: str,
     author: Optional[str] = None, replace: bool = False,
+    replaced_run: Optional[int] = None,
 ) -> dict:
     """Bind a review candidate back to an existing run, on proof and with an audit row.
 
@@ -232,6 +233,13 @@ def rebind_candidate(
                 raise LifecycleEvidenceError(
                     f"{task_id} is already bound to candidate run {current}; recovering one "
                     "candidate never replaces another unless --replace is given"
+                )
+            # A substitution names the run it displaces: if the binding moved since the
+            # command was prepared, the premise is stale and nothing may be overwritten.
+            if replaced_run is None or int(replaced_run) != int(current):
+                raise LifecycleEvidenceError(
+                    f"{task_id} is bound to candidate run {current}, not the run named for "
+                    "replacement; re-read the binding before substituting"
                 )
             replaced = int(current)
         # A verified substitution is allowed to move the binding; otherwise the write
