@@ -36,21 +36,24 @@ def conn(tmp_path, monkeypatch):
         yield c
 
 
-def _candidate(conn):
+def _candidate(conn, head: str = HEAD):
     tid = kb.create_task(conn, title="candidate", assignee="coder")
     assert kb.claim_task(conn, tid, claimer=kb._claimer_id()) is not None
     # The typed contract is bound after the first claim, so the later out-of-phase
     # claim is the one that exercises the ready-claim clearing path.
     conn.execute(
         "UPDATE tasks SET lifecycle_contract = ? WHERE id = ?",
-        (json.dumps({"kind": "code", "review_mode": "same_card"}), tid),
+        (json.dumps({
+            "kind": "code", "review_mode": "same_card", "reviewer": "reviewer",
+            "validation_required": True,
+        }), tid),
     )
     kbd._set_worker_pid(conn, tid, os.getpid())
     run_id = kb._current_run_id(conn, tid)
     kb._append_event(conn, tid, "spawned", {"runtime_identity": RECEIPT}, run_id=run_id)
     conn.execute(
         "UPDATE task_runs SET metadata = ? WHERE id = ?",
-        (json.dumps({"head_sha": HEAD, "lifecycle": {"candidate_run_id": run_id}}), run_id),
+        (json.dumps({"head_sha": head, "lifecycle": {"candidate_run_id": run_id}}), run_id),
     )
     # A candidate is a *finished* implementation handoff, not an active attempt.
     conn.execute(
@@ -148,3 +151,41 @@ def test_request_review_keeps_a_restored_candidate(conn):
     conn.execute("DELETE FROM task_events WHERE task_id = ? AND kind = 'spawned'", (tid,))
     conn.commit()
     assert restored_candidate_run(conn, tid, {"head_sha": HEAD}) is None
+
+
+def test_request_review_keeps_the_restored_candidate(conn, tmp_path):
+    """The caller keeps the binding through the transition, not just the selector."""
+    import subprocess
+
+    # A hermetic worktree: the handoff snapshot must not depend on this checkout's state.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
+    }
+    def _git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=ws, capture_output=True, text=True, check=True, env=env,
+        ).stdout.strip()
+
+    _git("init", "-q")
+    (ws / "f.py").write_text("x = 1\n", encoding="utf-8")
+    _git("add", ".")
+    _git("commit", "-qm", "init")
+    real_head = _git("rev-parse", "HEAD")
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD")
+
+    tid, run_id = _candidate(conn, head=real_head)
+    ok, reason = kb.request_review(
+        conn, tid, summary="repair resubmitted for review", reviewer="reviewer",
+        with_reason=True, expected_run_id=run_id,
+        metadata={
+            "base_sha": real_head, "head_sha": real_head, "changed_files": ["plugins/x.py"],
+            "branch_name": branch, "workspace_path": str(ws), "dirty_state": "clean",
+        },
+    )
+    assert ok, f"request_review refused a restored candidate: {reason}"
+    assert _binding(conn, tid) == run_id, "the restored candidate must survive the transition"
+    assert conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "review"

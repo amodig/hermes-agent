@@ -283,11 +283,13 @@ def restored_candidate_run(conn, task_id: str, metadata: Optional[dict]) -> Opti
         return None
     run_head = run_metadata.get("head_sha") if isinstance(run_metadata, dict) else None
     handed_head = metadata.get("head_sha") if isinstance(metadata, dict) else None
-    if run_head and handed_head and str(run_head) != str(handed_head):
+    # The candidate must have recorded its own head: a run that never named one cannot
+    # be given the head of an unrelated handoff.
+    if not run_head:
         return None
-    if not run_head and not handed_head:
+    if handed_head and str(run_head) != str(handed_head):
         return None
     identity = candidate_identity(conn, task_id, int(run_id))
-    if not identity or identity.get("verdict") == "receipt_missing":
+    if not identity or identity.get("verdict") in {"receipt_missing", "conflict"}:
         return None
     return int(run_id)
