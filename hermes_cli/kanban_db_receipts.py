@@ -166,7 +166,8 @@ def candidate_identity(conn, task_id: str, run_id: Optional[int] = None) -> Opti
 
 def rebind_candidate(
     conn, task_id: str, *, run_id: int, head_sha: str, reason: str,
-    author: Optional[str] = None,
+    author: Optional[str] = None, replace: bool = False,
+    replaced_run: Optional[int] = None,
 ) -> dict:
     """Bind a review candidate back to an existing run, on proof and with an audit row.
 
@@ -226,16 +227,34 @@ def rebind_candidate(
             "SELECT candidate_run_id FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         current = bound[0] if bound else None
+        replaced = None
         if current is not None and int(current) != int(run_id):
-            raise LifecycleEvidenceError(
-                f"{task_id} is already bound to candidate run {current}; recovering one "
-                "candidate must never replace another"
+            if not replace:
+                raise LifecycleEvidenceError(
+                    f"{task_id} is already bound to candidate run {current}; recovering one "
+                    "candidate never replaces another unless --replace is given"
+                )
+            # A substitution names the run it displaces: if the binding moved since the
+            # command was prepared, the premise is stale and nothing may be overwritten.
+            if replaced_run is None or int(replaced_run) != int(current):
+                raise LifecycleEvidenceError(
+                    f"{task_id} is bound to candidate run {current}, not the run named for "
+                    "replacement; re-read the binding before substituting"
+                )
+            replaced = int(current)
+        # A verified substitution is allowed to move the binding; otherwise the write
+        # only stands if the candidate is still unset (or already this run).
+        if replaced is None:
+            updated = conn.execute(
+                "UPDATE tasks SET candidate_run_id = ? WHERE id = ? AND "
+                "(candidate_run_id IS NULL OR candidate_run_id = ?)",
+                (run_id, task_id, run_id),
             )
-        updated = conn.execute(
-            "UPDATE tasks SET candidate_run_id = ? WHERE id = ? AND "
-            "(candidate_run_id IS NULL OR candidate_run_id = ?)",
-            (run_id, task_id, run_id),
-        )
+        else:
+            updated = conn.execute(
+                "UPDATE tasks SET candidate_run_id = ? WHERE id = ? AND candidate_run_id = ?",
+                (run_id, task_id, replaced),
+            )
         if updated.rowcount != 1:
             raise LifecycleEvidenceError(
                 f"{task_id} candidate binding changed during the rebind; nothing written"
@@ -248,6 +267,8 @@ def rebind_candidate(
             "reason": reason,
             "author": author,
         }
+        if replaced is not None:
+            payload["replaced_candidate_run_id"] = replaced
         _db._append_event(conn, task_id, "candidate_rebound", payload)
     return payload
 

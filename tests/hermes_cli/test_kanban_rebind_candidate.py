@@ -81,14 +81,24 @@ def test_rebind_restores_the_candidate_on_proof(conn):
     kinds = [r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id = ?", (tid,))]
     assert "candidate_rebound" in kinds
 
-    # An existing binding is never overwritten by a recovery command.
-    other = run_id
-    conn.execute("UPDATE tasks SET candidate_run_id = ? WHERE id = ?", (other + 1, tid))
+    # An existing binding is never overwritten unless the operator says so, and the
+    # substitution is recorded.
+    conn.execute("UPDATE tasks SET candidate_run_id = ? WHERE id = ?", (run_id + 1, tid))
     conn.commit()
     with pytest.raises(LifecycleEvidenceError, match="already bound"):
         rebind_candidate(conn, tid, run_id=run_id, head_sha=HEAD, reason="recovery")
-    conn.execute("UPDATE tasks SET candidate_run_id = ? WHERE id = ?", (other, tid))
-    conn.commit()
+    # A substitution must name the run it displaces, or the premise may be stale.
+    with pytest.raises(LifecycleEvidenceError, match="not the run named for replacement"):
+        rebind_candidate(
+            conn, tid, run_id=run_id, head_sha=HEAD, reason="recovery",
+            replace=True, replaced_run=run_id,
+        )
+    payload = rebind_candidate(
+        conn, tid, run_id=run_id, head_sha=HEAD, reason="recovery",
+        replace=True, replaced_run=run_id + 1,
+    )
+    assert payload["replaced_candidate_run_id"] == run_id + 1
+    assert _binding(conn, tid) == run_id
 
     # An attempt that has not finished is not a candidate.
     conn.execute("UPDATE task_runs SET status = 'running' WHERE id = ?", (run_id,))

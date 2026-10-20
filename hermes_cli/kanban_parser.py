@@ -305,6 +305,12 @@ _SPECS = [
                   "run recorded"),
         _arg("--reason", required=True,
              help="Why this recovery is being made (recorded on the audit event)"),
+        _arg("--replace", action="store_true",
+             help="Substitute a binding that currently points at another run; the "
+                  "replaced run is recorded on the audit event"),
+        _arg("--replace-run", dest="replaced_run", type=int,
+             help="The candidate run this command expects to displace; required with "
+                  "--replace, and refused if the binding has moved since"),
         _json_flag(help="Emit JSON output"),
     ], help="Re-bind a review candidate to an existing run after its binding was cleared"),
     _cmd("assign", [_TASK_ID, _arg("profile", help="Profile name (or 'none' to unassign)")],
