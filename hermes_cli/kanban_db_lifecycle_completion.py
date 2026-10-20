@@ -22,6 +22,7 @@ from hermes_cli.kanban_db_lifecycle_evidence import (
     _latest_lifecycle_run_id,
 )
 from hermes_cli.kanban_db_receipts import receipt_runtime_identity
+from hermes_cli.kanban_db_receipts import restored_candidate_run
 from hermes_cli.kanban_db_lifecycle_rework import _prior_reviewer
 from hermes_cli.kanban_lifecycle import LifecycleEvidenceError, get_lifecycle_state
 
@@ -1282,6 +1283,10 @@ def request_review(
                     )
                     return _ret(False, str(error))
                 stamp_run_id = expected_run_id or trow["current_run_id"]
+                if stamp_run_id is None:
+                    # A restored candidate keeps its own run: it is the launch that
+                    # holds the receipt, and synthesis here would replace it.
+                    stamp_run_id = restored_candidate_run(conn, task_id, metadata)
                 if stamp_run_id is None:
                     synthetic_run_id = _kb._synthesize_ended_run(
                         conn,

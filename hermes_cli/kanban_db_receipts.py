@@ -250,3 +250,44 @@ def rebind_candidate(
         }
         _db._append_event(conn, task_id, "candidate_rebound", payload)
     return payload
+
+
+def restored_candidate_run(conn, task_id: str, metadata: Optional[dict]) -> Optional[int]:
+    """The card's already-bound candidate run, when it can stand as this handoff's candidate.
+
+    A card whose candidate was restored (``rebind-candidate``) must keep that run:
+    synthesizing a handoff row here would replace the launch that actually holds the
+    receipt, leaving review with a candidate nothing can attest. Returns ``None``
+    whenever the binding cannot stand - wrong phase, unfinished, or a different head -
+    so the caller falls back to its normal path.
+    """
+    row = conn.execute(
+        "SELECT candidate_run_id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    run_id = row[0] if row and row[0] is not None else None
+    if run_id is None:
+        return None
+    run = conn.execute(
+        "SELECT status, outcome, metadata FROM task_runs WHERE id = ? AND task_id = ?",
+        (int(run_id), task_id),
+    ).fetchone()
+    if run is None:
+        return None
+    if str(run["status"]) == "running" or str(run["outcome"] or "") not in {
+        "review_requested", "completed",
+    }:
+        return None
+    try:
+        run_metadata = json.loads(run["metadata"]) if run["metadata"] else {}
+    except (TypeError, ValueError):
+        return None
+    run_head = run_metadata.get("head_sha") if isinstance(run_metadata, dict) else None
+    handed_head = metadata.get("head_sha") if isinstance(metadata, dict) else None
+    if run_head and handed_head and str(run_head) != str(handed_head):
+        return None
+    if not run_head and not handed_head:
+        return None
+    identity = candidate_identity(conn, task_id, int(run_id))
+    if not identity or identity.get("verdict") == "receipt_missing":
+        return None
+    return int(run_id)

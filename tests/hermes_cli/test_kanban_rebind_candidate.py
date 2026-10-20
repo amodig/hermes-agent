@@ -16,7 +16,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
-from hermes_cli.kanban_db_receipts import rebind_candidate
+from hermes_cli.kanban_db_receipts import rebind_candidate, restored_candidate_run
 from hermes_cli.kanban_lifecycle import LifecycleEvidenceError
 
 RECEIPT = {"code_sha": "a" * 40, "generation": "b" * 64}
@@ -128,3 +128,23 @@ def test_a_refused_attempt_restores_the_binding_it_displaced(conn):
     assert _binding(conn, tid) == run_id
     kinds = [r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id = ?", (tid,))]
     assert "candidate_binding_restored" in kinds
+
+
+def test_request_review_keeps_a_restored_candidate(conn):
+    """The handoff path must not synthesize a run over a restored candidate."""
+    tid, run_id = _candidate(conn)
+
+    assert restored_candidate_run(conn, tid, {"head_sha": HEAD}) == run_id
+    # A different head cannot inherit the binding, and neither can an unfinished run.
+    assert restored_candidate_run(conn, tid, {"head_sha": "f" * 40}) is None
+    conn.execute("UPDATE task_runs SET status = 'running' WHERE id = ?", (run_id,))
+    conn.commit()
+    assert restored_candidate_run(conn, tid, {"head_sha": HEAD}) is None
+    # A run with no launch receipt cannot stand as the candidate either.
+    conn.execute(
+        "UPDATE task_runs SET status = 'review', outcome = 'review_requested' WHERE id = ?",
+        (run_id,),
+    )
+    conn.execute("DELETE FROM task_events WHERE task_id = ? AND kind = 'spawned'", (tid,))
+    conn.commit()
+    assert restored_candidate_run(conn, tid, {"head_sha": HEAD}) is None
