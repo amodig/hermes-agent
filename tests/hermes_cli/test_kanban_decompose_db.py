@@ -304,7 +304,10 @@ def test_decompose_db_proposes_for_existing_graph_without_mutation(kanban_home):
 
 
 def test_record_decompose_proposal_is_idempotent_until_the_graph_changes(kanban_home):
-    """An unchanged graph must not re-propose on every dispatcher tick (#69)."""
+    """An unchanged state must not re-propose on every dispatcher tick (#69)."""
+    def proposals(conn):
+        return [e for e in kb.list_events(conn, root) if e.kind == "decompose_proposed"]
+
     with kbc.connect() as conn:
         root = _create_triage(
             conn,
@@ -316,24 +319,31 @@ def test_record_decompose_proposal_is_idempotent_until_the_graph_changes(kanban_
             conn, root, kb.create_task(conn, title="review implementation", assignee="reviewer"),
         )
 
+        # 1. One refusal for the initial state, and none while it is unchanged.
         assert kb.record_decompose_proposal(conn, root, author="decomposer") is True
         for _ in range(3):
             assert kb.record_decompose_proposal(conn, root, author="decomposer") is False
-        events = [e for e in kb.list_events(conn, root) if e.kind == "decompose_proposed"]
-        assert len(events) == 1, [e.payload for e in events]
+        assert len(proposals(conn)) == 1, [e.payload for e in proposals(conn)]
 
-        # A change the display payload truncates still counts: the fingerprint is
-        # taken from an uncapped context, so a new DESCENDANT (not a direct child)
-        # is new evidence and records exactly once.
+        # 2. A change the display payload truncates still counts: a new DESCENDANT
+        #    (not a direct child) is new evidence.
         reviewer = kb.child_ids(conn, root)[0]
         kb.link_tasks(
             conn, reviewer, kb.create_task(conn, title="validate", assignee="tester"),
         )
         assert kb.record_decompose_proposal(conn, root, author="decomposer") is True
         assert kb.record_decompose_proposal(conn, root, author="decomposer") is False
-        events = [e for e in kb.list_events(conn, root) if e.kind == "decompose_proposed"]
-        assert len(events) == 2, [e.payload for e in events]
-        # A revised goal is new evidence even with an identical graph.
+        assert len(proposals(conn)) == 2
+
+        # 3. A descendant that changed STATE is a different graph to refuse over.
+        grandchild = kb.child_ids(conn, reviewer)[0]
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (grandchild,))
+        assert kb.record_decompose_proposal(conn, root, author="decomposer") is True
+        assert kb.record_decompose_proposal(conn, root, author="decomposer") is False
+        assert len(proposals(conn)) == 3
+
+        # 4. A revised goal is new evidence even with an identical graph.
         assert kb.update_task(
             conn, root,
             expected_version=kb.get_task(conn, root).version,
@@ -342,11 +352,11 @@ def test_record_decompose_proposal_is_idempotent_until_the_graph_changes(kanban_
         )
         assert kb.record_decompose_proposal(conn, root, author="decomposer") is True
         assert kb.record_decompose_proposal(conn, root, author="decomposer") is False
-        assert len([e for e in kb.list_events(conn, root) if e.kind == "decompose_proposed"]) == 3
+        assert len(proposals(conn)) == 4
 
-        # A new direct child is new evidence too.
+        # 5. A new direct child is new evidence too.
         kb.link_tasks(
             conn, root, kb.create_task(conn, title="second review", assignee="reviewer"),
         )
         assert kb.record_decompose_proposal(conn, root, author="decomposer") is True
-        assert len([e for e in kb.list_events(conn, root) if e.kind == "decompose_proposed"]) == 4
+        assert len(proposals(conn)) == 5

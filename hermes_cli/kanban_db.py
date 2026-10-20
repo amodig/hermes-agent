@@ -3829,7 +3829,12 @@ def record_decompose_proposal(
                     ).hexdigest(),
                     "parents": uncapped["parents"],
                     "children": uncapped["children"],
-                    "descendants": [row["id"] for row in uncapped["descendants"]],
+                    # Identity AND state: a descendant that finished, was reassigned or
+                    # renamed is a different graph to refuse over.
+                    "descendants": [
+                        [row["id"], row["status"], row["assignee"], row["title"]]
+                        for row in uncapped["descendants"]
+                    ],
                     "comment_ids": [row["id"] for row in uncapped["comments"]],
                 },
                 sort_keys=True,
