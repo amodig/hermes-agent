@@ -213,7 +213,11 @@ Late completion cannot restore an expired response. Outbound requests wait at mo
 60 seconds; IPC waits at most 65. Disconnect/IPC cancellation clears partial responses;
 no request is automatically resent after reconnect. IPC uses the serving gateway's
 existing Unix socket or native Windows named pipe, with handlers running off the
-gateway event loop on both transports. The shared control socket keeps its existing
+gateway event loop on both transports. Long IRC waits use a dedicated four-worker
+pool, never the shared executor needed for profile initialization and other verbs.
+Saturated IPC calls fail immediately instead of queueing delayed requests. The
+65-second deadline, disconnect, cancellation and shutdown release the waiting work;
+capacity is returned only when its actual worker exits. The shared control socket keeps its existing
 64 KiB request / 512 KiB response caps and 2-second default for other verbs;
 the IRC handler applies its own question/target bounds.
 

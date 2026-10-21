@@ -23,6 +23,7 @@ IRC_BYTES = 510
 PREFIX_HEADROOM = 110
 REQUEST_TIMEOUT = 60.0
 REPLY_TIMEOUT = 55.0
+CONTROL_TIMEOUT = 65.0
 DEDUPE_SECONDS = 600
 DEDUPE_IDS = 1024
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
@@ -140,6 +141,8 @@ def irc_request_verb(runner, loop):
     def handler(params, *, cancelled=None):
         request_id = str(uuid.uuid4())
         error = lambda reason: {"requestId": request_id, "error": reason}
+        if cancelled is not None and cancelled.is_set():
+            return error("cancelled")
         profile, target, question = (params.get(key) for key in ("profile", "target", "question"))
         if (not isinstance(profile, str) or not profile or not isinstance(target, str) or target not in AGENT_ACCOUNTS
                 or not isinstance(question, str) or not question.strip()):
@@ -162,9 +165,11 @@ def irc_request_verb(runner, loop):
                     return error("unavailable")
                 return await adapter.request_peer(target, question, request_id=request_id)
 
-        future = asyncio.run_coroutine_threadsafe(request(), loop)
-        deadline = time.monotonic() + 65
+        future = None
+        coroutine = request()
+        deadline = time.monotonic() + CONTROL_TIMEOUT
         try:
+            future = asyncio.run_coroutine_threadsafe(coroutine, loop)
             while True:
                 if cancelled is not None and cancelled.is_set():
                     return error("cancelled")
@@ -178,6 +183,8 @@ def irc_request_verb(runner, loop):
         except Exception:
             return error("unavailable")
         finally:
-            if not future.done():
+            if future is None:
+                coroutine.close()
+            elif not future.done():
                 future.cancel()
     return handler

@@ -10,6 +10,7 @@ Consumers PREFER the socket and fall back to the state-file/scan layer when it d
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import hashlib
 import inspect
@@ -35,6 +36,7 @@ _MAX_UNIX_PATH = 100  # sun_path limit is 104 on macOS/BSD, 108 on Linux; margin
 _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_RESPONSE_BYTES = 512 * 1024
 _DEFAULT_CLIENT_TIMEOUT = 2.0
+_IRC_WAIT_WORKERS = 4
 
 
 def _home_hash(home: Path) -> str:
@@ -146,9 +148,14 @@ class GatewayControlServer:
         self._pointer_file: Optional[Path] = None
         self._handlers: dict[str, Callable[..., dict[str, Any]]] = {
             "identify": build_identify_payload, "status": build_status_payload, **(verb_handlers or {})}
+        self._irc_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self._irc_wait_slots = threading.BoundedSemaphore(_IRC_WAIT_WORKERS)
+        self._irc_cancellations: set[threading.Event] = set()
+        self._stopping = False
 
     async def start(self) -> bool:
         """Bind and start serving. Returns True on success, False otherwise."""
+        self._stopping = False
         try:
             return await (self._start_windows() if _IS_WINDOWS else self._start_posix())
         except Exception as exc:
@@ -192,6 +199,12 @@ class GatewayControlServer:
 
     async def stop(self) -> None:
         """Stop serving and remove the socket/pointer files."""
+        self._stopping = True
+        for cancelled in self._irc_cancellations:
+            cancelled.set()
+        if self._irc_executor is not None:
+            self._irc_executor.shutdown(wait=False, cancel_futures=True)
+            self._irc_executor = None
         if self._server is not None:
             self._server.close()
             with contextlib.suppress(Exception):
@@ -241,6 +254,51 @@ class GatewayControlServer:
             encoded = b'{"ok": false, "error": "response too large"}'
         return encoded + b"\n"
 
+    async def _run_request_line(self, raw: bytes, *, cancelled: threading.Event) -> bytes:
+        """Keep IRC's long blocking wait out of the executor needed by profile initialization."""
+        loop = asyncio.get_running_loop()
+        try:
+            request = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            request = None
+        if not isinstance(request, dict) or request.get("verb") != "irc-request":
+            return await loop.run_in_executor(None, lambda: self.handle_request_line(raw, cancelled=cancelled))
+
+        from gateway.irc_coordination import CONTROL_TIMEOUT
+
+        def failure(reason):
+            response = {"ok": False, "protocol": CONTROL_PROTOCOL_VERSION, "error": reason}
+            if request.get("id") is not None:
+                response["id"] = request["id"]
+            return json.dumps(response).encode("utf-8") + b"\n"
+
+        if self._stopping:
+            return failure("unavailable")
+        if not self._irc_wait_slots.acquire(blocking=False):
+            return failure("busy")  # No unbounded executor queue or delayed requests after reconnect.
+        future = None
+        self._irc_cancellations.add(cancelled)
+        try:
+            if self._irc_executor is None:
+                self._irc_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=_IRC_WAIT_WORKERS, thread_name_prefix="hermes-irc-control")
+            future = self._irc_executor.submit(self.handle_request_line, raw, cancelled=cancelled)
+            # Release only when the actual thread exits, not when its asyncio wrapper is cancelled.
+            future.add_done_callback(lambda completed: self._irc_wait_slots.release())
+            return await asyncio.wait_for(asyncio.wrap_future(future), timeout=CONTROL_TIMEOUT)
+        except asyncio.TimeoutError:
+            return failure("timeout")
+        except RuntimeError:
+            return failure("unavailable")
+        finally:
+            if future is None or not future.done():
+                cancelled.set()
+            self._irc_cancellations.discard(cancelled)
+            if future is None:
+                self._irc_wait_slots.release()
+            else:
+                future.cancel()
+
     async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         cancelled = threading.Event()
         disconnect = None
@@ -248,10 +306,7 @@ class GatewayControlServer:
             raw = await asyncio.wait_for(reader.readline(), timeout=_DEFAULT_CLIENT_TIMEOUT)
             if not raw or len(raw) > _MAX_REQUEST_BYTES:
                 return
-            # Handlers read disk; keep that off the loop that drives every platform
-            # adapter so a fast-polling consumer can't stall heartbeats.
-            response_task = asyncio.get_running_loop().run_in_executor(
-                None, lambda: self.handle_request_line(raw.rstrip(b"\n"), cancelled=cancelled))
+            response_task = asyncio.create_task(self._run_request_line(raw.rstrip(b"\n"), cancelled=cancelled))
             disconnect = asyncio.create_task(reader.read(1))
             done, _ = await asyncio.wait({response_task, disconnect}, return_when=asyncio.FIRST_COMPLETED)
             if disconnect in done:
@@ -298,8 +353,7 @@ class _PipeControlProtocol(asyncio.Protocol):
 
     async def _respond(self, raw: bytes) -> None:
         try:
-            response = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: self._server.handle_request_line(raw, cancelled=self._cancelled))
+            response = await self._server._run_request_line(raw, cancelled=self._cancelled)
             if self._transport is not None and not self._cancelled.is_set():
                 self._transport.write(response)
         except (ConnectionError, OSError):
