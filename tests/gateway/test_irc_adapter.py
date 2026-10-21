@@ -484,3 +484,380 @@ class TestMultiplexProfileScope:
         assert _env_enablement() is None
         assert is_connected(PlatformConfig(enabled=True, extra={})) is False
 
+
+def test_ircv3_tag_escaping_and_empty_trailing_parameter():
+    msg = _parse_irc_message(r"@account=amodig;label=a\:b\sc\\d\r\n;end=\\ :amodig!u@host PRIVMSG bot :")
+    assert msg["tags"] == {"account": "amodig", "label": "a;b c\\d\r\n", "end": "\\"}
+    assert msg["params"] == ["bot", ""]
+
+
+class _NegotiatingIRCConnection(_FakeIRCConnection):
+    """Script replies to client writes; feed deliberately split TCP frames."""
+
+    def __init__(self, *, reject=None):
+        super().__init__([])
+        self.reader = asyncio.StreamReader()
+        self.reject = reject
+        self.join_requested = asyncio.Event()
+
+    def feed(self, line):
+        encoded = (line + "\r\n").encode()
+        self.reader.feed_data(encoded[:7])
+        self.reader.feed_data(encoded[7:])
+
+    def write(self, data):
+        super().write(data)
+        line = data.decode().rstrip("\r\n")
+        if line == "CAP LS 302":
+            self.feed(":server CAP * LS * :sasl message-tags")
+            self.feed("PING :registration")
+            self.feed(":server CAP * LS :account-tag server-time batch")
+        elif line.startswith("CAP REQ"):
+            self.feed(f":server CAP * {self.reject or 'ACK'} :sasl message-tags account-tag server-time batch")
+        elif line == "AUTHENTICATE PLAIN":
+            self.feed("AUTHENTICATE +")
+        elif line.startswith("AUTHENTICATE "):
+            self.feed(":server 903 agent-hermes-cto :SASL success")
+        elif line == "CAP END":
+            self.feed(":server 001 agent-hermes-cto :Welcome")
+        elif line == "JOIN #agents":
+            self.join_requested.set()
+            # Suffixes/substrings are not membership proof.
+            self.feed(":server 353 agent-hermes-cto = #agents :@agent-hermes-cto-other")
+
+
+def _coordination_config():
+    from gateway.config import PlatformConfig
+    from gateway.irc_coordination import ALLOWED_ACCOUNTS, COORDINATION_ENDPOINT
+    return PlatformConfig(enabled=True, extra={
+        "server": COORDINATION_ENDPOINT[0], "port": COORDINATION_ENDPOINT[1],
+        "channel": "#agents", "nickname": "agent-hermes-cto",
+        "sasl_account": "agent-hermes-cto", "sasl_password": "synthetic-only",
+        "coordination": True, "use_tls": True, "allowed_accounts": sorted(ALLOWED_ACCOUNTS),
+    })
+
+
+@pytest.mark.asyncio
+async def test_sasl_cap_multiline_ping_split_frames_and_confirmed_join(monkeypatch, caplog):
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    conn = _NegotiatingIRCConnection()
+    opened = []
+
+    async def open_connection(*args, **kwargs):
+        opened.append(kwargs)
+        return conn.reader, conn
+
+    monkeypatch.setattr(_irc_mod.asyncio, "open_connection", open_connection)
+    adapter = IRCAdapter(_coordination_config())
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *args: True)
+    connecting = asyncio.create_task(adapter.connect())
+    await asyncio.wait_for(conn.join_requested.wait(), 3)
+    assert not adapter.is_connected and not connecting.done()
+    conn.feed(":server 353 agent-hermes-cto = #agents :@agent-hermes-cto agent-jeeves")
+    assert await asyncio.wait_for(connecting, 3)
+    assert opened[0]["ssl"].check_hostname is True
+    import ssl
+    assert opened[0]["ssl"].verify_mode == ssl.CERT_REQUIRED
+    lines = [line.decode().strip() for line in conn.writes]
+    assert "PONG :registration" in lines
+    assert not any(line.startswith("PASS ") for line in lines)
+    assert lines.index("AUTHENTICATE PLAIN") < lines.index("CAP END") < lines.index("JOIN #agents")
+    assert "synthetic-only" not in caplog.text
+    assert not any(line in caplog.text for line in lines if line.startswith("AUTHENTICATE "))
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["tls", "NAK", "missing-cap", "auth", "early-welcome", "nick"])
+async def test_sasl_failures_never_join_or_downgrade(monkeypatch, failure):
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    conn = _NegotiatingIRCConnection(reject="NAK" if failure == "NAK" else None)
+    original_feed = conn.feed
+
+    def feed(line):
+        if failure == "missing-cap" and " LS :account-tag" in line:
+            line = line.replace("account-tag", "")
+        elif failure == "auth" and " 903 " in line:
+            line = ":server 904 agent-hermes-cto :authentication failed"
+        elif failure == "early-welcome" and line == "AUTHENTICATE +":
+            line = ":server 001 agent-hermes-cto :Welcome too early"
+        elif failure == "nick" and " 001 " in line:
+            line = ":server 001 someone-else :Welcome"
+        original_feed(line)
+
+    conn.feed = feed
+
+    async def open_connection(*args, **kwargs):
+        if failure == "tls":
+            import ssl
+            raise ssl.SSLCertVerificationError("synthetic certificate failure")
+        return conn.reader, conn
+
+    monkeypatch.setattr(_irc_mod.asyncio, "open_connection", open_connection)
+    adapter = IRCAdapter(_coordination_config())
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *args: True)
+    assert not await asyncio.wait_for(adapter.connect(), 3)
+    assert not adapter.is_connected
+    assert adapter.fatal_error_retryable is False
+    assert not any(line.startswith((b"JOIN ", b"PASS ")) for line in conn.writes)
+
+
+@pytest.mark.asyncio
+async def test_sasl_payload_waits_for_challenge_and_400_byte_terminator():
+    sent = []
+
+    async def send(line):
+        sent.append(line)
+
+    # a NUL a NUL plus 296 bytes = 300 bytes => exactly 400 base64 characters.
+    registration = _irc_mod._SASLRegistration(send, "a", "a", "x" * 296)
+    await registration.start()
+    await registration.feed(_parse_irc_message(":server CAP * LS :sasl"))
+    await registration.feed(_parse_irc_message(":server CAP * ACK :sasl"))
+    assert [line for line in sent if line.startswith("AUTHENTICATE")] == ["AUTHENTICATE PLAIN"]
+    await registration.feed(_parse_irc_message("AUTHENTICATE +"))
+    assert len(sent[-2].split()[1]) == 400
+    assert sent[-1] == "AUTHENTICATE +"
+    with pytest.raises(ValueError):
+        await registration.feed(_parse_irc_message(":server 001 a :premature"))
+
+
+@pytest.mark.asyncio
+async def test_invalid_coordination_stays_tool_free_and_forbids_standalone(monkeypatch):
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    config = _coordination_config()
+    config.extra["use_tls"] = False
+    adapter = IRCAdapter(config)
+    opened = AsyncMock()
+    monkeypatch.setattr(_irc_mod.asyncio, "open_connection", opened)
+    assert adapter.toolsets_for_source(None) == ["no_tools"]
+    assert not await adapter.connect()
+    assert not validate_config(config)
+    result = await _standalone_send(config, "#agents", "hello")
+    assert "already-connected" in result["error"]
+    opened.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_standalone_sasl_uses_shared_registration(monkeypatch):
+    conn = _FakeIRCConnection([
+        b":server CAP * LS :sasl", b":server CAP * ACK :sasl", b"AUTHENTICATE +",
+        b":server 903 bot-cron :success", b":server 001 bot-cron :welcome",
+    ])
+    result = await _irc_mod._sa_register(_irc_mod._StandaloneConn(conn, conn), "bot", "not-used",
+                                       sasl_account="account", sasl_password="synthetic")
+    assert result is None
+    assert not any(line.startswith(b"PASS ") for line in conn.writes)
+    assert b"CAP END\r\n" in conn.writes
+
+
+@pytest.mark.asyncio
+async def test_http_connect_requires_success_and_verified_tls(monkeypatch):
+    conn = _FakeIRCConnection([b"HTTP/1.1 200 Connection established\r\n\r\n"])
+    conn.start_tls = AsyncMock()
+    opened = []
+
+    async def open_connection(*args, **kwargs):
+        opened.append(args)
+        return conn, conn
+
+    monkeypatch.setattr(_irc_mod.asyncio, "open_connection", open_connection)
+    await _irc_mod._open_connection("irc.example", 6697, True, "http://proxy:3128")
+    assert opened == [("proxy", 3128)]
+    assert conn.writes[0] == b"CONNECT irc.example:6697 HTTP/1.1\r\nHost: irc.example:6697\r\n\r\n"
+    assert conn.start_tls.call_args.kwargs["server_hostname"] == "irc.example"
+    assert conn.start_tls.call_args.args[0].check_hostname
+    conn._scripted = [b"HTTP/1.1 403 Forbidden\r\n\r\n"]
+    with pytest.raises(ValueError, match="proxy-connect-failed"):
+        await _irc_mod._open_connection("irc.example", 6697, True, "http://proxy:3128")
+    assert conn._closed
+    assert opened == [("proxy", 3128), ("proxy", 3128)]  # no direct fallback
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("key", "value"), [("server", "irc.example"), ("port", 6698)])
+async def test_coordination_rejects_other_endpoints_before_opening_socket(monkeypatch, key, value):
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    config = _coordination_config()
+    config.extra[key] = value
+    open_connection = AsyncMock()
+    monkeypatch.setattr(_irc_mod, "_open_connection", open_connection)
+    adapter = IRCAdapter(config)
+    assert not await adapter.connect()
+    assert adapter.fatal_error_retryable is False
+    open_connection.assert_not_awaited()
+    # Ordinary SASL IRC still supports other verified-TLS endpoints.
+    config.extra["coordination"] = False
+    assert IRCAdapter(config)._config_error() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coordination", [False, True])
+@pytest.mark.parametrize("read_failure", [False, True])
+async def test_registration_transport_loss_is_retryable(monkeypatch, coordination, read_failure):
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    config = _coordination_config()
+    if not coordination:
+        config.extra["coordination"] = False
+        config.extra.pop("sasl_account")
+        config.extra.pop("sasl_password")
+    conn = _FakeIRCConnection([])
+    reader = asyncio.StreamReader()
+    if read_failure:
+        reader.set_exception(ConnectionResetError("synthetic disconnect"))
+    else:
+        reader.feed_eof()
+    monkeypatch.setattr(_irc_mod, "_open_connection", AsyncMock(return_value=(reader, conn)))
+    adapter = IRCAdapter(config)
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *args: True)
+    assert not await asyncio.wait_for(adapter.connect(), 3)
+    assert adapter.fatal_error_retryable is True
+    assert not any(line.startswith(b"JOIN ") for line in conn.writes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel", ["#Hermes", "#hermes"])
+@pytest.mark.parametrize("confirmation", ["JOIN", "NAMES"])
+async def test_ordinary_irc_membership_is_case_insensitive(monkeypatch, channel, confirmation):
+    from gateway.config import PlatformConfig
+
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    reader = asyncio.StreamReader()
+
+    class Connection(_FakeIRCConnection):
+        def write(self, data):
+            super().write(data)
+            if data.startswith(b"USER "):
+                reader.feed_data(b":server 001 HermesBot :Welcome\r\n")
+            elif data.startswith(b"JOIN "):
+                reply = (":hermesbot!u@host JOIN :#hermes" if confirmation == "JOIN"
+                         else ":server 353 HermesBot = #hermes :@hermesbot")
+                reader.feed_data((reply + "\r\n").encode())
+
+    conn = Connection([])
+    monkeypatch.setattr(_irc_mod, "_open_connection", AsyncMock(return_value=(reader, conn)))
+    adapter = IRCAdapter(PlatformConfig(enabled=True, extra={
+        "server": "irc.example", "channel": channel, "nickname": "HermesBot", "use_tls": False}))
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *args: True)
+    try:
+        assert await asyncio.wait_for(adapter.connect(), 3)
+        assert adapter.is_connected and adapter._joined.is_set()
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coordination", [True, False])
+@pytest.mark.parametrize("end", ["healthy", "eof", "finished-task"])
+async def test_join_confirmation_requires_live_receive_task(monkeypatch, coordination, end):
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    config = _coordination_config()
+    config.extra["coordination"] = coordination
+    conn = _NegotiatingIRCConnection()
+    original_write = conn.write
+
+    def write(data):
+        original_write(data)
+        if data.startswith(b"JOIN "):
+            conn.feed(":agent-hermes-cto!u@host JOIN :#agents")
+            if end == "eof":
+                conn.reader.feed_eof()
+
+    conn.write = write
+    monkeypatch.setattr(_irc_mod, "_open_connection", AsyncMock(return_value=(conn.reader, conn)))
+    adapter = IRCAdapter(config)
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *args: True)
+    if end == "finished-task":
+        async def finished_receive_loop():
+            # Even a receive task that exits without publishing a fatal cannot report success.
+            adapter._registered = True
+            adapter._registration_event.set()
+            await conn.join_requested.wait()
+            adapter._joined.set()
+
+        monkeypatch.setattr(adapter, "_receive_loop", finished_receive_loop)
+    try:
+        assert await asyncio.wait_for(adapter.connect(), 3) is (end == "healthy")
+        assert adapter.is_connected is (end == "healthy")
+        if end == "healthy":
+            assert not adapter._recv_task.done() and not adapter.has_fatal_error
+        else:
+            assert adapter.has_fatal_error and adapter.fatal_error_retryable is True
+            assert adapter._recv_task.done()
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coordination", [True, False])
+@pytest.mark.parametrize("phase", ["ls", "auth", "welcome"])
+async def test_silent_sasl_registration_timeout_is_retryable(monkeypatch, coordination, phase):
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    config = _coordination_config()
+    config.extra["coordination"] = coordination
+    conn = _NegotiatingIRCConnection()
+    original_feed = conn.feed
+
+    def feed(line):
+        if phase == "ls" or (phase == "auth" and " 903 " in line) or (phase == "welcome" and " 001 " in line):
+            return
+        original_feed(line)
+
+    conn.feed = feed
+    monkeypatch.setattr(_irc_mod, "_open_connection", AsyncMock(return_value=(conn.reader, conn)))
+    original_wait = asyncio.wait_for
+
+    async def short_registration_timeout(awaitable, timeout):
+        return await original_wait(awaitable, timeout=0.05 if timeout == 30.0 else timeout)
+
+    monkeypatch.setattr(_irc_mod.asyncio, "wait_for", short_registration_timeout)
+    adapter = IRCAdapter(config)
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *args: True)
+    assert not await adapter.connect()
+    assert not adapter.is_connected and adapter.fatal_error_retryable is True
+    assert adapter._sasl.phase == {"ls": "ls", "auth": "result", "welcome": "welcome"}[phase]
+    assert not any(line.startswith((b"JOIN ", b"PASS ")) for line in conn.writes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coordination", [True, False])
+@pytest.mark.parametrize("failure,retryable", [
+    ("502", True), ("503", True), ("504", True),
+    ("refused", True), ("reset", True), ("timeout", True),
+    ("invalid-config", False), ("malformed-response", False), ("407", False), ("tls", False),
+    ("407-cleanup", False), ("tls-cleanup", False), ("503-cleanup", True),
+])
+async def test_connect_proxy_failures_preserve_retry_class(monkeypatch, coordination, failure, retryable):
+    import ssl
+    cleanup_failure = failure.endswith("-cleanup")
+    failure = failure.removesuffix("-cleanup")
+
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    config = _coordination_config()
+    config.extra.update(coordination=coordination, proxy_url="http://proxy:3128")
+    if failure == "invalid-config":
+        config.extra["proxy_url"] = "https://proxy:3128"
+    status = failure if failure.isdigit() else "200"
+    header = b"not HTTP\r\n\r\n" if failure == "malformed-response" else f"HTTP/1.1 {status} response\r\n\r\n".encode()
+    conn = _FakeIRCConnection([header])
+    conn.start_tls = AsyncMock()
+    if cleanup_failure:
+        conn.wait_closed = AsyncMock(side_effect=ConnectionResetError("synthetic cleanup failure"))
+    if failure == "tls":
+        conn.start_tls.side_effect = ssl.SSLCertVerificationError("synthetic verification failure")
+    open_connection = AsyncMock(return_value=(conn, conn))
+    errors = {"refused": ConnectionRefusedError, "reset": ConnectionResetError, "timeout": asyncio.TimeoutError}
+    if failure in errors:
+        open_connection.side_effect = errors[failure]("synthetic transport failure")
+    monkeypatch.setattr(_irc_mod.asyncio, "open_connection", open_connection)
+    adapter = IRCAdapter(config)
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *args: True)
+    assert not await adapter.connect()
+    assert not adapter.is_connected and adapter.fatal_error_retryable is retryable
+    if failure == "invalid-config":
+        open_connection.assert_not_awaited()
+    else:
+        open_connection.assert_awaited_once_with("proxy", 3128, limit=8192)
+    if failure != "tls":
+        conn.start_tls.assert_not_awaited()
+    assert not any(line.startswith((b"JOIN ", b"PASS ", b"AUTHENTICATE ")) for line in conn.writes)

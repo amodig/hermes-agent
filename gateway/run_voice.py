@@ -314,6 +314,8 @@ class GatewayVoiceMixin:
         voice_mode = self._voice_mode.get(self._voice_key_for_source(event.source))
         is_voice_input = event.message_type == MessageType.VOICE
         adapter = self._delivery_adapter_for(event.source)
+        if getattr(adapter, "coordination", False) is True:
+            return False
         adapter_auto_tts = False
         with suppress(Exception):  # adapters without the probe read as False
             adapter_auto_tts = bool(adapter._should_auto_tts_for_chat(chat_id))

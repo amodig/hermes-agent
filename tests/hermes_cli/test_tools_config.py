@@ -1058,3 +1058,147 @@ class TestLightpandaPostSetup:
         # Not in the forced-setup gate: a missing binary must not nag every
         # user who toggles the browser toolset.
         assert "lightpanda" not in _POST_SETUP_INSTALLED
+
+
+def test_no_tools_survives_picker_and_blocks_every_effective_injection(monkeypatch):
+    import model_tools
+    import hermes_cli.tools_config as tc
+    from hermes_cli.toolset_validation import saved_toolset_resolver
+    from tools.registry import registry
+    from tools.mcp_tool_agent import _reinject_post_build_tools
+
+    monkeypatch.setattr(registry, "_tools", dict(registry._tools))
+    for name, toolset in (("coord_test_write", "write_plugin"),
+                          ("coord_test_mcp_write", "mcp-write_server")):
+        registry.register(name=name, toolset=toolset,
+                          schema={"name": name, "parameters": {"type": "object", "properties": {}}},
+                          handler=lambda args: "{}")
+    monkeypatch.setattr(tc, "_get_plugin_toolset_keys", lambda: {"write_plugin", "irc_coord"})
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "synthetic-worker")
+    monkeypatch.setattr(model_tools, "_is_dispatcher_owned_worker", lambda: True)
+    monkeypatch.setattr(model_tools, "_is_delegated_child_context", lambda: False)
+    config = {
+        "platform_toolsets": {"irc": ["no_tools", "terminal", "irc_coord"]},
+        "context": {"engine": "write_engine"},
+        "mcp_servers": {"write_server": {"command": "never-started"}},
+        "toolsets": ["kanban"],
+    }
+    assert saved_toolset_resolver(config)("no_tools")
+    with patch("hermes_cli.tools_config.save_config"):
+        _save_platform_tools(config, "irc", {"terminal", "write_plugin", "irc_coord"})
+    assert "no_tools" in config["platform_toolsets"]["irc"]
+    enabled = sorted(_get_platform_tools(config, "irc"))
+    assert enabled == [] and enabled is not None
+    tools = model_tools.get_tool_definitions(enabled_toolsets=enabled, quiet_mode=True)
+    assert tools == []
+    schema = {"name": "engine_write", "parameters": {"type": "object", "properties": {}}}
+    agent = SimpleNamespace(
+        enabled_toolsets=enabled, disabled_toolsets=None,
+        context_compressor=SimpleNamespace(get_tool_schemas=lambda: [schema]),
+        _memory_manager=SimpleNamespace(get_all_tool_schemas=lambda: [schema]))
+    assert _reinject_post_build_tools(agent, tools, set()) == set()
+    assert tools == []
+    assert "irc_coord" not in _get_platform_tools({"platform_toolsets": {"irc": ["irc_coord"]}}, "irc")
+    assert "irc_coord" not in _get_platform_tools({}, "cli")
+    assert "irc_coord" in _get_platform_tools({"platform_toolsets": {"cli": ["irc_coord"]}}, "cli")
+
+
+def test_empty_adapter_toolset_override_is_not_replaced_with_defaults():
+    from gateway.run_turn import GatewayTurnMixin
+    runner = SimpleNamespace(_delivery_adapter_for=lambda source: SimpleNamespace(toolsets_for_source=lambda source: []))
+    assert GatewayTurnMixin._resolve_enabled_toolsets_for_source(
+        runner, {"platform_toolsets": {"irc": ["terminal"]}}, None, "irc") == []
+
+
+def test_no_tools_final_agent_surface_with_installed_plugin_mcp_and_engine(tmp_path, monkeypatch):
+    import hermes_yaml as yaml
+    import hermes_cli.plugins as plugins_mod
+    from agent.context_engine import ContextEngine
+    from hermes_cli.plugins import PluginManager
+    from tools.registry import registry
+
+    class WriteEngine(ContextEngine):
+        @property
+        def name(self):
+            return "write_engine"
+
+        def update_from_response(self, usage):
+            pass
+
+        def should_compress(self, prompt_tokens=None):
+            return False
+
+        def compress(self, messages, current_tokens=None):
+            return messages
+
+        def get_tool_schemas(self):
+            return [{"name": "engine_write", "parameters": {"type": "object", "properties": {}}}]
+
+    home = tmp_path / "isolated-home"
+    plugin = home / "plugins" / "coord_write"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.yaml").write_text("name: coord_write\n")
+    (plugin / "__init__.py").write_text(
+        'from pathlib import Path\n'
+        'def register(ctx):\n'
+        '    ctx.register_tool(name="coord_plugin_write", toolset="coord_write",'
+        ' schema={"name": "coord_plugin_write", "parameters": {"type": "object", "properties": {}}},'
+        ' handler=lambda args, **kw: str(Path(args["path"]).write_text(args["text"])))\n'
+    )
+    config = {
+        "plugins": {"enabled": ["coord_write"]}, "context": {"engine": "write_engine"},
+        "platform_toolsets": {"irc": ["no_tools"]}, "mcp_servers": {"fake": {"command": "never-started"}},
+        "agent": {},
+    }
+    (home / "config.yaml").write_text(yaml.safe_dump(config))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    manager.discover_and_load()
+    monkeypatch.setattr(plugins_mod, "_plugin_manager", manager)
+    engine = WriteEngine()
+    registry.register(name="mcp__coord_test__write", toolset="mcp-fake",
+                      schema={"name": "mcp__coord_test__write", "parameters": {"type": "object", "properties": {}}},
+                      handler=lambda args: "{}")
+    try:
+        from model_tools import get_tool_definitions
+        exposed = get_tool_definitions(enabled_toolsets=["coord_write", "mcp-fake"], quiet_mode=True,
+                                       skip_tool_search_assembly=True)
+        assert {t["function"]["name"] for t in exposed} == {"coord_plugin_write", "mcp__coord_test__write"}
+        with (patch("hermes_cli.config.load_config", return_value=config),
+              patch("hermes_cli.config.load_config_readonly", return_value=config),
+              patch("plugins.context_engine.load_context_engine", return_value=engine),
+              patch("agent.model_metadata.get_model_context_length", return_value=204800),
+              patch("model_tools.check_toolset_requirements", return_value={}),
+              patch("agent.process_bootstrap.OpenAI")):
+            from run_agent import AIAgent
+            agent = AIAgent(api_key="synthetic-only", base_url="https://provider.invalid/v1",
+                            enabled_toolsets=sorted(_get_platform_tools(config, "irc")), quiet_mode=True,
+                            skip_context_files=True, skip_memory=True)
+        assert agent.context_compressor is engine
+        assert agent.enabled_toolsets == []
+        assert agent.tools == [] and agent.valid_tool_names == set()
+        from tools.bot_mode_dm import ensure_message_agent_tool, message_agent_authorized, message_agent_tool_schema
+        from tools.bot_mode_probe import is_bot_mode_managed
+        from tools.mcp_tool_agent import _reinject_authorized_dynamic_tools
+
+        profile = home / "profiles" / "managed"
+        profile.mkdir(parents=True)
+        (profile / "profile.yaml").write_text("ui_meta:\n  hermes-bots:\n    shape: cloud\n")
+        agent._session_title_hint = "Bot Chat"
+        agent._bot_mode_protocol = True
+        agent._session_db = SimpleNamespace(db_path=str(home / "state.db"))
+        assert is_bot_mode_managed(str(home))
+        # Positive control: this same managed Bot Chat gets the tool absent an
+        # explicit empty selection, including after an MCP catalog rebuild.
+        agent.enabled_toolsets = None
+        assert message_agent_authorized(agent)
+        agent.enabled_toolsets = []
+        assert not message_agent_authorized(agent)
+        assert not ensure_message_agent_tool(agent)
+        assert agent.tools == [] and agent.valid_tool_names == set()
+        rebuilt, names = [message_agent_tool_schema()], {"message_agent"}
+        _reinject_authorized_dynamic_tools(agent, rebuilt, names)
+        assert rebuilt == [] and names == set()
+    finally:
+        registry.deregister("mcp__coord_test__write")
+        registry.deregister("coord_plugin_write")

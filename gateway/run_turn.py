@@ -1920,6 +1920,9 @@ class GatewayTurnMixin:
     ):
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
+        if (event.metadata or {}).get("irc_request_uuid"):
+            # Metadata survives the gateway's dataclasses.replace text rewrites.
+            event.metadata["_turn_error"] = bool(agent_result.get("failed"))
         if diagnostic_wake_muted(event):
             return None
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
@@ -1970,6 +1973,8 @@ class GatewayTurnMixin:
     async def _hmwa_agent_error_reply(self, e, event, source, session_entry, session_key, prepared):
         """``except Exception`` body of the agent turn: stop typing, log, persist the inbound user
         turn once and close it, and build the sanitized user-facing error reply."""
+        if (event.metadata or {}).get("irc_request_uuid"):
+            event.metadata["_turn_error"] = True
         # Retain Slack thread/workspace routing so a failed turn cannot leave its status visible.
         await self._hmwa_stop_typing_for_turn(event, source)
         logger.exception("Agent error in session %s", session_key)
@@ -2396,7 +2401,9 @@ class GatewayTurnMixin:
             override = adapter.toolsets_for_source(source) if adapter is not None else None
         except Exception:
             override = None
-        if override and isinstance(override, list):
+        if override == []:
+            return []
+        if isinstance(override, list):
             pts = dict(user_config.get("platform_toolsets") or {})
             pts[platform_key] = [str(x) for x in override]
             user_config = {**user_config, "platform_toolsets": pts}
@@ -3565,28 +3572,43 @@ class GatewayTurnMixin:
         from gateway.run import _abandon_timed_out_gateway_turn
         agent_holder = turn_ctx.agent_holder
         _warning_fired = False
-        while True:
-            done, _ = await asyncio.wait({worker.executor_task}, timeout=5.0)
-            if done:
-                # Prefer the real result even if the watchdog fired in the same window (the run already
-                # persisted its reply).
-                return worker.executor_task.result()
-            if worker.agent_timeout is not None:
-                if worker.timeout_fired.is_set():
-                    break
-                _idle_secs = self._agent_activity_summary(agent_holder[0]).get("seconds_since_activity", 0.0)
-                if not _warning_fired and worker.agent_warning is not None and _idle_secs >= worker.agent_warning:
-                    _warning_fired = True
-                    await self._run_agent_inactivity_warning(worker, turn_ctx.source, turn_ctx._status_thread_metadata)
-                if _idle_secs >= worker.agent_timeout:
-                    threading.Thread(
-                        target=_abandon_timed_out_gateway_turn,
-                        kwargs={"agent_holder": agent_holder, **self._reaper_kwargs(worker)},
-                        name=f"gateway-turn-reaper-{worker.task_id[:12]}", daemon=True,
-                    ).start()
-                    break
-            await self._run_agent_backup_interrupt_check(turn_ctx, _interrupt_detected, interrupt_monitor)
-        return self._run_agent_timeout_result(worker, turn_ctx)
+        retain_worker = (
+            getattr(turn_ctx.source.platform, "value", None) == "irc"
+            and getattr(self._delivery_adapter_for(turn_ctx.source), "coordination", False) is True)
+        try:
+            while True:
+                done, _ = await asyncio.wait({worker.executor_task}, timeout=5.0)
+                if done:
+                    # Prefer the real result even if the watchdog fired in the same window (the run already
+                    # persisted its reply).
+                    return worker.executor_task.result()
+                if worker.agent_timeout is not None:
+                    if worker.timeout_fired.is_set():
+                        break
+                    _idle_secs = self._agent_activity_summary(agent_holder[0]).get("seconds_since_activity", 0.0)
+                    if not _warning_fired and worker.agent_warning is not None and _idle_secs >= worker.agent_warning:
+                        _warning_fired = True
+                        await self._run_agent_inactivity_warning(worker, turn_ctx.source, turn_ctx._status_thread_metadata)
+                    if _idle_secs >= worker.agent_timeout:
+                        threading.Thread(
+                            target=_abandon_timed_out_gateway_turn,
+                            kwargs={"agent_holder": agent_holder, **self._reaper_kwargs(worker)},
+                            name=f"gateway-turn-reaper-{worker.task_id[:12]}", daemon=True,
+                        ).start()
+                        break
+                await self._run_agent_backup_interrupt_check(turn_ctx, _interrupt_detected, interrupt_monitor)
+            return self._run_agent_timeout_result(worker, turn_ctx)
+        finally:
+            if retain_worker:
+                # A cancelled coroutine or inactivity timeout cannot release IRC admission while
+                # the thread still occupies the executor. Other platforms retain their timeout policy.
+                while not worker.executor_task.done():
+                    try:
+                        await asyncio.shield(worker.executor_task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break  # The completed worker's failure is handled by the normal turn path.
 
     def _run_agent_evict_on_fallback(self, turn_ctx: TurnContext) -> None:
         """Evict the cached agent when a fallback model activated on a SUCCESSFUL run (so /model shows
@@ -4283,6 +4305,14 @@ class GatewayTurnMixin:
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
         if self._get_proxy_url():
+            if getattr(source.platform, "value", None) == "irc":
+                adapter = self._delivery_adapter_for(source)
+                if getattr(adapter, "coordination", False) is True:
+                    # Remote API toolsets are independently configured; zero tools cannot be guaranteed.
+                    await adapter.send(source.chat_id, "unavailable", metadata={
+                        "thread_id": source.thread_id, "_turn_error": True})
+                    return {"final_response": "", "messages": [], "api_calls": 0, "tools": [],
+                            "failed": True, "error": "unavailable"}
             return await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,

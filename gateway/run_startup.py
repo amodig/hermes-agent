@@ -568,6 +568,18 @@ class GatewayStartupMixin:
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
             return None
+        from gateway.irc_coordination import is_coordination_source
+        resumable = []
+        for entry in candidates:
+            source = entry.origin
+            if (is_coordination_source(source)
+                    or (getattr(source.platform, "value", None) == "irc"
+                        and getattr(self._delivery_adapter_for(self._restored_source(entry)), "coordination", False) is True)):
+                # No live admission/watchdog survives restart. Clear even aged/offline requests.
+                self.session_store.clear_resume_pending(entry.session_key)
+                continue
+            resumable.append(entry)
+        candidates = resumable
         # Restart-loop breaker: only boots WITH restart-interrupted sessions count; when tripped, skip
         # auto-resume for THIS boot only (inbound still served; sessions stay resume_pending).
         if candidates:

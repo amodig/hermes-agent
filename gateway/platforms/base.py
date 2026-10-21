@@ -4424,7 +4424,8 @@ class BasePlatformAdapter(ABC):
         a failing notice is logged, never raised). Returns the thread metadata used."""
         _thread_metadata = None
         try:
-            _thread_metadata = _thread_metadata_for_event(event)
+            _thread_metadata = dict(_thread_metadata_for_event(event) or {})
+            _thread_metadata["_turn_error"] = True
             error_detail = str(e)[:300] if str(e) else t("gateway.notify.turn_error_no_details")
             # Only the policy reads bind the routed profile; the send stays in the launch scope
             # as before, so delivery bookkeeping keeps landing where boot-time recovery reads it.
@@ -4599,6 +4600,10 @@ class BasePlatformAdapter(ABC):
                 text_content, media_files = extracted.text_content, extracted.media_files
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                if getattr(self, "coordination", False) is True:
+                    _final_thread_metadata["_final_response"] = True
+                    if (event.metadata or {}).get("_turn_error") is True:
+                        _final_thread_metadata["_turn_error"] = True
                 _tts_paths, _tts_requested_path = [], None
                 if self._wants_auto_tts(
                         event, session_key, interrupt_event, text_content, media_files):

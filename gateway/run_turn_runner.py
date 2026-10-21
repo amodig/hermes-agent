@@ -934,6 +934,9 @@ class TurnRunner:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
                 adapter = self._runner._delivery_adapter_for(ctx.source)
+                if getattr(adapter, "coordination", False) is True:
+                    # Even the non-editing commentary fallback would publish a premature response.
+                    return None, None, None, False
                 if adapter:
                     supports_incremental_stream = (
                         getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)
@@ -1269,6 +1272,9 @@ class TurnRunner:
         agent.stream_delta_callback = stream_delta_cb
         agent.interim_assistant_callback = interim_assistant_cb if want_interim_messages else None
         agent.status_callback, agent.notice_callback = ctx._status_callback_sync, self._notice_callback_sync
+        if getattr(ctx._status_adapter, "coordination", False) is True:
+            # Lifecycle notices are not the correlated final answer; reset cached callbacks too.
+            agent.status_callback = agent.notice_callback = None
         agent.notice_clear_callback = None  # sends can't be retracted
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config, agent.service_tier = reasoning_config, runner._service_tier
@@ -1904,6 +1910,8 @@ class TurnRunner:
         # *subprocess* exports HERMES_SESSION_KEY (from its own --session-key argv, a separate process) — so
         # removing this in-process gateway write does not affect any of them.
         platform_key = "cli" if ctx.source.platform == Platform.LOCAL else ctx.source.platform.value
+        coordination = (platform_key == "irc"
+                        and getattr(runner._delivery_adapter_for(ctx.source), "coordination", False) is True)
         combined_ephemeral = self._combined_ephemeral_prompt()
         max_iterations = _current_max_iterations()
         try:
@@ -1919,6 +1927,9 @@ class TurnRunner:
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
             )
         except Exception as exc:
+            if coordination:
+                return {"final_response": "unavailable", "messages": [], "api_calls": 0, "tools": [],
+                        "failed": True, "error": "unavailable"}
             # Model/credential resolution failed before the turn began; the raw text (URLs, status
             # codes) belongs in the log, and the chat gets the commands that fix it.
             logger.warning("Model resolution failed for session %s: %s", ctx.session_key or "", exc)
@@ -1938,6 +1949,10 @@ class TurnRunner:
         runner._service_tier = runner._resolve_session_service_tier(source=ctx.source, session_key=ctx.session_key)
         stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
         turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
+        if coordination and turn_route["runtime"].get("api_mode") == "codex_app_server":
+            # Codex owns its shell/file/MCP catalog and ignores Hermes' empty tool selection.
+            return {"final_response": "unavailable", "messages": [], "api_calls": 0, "tools": [],
+                    "failed": True, "error": "unavailable"}
         agent, reused_cached_agent = self._resolve_turn_agent(
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
         )

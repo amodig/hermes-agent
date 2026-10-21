@@ -314,6 +314,8 @@ def _apply_toolset_selection(tools: set, names: List[str], quiet_mode: bool, *, 
 
 def _select_tool_names(enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]], quiet_mode: bool) -> set:
     """Tool names requested by the toolset selection (before check_fn filtering)."""
+    if enabled_toolsets == []:
+        return set()  # Explicit emptiness also forbids worker lifecycle-tool injection.
     tools: set = set()
     if enabled_toolsets is not None:
         enabled = list(enabled_toolsets)
