@@ -934,6 +934,9 @@ class TurnRunner:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
                 adapter = self._runner._delivery_adapter_for(ctx.source)
+                if getattr(adapter, "coordination", False) is True:
+                    # Even the non-editing commentary fallback would publish a premature response.
+                    return None, None, None, False
                 if adapter:
                     supports_incremental_stream = (
                         getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)

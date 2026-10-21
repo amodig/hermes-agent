@@ -245,6 +245,7 @@ class IRCAdapter(BasePlatformAdapter):
             accounts = [account.strip() for account in accounts.split(",")]
         self.allowed_accounts = set(accounts) if isinstance(accounts, list) and all(isinstance(a, str) for a in accounts) else set()
         if self.coordination:
+            self.SUPPORTS_MESSAGE_EDITING = False
             # Defense in depth for the gateway's central authorization check; never nickname grants.
             config.extra["allowed_users"] = sorted(self.allowed_accounts)
         self.allowed_users: list = extra.get("allowed_users", [])
@@ -396,7 +397,8 @@ class IRCAdapter(BasePlatformAdapter):
             metadata = metadata or {}
             request_id = metadata.get("thread_id")
             request = self._active_requests.get(request_id)
-            if (metadata.get("_interim_send") or not request or request["destination"] != chat_id
+            if (metadata.get("_interim_send") or metadata.get("expect_edits")
+                    or not request or request["destination"] != chat_id
                     or time.monotonic() >= request["expires"]):
                 return SendResult(success=True)  # suppressed; never retry an uncorrelated send
             status, body = ("err", "unavailable") if metadata.get("_turn_error") else ("ok", content)
@@ -670,8 +672,8 @@ class IRCAdapter(BasePlatformAdapter):
         return _ExtractedResponse(text_content=response, images=[], media_files=[], local_files=[],
                                   force_document_attachments=False, pre_extract=response)
 
-    def _wants_auto_tts(self, *args, **kwargs):
-        return False if self.coordination else super()._wants_auto_tts(*args, **kwargs)
+    def _should_auto_tts_for_chat(self, chat_id):
+        return False if self.coordination else super()._should_auto_tts_for_chat(chat_id)
 
     async def _send_response(self, request_id, destination, status, body):
         if not self._writer or self._writer.is_closing() or not self.is_connected:

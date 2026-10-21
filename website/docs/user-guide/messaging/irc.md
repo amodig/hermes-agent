@@ -159,6 +159,13 @@ selection preserved by the tool picker. Slash commands and clarify/approval hand
 are disabled structurally; model MEDIA/file/TTS directives remain plain text.
 Explicitly empty tool selections also block managed Bot Chat's `message_agent`
 injection, including MCP catalog refreshes.
+Coordination refuses the model-proxy route (`gateway.proxy_url` or `GATEWAY_PROXY_URL`)
+with one `err unavailable`: the remote API server's independent tool configuration
+cannot guarantee zero tools. This restriction does not affect IRC's HTTP CONNECT
+`extra.proxy_url`. Coordination also disables streaming/interim consumers and auto-TTS,
+including explicit voice modes; editable previews cannot close the request. Only the
+final plain-text answer is framed as a successful response. Ordinary IRC retains
+its existing model-proxy, streaming and voice behavior.
 This is not an extension sandbox: trusted provider/context/plugin hooks still run,
 and the bounds below are not a provider-token-spend guarantee. Do not send private
 questions to the channel unless all participants may read them. OMP peers expose

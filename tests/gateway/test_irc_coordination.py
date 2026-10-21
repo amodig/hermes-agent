@@ -474,3 +474,147 @@ def test_tool_reaches_windows_pipe_without_unix_socket(tmp_path, monkeypatch):
     assert json.loads(tools.irc_request({"target": PEER, "question": "hello"}))["status"] == "ok"
     assert len(calls) == 1 and calls[0][0] == tmp_path and calls[0][2] == 65
     assert calls[0][1]["params"] == {"profile": "default", "target": PEER, "question": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_gateway_proxy_refuses_coordination_without_model_or_tools(adapter, monkeypatch):
+    from unittest.mock import Mock
+    from gateway.run_turn import GatewayTurnMixin
+
+    monkeypatch.setattr("agent.secret_scope.get_secret", lambda name: "")
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {
+        "gateway": {"proxy_url": "https://remote-model.invalid"}})
+    remote_tool = Mock()
+
+    async def remote_turn(**kwargs):
+        remote_tool()
+        return {"final_response": "ordinary proxy answer"}
+
+    runner = SimpleNamespace(
+        _delivery_adapter_for=lambda source: adapter,
+        _run_agent_via_proxy=AsyncMock(side_effect=remote_turn),
+        _run_agent_display_settings=Mock(side_effect=AssertionError("local model must not run")))
+    runner._get_proxy_url = lambda: GatewayTurnMixin._get_proxy_url(runner)
+    results, sources = [], []
+
+    async def handler(event):
+        sources.append(event.source)
+        result = await GatewayTurnMixin._run_agent_inner(
+            runner, event.text, "", [], event.source, "synthetic-session")
+        results.append(result)
+        return result["final_response"]
+
+    adapter._message_handler = handler
+    request_id, body = request()
+    await adapter._handle_line(frame(body))
+    await asyncio.wait_for(adapter._coord_dispatch_task, 3)
+    await adapter._handle_line(frame(body))
+    assert adapter._writer.lines == [f"PRIVMSG #agents :!res {request_id} err 1/1 unavailable"]
+    assert not adapter._active_requests and adapter._coord_dispatch_task is None
+    assert results[0]["failed"] and results[0]["api_calls"] == 0 and results[0]["tools"] == []
+    runner._run_agent_via_proxy.assert_not_awaited()
+    runner._run_agent_display_settings.assert_not_called()
+    remote_tool.assert_not_called()
+    ordinary = irc.IRCAdapter(PlatformConfig(extra={"server": "irc.example", "channel": "#ordinary"}))
+    runner._delivery_adapter_for = lambda source: ordinary
+    result = await GatewayTurnMixin._run_agent_inner(runner, "hello", "", [], sources[0], "ordinary-session")
+    assert result["final_response"] == "ordinary proxy answer"
+    runner._run_agent_via_proxy.assert_awaited_once()
+    remote_tool.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interim_enabled", [False, True])
+async def test_streaming_previews_never_consume_coordination_response(adapter, monkeypatch, interim_enabled):
+    from unittest.mock import Mock
+    from gateway.config import StreamingConfig
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
+    from gateway.stream_consumer import GatewayStreamConsumer
+
+    factory = Mock(wraps=GatewayStreamConsumer)
+    monkeypatch.setattr("gateway.stream_consumer.GatewayStreamConsumer", factory)
+    runner = SimpleNamespace(
+        config=SimpleNamespace(streaming=StreamingConfig(enabled=True)),
+        _delivery_adapter_for=lambda source: adapter)
+    runner._build_stream_consumer_config = lambda *args, **kwargs: (
+        GatewayTurnMixin._build_stream_consumer_config(runner, *args, **kwargs))
+    contexts = []
+
+    async def handler(event):
+        ctx = TurnContext(
+            source=event.source, user_config={}, resolve_display_setting=lambda *args: True,
+            interim_assistant_messages_enabled=interim_enabled, _run_still_current=lambda: True,
+            _status_adapter=adapter, _status_chat_id=event.source.chat_id,
+            _status_thread_metadata={"thread_id": event.message_id})
+        contexts.append(ctx)
+        assert TurnRunner(runner, ctx)._setup_stream_consumer("irc") == (None, None, None, False)
+        assert adapter.SUPPORTS_MESSAGE_EDITING is False
+        # A stray/older consumer must also be unable to close this request.
+        for text in ("preview one", "preview two", "preview three"):
+            await adapter.send("#agents", text, metadata={"thread_id": event.message_id, "expect_edits": True})
+            assert event.message_id in adapter._active_requests
+        return "complete final answer"
+
+    adapter._message_handler = handler
+    request_id, body = request()
+    await adapter._handle_line(frame(body))
+    await asyncio.wait_for(adapter._coord_dispatch_task, 3)
+    factory.assert_not_called()
+    assert adapter._writer.lines == [f"PRIVMSG #agents :!res {request_id} ok 1/1 complete final answer"]
+    ordinary = irc.IRCAdapter(PlatformConfig(extra={"server": "irc.example", "channel": "#ordinary"}))
+    assert getattr(ordinary, "SUPPORTS_MESSAGE_EDITING", True) is True
+    runner._delivery_adapter_for = lambda source: ordinary
+    consumer, delta, _, _ = TurnRunner(runner, contexts[0])._setup_stream_consumer("irc")
+    assert consumer is not None and delta is not None
+    factory.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice_mode", [None, "all"])
+@pytest.mark.parametrize("voice_input", [False, True])
+async def test_auto_tts_cannot_replace_coordination_answer(adapter, monkeypatch, voice_mode, voice_input):
+    from unittest.mock import Mock
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.run_voice import GatewayVoiceMixin
+    from gateway.platforms.event import MessageType
+
+    synthesis = Mock(side_effect=AssertionError("coordination must not synthesize speech"))
+    monkeypatch.setattr("tools.tts_tool.text_to_speech_tool", synthesis)
+    adapter._auto_tts_default = True
+    adapter._auto_tts_enabled_chats.add("#agents")
+    runner = SimpleNamespace(
+        _voice_mode={"irc:#agents": voice_mode} if voice_mode else {},
+        _voice_key_for_source=lambda source: "irc:#agents",
+        _delivery_adapter_for=lambda source: adapter)
+    runner._should_send_voice_reply = lambda *args, **kwargs: (
+        GatewayVoiceMixin._should_send_voice_reply(runner, *args, **kwargs))
+
+    async def send_voice(*args):
+        return await GatewayVoiceMixin._send_voice_reply(runner, *args)
+
+    runner._send_voice_reply = AsyncMock(wraps=send_voice)
+    events = []
+
+    async def handler(event):
+        events.append(event)
+        if voice_input:
+            event.message_type = MessageType.VOICE  # Exercise the base voice fallback too.
+        assert adapter._should_auto_tts_for_chat("#agents") is False
+        return await GatewayTurnMixin._hmwa_deliver_turn_response(
+            runner, event, event.source, SimpleNamespace(session_id="synthetic"),
+            adapter._event_session_key(event), None, {}, [], "model answer", "", False)
+
+    adapter._message_handler = handler
+    request_id, body = request()
+    await adapter._handle_line(frame(body))
+    await asyncio.wait_for(adapter._coord_dispatch_task, 3)
+    synthesis.assert_not_called()
+    runner._send_voice_reply.assert_not_awaited()
+    assert adapter._writer.lines == [f"PRIVMSG #agents :!res {request_id} ok 1/1 model answer"]
+    ordinary = irc.IRCAdapter(PlatformConfig(extra={"server": "irc.example", "channel": "#ordinary"}))
+    ordinary._auto_tts_default = True
+    runner._delivery_adapter_for = lambda source: ordinary
+    assert ordinary._should_auto_tts_for_chat("#agents")
+    assert runner._should_send_voice_reply(events[0], "ordinary answer", [], already_sent=True)

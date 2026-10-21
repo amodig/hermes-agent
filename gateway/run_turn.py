@@ -4300,6 +4300,14 @@ class GatewayTurnMixin:
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
         if self._get_proxy_url():
+            if getattr(source.platform, "value", None) == "irc":
+                adapter = self._delivery_adapter_for(source)
+                if getattr(adapter, "coordination", False) is True:
+                    # Remote API toolsets are independently configured; zero tools cannot be guaranteed.
+                    await adapter.send(source.chat_id, "unavailable", metadata={
+                        "thread_id": source.thread_id, "_turn_error": True})
+                    return {"final_response": "", "messages": [], "api_calls": 0, "tools": [],
+                            "failed": True, "error": "unavailable"}
             return await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
