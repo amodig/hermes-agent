@@ -713,3 +713,34 @@ async def test_registration_transport_loss_is_retryable(monkeypatch, coordinatio
     assert not await asyncio.wait_for(adapter.connect(), 3)
     assert adapter.fatal_error_retryable is True
     assert not any(line.startswith(b"JOIN ") for line in conn.writes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel", ["#Hermes", "#hermes"])
+@pytest.mark.parametrize("confirmation", ["JOIN", "NAMES"])
+async def test_ordinary_irc_membership_is_case_insensitive(monkeypatch, channel, confirmation):
+    from gateway.config import PlatformConfig
+
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    reader = asyncio.StreamReader()
+
+    class Connection(_FakeIRCConnection):
+        def write(self, data):
+            super().write(data)
+            if data.startswith(b"USER "):
+                reader.feed_data(b":server 001 HermesBot :Welcome\r\n")
+            elif data.startswith(b"JOIN "):
+                reply = (":hermesbot!u@host JOIN :#hermes" if confirmation == "JOIN"
+                         else ":server 353 HermesBot = #hermes :@hermesbot")
+                reader.feed_data((reply + "\r\n").encode())
+
+    conn = Connection([])
+    monkeypatch.setattr(_irc_mod, "_open_connection", AsyncMock(return_value=(reader, conn)))
+    adapter = IRCAdapter(PlatformConfig(enabled=True, extra={
+        "server": "irc.example", "channel": channel, "nickname": "HermesBot", "use_tls": False}))
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *args: True)
+    try:
+        assert await asyncio.wait_for(adapter.connect(), 3)
+        assert adapter.is_connected and adapter._joined.is_set()
+    finally:
+        await adapter.disconnect()

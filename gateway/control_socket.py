@@ -278,19 +278,42 @@ class _PipeControlProtocol(asyncio.Protocol):
         self._server = server
         self._transport: Any = None
         self._buffer = bytearray()
+        self._response_task: Optional[asyncio.Task] = None
+        self._cancelled = threading.Event()
 
     def connection_made(self, transport) -> None:  # pragma: no cover - windows
         self._transport = transport
 
     def data_received(self, data: bytes) -> None:  # pragma: no cover - windows
+        if self._response_task is not None or self._cancelled.is_set():
+            return
         self._buffer.extend(data)
         if len(self._buffer) > _MAX_REQUEST_BYTES:
+            self._cancelled.set()
             self._transport.close()
         elif b"\n" in self._buffer:
-            try:
-                self._transport.write(self._server.handle_request_line(bytes(self._buffer).partition(b"\n")[0]))
-            finally:
+            raw = bytes(self._buffer).partition(b"\n")[0]
+            self._buffer.clear()
+            self._response_task = asyncio.create_task(self._respond(raw))
+
+    async def _respond(self, raw: bytes) -> None:
+        try:
+            response = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self._server.handle_request_line(raw, cancelled=self._cancelled))
+            if self._transport is not None and not self._cancelled.is_set():
+                self._transport.write(response)
+        except (ConnectionError, OSError):
+            pass
+        except Exception:
+            logger.debug("Control pipe connection handler error", exc_info=True)
+        finally:
+            self._cancelled.set()
+            if self._transport is not None:
                 self._transport.close()
+
+    def connection_lost(self, exc) -> None:
+        self._cancelled.set()
+        self._transport = None
 
 
 def query_gateway_control(home: Path, verb: str, *, params: Optional[dict[str, Any]] = None,

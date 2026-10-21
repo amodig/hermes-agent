@@ -130,6 +130,8 @@ Additional supported environment aliases are `IRC_SASL_ACCOUNT`, `IRC_SASL_PASSW
 `z300.barracuda-trout.ts.net:6697`; another host or port is rejected before credentials
 are sent. Invalid coordination settings fail closed, including while disconnected;
 they never enable ordinary IRC intake. Ordinary IRC endpoints remain configurable.
+Ordinary JOIN/NAMES membership checks ignore nick/channel letter case; coordination
+account and nickname checks remain exact.
 
 The adapter requires `sasl`, `message-tags`, `account-tag`, `server-time`, and `batch`.
 Withdrawal of any required capability disconnects the adapter without automatic
@@ -161,6 +163,8 @@ This is not an extension sandbox: trusted provider/context/plugin hooks still ru
 and the bounds below are not a provider-token-spend guarantee. Do not send private
 questions to the channel unless all participants may read them. OMP peers expose
 their working-session context only after that session's explicit local opt-in.
+Tool availability uses the gateway's canonical merge of platform sections, so a
+top-level Telegram block does not hide nested `gateway.platforms.irc` settings.
 
 Human account `amodig` can DM the bot or start a channel message with an exact
 `@agent-hermes-cto`, `agent-hermes-cto:` or `agent-hermes-cto,` mention.
@@ -184,10 +188,14 @@ destination and authenticated peer. Duplicate/conflicting parts fail the request
 Each identity admits one automatic reply at a time, at most six requests/minute.
 New valid requests while busy get one `busy` response, not queued model work.
 A 55-second watchdog sends `!res <uuid> err 1/1 timeout` once, suppresses late output,
-and keeps admission busy until dispatch has unwound. Outbound requests wait at most
+and requests a cooperative interrupt without cancelling the base turn. Admission
+stays busy until the executor worker has actually finished, even when coroutine
+cancellation or the gateway inactivity timeout occurs. Outbound requests wait at most
 60 seconds; IPC waits at most 65. Disconnect/IPC cancellation clears partial responses;
-no request is automatically resent after reconnect. The shared control socket keeps
-its existing 64 KiB request / 512 KiB response caps and 2-second default for other verbs;
+no request is automatically resent after reconnect. IPC uses the serving gateway's
+existing Unix socket or native Windows named pipe, with handlers running off the
+gateway event loop on both transports. The shared control socket keeps its existing
+64 KiB request / 512 KiB response caps and 2-second default for other verbs;
 the IRC handler applies its own question/target bounds.
 
 Request UUIDs and optional msgids are deduplicated in process (1,024 entries, ten

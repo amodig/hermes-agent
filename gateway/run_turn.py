@@ -3567,28 +3567,43 @@ class GatewayTurnMixin:
         from gateway.run import _abandon_timed_out_gateway_turn
         agent_holder = turn_ctx.agent_holder
         _warning_fired = False
-        while True:
-            done, _ = await asyncio.wait({worker.executor_task}, timeout=5.0)
-            if done:
-                # Prefer the real result even if the watchdog fired in the same window (the run already
-                # persisted its reply).
-                return worker.executor_task.result()
-            if worker.agent_timeout is not None:
-                if worker.timeout_fired.is_set():
-                    break
-                _idle_secs = self._agent_activity_summary(agent_holder[0]).get("seconds_since_activity", 0.0)
-                if not _warning_fired and worker.agent_warning is not None and _idle_secs >= worker.agent_warning:
-                    _warning_fired = True
-                    await self._run_agent_inactivity_warning(worker, turn_ctx.source, turn_ctx._status_thread_metadata)
-                if _idle_secs >= worker.agent_timeout:
-                    threading.Thread(
-                        target=_abandon_timed_out_gateway_turn,
-                        kwargs={"agent_holder": agent_holder, **self._reaper_kwargs(worker)},
-                        name=f"gateway-turn-reaper-{worker.task_id[:12]}", daemon=True,
-                    ).start()
-                    break
-            await self._run_agent_backup_interrupt_check(turn_ctx, _interrupt_detected, interrupt_monitor)
-        return self._run_agent_timeout_result(worker, turn_ctx)
+        retain_worker = (
+            getattr(turn_ctx.source.platform, "value", None) == "irc"
+            and getattr(self._delivery_adapter_for(turn_ctx.source), "coordination", False) is True)
+        try:
+            while True:
+                done, _ = await asyncio.wait({worker.executor_task}, timeout=5.0)
+                if done:
+                    # Prefer the real result even if the watchdog fired in the same window (the run already
+                    # persisted its reply).
+                    return worker.executor_task.result()
+                if worker.agent_timeout is not None:
+                    if worker.timeout_fired.is_set():
+                        break
+                    _idle_secs = self._agent_activity_summary(agent_holder[0]).get("seconds_since_activity", 0.0)
+                    if not _warning_fired and worker.agent_warning is not None and _idle_secs >= worker.agent_warning:
+                        _warning_fired = True
+                        await self._run_agent_inactivity_warning(worker, turn_ctx.source, turn_ctx._status_thread_metadata)
+                    if _idle_secs >= worker.agent_timeout:
+                        threading.Thread(
+                            target=_abandon_timed_out_gateway_turn,
+                            kwargs={"agent_holder": agent_holder, **self._reaper_kwargs(worker)},
+                            name=f"gateway-turn-reaper-{worker.task_id[:12]}", daemon=True,
+                        ).start()
+                        break
+                await self._run_agent_backup_interrupt_check(turn_ctx, _interrupt_detected, interrupt_monitor)
+            return self._run_agent_timeout_result(worker, turn_ctx)
+        finally:
+            if retain_worker:
+                # A cancelled coroutine or inactivity timeout cannot release IRC admission while
+                # the thread still occupies the executor. Other platforms retain their timeout policy.
+                while not worker.executor_task.done():
+                    try:
+                        await asyncio.shield(worker.executor_task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break  # The completed worker's failure is handled by the normal turn path.
 
     def _run_agent_evict_on_fallback(self, turn_ctx: TurnContext) -> None:
         """Evict the cached agent when a fallback model activated on a SUCCESSFUL run (so /model shows

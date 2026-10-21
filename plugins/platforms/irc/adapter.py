@@ -488,12 +488,14 @@ class IRCAdapter(BasePlatformAdapter):
                 self._registration_error = str(e)
                 self._registration_event.set()
             return
-        if command == "JOIN" and params and _extract_nick(msg["prefix"]) == self._current_nick:
-            self._joined_channels.add(params[0])
+        # Match ordinary IRC's case-insensitive nick/channel names, not coordination accounts.
+        fold = (lambda value: value) if self.coordination else str.lower
+        if command == "JOIN" and params and fold(_extract_nick(msg["prefix"])) == fold(self._current_nick):
+            self._joined_channels.add(fold(params[0]))
         elif command == "353" and len(params) >= 4:
-            if self._current_nick in {nick.lstrip("~&@%+") for nick in params[-1].split()}:
-                self._joined_channels.add(params[-2])
-        if set(self.channel.split(",")) <= self._joined_channels:
+            if fold(self._current_nick) in {fold(nick.lstrip("~&@%+")) for nick in params[-1].split()}:
+                self._joined_channels.add(fold(params[-2]))
+        if {fold(channel) for channel in self.channel.split(",")} <= self._joined_channels:
             self._joined.set()
         if self.coordination:
             if command == "CAP" and len(params) >= 3 and params[1] == "DEL":
@@ -637,9 +639,10 @@ class IRCAdapter(BasePlatformAdapter):
             done, _ = await asyncio.wait({task}, timeout=REPLY_TIMEOUT)
             if not done:
                 await self._finish_request(request_id, "err", "timeout")
-                self._expected_cancelled_tasks.add(task)
-                task.cancel()
-            # Shielding keeps the admission slot occupied until the real base dispatch unwinds.
+                await self.interrupt_session_activity(
+                    self._event_session_key(event), destination, {"thread_id": request_id})
+            # Do not cancel the base task: its executor thread can outlive coroutine cancellation.
+            # Admission remains held while the cooperatively interrupted turn finishes.
             with contextlib.suppress(asyncio.CancelledError):
                 await asyncio.shield(task)
             if request_id in self._active_requests:
@@ -647,10 +650,15 @@ class IRCAdapter(BasePlatformAdapter):
         finally:
             self._active_requests.pop(request_id, None)
             if task is not None and not task.done():
+                await self.interrupt_session_activity(
+                    self._event_session_key(event), destination, {"thread_id": request_id})
                 self._expected_cancelled_tasks.add(task)
                 task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await asyncio.shield(task)
+                while not task.done():
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        continue
             self._coord_dispatch_task = None
 
     async def _extract_response_content(self, response, event, session_key, *, is_ephemeral_response):

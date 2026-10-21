@@ -12,7 +12,7 @@ _DESCRIPTION = (
 
 
 def irc_request(args: dict, **_) -> str:
-    from gateway.control_socket import query_gateway_control, resolve_client_socket_path
+    from gateway.control_socket import query_gateway_control
     from hermes_cli.gateway import host_multiplexer_serving
     from hermes_cli.profiles import current_profile_name
     from hermes_constants import get_hermes_home
@@ -34,8 +34,6 @@ def irc_request(args: dict, **_) -> str:
         home = owner.home
     else:
         home = get_hermes_home()
-    if resolve_client_socket_path(home) is None:
-        return json.dumps(unavailable)
     result = query_gateway_control(
         home, "irc-request", params={"profile": profile, "target": target, "question": question}, timeout=65)
     # The schema description labels peer text without modifying the wire/result body's contents.
@@ -44,9 +42,10 @@ def irc_request(args: dict, **_) -> str:
 
 def _available() -> bool:
     from hermes_cli.config import load_config_readonly
+    from gateway.config_loader import merge_platform_sections
 
     config = load_config_readonly() or {}
-    platforms = config.get("platforms") or (config.get("gateway") or {}).get("platforms") or {}
+    platforms = merge_platform_sections(config, config.get("gateway"), {}, also=frozenset({"irc"}))
     irc = platforms.get("irc") or {}
     return irc.get("enabled") is True and (irc.get("extra") or {}).get("coordination") is True
 

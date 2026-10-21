@@ -573,3 +573,74 @@ def test_legacy_verb_answers_half_closed_client(home):
         finally:
             await server.stop()
     _run(scenario())
+
+
+def test_pipe_handler_runs_off_loop_and_processes_one_request(home):
+    import threading
+    from types import SimpleNamespace
+    from gateway.control_socket import _PipeControlProtocol
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        main_thread = threading.get_ident()
+        started, release, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        calls, responses = [], []
+
+        async def on_gateway_loop(value):
+            started.set()
+            await release.wait()
+            return {"value": value}
+
+        def handler(params, *, cancelled):
+            calls.append(threading.get_ident())
+            future = asyncio.run_coroutine_threadsafe(on_gateway_loop(params["value"]), loop)
+            try:
+                return future.result(timeout=1)
+            finally:
+                if not future.done():
+                    future.cancel()
+
+        server = GatewayControlServer(home, verb_handlers={"blocking": handler})
+        protocol = _PipeControlProtocol(server)
+        protocol.connection_made(SimpleNamespace(write=responses.append, close=closed.set))
+        try:
+            protocol.data_received(b'{"verb":"blocking","params":')
+            protocol.data_received(b'{"value":42}}\n')
+            protocol.data_received(b'{"verb":"blocking","params":{"value":99}}\n')
+            await asyncio.wait_for(started.wait(), 3)
+            assert calls and calls[0] != main_thread
+            assert not responses and not closed.is_set()
+        finally:
+            release.set()
+            await asyncio.wait_for(protocol._response_task, 3)
+        assert len(calls) == 1 and closed.is_set()
+        assert len(responses) == 1
+        assert json.loads(responses[0])["result"] == {"value": 42}
+
+    _run(scenario())
+
+
+def test_pipe_disconnect_cancels_opted_in_handler_without_late_write(home):
+    from types import SimpleNamespace
+    from gateway.control_socket import _PipeControlProtocol
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        responses = []
+
+        def handler(*, cancelled):
+            loop.call_soon_threadsafe(started.set)
+            assert cancelled.wait(3)
+            return {"error": "cancelled"}
+
+        server = GatewayControlServer(home, verb_handlers={"blocking": handler})
+        protocol = _PipeControlProtocol(server)
+        protocol.connection_made(SimpleNamespace(write=responses.append, close=lambda: None))
+        protocol.data_received(b'{"verb":"blocking"}\n')
+        await asyncio.wait_for(started.wait(), 3)
+        protocol.connection_lost(None)
+        await asyncio.wait_for(protocol._response_task, 3)
+        assert not responses
+
+    _run(scenario())

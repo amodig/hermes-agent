@@ -174,38 +174,88 @@ async def test_human_exact_mentions_and_dm_get_unique_sessions(adapter):
 
 
 @pytest.mark.asyncio
-async def test_busy_watchdog_dedupe_and_unwind_block_late_output(adapter, monkeypatch):
+@pytest.mark.parametrize("exit_mode", ["normal", "cancelled", "inactivity"])
+async def test_watchdog_holds_admission_until_executor_worker_finishes(adapter, monkeypatch, exit_mode):
+    import threading
+    import gateway.run_turn as turn_module
+
     monkeypatch.setattr(irc, "REPLY_TIMEOUT", 0.02)
-    started, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    started, release, worker_done = asyncio.Event(), threading.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    turns = []
+    interrupt = adapter.interrupt_session_activity
+    adapter.interrupt_session_activity = AsyncMock(wraps=interrupt)
+
+    async def short_poll(tasks, *, timeout):
+        return await asyncio.wait(tasks, timeout=min(timeout, 0.01))
+
+    monkeypatch.setattr(turn_module, "asyncio", SimpleNamespace(
+        wait=short_poll, shield=asyncio.shield, CancelledError=asyncio.CancelledError))
+    runner = SimpleNamespace(
+        _delivery_adapter_for=lambda source: adapter,
+        _run_agent_backup_interrupt_check=AsyncMock(),
+        _run_agent_timeout_result=lambda *args: {"final_response": "late-answer"})
+
+    def run_sync():
+        loop.call_soon_threadsafe(started.set)
+        try:
+            release.wait(5)
+            return {"final_response": "late-answer"}
+        finally:
+            worker_done.set()
 
     async def handler(event):
-        started.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            cancelled.set()
-            await release.wait()  # deliberately slow provider unwind
-        return "late-answer"
+        turns.append(event)
+        worker = SimpleNamespace(
+            executor_task=asyncio.create_task(asyncio.to_thread(run_sync)),
+            agent_timeout=1 if exit_mode == "inactivity" else None,
+            timeout_fired=threading.Event())
+        worker.timeout_fired.set()
+        ctx = SimpleNamespace(source=event.source, agent_holder=[None])
+        result = await turn_module.GatewayTurnMixin._run_agent_await_turn_worker(
+            runner, worker, ctx, asyncio.Event(), None)
+        return result["final_response"]
 
     adapter._message_handler = handler
     request_id, body = request()
     await adapter._handle_line(frame(body))
     dispatch = adapter._coord_dispatch_task
-    await started.wait()
-    await adapter.send("#agents", "interim", metadata={"thread_id": request_id, "_interim_send": True})
-    busy_id, busy_body = request()
-    await adapter._handle_line(frame(busy_body))
-    await adapter._handle_line(frame(busy_body))
-    await asyncio.wait_for(cancelled.wait(), 3)
-    assert adapter._coord_dispatch_task is dispatch and not dispatch.done()
-    assert adapter._writer.lines.count(f"PRIVMSG #agents :!res {request_id} err 1/1 timeout") == 1
-    assert adapter._writer.lines.count(f"PRIVMSG #agents :!res {busy_id} busy 1/1 busy") == 1
-    release.set()
-    await asyncio.wait_for(dispatch, 3)
+    try:
+        await asyncio.wait_for(started.wait(), 3)
+        event = turns[0]
+        key = adapter._event_session_key(event)
+        await asyncio.wait_for(adapter._active_sessions[key].wait(), 3)
+        adapter.interrupt_session_activity.assert_awaited_once()
+        if exit_mode == "cancelled":
+            # Cancellation of the base coroutine must not free its executor worker.
+            task = adapter._session_tasks[key]
+            adapter._expected_cancelled_tasks.add(task)
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+        await adapter.send("#agents", "interim", metadata={"thread_id": request_id, "_interim_send": True})
+        busy_id, busy_body = request()
+        await adapter._handle_line(frame(busy_body))
+        await adapter._handle_line(frame(busy_body))
+        assert not worker_done.is_set() and len(turns) == 1
+        assert adapter._coord_dispatch_task is dispatch and not dispatch.done()
+        assert adapter._writer.lines.count(f"PRIVMSG #agents :!res {request_id} err 1/1 timeout") == 1
+        assert adapter._writer.lines.count(f"PRIVMSG #agents :!res {busy_id} busy 1/1 busy") == 1
+    finally:
+        release.set()
+        await asyncio.wait_for(dispatch, 3)
+    assert worker_done.is_set() and adapter._coord_dispatch_task is None
     assert not any("late-answer" in line or "interim" in line for line in adapter._writer.lines)
     replacement = irc.IRCAdapter(adapter.config)
     carry_inbound_dedup(inbound_dedup_caches(adapter), replacement)
     assert replacement._request_dedupe.contains("req:" + request_id)
+    monkeypatch.setattr(irc, "REPLY_TIMEOUT", 55.0)  # The fresh turn is not a timeout probe.
+    adapter._message_handler = AsyncMock(return_value="fresh-answer")
+    await adapter._handle_line(frame(request()[1]))
+    await asyncio.wait_for(adapter._coord_dispatch_task, 3)
+    adapter._message_handler.assert_awaited_once()
+    assert adapter._writer.lines[-1].endswith(" ok 1/1 fresh-answer")
 
 
 @pytest.mark.asyncio
@@ -265,6 +315,7 @@ def test_tool_uses_runtime_profile_and_owner_socket_only(tmp_path, monkeypatch):
     from hermes_cli import gateway, profiles
     from gateway import control_socket
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    original_query = control_socket.query_gateway_control
 
     monkeypatch.setattr(profiles, "_get_profiles_root", lambda: tmp_path / "profiles")
     monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: tmp_path)
@@ -288,6 +339,7 @@ def test_tool_uses_runtime_profile_and_owner_socket_only(tmp_path, monkeypatch):
     assert [call[2]["profile"] for call in calls] == ["alpha", "beta", "alpha"]
     assert all(call[0] == owner_home and call[1] == "irc-request" and call[3] == 65 for call in calls)
     monkeypatch.setattr(control_socket, "resolve_client_socket_path", lambda home: None)
+    monkeypatch.setattr(control_socket, "query_gateway_control", original_query)
     assert json.loads(tools.irc_request({"target": PEER, "question": "hi"}))["error"] == "unavailable"
     assert len(calls) == 3
 
@@ -385,3 +437,40 @@ async def test_timestamp_conversion_failures_warn_without_dispatch(adapter, monk
     assert f"account={PEER} category=malformed" in caplog.text
     assert "private-" not in caplog.text
     assert adapter._coord_dispatch_task is None and adapter._writer.lines == []
+
+
+def test_tool_availability_merges_mixed_platform_sections(monkeypatch):
+    from plugins.platforms.irc import tools
+    config = {"platforms": {"telegram": {"enabled": True}},
+              "gateway": {"platforms": {"irc": {"enabled": True, "extra": {"coordination": True}}}}}
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
+    assert tools._available()
+    config["platforms"]["irc"] = {"enabled": False}
+    assert not tools._available()  # Same top-level precedence as gateway configuration.
+    config["platforms"]["irc"] = {"enabled": True}
+    assert tools._available()  # Nested extra survives the top-level override.
+
+
+def test_tool_reaches_windows_pipe_without_unix_socket(tmp_path, monkeypatch):
+    from plugins.platforms.irc import tools
+    from gateway import control_socket
+
+    calls = []
+    monkeypatch.setattr("hermes_cli.profiles.current_profile_name", lambda: "default")
+    monkeypatch.setattr("hermes_cli.gateway.host_multiplexer_serving", lambda profile: None)
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(control_socket, "_IS_WINDOWS", True)
+
+    def no_unix_socket(home):
+        raise AssertionError("Unix socket lookup must not gate Windows pipes")
+
+    def pipe_query(home, payload, timeout):
+        calls.append((home, json.loads(payload), timeout))
+        return json.dumps({"ok": True, "result": {
+            "requestId": str(uuid.uuid4()), "account": PEER, "status": "ok", "text": "peer data"}}).encode()
+
+    monkeypatch.setattr(control_socket, "resolve_client_socket_path", no_unix_socket)
+    monkeypatch.setattr(control_socket, "_query_windows_pipe", pipe_query)
+    assert json.loads(tools.irc_request({"target": PEER, "question": "hello"}))["status"] == "ok"
+    assert len(calls) == 1 and calls[0][0] == tmp_path and calls[0][2] == 65
+    assert calls[0][1]["params"] == {"profile": "default", "target": PEER, "question": "hello"}
