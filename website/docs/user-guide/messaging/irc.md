@@ -223,15 +223,17 @@ destination and authenticated peer. Duplicate/conflicting parts fail the request
 
 Each identity admits one automatic reply at a time, at most six requests/minute.
 New valid requests while busy get one `busy` response, not queued model work.
-The rolling one-minute admission window travels with replay state across in-process
-adapter replacements, so reconnecting does not grant another six consultations.
+Worker ownership, replay IDs and the rolling one-minute admission window live in a
+process-owned registry keyed by the exact account, outside the reloadable plugin.
+Reconnects and mid-run plugin reloads therefore cannot admit overlapping workers,
+forget a replay or grant another six consultations. Different accounts remain independent.
 A 55-second watchdog sends `!res <uuid> err 1/1 timeout` once, suppresses late output,
 and requests a cooperative interrupt without cancelling the base turn. Admission
 stays busy until the executor worker has actually finished, even when coroutine
 cancellation or the gateway inactivity timeout occurs. Transport teardown has a
 five-second wait bound and does not await provider exit. The worker's account lease
 and platform lock survive disconnect/shutdown until actual completion, including
-adapter replacement; reconnect is retryably refused while that lease is held.
+adapter replacement or plugin reload; reconnect is retryably refused while that lease is held.
 Late completion cannot restore an expired response. Outbound requests wait at most
 60 seconds; IPC waits at most 65. Disconnect/IPC cancellation clears partial responses;
 no request is automatically resent after reconnect. IPC uses the serving gateway's

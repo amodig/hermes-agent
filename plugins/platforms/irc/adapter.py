@@ -15,7 +15,6 @@ import re
 import ssl
 import time
 import uuid
-from collections import deque
 from urllib.parse import urlsplit
 from typing import Any, Dict, List, Optional
 
@@ -24,12 +23,12 @@ from gateway.platforms._shared import (
 )
 from agent.i18n import t
 from gateway.platforms.base import BasePlatformAdapter, SendResult
-from gateway.platforms.helpers import MessageDeduplicator, cancel_task
+from gateway.platforms.helpers import cancel_task
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.config import Platform
 from gateway.irc_coordination import (
-    AGENT_ACCOUNTS, ALLOWED_ACCOUNTS, COORDINATION_ENDPOINT, REQUIRED_CAPS, DEDUPE_IDS, DEDUPE_SECONDS,
-    REQUEST_TIMEOUT, REPLY_TIMEOUT, ResponseAssembly, format_request, normalize_body,
+    AGENT_ACCOUNTS, ALLOWED_ACCOUNTS, COORDINATION_ENDPOINT, REQUIRED_CAPS, DEDUPE_SECONDS,
+    REQUEST_TIMEOUT, REPLY_TIMEOUT, ResponseAssembly, coordination_state, format_request, normalize_body,
     parse_request, response_lines,
 )
 
@@ -226,28 +225,11 @@ class _SASLRegistration:
         return False
 
 
-class _CoordinationReplay(MessageDeduplicator):
-    """Move replay IDs and the same account's monotonic admission window together on reconnect."""
-
-    def __init__(self, account):
-        super().__init__(max_size=DEDUPE_IDS, ttl_seconds=DEDUPE_SECONDS)
-        self.account = account
-        self.accepted_at = deque()
-
-    def absorb(self, other):
-        super().absorb(other)
-        if isinstance(other, _CoordinationReplay) and other.account == self.account:
-            self.accepted_at = other.accepted_at
-
 
 # ── IRC Adapter ──────────────────────────────────────────────────────────────
 
 class IRCAdapter(BasePlatformAdapter):
     """Async IRC adapter implementing the BasePlatformAdapter interface."""
-
-    # One live worker per account, including adapters rebuilt during reconnect/shutdown.
-    # Entries are removed only by the dispatch task's completion callback.
-    _coordination_dispatches: Dict[str, asyncio.Task] = {}
 
     def __init__(self, config, **kwargs):
         super().__init__(config=config, platform=Platform("irc"))
@@ -295,7 +277,8 @@ class IRCAdapter(BasePlatformAdapter):
         self._joined = asyncio.Event()
         self._joined_channels = set()
         self._connection_started = time.time()
-        self._request_dedupe = _CoordinationReplay(self.sasl_account)
+        self._coordination_state = coordination_state(self.sasl_account if self.coordination else None)
+        self._request_dedupe = self._coordination_state.replay
         self._active_requests = {}
         self._coord_dispatch_task = None
         self._outbound = None
@@ -336,7 +319,7 @@ class IRCAdapter(BasePlatformAdapter):
             return self._fail("config_missing", "IRC_SERVER and IRC_CHANNEL must be set", retryable=False)
         if error := self._config_error():
             return self._fail("config_invalid", error, retryable=False)
-        pending = self._coordination_dispatches.get(self.sasl_account) if self.coordination else None
+        pending = self._coordination_state.dispatch if self.coordination else None
         if pending is not None and not pending.done():
             return self._fail("coordination_busy", "IRC consultation worker is still stopping", retryable=True)
         self._registration_event.clear()
@@ -412,8 +395,8 @@ class IRCAdapter(BasePlatformAdapter):
     def _coordination_finished(self, task):
         if self._coord_dispatch_task is task:
             self._coord_dispatch_task = None
-        if self._coordination_dispatches.get(self.sasl_account) is task:
-            del self._coordination_dispatches[self.sasl_account]
+        if self._coordination_state.dispatch is task:
+            self._coordination_state.dispatch = None
         if not self.is_connected:
             self._release_platform_lock()
 
@@ -687,10 +670,10 @@ class IRCAdapter(BasePlatformAdapter):
         for key in ids:
             self._request_dedupe.is_duplicate(key)
         reply_destination = self.channel if destination == self.channel else account
-        accepted_at = self._request_dedupe.accepted_at
+        accepted_at = self._coordination_state.accepted_at
         while accepted_at and accepted_at[0] <= time.monotonic() - 60:
             accepted_at.popleft()
-        pending = self._coordination_dispatches.get(self.sasl_account)
+        pending = self._coordination_state.dispatch
         busy = (self._coord_dispatch_task is not None
                 or (pending is not None and not pending.done()) or len(accepted_at) >= 6)
         logger.info("IRC coordination request=%s account=%s outcome=%s",
@@ -703,7 +686,7 @@ class IRCAdapter(BasePlatformAdapter):
             "account": account, "destination": reply_destination, "expires": time.monotonic() + REQUEST_TIMEOUT}
         self._coord_dispatch_task = asyncio.create_task(
             self._dispatch_coordination(request_id, account, nick, question, reply_destination))
-        self._coordination_dispatches[self.sasl_account] = self._coord_dispatch_task
+        self._coordination_state.dispatch = self._coord_dispatch_task
         self._coord_dispatch_task.add_done_callback(self._coordination_finished)
 
     async def handle_message(self, event: MessageEvent) -> None:

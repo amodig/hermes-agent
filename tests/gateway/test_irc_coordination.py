@@ -41,6 +41,13 @@ class Writer:
         pass
 
 
+@pytest.fixture(autouse=True)
+def isolate_coordination_process_state(monkeypatch):
+    import gateway.irc_coordination as coordination
+
+    monkeypatch.setattr(coordination, "_coordination_states", {})
+
+
 @pytest.fixture
 def adapter(monkeypatch):
     monkeypatch.setattr(irc, "_get_scoped_secret", lambda *args: "")
@@ -1148,3 +1155,123 @@ async def test_synthetic_or_replayed_events_cannot_bypass_live_admission(adapter
     await adapter.handle_message(replace(events[0]))  # Closed UUID cannot be revived.
     assert len(events) == 1 and not adapter._active_requests
     assert adapter._writer.lines == [f"PRIVMSG #agents :!res {request_id} ok 1/1 one live answer"]
+
+
+@pytest.fixture
+def reload_irc_adapter(monkeypatch, tmp_path):
+    import sys
+    from pathlib import Path
+    from hermes_cli.plugins import PluginManager, PluginManifest
+    from hermes_cli.plugins_loader import _evict_modules
+
+    manager = PluginManager(scope_key=str(tmp_path))
+    manifest = PluginManifest(name="irc", path=str(Path(irc.__file__).parent), source="bundled", kind="platform")
+    namespace = "hermes_plugins.irc_coordination_reload_test"
+
+    def load(config):
+        # Production loader evicts the package AND adapter submodule before executing both again.
+        package = manager._load_directory_module(manifest, module_name=namespace)
+        module = sys.modules[package.__name__ + ".adapter"]
+        monkeypatch.setattr(module, "_get_scoped_secret", lambda *args: "")
+        instance = module.IRCAdapter(config)
+        instance.config.typing_indicator = False
+        instance._writer = Writer()
+        instance._registered = True
+        instance._mark_connected()
+        return instance, module
+
+    try:
+        yield load
+    finally:
+        _evict_modules(namespace)
+
+
+@pytest.mark.asyncio
+async def test_plugin_reload_preserves_worker_lease_and_expired_response(adapter, reload_irc_adapter, monkeypatch):
+    first, first_module = reload_irc_adapter(adapter.config)
+    started, release = asyncio.Event(), asyncio.Event()
+    events = []
+
+    async def handler(event):
+        events.append(event)
+        started.set()
+        await release.wait()
+        return "late generation-A answer"
+
+    first.set_message_handler(handler)
+    monkeypatch.setattr(first_module, "REPLY_TIMEOUT", 0.02)
+    request_id, body = request()
+    await first._handle_line(frame(body))
+    dispatch = first._coord_dispatch_task
+    try:
+        await asyncio.wait_for(started.wait(), 3)
+        second, second_module = reload_irc_adapter(adapter.config)
+        assert first_module is not second_module and type(first) is not type(second)
+        assert first._coordination_state is second._coordination_state
+        second.set_message_handler(AsyncMock(return_value="new generation answer"))
+        open_connection = AsyncMock()
+        monkeypatch.setattr(second_module, "_open_connection", open_connection)
+        assert not await second.connect(is_reconnect=True)
+        assert second.fatal_error_code == "coordination_busy" and second.fatal_error_retryable
+        open_connection.assert_not_awaited()
+        second._mark_connected()  # Even a pre-existing live transport cannot bypass the lease.
+        busy_id, busy_body = request()
+        await second._handle_line(frame(busy_body))
+        await second._handle_line(frame(busy_body))
+        second._message_handler.assert_not_awaited()
+        assert second._writer.lines == [f"PRIVMSG #agents :!res {busy_id} busy 1/1 busy"]
+        assert len(events) == 1 and not dispatch.done()
+
+        other_account = "agent-omp-loota-01"
+        other = type(second)(PlatformConfig(extra={
+            **adapter.config.extra, "nickname": other_account, "sasl_account": other_account}))
+        other.config.typing_indicator = False
+        other._writer = Writer()
+        other._registered = True
+        other._mark_connected()
+        other.set_message_handler(AsyncMock(return_value="independent answer"))
+        other_id, other_body = request(target=other_account)
+        await other._handle_line(frame(other_body))
+        await asyncio.wait_for(other._coord_dispatch_task, 3)
+        assert other._writer.lines == [f"PRIVMSG #agents :!res {other_id} ok 1/1 independent answer"]
+        assert not dispatch.done()
+        await asyncio.wait_for(first._active_sessions[first._event_session_key(events[0])].wait(), 3)
+        assert first._writer.lines == [f"PRIVMSG #agents :!res {request_id} err 1/1 timeout"]
+    finally:
+        release.set()
+        await asyncio.wait_for(dispatch, 3)
+    assert first._writer.lines == [f"PRIVMSG #agents :!res {request_id} err 1/1 timeout"]
+    assert second._coordination_state.dispatch is None
+    fresh_id, fresh_body = request()
+    await second._handle_line(frame(fresh_body))
+    await asyncio.wait_for(second._coord_dispatch_task, 3)
+    await first.send("#agents", "late old generation", metadata={"thread_id": request_id, "_final_response": True})
+    second._message_handler.assert_awaited_once()
+    assert second._writer.lines[-1] == f"PRIVMSG #agents :!res {fresh_id} ok 1/1 new generation answer"
+    assert len(first._writer.lines) == 1
+
+
+@pytest.mark.asyncio
+async def test_plugin_reload_preserves_rate_window_and_replay_ids(adapter, reload_irc_adapter):
+    first, first_module = reload_irc_adapter(adapter.config)
+    first.set_message_handler(AsyncMock(return_value="accepted"))
+    bodies = []
+    for index in range(6):
+        _, body = request()
+        bodies.append(body)
+        await first._handle_line(frame(body, tags=f";msgid=reload-{index}"))
+        await asyncio.wait_for(first._coord_dispatch_task, 3)
+    assert first._message_handler.await_count == 6
+    await first.disconnect()
+    second, second_module = reload_irc_adapter(adapter.config)
+    assert first_module is not second_module
+    second.set_message_handler(AsyncMock(return_value="must not run"))
+    await second._handle_line(frame(bodies[0]))  # Same UUID, fresh server timestamp.
+    await second._handle_line(frame(request()[1], tags=";msgid=reload-0"))  # New UUID, old msgid.
+    assert second._writer.lines == []  # Replays are silent, not even busy/error responses.
+    seventh_id, seventh_body = request()
+    await second._handle_line(frame(seventh_body))
+    await second._handle_line(frame(seventh_body))
+    assert second._writer.lines == [f"PRIVMSG #agents :!res {seventh_id} busy 1/1 busy"]
+    second._message_handler.assert_not_awaited()
+    assert second._coord_dispatch_task is None

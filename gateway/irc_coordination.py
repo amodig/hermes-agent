@@ -10,6 +10,7 @@ import concurrent.futures
 import re
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 
 COORDINATION_ENDPOINT = ("z300.barracuda-trout.ts.net", 6697)
@@ -30,6 +31,30 @@ _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
 _REQUEST = re.compile(rf"!req ({_UUID}) ([a-zA-Z0-9_-]+) (.+)", re.DOTALL)
 _RESPONSE = re.compile(rf"!res ({_UUID}) (ok|err|busy) ([1-6])/([1-6]) (.*)", re.DOTALL)
 _CONTROLS = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+class CoordinationState:
+    """Process-owned account admission; plugin module replacement must not reset it."""
+
+    def __init__(self):
+        from gateway.platforms.helpers import MessageDeduplicator
+
+        self.replay = MessageDeduplicator(max_size=DEDUPE_IDS, ttl_seconds=DEDUPE_SECONDS)
+        self.accepted_at = deque()
+        self.dispatch: asyncio.Task | None = None
+
+
+_coordination_states: dict[str, CoordinationState] = {}
+
+
+def coordination_state(account) -> CoordinationState:
+    # Only the fixed coordination roster persists; ordinary/invalid config stays instance-local.
+    if not isinstance(account, str) or account not in AGENT_ACCOUNTS:
+        return CoordinationState()
+    state = _coordination_states.get(account)
+    if state is None:
+        state = _coordination_states.setdefault(account, CoordinationState())
+    return state
 
 
 def is_coordination_source(source) -> bool:

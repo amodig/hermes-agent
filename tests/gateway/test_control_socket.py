@@ -669,6 +669,7 @@ def test_concurrent_irc_waits_leave_default_executor_and_other_verbs_live(home, 
         count = max(default_workers, private_workers) * 2
         release, started = asyncio.Event(), asyncio.Event()
         scope_threads, wait_threads, submitted, handlers, clients = [], [], [], [], []
+        request_tasks = []
         active = set()
         fail = exit_mode == "error"
 
@@ -681,6 +682,7 @@ def test_concurrent_irc_waits_leave_default_executor_and_other_verbs_live(home, 
         monkeypatch.setattr(gateway.run, "_async_profile_runtime_scope", scope)
 
         async def request_peer(target, question, *, request_id):
+            request_tasks.append(asyncio.current_task())
             active.add(request_id)
             if len(active) == private_workers:
                 started.set()
@@ -776,6 +778,10 @@ def test_concurrent_irc_waits_leave_default_executor_and_other_verbs_live(home, 
                     assert reply["error"] in {"busy", "timeout"}
             await asyncio.wait_for(asyncio.gather(
                 *(asyncio.wrap_future(future) for future in submitted), return_exceptions=True), 3)
+            # Cancelling a concurrent future schedules loop cancellation; thread exit is not
+            # acknowledgement that the coroutine's finally has run. Await that separately.
+            _, pending = await asyncio.wait(request_tasks, timeout=3)
+            assert not pending
             assert not active and all(future.done() for future in submitted)
             if exit_mode == "shutdown":
                 assert await server.start()
