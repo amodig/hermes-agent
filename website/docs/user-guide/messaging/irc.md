@@ -84,7 +84,9 @@ Native SASL PLAIN is also available without coordination: configure `sasl_accoun
 `sasl_password` (prefer the profile-local `IRC_SASL_PASSWORD` secret), and
 `require_sasl: true`. SASL requires verified TLS and never downgrades to PASS or
 NickServ. Registration waits for CAP negotiation, SASL success and welcome;
-gateway membership is reported only after the server confirms the bot's JOIN or NAMES entry.
+gateway membership is reported only after the server confirms the bot's JOIN or NAMES entry
+and the receive task is still alive. Registration timeouts and transport loss during setup
+remain retryable, including EOF immediately after JOIN; explicit SASL/capability rejections do not.
 
 The private Ergo integration is a separate, explicitly configured policy:
 
@@ -168,7 +170,13 @@ Explicitly empty tool selections also block managed Bot Chat's `message_agent`
 injection, including MCP catalog refreshes.
 Coordination refuses the model-proxy route (`gateway.proxy_url` or `GATEWAY_PROXY_URL`)
 with one `err unavailable`: the remote API server's independent tool configuration
-cannot guarantee zero tools. This restriction does not affect IRC's HTTP CONNECT
+cannot guarantee zero tools. The Codex app-server runtime (`model.openai_runtime:
+codex_app_server`, or an effective session/channel runtime of `codex_app_server`) is
+also refused with one `err unavailable`, before constructing or running the agent:
+Codex's own shell, file and MCP tools ignore Hermes' tool selection. Runtime-resolution
+failures likewise return `err unavailable`, never a successful answer containing an
+authentication error. Ordinary IRC may still use that runtime and retains its usual
+authentication guidance. These restrictions do not affect IRC's HTTP CONNECT
 `extra.proxy_url`. Coordination also disables streaming/interim consumers and auto-TTS,
 including explicit voice modes; editable previews cannot close the request. Only the
 final plain-text answer is framed as a successful response. Lifecycle status and

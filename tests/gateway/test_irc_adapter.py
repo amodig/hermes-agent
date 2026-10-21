@@ -744,3 +744,76 @@ async def test_ordinary_irc_membership_is_case_insensitive(monkeypatch, channel,
         assert adapter.is_connected and adapter._joined.is_set()
     finally:
         await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coordination", [True, False])
+@pytest.mark.parametrize("end", ["healthy", "eof", "finished-task"])
+async def test_join_confirmation_requires_live_receive_task(monkeypatch, coordination, end):
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    config = _coordination_config()
+    config.extra["coordination"] = coordination
+    conn = _NegotiatingIRCConnection()
+    original_write = conn.write
+
+    def write(data):
+        original_write(data)
+        if data.startswith(b"JOIN "):
+            conn.feed(":agent-hermes-cto!u@host JOIN :#agents")
+            if end == "eof":
+                conn.reader.feed_eof()
+
+    conn.write = write
+    monkeypatch.setattr(_irc_mod, "_open_connection", AsyncMock(return_value=(conn.reader, conn)))
+    adapter = IRCAdapter(config)
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *args: True)
+    if end == "finished-task":
+        async def finished_receive_loop():
+            # Even a receive task that exits without publishing a fatal cannot report success.
+            adapter._registered = True
+            adapter._registration_event.set()
+            await conn.join_requested.wait()
+            adapter._joined.set()
+
+        monkeypatch.setattr(adapter, "_receive_loop", finished_receive_loop)
+    try:
+        assert await asyncio.wait_for(adapter.connect(), 3) is (end == "healthy")
+        assert adapter.is_connected is (end == "healthy")
+        if end == "healthy":
+            assert not adapter._recv_task.done() and not adapter.has_fatal_error
+        else:
+            assert adapter.has_fatal_error and adapter.fatal_error_retryable is True
+            assert adapter._recv_task.done()
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coordination", [True, False])
+@pytest.mark.parametrize("phase", ["ls", "auth", "welcome"])
+async def test_silent_sasl_registration_timeout_is_retryable(monkeypatch, coordination, phase):
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    config = _coordination_config()
+    config.extra["coordination"] = coordination
+    conn = _NegotiatingIRCConnection()
+    original_feed = conn.feed
+
+    def feed(line):
+        if phase == "ls" or (phase == "auth" and " 903 " in line) or (phase == "welcome" and " 001 " in line):
+            return
+        original_feed(line)
+
+    conn.feed = feed
+    monkeypatch.setattr(_irc_mod, "_open_connection", AsyncMock(return_value=(conn.reader, conn)))
+    original_wait = asyncio.wait_for
+
+    async def short_registration_timeout(awaitable, timeout):
+        return await original_wait(awaitable, timeout=0.05 if timeout == 30.0 else timeout)
+
+    monkeypatch.setattr(_irc_mod.asyncio, "wait_for", short_registration_timeout)
+    adapter = IRCAdapter(config)
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *args: True)
+    assert not await adapter.connect()
+    assert not adapter.is_connected and adapter.fatal_error_retryable is True
+    assert adapter._sasl.phase == {"ls": "ls", "auth": "result", "welcome": "welcome"}[phase]
+    assert not any(line.startswith((b"JOIN ", b"PASS ")) for line in conn.writes)

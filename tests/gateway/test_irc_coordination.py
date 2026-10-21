@@ -968,3 +968,98 @@ async def test_admission_window_survives_adapter_replacement(adapter, monkeypatc
     assert replacement._writer.lines == [
         f"PRIVMSG #agents :!res {busy_id} busy 1/1 busy",
         f"PRIVMSG #agents :!res {fresh_id} ok 1/1 accepted"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coordination", [True, False])
+@pytest.mark.parametrize("runtime_failure", [True, False])
+async def test_coordination_refuses_unsafe_or_unavailable_runtime(adapter, coordination, runtime_failure):
+    from unittest.mock import MagicMock, Mock
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
+
+    if not coordination:
+        adapter = irc.IRCAdapter(PlatformConfig(extra={
+            "server": "irc.example", "channel": "#ordinary", "nickname": "ordinary-bot"}))
+        adapter.config.typing_indicator = False
+        adapter._writer = Writer()
+    execute = Mock(return_value={"final_response": "ordinary Codex answer", "messages": []})
+
+    def make_agent(**kwargs):
+        return SimpleNamespace(
+            model=kwargs["model"], api_mode=kwargs["api_mode"], session_id=kwargs["session_id"],
+            tools=[], context_compressor=SimpleNamespace(last_prompt_tokens=0, context_length=200_000),
+            session_prompt_tokens=0, session_completion_tokens=0, run_conversation=execute)
+
+    factory = Mock(side_effect=make_agent)
+    runner = MagicMock()
+    runner.config = SimpleNamespace(streaming=None)
+    runner._provider_routing = {}
+    runner._agent_cache_lock = runner._session_db = runner._prefill_messages = None
+    runner._agent_cache = {}
+    runner._pending_model_notes = {}
+    runner._pending_skills_reload_notes = {}
+    runner.session_store._entries = {}
+    runner._get_system_prompt_for_channel.return_value = None
+    runner._resolve_session_agent_runtime.side_effect = lambda **kwargs: (
+        "synthetic-codex", {"api_mode": kwargs["user_config"]["model"]["openai_runtime"]})
+    if runtime_failure:
+        runner._resolve_session_agent_runtime.side_effect = RuntimeError("synthetic private credential failure")
+    runner._resolve_session_reasoning_config.return_value = None
+    runner._resolve_session_service_tier.return_value = None
+    runner._resolve_turn_agent_config.side_effect = lambda *args: GatewayTurnMixin._resolve_turn_agent_config(runner, *args)
+    runner._agent_config_signature.return_value = ("synthetic-signature",)
+    runner._extract_cache_busting_config.return_value = {}
+    runner._refresh_fallback_model.return_value = None
+    runner._consume_pending_native_image_paths.return_value = []
+    runner._consume_pending_turn_sidecar_notes.return_value = []
+    runner._is_telegram_topic_lane.return_value = False
+    runner._is_discord_auto_thread_lane.return_value = False
+    runner._is_relay_discord_channel_lane.return_value = False
+    runner._delivery_adapter_for.return_value = adapter
+    runner._should_send_voice_reply.return_value = False
+    runner._hmwa_stop_typing_for_turn = AsyncMock()
+    runner._STATUS_HINTS = GatewayTurnMixin._STATUS_HINTS
+    runner._hmwa_add_failed_turn_notice.side_effect = lambda *args: GatewayTurnMixin._hmwa_add_failed_turn_notice(runner, *args)
+    results = []
+
+    async def handler(event):
+        key = adapter._event_session_key(event)
+        ctx = TurnContext(
+            source=event.source, message=event.text, history=[], session_id="synthetic", session_key=key,
+            user_config={"model": {"openai_runtime": "codex_app_server"}},
+            AIAgent=factory, enabled_toolsets=[] if coordination else ["terminal"],
+            resolve_display_setting=lambda *args: False, _run_still_current=lambda: True,
+            _hooks_ref=SimpleNamespace(loaded_hooks=False))
+        result = await asyncio.to_thread(TurnRunner(runner, ctx).run_sync)
+        results.append(result)
+        return await GatewayTurnMixin._hmwa_deliver_turn_response(
+            runner, event, event.source, SimpleNamespace(session_id="synthetic"), key, None,
+            result, [], result["final_response"], "", False)
+
+    adapter._message_handler = handler
+    if coordination:
+        request_id, body = request()
+        await adapter._handle_line(frame(body))
+        await asyncio.wait_for(adapter._coord_dispatch_task, 3)
+        await adapter._handle_line(frame(body))
+        assert adapter._writer.lines == [f"PRIVMSG #agents :!res {request_id} err 1/1 unavailable"]
+        assert not adapter._active_requests and adapter._coord_dispatch_task is None
+        assert results[0]["failed"] and results[0]["api_calls"] == 0 and results[0]["tools"] == []
+        factory.assert_not_called()
+        execute.assert_not_called()
+    else:
+        await adapter._handle_privmsg("amodig", "#ordinary", "ordinary-bot: hello")
+        await asyncio.wait_for(next(iter(adapter._session_tasks.values())), 3)
+        if runtime_failure:
+            assert adapter._writer.lines == [
+                f"PRIVMSG #ordinary :{line}" for line in adapter._split_message(results[0]["final_response"], "#ordinary")]
+            factory.assert_not_called()
+            execute.assert_not_called()
+        else:
+            assert adapter._writer.lines == ["PRIVMSG #ordinary :ordinary Codex answer"]
+            factory.assert_called_once()
+            assert factory.call_args.kwargs["api_mode"] == "codex_app_server"
+            execute.assert_called_once()
+    assert len(results) == 1

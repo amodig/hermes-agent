@@ -278,6 +278,7 @@ class IRCAdapter(BasePlatformAdapter):
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
         self._recv_task: Optional[asyncio.Task] = None
+        self._connecting = False
         self._current_nick = self.nickname
         self._registered = False  # IRC registration complete
         self._registration_event = asyncio.Event()
@@ -340,10 +341,12 @@ class IRCAdapter(BasePlatformAdapter):
         # Prevent two profiles from using the same IRC identity
         if not self._acquire_platform_lock("irc", f"{self.server}:{self.nickname}", f"IRC identity {self.nickname}@{self.server}"):
             return False
+        self._connecting = True
         try:
             self._reader, self._writer = await asyncio.wait_for(
                 _open_connection(self.server, self.port, self.use_tls, self.proxy_url), timeout=30.0)
         except Exception as e:
+            self._connecting = False
             self._release_platform_lock()
             logger.error("IRC: connection failed (%s)", type(e).__name__)
             return self._fail("connect_failed", type(e).__name__, retryable=not isinstance(e, (ssl.SSLError, ValueError)))
@@ -362,7 +365,7 @@ class IRCAdapter(BasePlatformAdapter):
         except asyncio.TimeoutError:
             logger.error("IRC: registration timed out")
             await self.disconnect()
-            return self._fail("registration_timeout", "IRC registration timed out", retryable=not bool(self._sasl))
+            return self._fail("registration_timeout", "IRC registration timed out", retryable=True)
         if self._registration_error or not self._registered:
             error = self._registration_error or "registration-failed"
             retryable = self._registration_error is None
@@ -382,6 +385,10 @@ class IRCAdapter(BasePlatformAdapter):
         if self.has_fatal_error:
             await self.disconnect()
             return False
+        if self._recv_task is None or self._recv_task.done():
+            await self.disconnect()
+            return self._fail("connection_lost", "IRC connection closed during setup", retryable=True)
+        self._connecting = False
         self._mark_connected()
         logger.info("IRC: connected to %s:%s as %s, joined %s", self.server, self.port, self._current_nick, self.channel)
         self._wire_plugin_handlers(None)
@@ -404,6 +411,7 @@ class IRCAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Quit and close the connection."""
+        self._connecting = False
         if self.coordination:
             self._mark_disconnected()
             self._cancel_coordination()
@@ -530,10 +538,13 @@ class IRCAdapter(BasePlatformAdapter):
             self._registration_event.set()
             if self.coordination:
                 self._cancel_coordination()
-            if self.is_connected:
+            if (self.is_connected or self._connecting) and not self.has_fatal_error and self._registration_error is None:
+                was_connected = self.is_connected
                 logger.warning("IRC: connection lost, marking disconnected")
                 self._set_fatal_error("connection_lost", "IRC connection closed unexpectedly", retryable=True)
-                await self._notify_fatal_error()
+                self._joined.set()  # Wake a connect() waiting for membership after registration.
+                if was_connected:
+                    await self._notify_fatal_error()
 
     async def _handle_line(self, raw: str) -> None:
         """Dispatch a single IRC protocol line."""
