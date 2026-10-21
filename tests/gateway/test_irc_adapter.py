@@ -254,8 +254,76 @@ class TestIRCRequirements:
     def test_check_requirements_with_env(self, monkeypatch):
         monkeypatch.setenv("IRC_SERVER", "irc.test.net")
         monkeypatch.setenv("IRC_CHANNEL", "#test")
+        load = MagicMock(side_effect=RuntimeError("config unavailable"))
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", load)
         assert check_requirements() is True
+        load.assert_not_called()
 
+
+    @pytest.mark.parametrize("shape", ["extra", "flat"])
+    @pytest.mark.parametrize("case,expected", [
+        ("enabled", True), ("disabled", False), ("missing-enabled", False),
+        ("missing-server", False), ("missing-channel", False),
+    ])
+    def test_config_requirements_gate_actual_adapter_creation(self, monkeypatch, tmp_path, shape, case, expected):
+        import json
+        from gateway.config import PlatformConfig
+        from gateway.platform_registry import PlatformEntry, PlatformRegistry
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+        monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+        settings = dict(_coordination_config().extra)
+        if case.startswith("missing-") and case != "missing-enabled":
+            settings.pop(case.removeprefix("missing-"))
+        block = {"enabled": case != "disabled", **({"extra": settings} if shape == "extra" else settings)}
+        if case == "missing-enabled":
+            block.pop("enabled")
+        # A top-level sibling must not hide the documented nested IRC block.
+        config = {"gateway": {"platforms": {"irc": block}}, "platforms": {"telegram": {"enabled": False}}}
+        (tmp_path / "config.yaml").write_text(json.dumps(config))
+        registry = PlatformRegistry()
+        registry.register(PlatformEntry(
+            name="irc", label="IRC", adapter_factory=IRCAdapter,
+            check_fn=check_requirements, validate_config=validate_config))
+        token = set_hermes_home_override(str(tmp_path))
+        try:
+            assert check_requirements() is expected
+            created = registry.create_adapter("irc", PlatformConfig.from_dict(block))
+            assert isinstance(created, IRCAdapter) is expected
+            if expected:
+                assert created.server == settings["server"] and created.channel == settings["channel"]
+                assert created.coordination is True
+        finally:
+            reset_hermes_home_override(token)
+
+    @pytest.mark.parametrize("failure", ["load", "import"])
+    def test_check_requirements_config_errors_fail_closed(self, monkeypatch, failure):
+        import sys
+
+        monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+        if failure == "import":
+            monkeypatch.setitem(sys.modules, "gateway.config_loader", None)
+        else:
+            monkeypatch.setattr("hermes_cli.config.load_config_readonly",
+                                MagicMock(side_effect=RuntimeError("synthetic load failure")))
+        assert check_requirements() is False
+
+    def test_check_requirements_follows_effective_profile_config(self, monkeypatch, tmp_path):
+        import json
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+        monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+        homes = [tmp_path / name for name in ("alpha", "beta")]
+        for index, home in enumerate(homes):
+            home.mkdir()
+            (home / "config.yaml").write_text(json.dumps({"platforms": {"irc": {
+                "enabled": index == 0, "server": "irc.example", "channel": "#synthetic"}}}))
+        for index in (0, 1, 0):
+            token = set_hermes_home_override(str(homes[index]))
+            try:
+                assert check_requirements() is (index == 0)
+            finally:
+                reset_hermes_home_override(token)
 
     def test_validate_config_from_extra(self, monkeypatch):
         for key in ("IRC_SERVER", "IRC_CHANNEL"):

@@ -123,6 +123,10 @@ platform_toolsets:
 Adapter settings may also appear directly under `gateway.platforms.irc` instead of
 inside `extra`; gateway configuration and outbound-tool availability normalize both
 forms identically. Explicit `extra` values win if both forms specify the same setting.
+The adapter requirements gate accepts these explicitly enabled config-only forms:
+`IRC_SERVER` and `IRC_CHANNEL` do not need duplicate environment entries. Disabled
+or incomplete IRC configuration does not satisfy the gate; existing env-only
+server/channel configuration remains supported.
 
 Use only the account's own unprivileged credential in that profile's private `.env`;
 do not copy human/operator credentials or put passwords in YAML or Git. Jeeves uses
