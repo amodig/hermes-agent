@@ -128,7 +128,10 @@ Use only the account's own unprivileged credential in that profile's private `.e
 do not copy human/operator credentials or put passwords in YAML or Git. Jeeves uses
 `agent-jeeves` and may set `proxy_url: http://egress-proxy:3128`; CONNECT must return
 HTTP 200 before TLS is verified against the canonical IRC server hostname. Proxy
-failure never falls back to direct TCP.
+failure never falls back to direct TCP. Transient proxy/relay failures (HTTP 5xx,
+including 502/503, connection refusal/reset and timeouts) remain retryable. Invalid
+proxy configuration, rejected proxy authentication and TLS verification failures
+remain permanent failures requiring operator correction.
 
 Additional supported environment aliases are `IRC_SASL_ACCOUNT`, `IRC_SASL_PASSWORD`,
 `IRC_SASL_REQUIRED`, `IRC_ALLOWED_ACCOUNTS` (comma-separated), and `IRC_PROXY_URL`.
@@ -198,6 +201,10 @@ Human account `amodig` can DM the bot or start a channel message with an exact
 `@agent-hermes-cto`, `agent-hermes-cto:` or `agent-hermes-cto,` mention.
 Ordinary chatter, unsolicited responses, self echoes, unauthenticated traffic,
 spoofed nicks, notices, CTCP and all BATCH content do not start turns.
+Interrupted consultations are never auto-resumed after restart: their UUID-thread
+resume markers are cleared even while the adapter is offline or the request is old.
+Internal/replayed events cannot execute without the currently admitted live dispatch;
+ordinary IRC and other platforms retain their existing session recovery behavior.
 
 ### Wire, limits and rollback
 

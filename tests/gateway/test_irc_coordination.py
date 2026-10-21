@@ -1063,3 +1063,88 @@ async def test_coordination_refuses_unsafe_or_unavailable_runtime(adapter, coord
             assert factory.call_args.kwargs["api_mode"] == "codex_app_server"
             execute.assert_called_once()
     assert len(results) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["coord-online", "coord-offline", "coord-aged", "coord-no-uuid", "ordinary", "telegram"])
+async def test_restart_discards_consultations_but_resumes_ordinary_sessions(adapter, monkeypatch, tmp_path, case):
+    from unittest.mock import Mock
+    from gateway.config import GatewayConfig, Platform
+    from gateway.session import SessionStore
+    from tests.gateway.restart_test_helpers import RestartTestAdapter, make_restart_runner
+
+    coordination = case.startswith("coord-")
+    if case == "ordinary":
+        adapter = irc.IRCAdapter(PlatformConfig(extra={"server": "irc.example", "channel": "#ordinary"}))
+        adapter.config.typing_indicator = False
+        adapter._writer = Writer()
+    elif case == "telegram":
+        adapter = RestartTestAdapter()
+    runner, _ = make_restart_runner(adapter)
+    handler = AsyncMock(return_value="resumed ordinary session")
+    adapter.set_message_handler(handler)
+    runner.adapters = {} if case == "coord-offline" else {adapter.platform: adapter}
+    runner._persist_active_agents = Mock()
+    runner._resume_owner_authorized = Mock(return_value=True)
+    breaker = Mock(return_value=False)
+    monkeypatch.setattr("gateway.restart_loop_guard.check_and_record", breaker)
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    runner.session_store = store
+    source = adapter.build_source(
+        chat_id="#agents" if coordination else "ordinary-chat", chat_type="group", user_id=PEER,
+        thread_id=str(uuid.uuid4()) if coordination and case != "coord-no-uuid" else None)
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, reason="restart_timeout")
+    if case == "coord-aged":
+        store._update_entry(entry.session_key, lambda row: setattr(
+            row, "last_resume_marked_at", datetime.datetime.now() - datetime.timedelta(days=1)))
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    if runner._background_tasks:
+        await asyncio.wait_for(asyncio.gather(*runner._background_tasks), 3)
+    if coordination:
+        assert scheduled == 0 and not runner._running_agents and not adapter._session_tasks
+        handler.assert_not_awaited()
+        runner._persist_active_agents.assert_not_called()
+        breaker.assert_not_called()
+        reloaded = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig()).get_or_create_session(source)
+        assert not reloaded.resume_pending and reloaded.resume_reason is None and reloaded.last_resume_marked_at is None
+    else:
+        assert scheduled == 1
+        handler.assert_awaited_once()
+        event = handler.await_args.args[0]
+        assert event.internal and event.text == "" and event.source.platform == adapter.platform
+        assert adapter.platform in (Platform("irc"), Platform.TELEGRAM)
+
+
+@pytest.mark.asyncio
+async def test_synthetic_or_replayed_events_cannot_bypass_live_admission(adapter):
+    from dataclasses import replace
+    from gateway.platforms.event import MessageEvent
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    events = []
+
+    async def handler(event):
+        events.append(event)
+        entered.set()
+        await release.wait()
+        return "one live answer"
+
+    adapter.set_message_handler(handler)
+    source = adapter.build_source(chat_id="#agents", chat_type="group", user_id=PEER, thread_id=str(uuid.uuid4()))
+    restored = MessageEvent(text="", source=source, internal=True)
+    await adapter.handle_message(restored)
+    assert not restored._gateway_accepted and not adapter._session_tasks and not events
+    request_id, body = request()
+    await adapter._handle_line(frame(body))
+    dispatch = adapter._coord_dispatch_task
+    await asyncio.wait_for(entered.wait(), 3)
+    replay = replace(events[0])
+    await adapter.handle_message(replay)  # Even an exact event copy cannot borrow the admitted dispatch.
+    assert not replay._gateway_accepted and len(events) == 1
+    release.set()
+    await asyncio.wait_for(dispatch, 3)
+    await adapter.handle_message(replace(events[0]))  # Closed UUID cannot be revived.
+    assert len(events) == 1 and not adapter._active_requests
+    assert adapter._writer.lines == [f"PRIVMSG #agents :!res {request_id} ok 1/1 one live answer"]

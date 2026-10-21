@@ -148,13 +148,21 @@ async def _open_connection(server: str, port: int, use_tls: bool, proxy_url: str
         writer.write(f"CONNECT {server}:{port} HTTP/1.1\r\nHost: {server}:{port}\r\n\r\n".encode("ascii"))
         await writer.drain()
         header = await reader.readuntil(b"\r\n\r\n")
-        if len(header) > 8192 or not re.fullmatch(rb"HTTP/1\.[01] 200(?: [^\r\n]*)?", header.split(b"\r\n", 1)[0]):
+        status = re.fullmatch(rb"HTTP/1\.[01] ([0-9]{3})(?: [^\r\n]*)?", header.split(b"\r\n", 1)[0])
+        if len(header) > 8192 or status is None:
+            raise ValueError("invalid-proxy-response")
+        code = int(status[1])
+        if 500 <= code < 600:
+            raise ConnectionError("proxy-upstream-unavailable")
+        if code != 200:
             raise ValueError("proxy-connect-failed")
         await writer.start_tls(_ssl_ctx(True), server_hostname=server)
         return reader, writer
     except BaseException:
-        writer.close()
-        await writer.wait_closed()
+        # Preserve the original rejection/TLS classification even if tunnel cleanup fails.
+        with contextlib.suppress(Exception):
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=5.0)
         raise
 
 
@@ -697,6 +705,21 @@ class IRCAdapter(BasePlatformAdapter):
             self._dispatch_coordination(request_id, account, nick, question, reply_destination))
         self._coordination_dispatches[self.sasl_account] = self._coord_dispatch_task
         self._coord_dispatch_task.add_done_callback(self._coordination_finished)
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        if self.coordination:
+            event._gateway_accepted = False
+            request_id = (event.metadata or {}).get("irc_request_uuid")
+            request = self._active_requests.get(request_id)
+            if (not self.is_connected or not request
+                    or asyncio.current_task() is not self._coord_dispatch_task
+                    or time.monotonic() >= request["expires"]
+                    or request_id != event.message_id or request_id != event.source.thread_id
+                    or request["account"] != event.source.user_id
+                    or request["destination"] != event.source.chat_id
+                    or event.allow_gateway_control is not False):
+                return  # Restores/internal injections cannot bypass authenticated live admission.
+        await super().handle_message(event)
 
     async def _dispatch_coordination(self, request_id, account, nick, question, destination):
         task = event = None

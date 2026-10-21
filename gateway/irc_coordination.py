@@ -32,6 +32,12 @@ _RESPONSE = re.compile(rf"!res ({_UUID}) (ok|err|busy) ([1-6])/([1-6]) (.*)", re
 _CONTROLS = re.compile(r"[\x00-\x1f\x7f]+")
 
 
+def is_coordination_source(source) -> bool:
+    """Recognize durable consultation origins even when their adapter is offline."""
+    return (getattr(getattr(source, "platform", None), "value", None) == "irc"
+            and re.fullmatch(_UUID, getattr(source, "thread_id", None) or "") is not None)
+
+
 def normalize_body(text: str) -> str:
     return _CONTROLS.sub(" ", text).strip()
 

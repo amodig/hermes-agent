@@ -817,3 +817,47 @@ async def test_silent_sasl_registration_timeout_is_retryable(monkeypatch, coordi
     assert not adapter.is_connected and adapter.fatal_error_retryable is True
     assert adapter._sasl.phase == {"ls": "ls", "auth": "result", "welcome": "welcome"}[phase]
     assert not any(line.startswith((b"JOIN ", b"PASS ")) for line in conn.writes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coordination", [True, False])
+@pytest.mark.parametrize("failure,retryable", [
+    ("502", True), ("503", True), ("504", True),
+    ("refused", True), ("reset", True), ("timeout", True),
+    ("invalid-config", False), ("malformed-response", False), ("407", False), ("tls", False),
+    ("407-cleanup", False), ("tls-cleanup", False), ("503-cleanup", True),
+])
+async def test_connect_proxy_failures_preserve_retry_class(monkeypatch, coordination, failure, retryable):
+    import ssl
+    cleanup_failure = failure.endswith("-cleanup")
+    failure = failure.removesuffix("-cleanup")
+
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    config = _coordination_config()
+    config.extra.update(coordination=coordination, proxy_url="http://proxy:3128")
+    if failure == "invalid-config":
+        config.extra["proxy_url"] = "https://proxy:3128"
+    status = failure if failure.isdigit() else "200"
+    header = b"not HTTP\r\n\r\n" if failure == "malformed-response" else f"HTTP/1.1 {status} response\r\n\r\n".encode()
+    conn = _FakeIRCConnection([header])
+    conn.start_tls = AsyncMock()
+    if cleanup_failure:
+        conn.wait_closed = AsyncMock(side_effect=ConnectionResetError("synthetic cleanup failure"))
+    if failure == "tls":
+        conn.start_tls.side_effect = ssl.SSLCertVerificationError("synthetic verification failure")
+    open_connection = AsyncMock(return_value=(conn, conn))
+    errors = {"refused": ConnectionRefusedError, "reset": ConnectionResetError, "timeout": asyncio.TimeoutError}
+    if failure in errors:
+        open_connection.side_effect = errors[failure]("synthetic transport failure")
+    monkeypatch.setattr(_irc_mod.asyncio, "open_connection", open_connection)
+    adapter = IRCAdapter(config)
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *args: True)
+    assert not await adapter.connect()
+    assert not adapter.is_connected and adapter.fatal_error_retryable is retryable
+    if failure == "invalid-config":
+        open_connection.assert_not_awaited()
+    else:
+        open_connection.assert_awaited_once_with("proxy", 3128, limit=8192)
+    if failure != "tls":
+        conn.start_tls.assert_not_awaited()
+    assert not any(line.startswith((b"JOIN ", b"PASS ", b"AUTHENTICATE ")) for line in conn.writes)
