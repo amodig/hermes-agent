@@ -4602,6 +4602,8 @@ class BasePlatformAdapter(ABC):
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
                 if getattr(self, "coordination", False) is True:
                     _final_thread_metadata["_final_response"] = True
+                    if (event.metadata or {}).get("_turn_error") is True:
+                        _final_thread_metadata["_turn_error"] = True
                 _tts_paths, _tts_requested_path = [], None
                 if self._wants_auto_tts(
                         event, session_key, interrupt_event, text_content, media_files):

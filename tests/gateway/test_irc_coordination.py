@@ -847,3 +847,124 @@ async def test_only_explicit_final_response_can_close_request(adapter, monkeypat
     assert adapter._writer.lines == [f"PRIVMSG #agents :!res {request_id} ok 1/1 the final answer"]
     await adapter.send("#agents", "late final", metadata={"thread_id": request_id, "_final_response": True})
     assert len(adapter._writer.lines) == 1 and not adapter._active_requests
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coordination", [True, False])
+@pytest.mark.parametrize("outcome", ["success", "provider-failure", "exception", "overflow-exception"])
+async def test_handled_turn_failures_are_errors_not_successes(adapter, coordination, outcome):
+    from dataclasses import replace
+    from gateway.run_turn import GatewayTurnMixin
+
+    if not coordination:
+        adapter = irc.IRCAdapter(PlatformConfig(extra={
+            "server": "irc.example", "channel": "#ordinary", "nickname": "ordinary-bot"}))
+        adapter.config.typing_indicator = False
+        adapter._writer = Writer()
+    runner = SimpleNamespace(
+        _delivery_adapter_for=lambda source: adapter, _should_send_voice_reply=lambda *args, **kwargs: False,
+        _hmwa_stop_typing_for_turn=AsyncMock(), _STATUS_HINTS=GatewayTurnMixin._STATUS_HINTS)
+    runner._hmwa_add_failed_turn_notice = lambda *args: GatewayTurnMixin._hmwa_add_failed_turn_notice(runner, *args)
+    returned = []
+
+    async def handler(original):
+        # pre_gateway_dispatch uses replace(): the outcome must reach the original adapter event too.
+        event = replace(original, text=original.text)
+        key = adapter._event_session_key(event)
+        if outcome in {"exception", "overflow-exception"}:
+            try:
+                error = RuntimeError("private-provider-detail")
+                if outcome == "overflow-exception":
+                    error.status_code = 400
+                raise error
+            except RuntimeError as error:
+                text = await GatewayTurnMixin._hmwa_agent_error_reply(
+                    runner, error, event, event.source, None, key,
+                    SimpleNamespace(history=[{}] * 60, message_text=None))
+        else:
+            failed = outcome == "provider-failure"
+            text = await GatewayTurnMixin._hmwa_deliver_turn_response(
+                runner, event, event.source, SimpleNamespace(session_id="synthetic"), key, None,
+                {"failed": failed}, [], "private-provider-detail" if failed else "successful answer", "", False)
+        returned.append(text)
+        return text
+
+    adapter._message_handler = handler
+    if coordination:
+        request_id, body = request()
+        await adapter._handle_line(frame(body))
+        await asyncio.wait_for(adapter._coord_dispatch_task, 3)
+        status, text = ("ok", "successful answer") if outcome == "success" else ("err", "unavailable")
+        assert adapter._writer.lines == [f"PRIVMSG #agents :!res {request_id} {status} 1/1 {text}"]
+    else:
+        await adapter._handle_privmsg("amodig", "#ordinary", "ordinary-bot: hello")
+        await asyncio.wait_for(next(iter(adapter._session_tasks.values())), 3)
+        assert adapter._writer.lines == [
+            f"PRIVMSG #ordinary :{line}" for line in adapter._split_message(returned[0], "#ordinary")]
+    assert len(returned) == 1
+
+
+@pytest.mark.parametrize("shape", ["flat", "extra"])
+@pytest.mark.parametrize("enabled,coordination", [(True, True), (False, True), (True, False)])
+def test_tool_catalog_matches_normalized_gateway_config(adapter, monkeypatch, shape, enabled, coordination):
+    from plugins.platforms.irc import tools
+    from tools.registry import ToolRegistry, invalidate_check_fn_cache
+
+    settings = {**adapter.config.extra, "coordination": coordination}
+    block = {"enabled": enabled, **(settings if shape == "flat" else {"extra": settings})}
+    config = {"gateway": {"platforms": {"irc": block}}, "platform_toolsets": {"cli": ["irc_coord"]}}
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
+    normalized = PlatformConfig.from_dict(block)
+    gateway_adapter = irc.IRCAdapter(normalized)
+    expected = normalized.enabled and gateway_adapter.coordination
+    assert gateway_adapter._config_error() is None
+    catalog = ToolRegistry()
+    tools.register_tools(SimpleNamespace(register_tool=catalog.register))
+    invalidate_check_fn_cache()
+    try:
+        selected = set(catalog.get_tool_names_for_toolset(config["platform_toolsets"]["cli"][0]))
+        definitions = catalog.get_definitions(selected)
+        assert {item["function"]["name"] for item in definitions} == ({"irc_request"} if expected else set())
+        assert tools._available() is expected
+    finally:
+        invalidate_check_fn_cache()
+
+
+@pytest.mark.asyncio
+async def test_admission_window_survives_adapter_replacement(adapter, monkeypatch):
+    import time
+
+    now = [1000.0]
+    monkeypatch.setattr(irc, "time", SimpleNamespace(time=time.time, monotonic=lambda: now[0]))
+    handler = AsyncMock(return_value="accepted")
+    adapter._message_handler = handler
+    bodies = []
+    for _ in range(6):
+        _, body = request()
+        bodies.append(body)
+        await adapter._handle_line(frame(body))
+        await asyncio.wait_for(adapter._coord_dispatch_task, 3)
+    assert handler.await_count == 6
+    caches = inbound_dedup_caches(adapter)
+    await adapter.disconnect()
+    replacement = irc.IRCAdapter(adapter.config)
+    carry_inbound_dedup(caches, replacement)
+    replacement._writer = Writer()
+    replacement._registered = True
+    replacement._mark_connected()
+    replacement._message_handler = handler
+    await replacement._handle_line(frame(bodies[0]))  # Fresh timestamp, same old UUID: still deduplicated.
+    assert not replacement._writer.lines
+    busy_id, busy_body = request()
+    await replacement._handle_line(frame(busy_body))
+    assert replacement._writer.lines == [f"PRIVMSG #agents :!res {busy_id} busy 1/1 busy"]
+    assert handler.await_count == 6 and replacement._coord_dispatch_task is None
+    now[0] += 61
+    await replacement._handle_line(frame(busy_body))  # The busy UUID itself cannot become queued work.
+    fresh_id, fresh_body = request()
+    await replacement._handle_line(frame(fresh_body))
+    await asyncio.wait_for(replacement._coord_dispatch_task, 3)
+    assert handler.await_count == 7
+    assert replacement._writer.lines == [
+        f"PRIVMSG #agents :!res {busy_id} busy 1/1 busy",
+        f"PRIVMSG #agents :!res {fresh_id} ok 1/1 accepted"]

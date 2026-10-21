@@ -1920,6 +1920,9 @@ class GatewayTurnMixin:
     ):
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
+        if (event.metadata or {}).get("irc_request_uuid"):
+            # Metadata survives the gateway's dataclasses.replace text rewrites.
+            event.metadata["_turn_error"] = bool(agent_result.get("failed"))
         if diagnostic_wake_muted(event):
             return None
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
@@ -1970,6 +1973,8 @@ class GatewayTurnMixin:
     async def _hmwa_agent_error_reply(self, e, event, source, session_entry, session_key, prepared):
         """``except Exception`` body of the agent turn: stop typing, log, persist the inbound user
         turn once and close it, and build the sanitized user-facing error reply."""
+        if (event.metadata or {}).get("irc_request_uuid"):
+            event.metadata["_turn_error"] = True
         # Retain Slack thread/workspace routing so a failed turn cannot leave its status visible.
         await self._hmwa_stop_typing_for_turn(event, source)
         logger.exception("Agent error in session %s", session_key)

@@ -218,6 +218,20 @@ class _SASLRegistration:
         return False
 
 
+class _CoordinationReplay(MessageDeduplicator):
+    """Move replay IDs and the same account's monotonic admission window together on reconnect."""
+
+    def __init__(self, account):
+        super().__init__(max_size=DEDUPE_IDS, ttl_seconds=DEDUPE_SECONDS)
+        self.account = account
+        self.accepted_at = deque()
+
+    def absorb(self, other):
+        super().absorb(other)
+        if isinstance(other, _CoordinationReplay) and other.account == self.account:
+            self.accepted_at = other.accepted_at
+
+
 # ── IRC Adapter ──────────────────────────────────────────────────────────────
 
 class IRCAdapter(BasePlatformAdapter):
@@ -272,8 +286,7 @@ class IRCAdapter(BasePlatformAdapter):
         self._joined = asyncio.Event()
         self._joined_channels = set()
         self._connection_started = time.time()
-        self._request_dedupe = MessageDeduplicator(max_size=DEDUPE_IDS, ttl_seconds=DEDUPE_SECONDS)
-        self._accepted_at = deque()
+        self._request_dedupe = _CoordinationReplay(self.sasl_account)
         self._active_requests = {}
         self._coord_dispatch_task = None
         self._outbound = None
@@ -655,17 +668,18 @@ class IRCAdapter(BasePlatformAdapter):
         for key in ids:
             self._request_dedupe.is_duplicate(key)
         reply_destination = self.channel if destination == self.channel else account
-        while self._accepted_at and self._accepted_at[0] <= time.monotonic() - 60:
-            self._accepted_at.popleft()
+        accepted_at = self._request_dedupe.accepted_at
+        while accepted_at and accepted_at[0] <= time.monotonic() - 60:
+            accepted_at.popleft()
         pending = self._coordination_dispatches.get(self.sasl_account)
         busy = (self._coord_dispatch_task is not None
-                or (pending is not None and not pending.done()) or len(self._accepted_at) >= 6)
+                or (pending is not None and not pending.done()) or len(accepted_at) >= 6)
         logger.info("IRC coordination request=%s account=%s outcome=%s",
                     request_id, account, "busy" if busy else "accepted")
         if busy:
             await self._send_response(request_id, reply_destination, "busy", "busy")
             return
-        self._accepted_at.append(time.monotonic())
+        accepted_at.append(time.monotonic())
         self._active_requests[request_id] = {
             "account": account, "destination": reply_destination, "expires": time.monotonic() + REQUEST_TIMEOUT}
         self._coord_dispatch_task = asyncio.create_task(

@@ -118,6 +118,10 @@ platform_toolsets:
   irc: [no_tools]
 ```
 
+Adapter settings may also appear directly under `gateway.platforms.irc` instead of
+inside `extra`; gateway configuration and outbound-tool availability normalize both
+forms identically. Explicit `extra` values win if both forms specify the same setting.
+
 Use only the account's own unprivileged credential in that profile's private `.env`;
 do not copy human/operator credentials or put passwords in YAML or Git. Jeeves uses
 `agent-jeeves` and may set `proxy_url: http://egress-proxy:3128`; CONNECT must return
@@ -173,6 +177,8 @@ cannot seal the response before that answer. The adapter accepts only explicitly
 marked final/error delivery; a UUID-bearing working notification (including the
 30-second notification interval) is not a final answer. Ordinary IRC retains its
 existing model-proxy, streaming, interim, lifecycle-notice and voice behavior.
+Provider-declared failures and handled turn exceptions produce one `err unavailable`,
+never an `ok` response containing failure text. Successful turns retain their answer.
 This is not an extension sandbox: trusted provider/context/plugin hooks still run,
 and the bounds below are not a provider-token-spend guarantee. Do not send private
 questions to the channel unless all participants may read them. OMP peers expose
@@ -202,6 +208,8 @@ destination and authenticated peer. Duplicate/conflicting parts fail the request
 
 Each identity admits one automatic reply at a time, at most six requests/minute.
 New valid requests while busy get one `busy` response, not queued model work.
+The rolling one-minute admission window travels with replay state across in-process
+adapter replacements, so reconnecting does not grant another six consultations.
 A 55-second watchdog sends `!res <uuid> err 1/1 timeout` once, suppresses late output,
 and requests a cooperative interrupt without cancelling the base turn. Admission
 stays busy until the executor worker has actually finished, even when coroutine

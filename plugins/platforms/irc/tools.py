@@ -42,12 +42,13 @@ def irc_request(args: dict, **_) -> str:
 
 def _available() -> bool:
     from hermes_cli.config import load_config_readonly
+    from gateway.config import PlatformConfig
     from gateway.config_loader import merge_platform_sections
 
     config = load_config_readonly() or {}
     platforms = merge_platform_sections(config, config.get("gateway"), {}, also=frozenset({"irc"}))
-    irc = platforms.get("irc") or {}
-    return irc.get("enabled") is True and (irc.get("extra") or {}).get("coordination") is True
+    irc = PlatformConfig.from_dict(platforms.get("irc") or {})
+    return irc.enabled and irc.extra.get("coordination") is True
 
 
 def register_tools(ctx) -> None:
