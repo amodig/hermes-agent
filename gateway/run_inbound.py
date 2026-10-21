@@ -1747,6 +1747,12 @@ class GatewayInboundMixin:
         follow-up paths so attribution, image enrichment, STT, document notes, reply context and
         @ references behave the same. Side effect: buffers per-session native image paths when the
         model supports native vision; the caller consumes that buffer at ``run_conversation``."""
+        request_id = (event.metadata or {}).get("irc_request_uuid")
+        if (getattr(source.platform, "value", None) == "irc" and request_id
+                and request_id == event.message_id == source.thread_id
+                and event.allow_gateway_control is False):
+            # Verified coordination questions are literal data, never file/URL/Git/media references.
+            return event.text or ""
         rehome_inbound_media(event)  # before any consumer (vision, STT, document notes) reads media_urls
         _pending_stt_prepared = hasattr(event, "_gateway_pending_stt_text")
         message_text = (event._gateway_pending_stt_text if _pending_stt_prepared else event.text) or ""

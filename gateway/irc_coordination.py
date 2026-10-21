@@ -55,14 +55,14 @@ def parse_request(text: str) -> tuple[str, str, str] | None:
 
 
 def format_request(request_id: str, target: str, question: str, destination: str) -> str:
-    """One complete PRIVMSG line (without CRLF); oversized requests are never split."""
+    """One PRIVMSG line (without CRLF), reserving relay prefix bytes; never split requests."""
     if not isinstance(question, str) or len(question.encode("utf-8")) > MAX_BODY_BYTES:
         raise ValueError("question-too-large")
     body = f"!req {request_id} {target} {normalize_body(question)}"
     if parse_request(body) is None or not re.fullmatch(r"[#a-zA-Z0-9_-]+", destination):
         raise ValueError("invalid-request")
     line = f"PRIVMSG {destination} :{body}"
-    if len(line.encode("utf-8")) > IRC_BYTES:
+    if len(line.encode("utf-8")) > IRC_BYTES - PREFIX_HEADROOM:
         raise ValueError("request-too-large")
     return line
 

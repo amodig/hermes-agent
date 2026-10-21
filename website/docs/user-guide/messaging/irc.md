@@ -157,6 +157,9 @@ Incoming consultations run in independent UUID-keyed sessions with zero model to
 even with plugin, MCP and context-engine tools installed. `no_tools` is a hard empty
 selection preserved by the tool picker. Slash commands and clarify/approval handlers
 are disabled structurally; model MEDIA/file/TTS directives remain plain text.
+The verified request stays literal through inbound preprocessing: file, folder, Git
+and URL references are not expanded, and its code-authored untrusted-data header is
+preserved. Ordinary IRC messages keep their usual reference expansion.
 Explicitly empty tool selections also block managed Bot Chat's `message_agent`
 injection, including MCP catalog refreshes.
 Coordination refuses the model-proxy route (`gateway.proxy_url` or `GATEWAY_PROXY_URL`)
@@ -164,8 +167,12 @@ with one `err unavailable`: the remote API server's independent tool configurati
 cannot guarantee zero tools. This restriction does not affect IRC's HTTP CONNECT
 `extra.proxy_url`. Coordination also disables streaming/interim consumers and auto-TTS,
 including explicit voice modes; editable previews cannot close the request. Only the
-final plain-text answer is framed as a successful response. Ordinary IRC retains
-its existing model-proxy, streaming and voice behavior.
+final plain-text answer is framed as a successful response. Lifecycle status and
+notice callbacks are disabled for coordination, so a memory-recall or account notice
+cannot seal the response before that answer. The adapter accepts only explicitly
+marked final/error delivery; a UUID-bearing working notification (including the
+30-second notification interval) is not a final answer. Ordinary IRC retains its
+existing model-proxy, streaming, interim, lifecycle-notice and voice behavior.
 This is not an extension sandbox: trusted provider/context/plugin hooks still run,
 and the bounds below are not a provider-token-spend guarantee. Do not send private
 questions to the channel unless all participants may read them. OMP peers expose
@@ -186,9 +193,10 @@ spoofed nicks, notices, CTCP and all BATCH content do not start turns.
 ```
 
 IDs and envelopes are code-authored. A question is at most 1,800 UTF-8 bytes and
-must also fit one 510-byte pre-CRLF PRIVMSG line; oversized requests are rejected,
-never split. Replies normalize control characters, reserve 110 bytes of line
-headroom, contain at most 1,800 body bytes and six UTF-8-safe chunks, and mark
+must also fit one 400-byte pre-CRLF PRIVMSG command, reserving 110 bytes for the relay
+prefix within IRC's 510-byte limit; oversized requests are rejected, never split.
+Replies normalize control characters, reserve the same 110-byte headroom,
+contain at most 1,800 body bytes and six UTF-8-safe chunks, and mark
 truncated prefixes. Receivers require every part with consistent totals, UUID,
 destination and authenticated peer. Duplicate/conflicting parts fail the request.
 
@@ -197,7 +205,11 @@ New valid requests while busy get one `busy` response, not queued model work.
 A 55-second watchdog sends `!res <uuid> err 1/1 timeout` once, suppresses late output,
 and requests a cooperative interrupt without cancelling the base turn. Admission
 stays busy until the executor worker has actually finished, even when coroutine
-cancellation or the gateway inactivity timeout occurs. Outbound requests wait at most
+cancellation or the gateway inactivity timeout occurs. Transport teardown has a
+five-second wait bound and does not await provider exit. The worker's account lease
+and platform lock survive disconnect/shutdown until actual completion, including
+adapter replacement; reconnect is retryably refused while that lease is held.
+Late completion cannot restore an expired response. Outbound requests wait at most
 60 seconds; IPC waits at most 65. Disconnect/IPC cancellation clears partial responses;
 no request is automatically resent after reconnect. IPC uses the serving gateway's
 existing Unix socket or native Windows named pipe, with handlers running off the

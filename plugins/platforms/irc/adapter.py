@@ -223,6 +223,10 @@ class _SASLRegistration:
 class IRCAdapter(BasePlatformAdapter):
     """Async IRC adapter implementing the BasePlatformAdapter interface."""
 
+    # One live worker per account, including adapters rebuilt during reconnect/shutdown.
+    # Entries are removed only by the dispatch task's completion callback.
+    _coordination_dispatches: Dict[str, asyncio.Task] = {}
+
     def __init__(self, config, **kwargs):
         super().__init__(config=config, platform=Platform("irc"))
         extra = getattr(config, "extra", {}) or {}
@@ -310,6 +314,9 @@ class IRCAdapter(BasePlatformAdapter):
             return self._fail("config_missing", "IRC_SERVER and IRC_CHANNEL must be set", retryable=False)
         if error := self._config_error():
             return self._fail("config_invalid", error, retryable=False)
+        pending = self._coordination_dispatches.get(self.sasl_account) if self.coordination else None
+        if pending is not None and not pending.done():
+            return self._fail("coordination_busy", "IRC consultation worker is still stopping", retryable=True)
         self._registration_event.clear()
         self._registered = False
         self._registration_error = None
@@ -367,8 +374,52 @@ class IRCAdapter(BasePlatformAdapter):
         self._wire_plugin_handlers(None)
         return True
 
+    def _cancel_coordination(self):
+        self._active_requests.clear()
+        if self._outbound is not None:
+            self._outbound[1].cancel()
+        if self._coord_dispatch_task is not None:
+            self._coord_dispatch_task.cancel()
+
+    def _coordination_finished(self, task):
+        if self._coord_dispatch_task is task:
+            self._coord_dispatch_task = None
+        if self._coordination_dispatches.get(self.sasl_account) is task:
+            del self._coordination_dispatches[self.sasl_account]
+        if not self.is_connected:
+            self._release_platform_lock()
+
     async def disconnect(self) -> None:
         """Quit and close the connection."""
+        if self.coordination:
+            self._mark_disconnected()
+            self._cancel_coordination()
+            writer, self._writer, self._reader = self._writer, None, None
+            waits = []
+            if writer:
+                with contextlib.suppress(Exception):
+                    writer.close()
+                    waits.append(asyncio.create_task(writer.wait_closed()))
+            if self._recv_task is not None and self._recv_task is not asyncio.current_task():
+                self._recv_task.cancel()
+                waits.append(self._recv_task)
+            try:
+                # Transport shutdown is bounded; the separate dispatch owner keeps admission.
+                if waits:
+                    done, _ = await asyncio.wait(waits, timeout=5.0)
+                    for task in done:
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            task.result()
+            finally:
+                for task in waits:
+                    if not task.done():
+                        task.cancel()
+                self._registered = False
+                self._registration_event.clear()
+                self._joined.clear()
+                if self._coord_dispatch_task is None or self._coord_dispatch_task.done():
+                    self._release_platform_lock()
+            return
         with contextlib.suppress(Exception):
             self._release_platform_lock()
         self._mark_disconnected()
@@ -398,6 +449,7 @@ class IRCAdapter(BasePlatformAdapter):
             request_id = metadata.get("thread_id")
             request = self._active_requests.get(request_id)
             if (metadata.get("_interim_send") or metadata.get("expect_edits")
+                    or not (metadata.get("_final_response") is True or metadata.get("_turn_error") is True)
                     or not request or request["destination"] != chat_id
                     or time.monotonic() >= request["expires"]):
                 return SendResult(success=True)  # suppressed; never retry an uncorrelated send
@@ -464,10 +516,7 @@ class IRCAdapter(BasePlatformAdapter):
         finally:
             self._registration_event.set()
             if self.coordination:
-                self._active_requests.clear()
-                if self._outbound is not None:
-                    self._outbound[1].cancel()
-                await cancel_task(self._coord_dispatch_task)
+                self._cancel_coordination()
             if self.is_connected:
                 logger.warning("IRC: connection lost, marking disconnected")
                 self._set_fatal_error("connection_lost", "IRC connection closed unexpectedly", retryable=True)
@@ -608,7 +657,9 @@ class IRCAdapter(BasePlatformAdapter):
         reply_destination = self.channel if destination == self.channel else account
         while self._accepted_at and self._accepted_at[0] <= time.monotonic() - 60:
             self._accepted_at.popleft()
-        busy = self._coord_dispatch_task is not None or len(self._accepted_at) >= 6
+        pending = self._coordination_dispatches.get(self.sasl_account)
+        busy = (self._coord_dispatch_task is not None
+                or (pending is not None and not pending.done()) or len(self._accepted_at) >= 6)
         logger.info("IRC coordination request=%s account=%s outcome=%s",
                     request_id, account, "busy" if busy else "accepted")
         if busy:
@@ -619,9 +670,11 @@ class IRCAdapter(BasePlatformAdapter):
             "account": account, "destination": reply_destination, "expires": time.monotonic() + REQUEST_TIMEOUT}
         self._coord_dispatch_task = asyncio.create_task(
             self._dispatch_coordination(request_id, account, nick, question, reply_destination))
+        self._coordination_dispatches[self.sasl_account] = self._coord_dispatch_task
+        self._coord_dispatch_task.add_done_callback(self._coordination_finished)
 
     async def _dispatch_coordination(self, request_id, account, nick, question, destination):
-        task = None
+        task = event = None
         try:
             source = self.build_source(
                 chat_id=destination, chat_name=destination,
@@ -651,9 +704,13 @@ class IRCAdapter(BasePlatformAdapter):
                 await self._finish_request(request_id, "err", "unavailable")
         finally:
             self._active_requests.pop(request_id, None)
+            if event is not None:
+                key = self._event_session_key(event)
+                task = task or self._session_tasks.get(key)
+                if guard := self._active_sessions.get(key):
+                    guard.set()
             if task is not None and not task.done():
-                await self.interrupt_session_activity(
-                    self._event_session_key(event), destination, {"thread_id": request_id})
+                # No await before cancellation accounting: repeated disconnects cannot escape it.
                 self._expected_cancelled_tasks.add(task)
                 task.cancel()
                 while not task.done():
@@ -661,7 +718,8 @@ class IRCAdapter(BasePlatformAdapter):
                         await asyncio.shield(task)
                     except asyncio.CancelledError:
                         continue
-            self._coord_dispatch_task = None
+                    except Exception:
+                        break  # A failed base task is finished; its worker has already unwound.
 
     async def _extract_response_content(self, response, event, session_key, *, is_ephemeral_response):
         if not self.coordination:

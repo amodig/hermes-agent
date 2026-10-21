@@ -174,15 +174,19 @@ async def test_human_exact_mentions_and_dm_get_unique_sessions(adapter):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("exit_mode", ["normal", "cancelled", "inactivity"])
+@pytest.mark.parametrize("exit_mode", ["normal", "cancelled", "inactivity", "disconnect", "shutdown"])
 async def test_watchdog_holds_admission_until_executor_worker_finishes(adapter, monkeypatch, exit_mode):
     import threading
     import gateway.run_turn as turn_module
+    from unittest.mock import Mock
 
     monkeypatch.setattr(irc, "REPLY_TIMEOUT", 0.02)
     started, release, worker_done = asyncio.Event(), threading.Event(), threading.Event()
     loop = asyncio.get_running_loop()
     turns = []
+    receiver, writers = adapter, [adapter._writer]
+    release_lock = Mock()
+    monkeypatch.setattr(adapter, "_release_platform_lock", release_lock)
     interrupt = adapter.interrupt_session_activity
     adapter.interrupt_session_activity = AsyncMock(wraps=interrupt)
 
@@ -199,7 +203,7 @@ async def test_watchdog_holds_admission_until_executor_worker_finishes(adapter, 
     def run_sync():
         loop.call_soon_threadsafe(started.set)
         try:
-            release.wait(5)
+            release.wait(15)
             return {"final_response": "late-answer"}
         finally:
             worker_done.set()
@@ -234,22 +238,46 @@ async def test_watchdog_holds_admission_until_executor_worker_finishes(adapter, 
             await asyncio.sleep(0)
             task.cancel()
             await asyncio.sleep(0)
+        if exit_mode in {"disconnect", "shutdown"}:
+            await asyncio.wait_for(adapter.disconnect(), 1)
+            await asyncio.wait_for(adapter.disconnect(), 1)  # Repeated cancellation must retain ownership.
+            assert writers[0].closed and adapter._writer is None and not adapter.is_connected
+            if exit_mode == "shutdown":
+                await asyncio.wait_for(adapter.cancel_background_tasks(), 6)
+            assert not worker_done.is_set() and not adapter._active_requests
+            release_lock.assert_not_called()
+            receiver = irc.IRCAdapter(adapter.config)
+            carry_inbound_dedup(inbound_dedup_caches(adapter), receiver)
+            open_connection = AsyncMock()
+            monkeypatch.setattr(irc, "_open_connection", open_connection)
+            assert not await receiver.connect(is_reconnect=True)
+            assert receiver.fatal_error_code == "coordination_busy" and receiver.fatal_error_retryable
+            open_connection.assert_not_awaited()
+            # Even a replacement with a live transport cannot bypass the account's worker lease.
+            receiver._writer = Writer()
+            receiver._registered = True
+            receiver._mark_connected()
+            writers.append(receiver._writer)
         await adapter.send("#agents", "interim", metadata={"thread_id": request_id, "_interim_send": True})
         busy_id, busy_body = request()
-        await adapter._handle_line(frame(busy_body))
-        await adapter._handle_line(frame(busy_body))
+        await receiver._handle_line(frame(busy_body))
+        await receiver._handle_line(frame(busy_body))
         assert not worker_done.is_set() and len(turns) == 1
         assert adapter._coord_dispatch_task is dispatch and not dispatch.done()
-        assert adapter._writer.lines.count(f"PRIVMSG #agents :!res {request_id} err 1/1 timeout") == 1
-        assert adapter._writer.lines.count(f"PRIVMSG #agents :!res {busy_id} busy 1/1 busy") == 1
+        lines = [line for writer in writers for line in writer.lines]
+        assert lines.count(f"PRIVMSG #agents :!res {request_id} err 1/1 timeout") == 1
+        assert lines.count(f"PRIVMSG #agents :!res {busy_id} busy 1/1 busy") == 1
     finally:
         release.set()
         await asyncio.wait_for(dispatch, 3)
     assert worker_done.is_set() and adapter._coord_dispatch_task is None
-    assert not any("late-answer" in line or "interim" in line for line in adapter._writer.lines)
+    assert not any("late-answer" in line or "interim" in line for writer in writers for line in writer.lines)
+    if exit_mode in {"disconnect", "shutdown"}:
+        release_lock.assert_called_once()
     replacement = irc.IRCAdapter(adapter.config)
     carry_inbound_dedup(inbound_dedup_caches(adapter), replacement)
     assert replacement._request_dedupe.contains("req:" + request_id)
+    adapter = receiver
     monkeypatch.setattr(irc, "REPLY_TIMEOUT", 55.0)  # The fresh turn is not a timeout probe.
     adapter._message_handler = AsyncMock(return_value="fresh-answer")
     await adapter._handle_line(frame(request()[1]))
@@ -618,3 +646,204 @@ async def test_auto_tts_cannot_replace_coordination_answer(adapter, monkeypatch,
     runner._delivery_adapter_for = lambda source: ordinary
     assert ordinary._should_auto_tts_for_chat("#agents")
     assert runner._should_send_voice_reply(events[0], "ordinary answer", [], already_sent=True)
+
+
+@pytest.mark.asyncio
+async def test_coordination_reference_payload_stays_literal_without_io(adapter, monkeypatch, tmp_path):
+    from unittest.mock import Mock
+    import agent.context_references as references
+    import gateway.run_inbound as inbound
+    from gateway.platforms.event import MessageEvent
+
+    (tmp_path / "literal.txt").write_text("LOCAL_SENTINEL")
+    (tmp_path / "folder").mkdir()
+    read_file = Mock(wraps=references._read_file_reference)
+    list_folder = Mock(return_value="FOLDER_SENTINEL")
+    git = Mock(return_value=(None, "GIT_SENTINEL"))
+    fetch = AsyncMock(return_value="URL_SENTINEL")
+    expand = AsyncMock(wraps=references.preprocess_context_references_async)
+    rehome = Mock(wraps=inbound.rehome_inbound_media)
+    monkeypatch.setattr(references, "_read_file_reference", read_file)
+    monkeypatch.setattr(references, "_build_folder_listing", list_folder)
+    monkeypatch.setattr(references, "_expand_git_reference", git)
+    monkeypatch.setattr(references, "_fetch_url_content", fetch)
+    monkeypatch.setattr(references, "preprocess_context_references_async", expand)
+    monkeypatch.setattr(inbound, "rehome_inbound_media", rehome)
+    monkeypatch.setattr("tools.terminal_scope.terminal_env",
+                        lambda key, default=None: str(tmp_path) if key == "TERMINAL_CWD" else default)
+    runner = SimpleNamespace(
+        _session_key_for_source=lambda source: "synthetic-session",
+        _consume_pending_native_image_paths=Mock(),
+        _prefix_inbound_sender_context=lambda event, source, text: text,
+        _classify_inbound_media=lambda *args: ([], [], [], []),
+        _prepend_inbound_media_file_notes=lambda text, *args: text,
+        _prepend_inbound_document_notes=lambda event, text: text,
+        _prepend_inbound_reply_context=lambda event, source, text: text,
+        _inbound_model_context_length=AsyncMock(return_value=128000))
+    runner._expand_inbound_context_references = lambda *args: (
+        inbound.GatewayInboundMixin._expand_inbound_context_references(runner, *args))
+    question = "@file:literal.txt @folder:folder @url:https://example.invalid/doc @git:1 git@example.invalid:repo.git"
+    events, prepared = [], []
+
+    async def handler(event):
+        events.append(event)
+        text = await inbound.GatewayInboundMixin._prepare_inbound_message_text(
+            runner, event=event, source=event.source, history=[])
+        prepared.append(text)
+        assert text.encode() == event.text.encode()
+        assert text.partition("\n> ")[2] == question
+        return "literal answer"
+
+    adapter._message_handler = handler
+    request_id, body = request(question)
+    await adapter._handle_line(frame(body))
+    await asyncio.wait_for(adapter._coord_dispatch_task, 3)
+    assert len(prepared) == 1
+    expand.assert_not_awaited()
+    fetch.assert_not_awaited()
+    for probe in (read_file, list_folder, git, rehome, runner._consume_pending_native_image_paths):
+        probe.assert_not_called()
+    assert adapter._writer.lines == [f"PRIVMSG #agents :!res {request_id} ok 1/1 literal answer"]
+    # Ordinary IRC events still use the real reference parser/expander.
+    ordinary = MessageEvent(text=question, source=events[0].source)
+    text = await inbound.GatewayInboundMixin._prepare_inbound_message_text(
+        runner, event=ordinary, source=ordinary.source, history=[])
+    assert all(marker in text for marker in ("LOCAL_SENTINEL", "FOLDER_SENTINEL", "GIT_SENTINEL", "URL_SENTINEL"))
+    expand.assert_awaited_once()
+    fetch.assert_awaited_once()
+    for probe in (read_file, list_folder, git, rehome, runner._consume_pending_native_image_paths):
+        probe.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_notices_cannot_seal_coordination_response(adapter, monkeypatch):
+    from unittest.mock import Mock
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
+
+    async def status_send(current, chat_id, kind, text, metadata):
+        return await current.send(chat_id, text, metadata=metadata)
+
+    status_sink = AsyncMock(side_effect=status_send)
+    monkeypatch.setattr("gateway.run._send_or_update_status_coro", status_sink)
+    monkeypatch.setattr("gateway.run._prepare_gateway_status_message", lambda platform, kind, text: text)
+    monkeypatch.setattr("gateway.run.render_notice_line", lambda notice: notice)
+    monkeypatch.setattr("gateway.warning_notifications.render_notification", lambda present, **kwargs: present())
+    monkeypatch.setattr("gateway.warning_notifications.is_diagnostic_notice", lambda notice: False)
+    agent = SimpleNamespace(tools=[], status_callback=Mock(), notice_callback=Mock())
+    events = []
+
+    async def emit(event, current):
+        scheduled = []
+
+        async def notice_send(source, text):
+            return await current.send(source.chat_id, text, metadata={"thread_id": source.thread_id})
+
+        runner = SimpleNamespace(_service_tier=None, _consume_pending_turn_sidecar_notes=lambda key: [],
+                                 _deliver_platform_notice=AsyncMock(side_effect=notice_send))
+        ctx = TurnContext(
+            source=event.source, user_config={}, session_key=current._event_session_key(event),
+            _hooks_ref=SimpleNamespace(loaded_hooks=[]), _run_still_current=lambda: True,
+            _status_adapter=current, _status_chat_id=event.source.chat_id,
+            _status_thread_metadata={"thread_id": event.message_id})
+        turn = TurnRunner(runner, ctx)
+        ctx._status_callback_sync = turn._status_callback_sync
+        turn._attach_session_title_callback = lambda *args: None
+
+        def schedule(coro, *args):
+            task = asyncio.create_task(coro)
+            scheduled.append(task)
+            return task
+
+        turn._schedule = schedule
+        interim = lambda text: schedule(current.send(event.source.chat_id, text, metadata={"_interim_send": True}))
+        turn._wire_turn_agent_callbacks(agent, {}, None, None, interim, not current.coordination)
+        if agent.status_callback:
+            agent.status_callback("memory_recall", "lifecycle status")
+        if agent.notice_callback:
+            agent.notice_callback("lifecycle notice")
+        if agent.interim_assistant_callback:
+            agent.interim_assistant_callback("ordinary interim")
+        await asyncio.gather(*scheduled)
+        return runner
+
+    async def handler(event):
+        events.append(event)
+        runner = await emit(event, adapter)
+        assert agent.status_callback is None and agent.notice_callback is None
+        runner._deliver_platform_notice.assert_not_awaited()
+        status_sink.assert_not_awaited()
+        return "complete model answer"
+
+    adapter._message_handler = handler
+    request_id, body = request()
+    await adapter._handle_line(frame(body))
+    await asyncio.wait_for(adapter._coord_dispatch_task, 3)
+    assert adapter._writer.lines == [f"PRIVMSG #agents :!res {request_id} ok 1/1 complete model answer"]
+    ordinary = irc.IRCAdapter(PlatformConfig(extra={"server": "irc.example", "channel": "#ordinary"}))
+    ordinary._writer = Writer()
+    runner = await emit(events[0], ordinary)  # Reusing the same agent restores its normal callbacks.
+    status_sink.assert_awaited_once()
+    runner._deliver_platform_notice.assert_awaited_once()
+    assert sorted(ordinary._writer.lines) == sorted(
+        f"PRIVMSG #agents :{text}" for text in ("lifecycle status", "lifecycle notice", "ordinary interim"))
+
+
+def test_request_boundary_reserves_relay_prefix_headroom():
+    from gateway.irc_coordination import IRC_BYTES, PREFIX_HEADROOM
+
+    request_id = str(uuid.uuid4())
+    envelope = f"PRIVMSG #agents :!req {request_id} {OWN} "
+    room = IRC_BYTES - PREFIX_HEADROOM - len(envelope.encode())
+    question = "é" * (room // 2) + "x" * (room % 2)
+    line = format_request(request_id, OWN, question, "#agents")
+    assert len(line.encode()) + PREFIX_HEADROOM == IRC_BYTES
+    prefix = f":{OWN}!hermes@relay.example "
+    assert len((prefix + line).encode()) <= IRC_BYTES
+    received = irc._parse_irc_message(prefix + line)
+    assert parse_request(received["params"][1]) == (request_id, OWN, question)
+    with pytest.raises(ValueError, match="request-too-large"):
+        format_request(request_id, OWN, question + "x", "#agents")
+
+
+@pytest.mark.asyncio
+async def test_only_explicit_final_response_can_close_request(adapter, monkeypatch):
+    from unittest.mock import Mock
+    import gateway.run_turn as turn_module
+
+    intervals = []
+
+    async def advance_interval(seconds):
+        intervals.append(seconds)
+
+    monkeypatch.setattr("gateway.run._float_env", lambda key, default: 30)
+    monkeypatch.setattr(turn_module, "asyncio", SimpleNamespace(sleep=advance_interval))
+    disp = SimpleNamespace(
+        _display_surface_mode=lambda *args, **kwargs: "full", user_config={}, platform_key="irc",
+        resolve_display_setting=lambda *args: False)
+    runner = SimpleNamespace(
+        _delivery_adapter_for=lambda source: adapter,
+        _should_emit_long_running_notification=Mock(side_effect=[True, True, False]),
+        _agent_activity_summary=lambda agent: {})
+
+    async def handler(event):
+        for metadata in ({"thread_id": event.message_id},
+                         {"thread_id": event.message_id, "notify": True},
+                         {"thread_id": event.message_id, "_final_response": "true"}):
+            await adapter.send("#agents", "not a final answer", metadata=metadata)
+            assert event.message_id in adapter._active_requests
+        ctx = SimpleNamespace(
+            source=event.source, session_key="synthetic-session", agent_holder=[None],
+            _status_thread_metadata={"thread_id": event.message_id}, _cleanup_progress=False)
+        await turn_module.GatewayTurnMixin._run_agent_notify_long_running(runner, disp, ctx, [None])
+        assert intervals == [30, 30] and adapter._writer.lines == []
+        assert event.message_id in adapter._active_requests
+        return "the final answer"
+
+    adapter._message_handler = handler
+    request_id, body = request()
+    await adapter._handle_line(frame(body))
+    await asyncio.wait_for(adapter._coord_dispatch_task, 3)
+    assert adapter._writer.lines == [f"PRIVMSG #agents :!res {request_id} ok 1/1 the final answer"]
+    await adapter.send("#agents", "late final", metadata={"thread_id": request_id, "_final_response": True})
+    assert len(adapter._writer.lines) == 1 and not adapter._active_requests

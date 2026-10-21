@@ -1272,6 +1272,9 @@ class TurnRunner:
         agent.stream_delta_callback = stream_delta_cb
         agent.interim_assistant_callback = interim_assistant_cb if want_interim_messages else None
         agent.status_callback, agent.notice_callback = ctx._status_callback_sync, self._notice_callback_sync
+        if getattr(ctx._status_adapter, "coordination", False) is True:
+            # Lifecycle notices are not the correlated final answer; reset cached callbacks too.
+            agent.status_callback = agent.notice_callback = None
         agent.notice_clear_callback = None  # sends can't be retracted
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config, agent.service_tier = reasoning_config, runner._service_tier
