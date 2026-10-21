@@ -853,8 +853,21 @@ class IRCAdapter(BasePlatformAdapter):
 # ── Plugin registration ──────────────────────────────────────────────────────
 
 def check_requirements() -> bool:
-    """Check if IRC is configured via env (server + channel; no pip packages needed)."""
-    return bool(_get_scoped_secret("IRC_SERVER", "") and _get_scoped_secret("IRC_CHANNEL", ""))
+    """Check for env or explicitly enabled profile config (no pip packages needed)."""
+    if _get_scoped_secret("IRC_SERVER", "") and _get_scoped_secret("IRC_CHANNEL", ""):
+        return True
+    try:
+        from hermes_cli.config import load_config_readonly
+        from gateway.config import PlatformConfig
+        from gateway.config_loader import merge_platform_sections
+
+        config = load_config_readonly() or {}
+        platforms = merge_platform_sections(config, config.get("gateway"), {}, also=frozenset({"irc"}))
+        irc = PlatformConfig.from_dict(platforms.get("irc") or {})
+        server, channel = _server_channel(irc)
+        return irc.enabled is True and bool(server and channel)
+    except Exception:
+        return False
 
 
 def validate_config(config) -> bool:
