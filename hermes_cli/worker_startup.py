@@ -30,9 +30,6 @@ from typing import TYPE_CHECKING, Any, Optional
 if TYPE_CHECKING:  # runtime imports are lazy: this module must import cheaply
     from hermes_cli.kanban_runtime import RuntimeIdentity
 
-#: Profiles a dispatcher ever assigns to an unattended worker.
-_WORKER_PROFILES = frozenset({"cto", "implementer", "reviewer", "tester"})
-
 #: The dispatcher-supplied grant fields this capability is allowed to consume.
 _CONTEXT_FIELDS = frozenset({"task_id", "profile", "board", "workspace", "db_path"})
 
@@ -164,12 +161,17 @@ def worker_startup_available() -> bool:
     try:
         if not sys.platform.startswith("linux"):
             return False
-        grant = _retained_grant()
+        # Raises when this process holds no grant: that is the whole check.
+        _retained_grant()
         from agent.delegation_context import is_dispatcher_owned_worker_context
 
         if not is_dispatcher_owned_worker_context():
             return False
-        return grant.profile in _WORKER_PROFILES
+        # The profile name is not authority: the dispatcher launches a task for
+        # any profile that exists on the home, so a fixed role list would hide the
+        # capability from supported workers. The authenticated grant is the
+        # boundary, and ``_authorize`` re-checks it against the current process.
+        return True
     except Exception:
         return False
 
@@ -204,8 +206,6 @@ def _authorize() -> WorkerGrantContext:
 
     if is_delegated_child_process_context() or not is_dispatcher_owned_worker_context():
         raise WorkerStartupUnavailable("not a dispatcher-owned worker context")
-    if grant.profile not in _WORKER_PROFILES:
-        raise WorkerStartupUnavailable("granted profile is not an unattended worker role")
     if os.environ.get("HERMES_KANBAN_RUNTIME_GRANTED") != "1":
         raise WorkerStartupUnavailable("runtime grant flag is not set")
     if os.environ.get("HERMES_KANBAN_RUN_ID", "") != str(grant.run_id):

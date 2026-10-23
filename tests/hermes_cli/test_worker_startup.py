@@ -292,7 +292,7 @@ class GrantAuthorityTests(WorkerStartupFixture):
             with self.subTest(override=override), self.environment(**override), self.refusal():
                 worker_startup.worker_startup_snapshot()
 
-    def test_delegated_and_unsupported_roles_are_refused(self):
+    def test_delegated_and_non_dispatcher_contexts_are_refused(self):
         from agent import delegation_context
 
         self.retain()
@@ -304,9 +304,34 @@ class GrantAuthorityTests(WorkerStartupFixture):
             self.assertFalse(worker_startup.worker_startup_available())
             with self.refusal():
                 worker_startup.worker_startup_snapshot()
+
+    def test_any_dispatcher_granted_profile_may_inspect(self):
+        """The grant decides, not a fixed role list.
+
+        ``kanban_db_dispatch._profile_exists_fn`` lets the dispatcher launch a task
+        for any profile present on the home, so a hard-coded worker-role allowlist
+        would hide this operation from supported workers. The granted profile must
+        still match the board rows and the environment, which
+        ``test_granted_profile_must_match_the_current_environment`` covers.
+        """
+        for profile in ("default", "researcher"):
+            with self.subTest(profile=profile):
+                self.new_fixture()
+                with mock.patch.object(sys.modules[__name__], "PROFILE", profile):
+                    self.write_worker_state()
+                    with self.environment():
+                        worker_startup._retain_worker_grant(self.grant(), self.identity)
+                    with self.environment():
+                        self.assertTrue(worker_startup.worker_startup_available())
+                        snapshot = worker_startup.worker_startup_snapshot()
+                self.assertEqual(snapshot["profile"], profile)
+
+    def test_granted_profile_must_match_the_current_environment(self):
+        self.retain()
         with self.environment():
             worker_startup._GRANT = replace(worker_startup._GRANT, profile="orchestrator")
-            self.assertFalse(worker_startup.worker_startup_available())
+            # Visibility is not authorization: the catalog check only proves a grant
+            # exists, so the invocation re-checks it against this process.
             with self.refusal():
                 worker_startup.worker_startup_snapshot()
 
