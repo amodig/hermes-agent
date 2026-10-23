@@ -337,7 +337,11 @@ class GrantAuthorityTests(WorkerStartupFixture):
 
     def test_unsupported_platform_refuses_before_any_io(self):
         self.retain()
-        with self.environment(), mock.patch.object(sys, "platform", "darwin"), \
+        # Simulates a foreign platform to prove the refusal is host-independent
+        # containment rather than macOS behaviour: the assertion is "an unsupported
+        # platform refuses before any board I/O", which holds on every host.
+        foreign = mock.patch.object(sys, "platform", "darwin")  # os-marker: ok — host-independent refusal, no macOS branch
+        with self.environment(), foreign, \
                 mock.patch.object(worker_startup.sqlite3, "connect") as connect:
             self.assertFalse(worker_startup.worker_startup_available())
             with self.refusal():
