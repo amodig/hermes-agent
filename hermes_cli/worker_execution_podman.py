@@ -52,6 +52,11 @@ READINESS_PER_EXEC_SECONDS = 5.0
 CLEANUP_GRACE_SECONDS = 10.0
 JOURNAL_PROTOCOL = 1
 MAX_REAP_JOURNALS = 64
+#: Admission needs room for a private engine store and one image load; the running
+#: check only cancels when the owned filesystem is about to run dry. Neither is an
+#: aggregate disk quota.
+ADMISSION_FREE_BYTES = 1024 * 1024 * 1024
+MONITOR_FREE_BYTES = 256 * 1024 * 1024
 
 _CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _TAG_PREFIX = "localhost/worker-execution:"
@@ -126,6 +131,13 @@ def _free_bytes(path: Path) -> int:
     return int(statvfs.f_bavail) * int(statvfs.f_frsize)
 
 
+def _require_space(path: Path) -> int:
+    free = _free_bytes(path)
+    if free < MONITOR_FREE_BYTES:
+        raise VerificationFailure("insufficient_disk", "the task-owned filesystem is low on space")
+    return free
+
+
 def _process_start_time(pid: int) -> Optional[int]:
     try:
         text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="strict")
@@ -151,15 +163,24 @@ def _process_running(pid: Any, start: Any) -> bool:
     """True only for a live (non-zombie) process whose start time matches *start*.
 
     A killed container init or conmon can linger as a zombie until its parent reaps
-    it; a zombie executes nothing, holds no namespace and must not fail teardown.
+    it; a zombie executes nothing, holds no namespace and must not fail teardown. An
+    unreadable process entry is NOT evidence of absence: it counts as running.
     """
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         return False
     if isinstance(start, bool) or not isinstance(start, int):
         return True
-    if _process_start_time(pid) != start:
+    if not Path(f"/proc/{pid}").exists():
         return False
-    return _process_state(pid) not in {"Z", "X", "x", None}
+    observed = _process_start_time(pid)
+    if observed is None:
+        return True  # exists but unreadable: fail closed, never "gone"
+    if observed != start:
+        return False
+    state = _process_state(pid)
+    if state is None:
+        return True
+    return state not in {"Z", "X", "x"}
 
 
 def _process_cgroup(pid: int) -> Optional[str]:
@@ -228,6 +249,7 @@ class Engine:
 
     def __init__(self, run_root: Path) -> None:
         self.run_root = run_root
+        self.worker_cgroup = ""
         self.storage = run_root / "storage"
         self.runroot = run_root / "runroot"
         self.tmpdir = run_root / "engine-tmp"
@@ -296,16 +318,39 @@ class Engine:
         }
 
     def run(self, args: list[str], *, timeout: float = 60.0, check: bool = False) -> subprocess.CompletedProcess:
+        """Run one engine command under live identity/placement supervision.
+
+        The child is started with ``Popen`` and its PID start-time and cgroup are read
+        before waiting: an engine command that is not in the authenticated worker's
+        cgroup is killed and refused, never trusted.
+        """
         try:
-            result = subprocess.run(  # noqa: S603 -- fixed executable and constructed argv
+            process = subprocess.Popen(  # noqa: S603 -- fixed executable and constructed argv
                 [*self.prefix, *args], cwd=str(self.run_root), env=self.env(),
-                stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise VerificationFailure("engine_unavailable", _bounded(exc))
+        start = _process_start_time(process.pid)
+        cgroup = _process_cgroup(process.pid)
+        if start is None or cgroup is None or not _cgroup_contained(cgroup, self.worker_cgroup):
+            with contextlib.suppress(Exception):
+                process.kill()
+                process.wait(timeout=5)
+            raise VerificationFailure("attestation_failed", "engine command is outside the authenticated worker cgroup")
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(Exception):
+                process.kill()
+                process.wait(timeout=5)
+            raise VerificationFailure("engine_timeout", "engine command exceeded its time bound")
+        result = subprocess.CompletedProcess(
+            [*self.prefix, *args], process.returncode, stdout, stderr,
+        )
         if check and result.returncode != 0:
             raise VerificationFailure(
-                "engine_failed", _bounded(result.stderr.decode("utf-8", "replace")) or "engine command failed",
+                "engine_failed", _bounded(stderr.decode("utf-8", "replace")) or "engine command failed",
             )
         return result
 
@@ -478,6 +523,8 @@ class Container:
         self.conmon_pid: Optional[int] = None
         self.conmon_start: Optional[int] = None
         self.net_inode: Optional[int] = None
+        self.pid_inode: Optional[int] = None
+        self.conmon_path: Optional[Path] = None
         self.exit_code: Optional[int] = None
         self.timed_out = False
         self.log_path: Optional[Path] = None
@@ -487,7 +534,8 @@ class Container:
             "name": self.name, "kind": self.kind, "id": self.id,
             "pid": self.pid, "pid_start": self.pid_start,
             "conmon_pid": self.conmon_pid, "conmon_start": self.conmon_start,
-            "net_inode": self.net_inode,
+            "conmon_path": str(self.conmon_path) if self.conmon_path else None,
+            "net_inode": self.net_inode, "pid_inode": self.pid_inode,
             "log_path": str(self.log_path) if self.log_path else None,
         }
 
@@ -604,6 +652,7 @@ def _attest(
     image_id: str,
     keeper_id: Optional[str],
     keeper_net_inode: Optional[int],
+    host_pid_inode: Optional[int],
     worker_cgroup: str,
     expect_waiting_gate: bool,
 ) -> None:
@@ -680,8 +729,24 @@ def _attest(
     container.pid = pid
     container.pid_start = _process_start_time(pid)
     container.conmon_pid = int(state.get("ConmonPid") or 0) or None
-    container.conmon_start = _process_start_time(container.conmon_pid) if container.conmon_pid else None
+    if not container.conmon_pid:
+        raise VerificationFailure("attestation_failed", "container has no conmon process")
+    container.conmon_start = _process_start_time(container.conmon_pid)
+    if container.conmon_start is None:
+        raise VerificationFailure("attestation_failed", "conmon process identity is unreadable")
+    container.conmon_path = engine.run_root / (spec.name + ".conmon.pid")
+    try:
+        recorded = int(container.conmon_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        raise VerificationFailure("attestation_failed", "conmon pidfile is missing or malformed")
+    if recorded != container.conmon_pid:
+        raise VerificationFailure("attestation_failed", "conmon pidfile names another process")
     container.net_inode = _namespace_inode(pid, "net")
+    container.pid_inode = _namespace_inode(pid, "pid")
+    if container.pid_inode is None:
+        raise VerificationFailure("attestation_failed", "container PID namespace is unreadable")
+    if host_pid_inode is not None and container.pid_inode == host_pid_inode:
+        raise VerificationFailure("attestation_failed", "container shares the host PID namespace")
     if container.pid_start is None or container.net_inode is None:
         raise VerificationFailure("attestation_failed", "container process identity is unreadable")
     if not sandbox:
@@ -843,6 +908,49 @@ def _deadline_seconds(deadline: float) -> int:
     return max(1, int(remaining) + 1)
 
 
+def _cgroup_limit(cgroup: str, name: str) -> Optional[int]:
+    """Smallest finite *name* along the ancestor chain, or None when unreadable/unlimited.
+
+    The effective ceiling is the minimum along the tree, not the first value found: a
+    child may be unlimited while its slice is capped.
+    """
+    current = cgroup.strip("/")
+    parts = current.split("/") if current else []
+    observed: list[int] = []
+    while True:
+        path = Path("/sys/fs/cgroup") / ("/".join(parts) if parts else "") / name
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            text = ""
+        if text and text != "max":
+            try:
+                observed.append(int(text))
+            except ValueError:
+                return None
+        if not parts:
+            break
+        parts.pop()
+    return min(observed) if observed else None
+
+
+def _inherited_limits(worker_cgroup: str) -> dict[str, int]:
+    """The finite ancestor limits this worker's containers inherit.
+
+    ``--cgroups=disabled`` puts payload processes in the caller's cgroup, so the only
+    aggregate ceilings are the ones already on that chain. A host without a finite
+    process bound must refuse instead of trusting per-UID ``nproc``.
+    """
+    memory = _cgroup_limit(worker_cgroup, "memory.max")
+    pids = _cgroup_limit(worker_cgroup, "pids.max")
+    if memory is None or pids is None:
+        raise VerificationFailure(
+            "isolation_unavailable",
+            "the worker cgroup has no finite inherited memory/process limit",
+        )
+    return {"memory_max_bytes": memory, "pids_max": pids}
+
+
 def _claim_check(grant: Any) -> Callable[[], None]:
     from hermes_cli import worker_execution
 
@@ -879,10 +987,13 @@ def run_verification(
     if not worker_cgroup:
         raise VerificationFailure("isolation_unavailable", "the worker cgroup is unreadable")
     engine = Engine(run_root)
+    engine.worker_cgroup = worker_cgroup
     engine.prepare()
     _verify_local_rootless(engine)
-    if _free_bytes(run_root) < 1024 * 1024 * 1024:
+    if _free_bytes(run_root) < ADMISSION_FREE_BYTES:
         raise VerificationFailure("insufficient_disk", "verification requires at least 1 GiB free")
+    limits = _inherited_limits(worker_cgroup)
+    host_pid_inode = _namespace_inode(os.getpid(), "pid")
     images: dict[str, dict[str, Any]] = {}
 
     journal: dict[str, Any] = {
@@ -897,6 +1008,7 @@ def run_verification(
         "host_epoch": _host_epoch(),
         "deadline_epoch": time.time() + timeout_seconds,
         "phase": "provisioning",
+        "recipe": str(recipe.get("id")),
         "containers": [],
     }
     _journal_write(journal_path, journal)
@@ -923,6 +1035,7 @@ def run_verification(
         services = list(recipe.get("services") or ())
         references = [KEEPER_IMAGE, str(recipe.get("image"))] + [str(service.get("image")) for service in services]
         images = _load_images(engine, store, references)
+        _require_space(run_root)
         keeper = Container("keeper", "keeper", KEEPER_IMAGE, images[KEEPER_IMAGE]["tag"])
         identity = _write_synthetic_identity(run_root)
         workspace = _stage_workspace(run_root, Path(source_dir))
@@ -948,7 +1061,8 @@ def run_verification(
         _start(engine, keeper)
         _attest(
             engine, keeper, keeper_spec, image_id=images[KEEPER_IMAGE]["image_id"],
-            keeper_id=None, keeper_net_inode=None, worker_cgroup=worker_cgroup,
+            keeper_id=None, keeper_net_inode=None,
+            host_pid_inode=host_pid_inode, worker_cgroup=worker_cgroup,
             expect_waiting_gate=False,
         )
         keeper_id = keeper.id
@@ -1015,12 +1129,14 @@ def run_verification(
             _attest(
                 engine, container, spec, image_id=images[str(service["image"])]["image_id"],
                 keeper_id=keeper_id, keeper_net_inode=keeper.net_inode,
-                worker_cgroup=worker_cgroup, expect_waiting_gate=True,
+                host_pid_inode=host_pid_inode, worker_cgroup=worker_cgroup,
+                expect_waiting_gate=True,
             )
         _attest(
             engine, verifier, verifier_spec, image_id=images[str(recipe["image"])]["image_id"],
             keeper_id=keeper_id, keeper_net_inode=keeper.net_inode,
-            worker_cgroup=worker_cgroup, expect_waiting_gate=True,
+            host_pid_inode=host_pid_inode, worker_cgroup=worker_cgroup,
+            expect_waiting_gate=True,
         )
         # Persist the identity tuples the reaper needs before anything is released.
         journal["containers"] = [container.record() for container in ([keeper] if keeper is not None else []) + containers]
@@ -1038,12 +1154,14 @@ def run_verification(
             startup_deadline=min(deadline, time.monotonic() + STARTUP_DEADLINE_SECONDS),
         )
         claim_check()
+        _require_space(run_root)
         journal["phase"] = "released"
         _journal_write(journal_path, journal)
         _release(verifier_scratch / "release")
 
         exit_code, timed_out = _wait_exit(
             engine, verifier, deadline=deadline, claim_check=claim_check,
+            space_check=lambda: _require_space(run_root),
         )
         result["exit_code"] = exit_code
         result["timed_out"] = timed_out
@@ -1093,6 +1211,7 @@ def run_verification(
                 for reference, entry in images.items()
             },
             "resources": {
+                "limits": limits,
                 "keeper_id": keeper_id,
                 "containers": [container.record() for container in ([keeper] if keeper is not None else []) + containers],
                 "worker_cgroup": worker_cgroup,
@@ -1128,10 +1247,15 @@ def _wait_exit(
     *,
     deadline: float,
     claim_check: Optional[Callable[[], None]],
+    space_check: Optional[Callable[[], int]] = None,
 ) -> tuple[Optional[int], bool]:
+    last_space = 0.0
     while time.monotonic() < deadline:
         if claim_check is not None:
             claim_check()
+        if space_check is not None and time.monotonic() - last_space > 2.0:
+            space_check()
+            last_space = time.monotonic()
         data = _inspect_json(engine, container.id or "")
         state = data.get("State") or {}
         if state.get("Status") != "running":
@@ -1144,9 +1268,15 @@ def _cleanup(engine: Engine, containers: list[Container]) -> tuple[bool, list[st
     ok = True
     reasons: list[str] = []
     listed = engine.run(["ps", "-a", "--format", "{{.ID}}"], timeout=30.0)
-    present = {
-        line.strip().lower() for line in listed.stdout.decode("utf-8", "replace").splitlines() if line.strip()
-    } if listed.returncode == 0 else set()
+    if listed.returncode != 0:
+        # An unreadable inventory is not an empty one: never claim cleanup on it.
+        ok = False
+        reasons.append("listing_failed")
+        present: set[str] = set()
+    else:
+        present = {
+            line.strip().lower() for line in listed.stdout.decode("utf-8", "replace").splitlines() if line.strip()
+        }
     # Children share the keeper's network namespace, so they must go first.
     for container in reversed(containers):
         if not container.id or container.id.lower() not in present:
@@ -1162,9 +1292,14 @@ def _cleanup(engine: Engine, containers: list[Container]) -> tuple[bool, list[st
         if container.conmon_pid:
             _terminate_recorded(container.conmon_pid, container.conmon_start)
     listed = engine.run(["ps", "-a", "--format", "{{.ID}}"], timeout=30.0)
-    remaining = {
-        line.strip().lower() for line in listed.stdout.decode("utf-8", "replace").splitlines() if line.strip()
-    } if listed.returncode == 0 else set()
+    if listed.returncode != 0:
+        ok = False
+        reasons.append("listing_failed_after_rm")
+        remaining: set[str] = set()
+    else:
+        remaining = {
+            line.strip().lower() for line in listed.stdout.decode("utf-8", "replace").splitlines() if line.strip()
+        }
     for container in containers:
         if container.id and container.id.lower() in remaining:
             ok = False
@@ -1182,9 +1317,16 @@ def _cleanup(engine: Engine, containers: list[Container]) -> tuple[bool, list[st
             if container.conmon_pid and _process_running(container.conmon_pid, container.conmon_start):
                 residual = True
                 reasons.append(f"conmon_alive:{container.name}")
-            if container.net_inode is not None and _namespace_inodes_in_use(container.net_inode):
+            if container.net_inode is not None and _namespace_inodes_in_use(
+                container.net_inode, worker_cgroup=engine.worker_cgroup,
+            ):
                 residual = True
                 reasons.append(f"namespace_alive:{container.name}:{container.net_inode}")
+            if container.pid_inode is not None and _namespace_inodes_in_use(
+                container.pid_inode, name="pid", worker_cgroup=engine.worker_cgroup,
+            ):
+                residual = True
+                reasons.append(f"pid_namespace_alive:{container.name}:{container.pid_inode}")
         if not residual:
             break
         if time.monotonic() >= grace_deadline:
@@ -1223,11 +1365,20 @@ def _terminate_recorded(pid: Any, start: Any) -> bool:
     return True
 
 
-def _namespace_inodes_in_use(inode: int) -> bool:
-    """Any process of this host UID still inside a recorded namespace blocks cleanup."""
+def _namespace_inodes_in_use(inode: int, *, name: str = "net", worker_cgroup: str = "") -> bool:
+    """Any process of this host UID still inside a recorded namespace blocks cleanup.
+
+    An unreadable namespace link is uncertainty, not absence: it fails closed when the
+    process belongs to this worker's cgroup. A process outside it (for example the
+    user manager, whose namespace links are not readable) is unrelated host evidence.
+    """
     if inode <= 0:
         return False
-    for entry in os.scandir("/proc"):
+    try:
+        entries = list(os.scandir("/proc"))
+    except OSError:
+        return True
+    for entry in entries:
         if not entry.name.isdigit():
             continue
         pid = int(entry.name)
@@ -1237,8 +1388,24 @@ def _namespace_inodes_in_use(inode: int) -> bool:
             continue
         if int(info.st_uid) != os.getuid():
             continue
-        if _namespace_inode(pid, "net") == inode:
+        try:
+            observed = int(os.stat(f"/proc/{pid}/ns/{name}").st_ino)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            if worker_cgroup:
+                process_cgroup = _process_cgroup(pid)
+                if process_cgroup is not None and not _cgroup_contained(process_cgroup, worker_cgroup):
+                    continue
             return True
+        if observed != inode:
+            continue
+        state = _process_state(pid)
+        if state in {"Z", "X", "x"}:
+            # A zombie still appears in /proc and holds a namespace reference until
+            # its parent reaps it, but it executes nothing and owns no children.
+            continue
+        return True
     return False
 
 
@@ -1258,11 +1425,13 @@ def cleanup_journal(journal_path: Path, *, home: Optional[Path] = None) -> tuple
     record = payload.get("run_root") or {}
     try:
         info = os.lstat(root)
-    except OSError:
-        # The whole root is gone: nothing can still be running from it.
+    except FileNotFoundError:
+        # Positively absent: nothing can still be running from this root.
         with contextlib.suppress(OSError):
             journal_path.unlink()
         return True, "absent"
+    except OSError:
+        return False, "root_unreadable"
     if (
         not stat.S_ISDIR(info.st_mode) or root.is_symlink()
         or int(info.st_dev) != int(record.get("device", -1))
@@ -1276,9 +1445,11 @@ def cleanup_journal(journal_path: Path, *, home: Optional[Path] = None) -> tuple
     engine = Engine(root)
     ok = True
     listed = engine.run(["ps", "-a", "--format", "{{.ID}}"], timeout=60.0)
+    if listed.returncode != 0:
+        return False, "listing_failed"
     present = {
         line.strip().lower() for line in listed.stdout.decode("utf-8", "replace").splitlines() if line.strip()
-    } if listed.returncode == 0 else set()
+    }
     for record in payload.get("containers") or []:
         container_id = str(record.get("id") or "")
         if not _CONTAINER_ID_RE.match(container_id):
@@ -1303,7 +1474,14 @@ def cleanup_journal(journal_path: Path, *, home: Optional[Path] = None) -> tuple
         if _process_running(conmon, conmon_start):
             ok = False
         inode = record.get("net_inode")
-        if isinstance(inode, int) and _namespace_inodes_in_use(inode):
+        if isinstance(inode, int) and _namespace_inodes_in_use(
+            inode, worker_cgroup=str(payload.get("worker_cgroup") or ""),
+        ):
+            ok = False
+        pid_inode = record.get("pid_inode")
+        if isinstance(pid_inode, int) and _namespace_inodes_in_use(
+            pid_inode, name="pid", worker_cgroup=str(payload.get("worker_cgroup") or ""),
+        ):
             ok = False
     if ok:
         if not remove_tree(root):

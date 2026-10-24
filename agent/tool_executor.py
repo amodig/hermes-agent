@@ -453,7 +453,15 @@ class _ParsedCall:
     scope_block: Optional[str]
 
     def ref(self, task_id: str) -> _ToolCallRef:
-        return _ToolCallRef(self.name, self.args, task_id, _pairing_tool_call_id(self.tool_call), self.middleware_trace)
+        # The model's original request must survive every rewrite between here and the
+        # registry handler: runtime-owned tools refuse any final-argument change.
+        from model_tools import worker_original_args_snapshot
+
+        return _ToolCallRef(
+            self.name, self.args, task_id, _pairing_tool_call_id(self.tool_call),
+            self.middleware_trace,
+            original_args=worker_original_args_snapshot(self.name, self.args),
+        )
 
 
 def _parse_tool_call(agent, tool_call, *, flatten_probe: bool = False) -> _ParsedCall:

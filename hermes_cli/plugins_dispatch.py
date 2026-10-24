@@ -681,8 +681,8 @@ def dispatch_required_worker_execution(
     hook_name = "pre_worker_execution"
     try:
         manager = get_plugin_manager()
-        callback, reason = manager.required_hook_callback(hook_name, owner)
-        if callback is None:
+        required, reason = manager.required_hook_callback(hook_name, owner)
+        if required is None:
             return False, reason or "required approval callback is unavailable"
         payload = {
             "tool_name": tool_name,
@@ -693,9 +693,22 @@ def dispatch_required_worker_execution(
             "recipe": recipe,
         }
         timeout = min(_resolve_hook_callback_timeout(), 30.0)
-        result = manager._run_hook_callback_bounded(hook_name, callback, payload, timeout)
-        if result is _HOOK_SKIPPED:
-            return False, "required approval callback timed out or is unavailable"
+        result: Any = None
+        # Every registered policy callback runs, and any veto/failure refuses. Only
+        # the frozen guard's own callback may supply the allow; the others can abstain
+        # or veto, never authorize.
+        for callback in list(manager._hooks.get(hook_name, [])):
+            verdict = manager._run_hook_callback_bounded(hook_name, callback, payload, timeout)
+            if verdict is _HOOK_SKIPPED:
+                return False, "required approval callback timed out or is unavailable"
+            if callback is required:
+                result = verdict
+                continue
+            if verdict is None:
+                continue
+            if isinstance(verdict, Mapping) and verdict.get("action") in {"allow", "pass"}:
+                continue
+            return False, "another policy callback refused this invocation"
     except (Exception, SystemExit) as exc:
         return False, f"required approval callback failed: {str(exc)[:200]}"
     if not isinstance(result, Mapping):

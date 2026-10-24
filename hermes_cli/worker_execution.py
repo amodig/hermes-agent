@@ -23,6 +23,7 @@ import contextlib
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shutil
 import stat
@@ -325,29 +326,24 @@ def parse_policy(section: Any) -> WorkerExecutionPolicy:
     return WorkerExecutionPolicy(image_store, tuple(workspaces), digest)
 
 
-def load_policy(*, profile_home: Optional[str] = None) -> Optional[WorkerExecutionPolicy]:
-    """Read ``kanban.worker_execution`` from the dispatcher's profile config.
+def load_policy() -> Optional[WorkerExecutionPolicy]:
+    """Read ``kanban.worker_execution`` from the dispatcher's own process home.
 
-    The read goes through :func:`hermes_constants.set_hermes_home_override` so the
-    profile being launched is consulted without mutating ``os.environ``; the worker's
-    own later environment is never a source.
+    The override is pinned to :func:`get_process_hermes_home` so an active profile
+    scope (or an inherited environment value the worker will later carry) can never
+    substitute another home's policy. Only the dispatcher process reads this; the
+    worker consumes the frozen grant.
     """
     from hermes_cli.config import load_config_readonly
     from hermes_constants import get_process_hermes_home, reset_hermes_home_override, set_hermes_home_override
 
-    home = get_process_hermes_home()
-    token = None
-    if profile_home:
-        candidate = Path(profile_home).expanduser()
-        if candidate.is_dir():
-            token = set_hermes_home_override(candidate)
+    token = set_hermes_home_override(get_process_hermes_home())
     try:
         config = load_config_readonly()
     except Exception as exc:  # a broken config must grant nothing
         raise WorkerExecutionUnavailable("policy_malformed", f"worker execution config is unavailable: {_bounded(exc)}")
     finally:
-        if token is not None:
-            reset_hermes_home_override(token)
+        reset_hermes_home_override(token)
     kanban = config.get("kanban") if isinstance(config, Mapping) else None
     if not isinstance(kanban, Mapping) or CONFIG_KEY not in kanban:
         return None
@@ -541,38 +537,55 @@ def _policy_plugin_digests(profile_home: Optional[str]) -> Optional[dict[str, An
     return None
 
 
-def resolve_review_pair(db_path: str, task_id: str) -> Optional[dict[str, str]]:
-    """Bind the native immutable candidate handoff for a review/validation claim."""
+def resolve_review_context(db_path: str, task_id: str) -> tuple[str, Optional[dict[str, str]]]:
+    """``(role, review_pair)`` for the claimed task.
+
+    ``role`` is ``review`` when the card is being reviewed (separate-card role cards
+    and same-card reviews, whose contract stays ``kind: code``), otherwise
+    ``implementation``. The pair comes only from the native immutable handoff of the
+    reviewed candidate — for a same-card review the candidate is the card itself. An
+    unreadable board yields ``unknown``: metadata startup still works, commit diffs
+    and working diffs are both refused.
+    """
     from hermes_cli import kanban_db
     from hermes_cli.worker_startup import _open_board
 
     try:
         connection = _open_board(db_path)
     except Exception:
-        return None
+        return "unknown", None
     try:
         row = connection.execute(
-            "SELECT lifecycle_contract FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, lifecycle_contract FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
-            return None
+            return "unknown", None
+        status = str(row["status"] or "")
+        if status != "review":
+            return "implementation", None
         raw = row["lifecycle_contract"]
-        if not raw:
-            return None
-        contract = json.loads(raw) if isinstance(raw, str) else raw
-        if not isinstance(contract, Mapping) or contract.get("kind") not in ("review", "validation"):
-            return None
-        candidate_id = contract.get("candidate_task_id") or task_id
+        contract = {}
+        if raw:
+            try:
+                contract = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            except (TypeError, ValueError):
+                return "review", None
+        if not isinstance(contract, Mapping):
+            return "review", None
+        if contract.get("kind") in ("review", "validation"):
+            candidate_id = contract.get("candidate_task_id")
+        else:
+            candidate_id = task_id
         if not isinstance(candidate_id, str) or not candidate_id:
-            return None
+            return "review", None
         handoff = kanban_db.latest_handoff(connection, candidate_id)
         base = str(handoff.get("base_sha") or "").strip()
         head = str(handoff.get("head_sha") or "").strip()
         if not _OBJECT_ID_RE.match(base) or not _OBJECT_ID_RE.match(head):
-            return None
-        return {"base": base, "head": head}
+            return "review", None
+        return "review", {"base": base, "head": head}
     except Exception:
-        return None
+        return "unknown", None
     finally:
         with contextlib.suppress(Exception):
             connection.execute("ROLLBACK")
@@ -592,7 +605,7 @@ def resolve_execution_grant(
 ) -> tuple[Optional["ExecutionGrant"], Optional[str]]:
     """Resolve and validate configured authority; ``(None, reason)`` grants nothing."""
     try:
-        policy = load_policy(profile_home=profile_home)
+        policy = load_policy()
     except WorkerExecutionError as exc:
         return None, f"{exc.code}: {exc.message}"
     if policy is None:
@@ -629,7 +642,7 @@ def resolve_execution_grant(
     plugin = _policy_plugin_digests(profile_home)
     if plugin is None:
         return None, "policy_plugin_unavailable"
-    review = resolve_review_pair(db_path, task_id)
+    role, review = resolve_review_context(db_path, task_id)
     if review is not None and git is not None:
         head = _workspace_head_from_identity(git)
         if head is not None and head.lower() != review["head"].lower():
@@ -664,6 +677,7 @@ def resolve_execution_grant(
         git=git,
         image_store=image_store,
         inspect=entry.inspect,
+        role=role,
         extra_source_paths=tuple(entry.extra_source_paths),
         recipes=tuple({"id": recipe.id, **recipe.as_dict()} for recipe in entry.recipes),
         review=review,
@@ -702,6 +716,7 @@ class ExecutionGrant:
     git: Optional[dict[str, Any]]
     image_store: Optional[dict[str, Any]]
     inspect: bool
+    role: str
     extra_source_paths: tuple[str, ...]
     recipes: tuple[dict[str, Any], ...]
     review: Optional[dict[str, str]]
@@ -723,6 +738,7 @@ class ExecutionGrant:
             "git": self.git,
             "image_store": self.image_store,
             "inspect": self.inspect,
+            "role": self.role,
             "extra_source_paths": list(self.extra_source_paths),
             "recipes": [dict(recipe) for recipe in self.recipes],
             "review": self.review,
@@ -813,6 +829,7 @@ def parse_grant_section(section: Any, grant: Any) -> "ExecutionAuthority":
         git=_freeze_mapping(body.get("git")),
         image_store=_freeze_mapping(body.get("image_store")),
         inspect=bool(body.get("inspect")),
+        role=str(body.get("role") or "unknown"),
         extra_source_paths=tuple(str(item) for item in body.get("extra_source_paths") or ()),
         recipes=_freeze_recipes(body.get("recipes")),
         review=_freeze_mapping(body.get("review")),
@@ -905,6 +922,7 @@ class ExecutionAuthority:
     git: Optional[dict[str, Any]]
     image_store: Optional[dict[str, Any]]
     inspect: bool
+    role: str
     extra_source_paths: tuple[str, ...]
     recipes: tuple[dict[str, Any], ...]
     review: Optional[dict[str, Any]]
@@ -1098,6 +1116,9 @@ class SafeRoot:
             self.fd = os.open(path, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC)
         except OSError as exc:
             raise WorkerExecutionRefused("workspace_unavailable", _bounded(exc))
+        info = os.fstat(self.fd)
+        self.device = int(info.st_dev)
+        self.inode = int(info.st_ino)
 
     def close(self) -> None:
         with contextlib.suppress(OSError):
@@ -1126,8 +1147,22 @@ class SafeRoot:
             raise
 
     def _open_base(self) -> int:
-        """A fresh descriptor for the granted root (never a duplicate of another fd)."""
-        return os.open(self.path, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC)
+        """A fresh descriptor for the SAME directory inode this root was opened on.
+
+        Re-opening ``self.path`` would follow a pathname swapped after the identity
+        check. ``/proc/self/fd/<n>`` names the held inode instead; the duplicate is
+        then re-verified, so every traversal stays anchored to the granted directory.
+        """
+        fd = os.open(f"/proc/self/fd/{self.fd}", os.O_RDONLY | _O_DIRECTORY | _O_CLOEXEC)
+        info = os.fstat(fd)
+        if (int(info.st_dev), int(info.st_ino)) != (self.device, self.inode):
+            os.close(fd)
+            raise WorkerExecutionRefused("workspace_changed", "granted workspace root identity changed")
+        return fd
+
+    def current_identity(self) -> tuple[int, int]:
+        info = os.fstat(self.fd)
+        return int(info.st_dev), int(info.st_ino)
 
     def open_dir(self, parts: list[str]) -> int:
         return self._walk(parts, final_dir=True)
@@ -1227,15 +1262,27 @@ class SyntheticGit:
         return self.root
 
     def _copy_regular(self, source: Path, target: Path, *, limit: int = 1024 * 1024) -> bool:
+        """Copy one bounded regular Git metadata file, validating the opened inode.
+
+        The descriptor is opened first (no symlink following) and every check runs on
+        that descriptor, so a pathname swap between check and open cannot substitute a
+        different file.
+        """
         try:
-            info = os.lstat(source)
-        except OSError:
+            fd = os.open(source, os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC)
+        except FileNotFoundError:
             return False
-        if not stat.S_ISREG(info.st_mode) or source.is_symlink() or info.st_size > limit:
-            _refuse("git_metadata_unsafe", f"Git metadata {source.name} is not a bounded regular file")
-        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with open(source, "rb") as reader, open(target, "xb") as writer:
-            shutil.copyfileobj(reader, writer, 1024 * 1024)
+        except OSError as exc:
+            _refuse("git_metadata_unsafe", _bounded(exc))
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+                _refuse("git_metadata_unsafe", f"Git metadata {source.name} is not a bounded regular file")
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with os.fdopen(fd, "rb", closefd=False) as reader, open(target, "xb") as writer:
+                shutil.copyfileobj(reader, writer, 1024 * 1024)
+        finally:
+            os.close(fd)
         return True
 
     def _write_metadata(self) -> None:
@@ -1263,9 +1310,15 @@ class SyntheticGit:
 
     def _write_config(self) -> None:
         format_lines = self._format_scalars()
+        # Only validated scalar constants reach the generated config: a repository
+        # value with quotes/newlines must not be able to inject sections, includes or
+        # filter definitions into the trusted synthetic file.
+        version = format_lines.get("core.repositoryformatversion") or "0"
+        if not re.fullmatch(r"0|1", version):
+            _refuse("git_unsupported", "Git repository format version is not supported")
         config: list[str] = [
             "[core]",
-            "\trepositoryformatversion = " + (format_lines.get("core.repositoryformatversion") or "0"),
+            "\trepositoryformatversion = " + version,
             "\tbare = false",
             "\thooksPath = /dev/null",
             "\tfsmonitor = false",
@@ -1291,11 +1344,13 @@ class SyntheticGit:
             config.append("[extensions]")
             for key, value in sorted(extensions.items()):
                 name = key.split(".", 1)[1]
+                if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", name):
+                    _refuse("git_unsupported", "Git extension name is not supported for inspection")
                 if name not in {"objectformat"}:
                     _refuse("git_unsupported", f"Git extension {name} is not supported for inspection")
-                if name == "objectformat" and value.lower() not in {"sha1", "sha256"}:
+                if value.lower() not in {"sha1", "sha256"}:
                     _refuse("git_unsupported", "Git object format is not supported for inspection")
-                config.append(f"\t{name} = {value}")
+                config.append(f"\t{name} = {value.lower()}")
         body = "\n".join(config) + "\n"
         config_path = self.path / "config"
         config_path.write_text(body, encoding="utf-8")
@@ -1340,7 +1395,12 @@ class SyntheticGit:
                 key, _, value = text.partition("\n")
             else:
                 key, _, value = text.partition(" ")
-            values[key.strip()] = value.strip()
+            key, value = key.strip(), value.strip()
+            if not re.fullmatch(r"(core\.repositoryformatversion|extensions\.[a-z][a-z0-9-]{0,31})", key):
+                continue
+            if any(ch in value for ch in "\x00\n\r") or len(value) > 64:
+                _refuse("git_unsupported", "Git config value is not a supported scalar")
+            values[key] = value
         return values
 
     def object_dir(self) -> Path:
@@ -1354,9 +1414,27 @@ class SyntheticGit:
         alternates = objects / "info" / "alternates"
         if alternates.exists() or alternates.is_symlink():
             _refuse("git_metadata_unsafe", "Git object alternates are not supported")
-        for entry in os.scandir(objects):
-            if entry.is_symlink():
-                _refuse("git_metadata_unsafe", "Git object storage contains a symlink")
+        entries = 0
+        for directory, dirnames, filenames in os.walk(objects, followlinks=False):
+            base = Path(directory)
+            try:
+                base_info = os.lstat(base)
+            except OSError as exc:
+                _refuse("git_metadata_unsafe", _bounded(exc))
+            if not stat.S_ISDIR(base_info.st_mode) or base.is_symlink():
+                _refuse("git_metadata_unsafe", "Git object storage contains a non-directory")
+            for name in [*dirnames, *filenames]:
+                candidate = base / name
+                entries += 1
+                if entries > 1_000_000:
+                    _refuse("git_unsupported", "Git object storage is too large for inspection")
+                try:
+                    entry_info = os.lstat(candidate)
+                except OSError as exc:
+                    _refuse("git_metadata_unsafe", _bounded(exc))
+                if stat.S_ISLNK(entry_info.st_mode):
+                    _refuse("git_metadata_unsafe", "Git object storage contains a symlink")
+            dirnames[:] = [name for name in dirnames if not (base / name).is_symlink()]
         return objects
 
     def run(self, args: list[str], *, cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
@@ -1485,7 +1563,6 @@ def _scan_source(
         with SafeRoot(authority.workspace_path) as root:
             for name in sorted(accepted):
                 parts = name.split("/")
-                kind = accepted[name]
                 try:
                     info = root.lstat(parts)
                 except FileNotFoundError:
@@ -1493,24 +1570,29 @@ def _scan_source(
                     continue
                 except OSError as exc:
                     raise WorkerExecutionRefused("source_unreadable", _bounded(exc))
-                if kind == "link":
-                    if not stat.S_ISLNK(info.st_mode):
-                        entries.append(SourceEntry(name, "file", bool(info.st_mode & 0o111), int(info.st_size), "type-changed"))
-                        continue
+                # The worktree entry's ACTUAL type decides how it is hashed and copied;
+                # the index only selects the path. A tracked symlink replaced by a file
+                # (or the reverse) is therefore represented, never silently dropped.
+                if stat.S_ISLNK(info.st_mode):
                     target = root.readlink(parts)
-                    normalized = os.path.normpath(target).replace(os.sep, "/")
-                    if os.path.isabs(target) or normalized.startswith("../") or normalized in ("..", "."):
+                    parent = "/".join(parts[:-1])
+                    joined = posixpath.normpath(posixpath.join(parent, target)) if parent else posixpath.normpath(target)
+                    normalized = joined.replace(os.sep, "/")
+                    if (
+                        os.path.isabs(target) or "\x00" in target
+                        or normalized in ("", ".", "..") or normalized.startswith("../")
+                    ):
                         raise WorkerExecutionRefused("unsafe_symlink", "the granted source set contains an escaping symlink")
                     if normalized not in accepted:
                         raise WorkerExecutionRefused("unsafe_symlink", "the granted source set contains an unaccepted symlink target")
-                    if accepted[normalized] == "link":
+                    if normalized == name:
                         raise WorkerExecutionRefused("unsafe_symlink", "the granted source set contains a symlink cycle")
                     digest = "sha256:" + sha256_hex(normalized.encode("utf-8", "surrogateescape"))
                     entries.append(SourceEntry(name, "link", False, len(target), digest))
                     if materialize is not None:
                         target_path = materialize / name
                         target_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                        os.symlink(normalized, target_path)
+                        os.symlink(target, target_path)
                     continue
                 if not stat.S_ISREG(info.st_mode):
                     raise WorkerExecutionRefused("unsupported_source_type", "the granted source set contains a non-regular entry")
@@ -1700,35 +1782,82 @@ def _line_page(data: bytes, start_line: int, line_count: int) -> tuple[list[str]
     return rendered, next_line
 
 
-def _read_file_page(root: SafeRoot, parts: list[str], entry: SourceEntry, start_line: int, line_count: int) -> tuple[str, Optional[int]]:
+def _read_file_page(
+    root: SafeRoot, parts: list[str], entry: SourceEntry, start_line: int, line_count: int,
+) -> tuple[str, Optional[int]]:
+    """One pass over the opened file: hash every byte AND collect the requested lines."""
     try:
         fd = root.open_file(parts)
     except OSError as exc:
         raise WorkerExecutionRefused("source_unreadable", _bounded(exc))
     digest = hashlib.sha256()
+    wanted_start = max(0, start_line - 1)
+    wanted_end = wanted_start + line_count
+    page: list[bytes] = []
+    page_bytes = 0
+    completed_lines = 0
+    pending = bytearray()
+    last_chunk = b""
+    binary = False
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or int(info.st_nlink) != 1:
             _refuse("unsupported_source_type", "requested source is not a single regular file")
         if info.st_size > MAX_INVENTORY_BYTES:
             _refuse("source_too_large", "requested source exceeds the byte bound")
-        for chunk in iter(lambda: os.read(fd, 1024 * 1024), b""):
-            digest.update(chunk)
-        actual = "sha256:" + digest.hexdigest()
-        if actual != entry.digest:
-            raise WorkerExecutionRefused("source_changed", "requested source changed during inspection")
-        os.lseek(fd, 0, os.SEEK_SET)
-        data = bytearray()
         while True:
             chunk = os.read(fd, 1024 * 1024)
             if not chunk:
                 break
-            data.extend(chunk)
+            digest.update(chunk)
+            last_chunk = chunk
+            if not binary and b"\x00" in chunk:
+                binary = True
+            if completed_lines >= wanted_end:
+                # Past the requested page: only the digest and the line count matter.
+                completed_lines += chunk.count(b"\n")
+                continue
+            pending.extend(chunk)
+            while True:
+                newline = pending.find(b"\n")
+                if newline < 0:
+                    break
+                line = bytes(pending[: newline + 1])
+                del pending[: newline + 1]
+                if wanted_start <= completed_lines < wanted_end:
+                    page_bytes += len(line)
+                    if page_bytes > MAX_PAGE_BYTES:
+                        _refuse("page_too_large", "the requested page exceeds the byte bound")
+                    page.append(line)
+                completed_lines += 1
+                if completed_lines >= wanted_end:
+                    # Count the rest of this chunk, then stop buffering lines.
+                    completed_lines += pending.count(b"\n")
+                    pending.clear()
+                    break
+        if pending and wanted_start <= completed_lines < wanted_end:
+            page_bytes += len(pending)
+            if page_bytes > MAX_PAGE_BYTES:
+                _refuse("page_too_large", "the requested page exceeds the byte bound")
+            page.append(bytes(pending))
+        total_lines = completed_lines + (1 if last_chunk and not last_chunk.endswith(b"\n") else 0)
+        after = os.fstat(fd)
+        if (after.st_size, after.st_mtime_ns, after.st_ino) != (info.st_size, info.st_mtime_ns, info.st_ino):
+            raise WorkerExecutionRefused("source_changed", "requested source changed during inspection")
     finally:
         os.close(fd)
-    if b"\x00" in data:
+    if binary:
         raise WorkerExecutionRefused("binary_content", "requested source is binary")
-    rendered, next_line = _line_page(bytes(data), start_line, line_count)
+    if "sha256:" + digest.hexdigest() != entry.digest:
+        raise WorkerExecutionRefused("source_changed", "requested source changed during inspection")
+    rendered: list[str] = []
+    for line in page:
+        try:
+            rendered.append(line.decode("utf-8", "strict"))
+        except UnicodeDecodeError:
+            _refuse("not_utf8", "requested source is not valid UTF-8")
+    consumed = wanted_start + len(rendered)
+    next_line = consumed + 1 if consumed < total_lines else None
     return "".join(rendered), next_line
 
 
@@ -1917,10 +2046,16 @@ def _inspect_list(args: Mapping[str, Any], authority: ExecutionAuthority) -> dic
 
 
 def _diff_scope(authority: ExecutionAuthority, args: Mapping[str, Any]) -> tuple[list[str], str]:
-    if "mode" in args:
-        if authority.review is not None:
-            _refuse("diff_not_granted", "commit-diff is the granted capability for this claim")
+    role = str(getattr(authority, "role", "unknown"))
+    if role == "review":
+        if "mode" in args:
+            _refuse("diff_not_granted", "commit-diff is the granted capability for a review claim")
+    elif role == "implementation":
+        if "mode" not in args:
+            _refuse("diff_not_granted", "implementation claims have no historical commit-diff capability")
         return (["--cached"] if args["mode"] == "staged" else []), args["mode"]
+    else:
+        _refuse("diff_not_granted", "this claim has no diff capability")
     review = authority.review
     if review is None:
         _refuse("diff_not_granted", "no immutable candidate handoff is bound to this claim")
@@ -2082,22 +2217,36 @@ def worker_verify(args: dict, *, original_args: dict | None = None) -> str:
             run_root = Path(str(_record_value(authority.execution_parent, "path", ""))) / invocation
             run_root.mkdir(mode=0o700)
             journal_path = Path(str(_record_value(authority.journal_dir, "path", ""))) / f"{invocation}.json"
-            snapshot, source_dir = _materialize_source(authority, run_root)
-            if snapshot.source_digest != normalized["source_digest"]:
-                raise WorkerExecutionRefused("source_changed", "the granted source does not match the requested digest")
-            from hermes_cli import worker_execution_podman as backend
+            backend_entered = False
+            try:
+                snapshot, source_dir = _materialize_source(authority, run_root)
+                if snapshot.source_digest != normalized["source_digest"]:
+                    raise WorkerExecutionRefused("source_changed", "the granted source does not match the requested digest")
+                from hermes_cli import worker_execution_podman as backend
 
-            result = backend.run_verification(
-                authority=authority,
-                recipe=recipe,
-                source_dir=source_dir,
-                run_root=run_root,
-                journal_path=journal_path,
-                grant=grant,
-            )
+                backend_entered = True
+                result = backend.run_verification(
+                    authority=authority,
+                    recipe=recipe,
+                    source_dir=source_dir,
+                    run_root=run_root,
+                    journal_path=journal_path,
+                    grant=grant,
+                )
+            except BaseException:
+                # Before the backend owns the journal, this call owns the allocation:
+                # a refused digest must not leave a source copy behind.
+                if not backend_entered:
+                    from hermes_cli.worker_execution_podman import remove_tree
+
+                    remove_tree(run_root)
+                    with contextlib.suppress(OSError):
+                        journal_path.unlink()
+                raise
             # Revalidate the claim and source identity at finish; anything that changed
             # makes the evidence unusable rather than silently accepted.
             _reauthorize_live_claim(grant)
+            authority.verify_static_identities()
             final = _scan_source(authority)
             if final.source_digest != snapshot.source_digest or final.head != snapshot.head:
                 raise WorkerExecutionRefused("source_changed", "the granted source changed during verification")
@@ -2145,8 +2294,10 @@ def worker_inspect(args: dict, *, original_args: dict | None = None) -> str:
             result = _inspect_list(normalized, authority)
         else:
             result = _inspect_diff(normalized, authority)
-        # Discard the buffered result if this worker lost the claim meanwhile.
+        # Discard the buffered result if this worker lost the claim or its granted
+        # filesystem identity meanwhile.
         _reauthorize_live_claim(grant)
+        authority.verify_static_identities()
         return json.dumps(result, sort_keys=True)
     except WorkerExecutionError as exc:
         return json.dumps({

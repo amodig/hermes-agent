@@ -12,10 +12,10 @@ home, board and Git repository:
 2. ``death``    — the dispatcher parent SIGKILLs the worker mid-verification, then
                   observes the journal's conmon deadline, payload teardown and cleanup.
 
-Only the *host admission* checks are stated by this harness (a source checkout has no
-deployed autonomous slice); every execution gate below — grant, claim, approval hook,
-source digest, image identity, namespace attestation, release marker and teardown — is
-the production path. Images are prepared once into ``--image-store`` from the pinned
+The harness re-executes itself inside ``autonomous.slice``, so host admission, worker
+scope placement and the concurrency slot are the real production checks. Every other
+gate — grant, claim, approval hook, source digest, image identity, namespace
+attestation, release marker and teardown — is likewise the production path. Images are prepared once into ``--image-store`` from the pinned
 digests; nothing is pulled during a normal run.
 
 Usage::
@@ -250,9 +250,10 @@ def sha256_file(path: Path) -> str:
 
 def _private_engine(run_root: Path):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from hermes_cli.worker_execution_podman import Engine
+    from hermes_cli.worker_execution_podman import Engine, _process_cgroup
 
     engine = Engine(run_root)
+    engine.worker_cgroup = _process_cgroup(os.getpid()) or ""
     engine.prepare()
     return engine
 
@@ -281,6 +282,24 @@ def _remove_tree(path: Path) -> None:
 
     if path.exists():
         remove_tree(path)
+
+
+def _validate_images(store: Path) -> None:
+    """Normal runs only validate the operator-provisioned store; never pull or rewrite."""
+    inventory_path = store / "inventory.json"
+    if not inventory_path.is_file():
+        fail("image store is not prepared; run with --prepare-images first")
+    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    images = inventory.get("images") if isinstance(inventory, dict) else None
+    if not isinstance(images, dict):
+        fail("image store inventory is malformed")
+    for reference in IMAGE_TAGS:
+        record = images.get(reference)
+        if not isinstance(record, dict):
+            fail(f"image store has no provisioned entry for {reference}")
+        archive = store / str(record.get("archive") or "")
+        if not archive.is_file() or "sha256:" + sha256_file(archive) != record.get("sha256"):
+            fail(f"provisioned archive for {reference} is missing or changed")
 
 
 def prepare_images(store: Path) -> dict[str, Any]:
@@ -599,14 +618,17 @@ def _run_case(
                 "toolsets:\n  - kanban\n"
                 "tools:\n  tool_search:\n    enabled: \"on\"\n"
                 "plugins:\n  enabled: [cto-consequence-guard]\n"
-                + _policy_text(workspace, image_store, {"stall": death})
             ),
         )
         plugin = profile_home / "plugins" / "cto-consequence-guard"
         plugin.mkdir(parents=True)
         for name in ("__init__.py", "plugin.yaml"):
             shutil.copyfile(plugin_source / name, plugin / name)
-        (root / "hermes" / "config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+        # Execution authority comes from the DISPATCHER's process home only.
+        (root / "hermes" / "config.yaml").write_text(
+            "toolsets:\n  - kanban\n" + _policy_text(workspace, image_store, {"stall": death}),
+            encoding="utf-8",
+        )
         return _launch(
             root=root, workspace=workspace, board_path=board_path,
             base_sha=base_sha, head_sha=head_sha, state=state, death=death,
@@ -667,7 +689,13 @@ def _launch(
             reconcile_orphans=False,
         )
         if not result.spawned:
-            fail(f"dispatcher spawned no worker: {result}")
+            events = connection.execute(
+                "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id", (review,),
+            ).fetchall()
+            fail(
+                f"dispatcher spawned no worker: {result}; "
+                f"events={[dict(row) for row in events]}; logs={_log_tail(root)}"
+            )
         task = kb.get_task(connection, review)
         worker_pid = int(task.worker_pid or 0) or None
         state.worker_pid = worker_pid
@@ -680,31 +708,58 @@ def _launch(
         if death:
             deadline = time.monotonic() + 600
             journals: list[Path] = []
+            stall_journal: dict[str, Any] | None = None
             while time.monotonic() < deadline:
                 journals = _journal_files(journal_roots)
-                if any(_journal_has_containers(path) for path in journals):
+                for path in journals:
+                    payload = _journal_payload(path)
+                    if (
+                        payload
+                        and payload.get("recipe") == "stall"
+                        and payload.get("phase") in {"released", "services-released"}
+                        and any(record.get("pid") for record in payload.get("containers") or [])
+                    ):
+                        stall_journal = payload
+                        break
+                if stall_journal is not None:
                     break
                 if state.failure or state.completed:
                     break
                 if worker_pid and not runtime._pid_alive(worker_pid):
                     break
                 time.sleep(0.2)
-            if not any(_journal_has_containers(path) for path in journals):
+            if stall_journal is None:
                 fail(
-                    "the verification journal never recorded containers: "
+                    "the stall invocation never reached its released payload: "
                     f"steps={state.steps}; failure={state.failure}; "
                     f"last_tool={state.last_tool_content}; journals={[str(p) for p in journals]}; "
                     f"logs={_log_tail(root)}"
                 )
-            receipt["journals"] = [str(path) for path in journals]
+            # Prove the detached child is live before the worker dies.
+            payload_pids = [
+                record.get("pid") for record in stall_journal.get("containers") or []
+                if record.get("kind") == "verifier" and record.get("pid")
+            ]
+            if not payload_pids:
+                fail(f"the stall journal has no verifier process: {stall_journal}")
+            if "sleep 600" not in _proc_cmdline(int(payload_pids[0])):
+                fail("the stall payload did not start before the worker was killed")
+            receipt["stall_journal"] = stall_journal
+            receipt["payload_pids"] = payload_pids
             if worker_pid:
                 with __import__("contextlib").suppress(ProcessLookupError):
                     os.kill(worker_pid, signal.SIGKILL)
             receipt["worker_killed"] = True
-            cleaned, cleanup_results = _await_cleanup(
+            cleaned, cleanup_results, cleaned_at = _await_cleanup(
                 journal_roots, deadline=time.monotonic() + 300,
             )
             receipt["journals_cleaned"] = cleaned
+            receipt["cleanup_observed_epoch"] = cleaned_at
+            if cleaned and cleaned_at < float(stall_journal.get("deadline_epoch") or 0):
+                fail(
+                    "journals disappeared before the recorded conmon deadline: "
+                    f"cleaned_at={cleaned_at} deadline={stall_journal.get('deadline_epoch')}"
+                )
             receipt["cleanup_results"] = cleanup_results
             if not cleaned:
                 fail(
@@ -807,13 +862,20 @@ def _tree_digest(root: Path) -> str:
     return sha256_bytes("\n".join(entries).encode())
 
 
-def _journal_has_containers(path: Path) -> bool:
+def _journal_payload(path: Path) -> dict[str, Any] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return False
-    return bool(payload.get("phase") in {"created", "started", "attested", "released"}
-                and payload.get("containers"))
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _proc_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\x00", b" ").decode("utf-8", "replace")
 
 
 def _journal_roots(root: Path) -> list[Path]:
@@ -833,7 +895,9 @@ def _journal_files(roots: list[Path]) -> list[Path]:
     return files
 
 
-def _await_cleanup(journal_roots: list[Path], *, deadline: float) -> tuple[bool, list[dict[str, Any]]]:
+def _await_cleanup(
+    journal_roots: list[Path], *, deadline: float,
+) -> tuple[bool, list[dict[str, Any]], float]:
     from hermes_cli import kanban_worker_runtime as runtime
     from hermes_cli.worker_execution_podman import reap_journals
 
@@ -848,9 +912,9 @@ def _await_cleanup(journal_roots: list[Path], *, deadline: float) -> tuple[bool,
                     if directory.is_dir() and not directory.is_symlink():
                         last.extend(reap_journals(directory))
         if not _journal_files(journal_roots):
-            return True, last
+            return True, last, time.time()
         time.sleep(1.0)
-    return False, last
+    return False, last, 0.0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -865,12 +929,11 @@ def main(argv: list[str] | None = None) -> int:
     image_store = Path(args.image_store).expanduser()
     if not (policy_root / "plugins" / "consequence_guard" / "plugin.yaml").is_file():
         fail(f"policy root has no consequence guard plugin: {policy_root}")
-    prepare_images(image_store)
     if args.prepare_images:
+        prepare_images(image_store)
         print("worker execution images: ok")
         return 0
-    if not (Path(args.image_store) / "inventory.json").is_file():
-        fail("image store was not prepared; run with --prepare-images first")
+    _validate_images(image_store)
     _enter_autonomous_scope()
     free = shutil.disk_usage(image_store).free
     if free < 8 * 1024 * 1024 * 1024:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sqlite3
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -102,21 +103,45 @@ def fixture(tmp_path, monkeypatch):
     )
 
 
-def _authority(fixture, *, recipes=None, inspect=True, extras=None, review=None, image_store=True):
+def _board(fixture, status: str = "running") -> tuple[str, str]:
+    """A real board with one claimed-looking task, so the grant role is resolved."""
+    from hermes_cli import kanban_db as kb
+
+    db_path = fixture.hermes / "kanban.db"
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.executescript(kb.SCHEMA_SQL)
+        kb._ensure_lifecycle_schema(connection)
+        task_id = kb.create_task(
+            connection, title="fixture task", assignee="reviewer",
+            workspace_kind="dir", workspace_path=str(fixture.repo),
+        )
+        connection.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+        connection.commit()
+    finally:
+        connection.close()
+    return task_id, str(db_path)
+
+
+def _authority(
+    fixture, *, recipes=None, inspect=True, extras=None, review=None, image_store=True,
+    status: str = "running",
+):
+    task_id, db_path = _board(fixture, status)
     section = _policy_section(
         fixture.repo, fixture.images if image_store else None,
         recipes=recipes, inspect=inspect, extras=extras,
     )
     _write_config(fixture.hermes, section)
     _stage_plugin(fixture.hermes)
-    (fixture.hermes / "kanban.db").write_bytes(b"")
     identity = SimpleNamespace(
         generation="gen", dependency_fingerprint="dep", code_sha="sha",
         pid=os.getpid(), start_time=0, as_dict=lambda: {"generation": "gen"},
     )
     grant, refusal = we.resolve_execution_grant(
-        profile_home=str(fixture.hermes), workspace=str(fixture.repo), task_id="t_fixture",
-        profile="reviewer", board="fixture", db_path=str(fixture.hermes / "kanban.db"),
+        profile_home=str(fixture.hermes), workspace=str(fixture.repo), task_id=task_id,
+        profile="reviewer", board="fixture", db_path=db_path,
         preparation_id="prep-fixture", runtime_identity=identity,
     )
     assert refusal is None, refusal
@@ -129,9 +154,9 @@ def _authority(fixture, *, recipes=None, inspect=True, extras=None, review=None,
         body["digest"] = we.digest_of(body)
         section = body
     stub = SimpleNamespace(
-        task_id="t_fixture", profile="reviewer", board="fixture", preparation_id="prep-fixture",
+        task_id=task_id, profile="reviewer", board="fixture", preparation_id="prep-fixture",
         run_id=7, claim_lock="claim-fixture", workspace=str(fixture.repo),
-        db_path=str(fixture.hermes / "kanban.db"), runtime_identity=identity,
+        db_path=db_path, runtime_identity=identity,
     )
     return we.parse_grant_section(section, stub)
 
@@ -203,10 +228,11 @@ def test_grant_digest_and_identities_are_frozen(fixture):
 
     section = _policy_section(fixture.repo, fixture.images)
     _write_config(fixture.hermes, section)
+    task_id, db_path = _board(fixture)
     identity = SimpleNamespace(generation="gen", dependency_fingerprint="dep", code_sha="sha", pid=os.getpid())
     grant, refusal = we.resolve_execution_grant(
-        profile_home=str(fixture.hermes), workspace=str(fixture.repo), task_id="t_fixture",
-        profile="reviewer", board="fixture", db_path=str(fixture.hermes / "kanban.db"),
+        profile_home=str(fixture.hermes), workspace=str(fixture.repo), task_id=task_id,
+        profile="reviewer", board="fixture", db_path=db_path,
         preparation_id="prep-fixture", runtime_identity=identity,
     )
     assert refusal is None
@@ -214,9 +240,9 @@ def test_grant_digest_and_identities_are_frozen(fixture):
     body = dict(bound)
     body["inspect"] = False
     stub = SimpleNamespace(
-        task_id="t_fixture", profile="reviewer", board="fixture", preparation_id="prep-fixture",
+        task_id=task_id, profile="reviewer", board="fixture", preparation_id="prep-fixture",
         run_id=7, claim_lock="claim-fixture", workspace=str(fixture.repo),
-        db_path=str(fixture.hermes / "kanban.db"), runtime_identity=identity,
+        db_path=db_path, runtime_identity=identity,
     )
     with pytest.raises(we.WorkerExecutionUnavailable):
         we.parse_grant_section(body, stub)
@@ -309,24 +335,79 @@ def test_non_repository_is_explicitly_unavailable(fixture):
     section = _policy_section(plain, fixture.images)
     _write_config(fixture.hermes, section)
     _stage_plugin(fixture.hermes)
-    (fixture.hermes / "kanban.db").write_bytes(b"")
+    task_id, db_path = _board(fixture)
     identity = SimpleNamespace(generation="gen", dependency_fingerprint="dep", code_sha="sha", pid=os.getpid())
     grant, refusal = we.resolve_execution_grant(
-        profile_home=str(fixture.hermes), workspace=str(plain), task_id="t_fixture",
-        profile="reviewer", board="fixture", db_path=str(fixture.hermes / "kanban.db"),
+        profile_home=str(fixture.hermes), workspace=str(plain), task_id=task_id,
+        profile="reviewer", board="fixture", db_path=db_path,
         preparation_id="prep-fixture", runtime_identity=identity,
     )
     assert refusal is None and grant is not None
     stub = SimpleNamespace(
-        task_id="t_fixture", profile="reviewer", board="fixture", preparation_id="prep-fixture",
+        task_id=task_id, profile="reviewer", board="fixture", preparation_id="prep-fixture",
         run_id=7, claim_lock="claim-fixture", workspace=str(plain),
-        db_path=str(fixture.hermes / "kanban.db"), runtime_identity=identity,
+        db_path=db_path, runtime_identity=identity,
     )
     authority = we.parse_grant_section(grant.bind(7, "claim-fixture"), stub)
     assert authority.git is None
     with pytest.raises(we.WorkerExecutionRefused) as excinfo:
         we._scan_source(authority)
     assert excinfo.value.code == "workspace_not_a_repository"
+
+
+def test_nested_relative_symlink_resolves_against_its_parent(fixture):
+    # docs/link -> ../app.py is a valid in-tree target; docs/link2 -> ../outside is not.
+    os.symlink("../app.py", fixture.repo / "docs" / "link")
+    _git(fixture.repo, "add", "docs/link")
+    _git(fixture.repo, "commit", "-qm", "link")
+    authority = _authority(fixture)
+    snapshot = we._scan_source(authority)
+    entry = snapshot.entry("docs/link")
+    assert entry is not None and entry.kind == "link"
+
+    os.symlink("../outside", fixture.repo / "docs" / "link2")
+    _git(fixture.repo, "add", "docs/link2")
+    _git(fixture.repo, "commit", "-qm", "escape-link")
+    authority = _authority(fixture)
+    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
+        we._scan_source(authority)
+    assert excinfo.value.code == "unsafe_symlink"
+
+
+def test_tracked_symlink_replaced_by_file_is_hashed_not_omitted(fixture):
+    os.symlink("app.py", fixture.repo / "alias")
+    _git(fixture.repo, "add", "alias")
+    _git(fixture.repo, "commit", "-qm", "alias")
+    (fixture.repo / "alias").unlink()
+    (fixture.repo / "alias").write_text("print('real file')\n", encoding="utf-8")
+    authority = _authority(fixture)
+    snapshot = we._scan_source(authority)
+    entry = snapshot.entry("alias")
+    assert entry is not None and entry.kind == "file"
+    first = snapshot.source_digest
+    (fixture.repo / "alias").write_text("print('changed file')\n", encoding="utf-8")
+    second = we._scan_source(authority).source_digest
+    assert second != first
+
+
+def test_read_reports_next_line_and_matches_the_digest(fixture):
+    (fixture.repo / "multi.py").write_text("one\ntwo\nthree\n", encoding="utf-8")
+    _git(fixture.repo, "add", "multi.py")
+    _git(fixture.repo, "commit", "-qm", "multi")
+    authority = _authority(fixture)
+    snapshot = we._scan_source(authority)
+    entry = snapshot.entry("multi.py")
+    with we.SafeRoot(authority.workspace_path) as root:
+        text, next_line = we._read_file_page(root, ["multi.py"], entry, 1, 1)
+        assert text == "one\n"
+        assert next_line == 2
+        whole, end = we._read_file_page(root, ["multi.py"], entry, 1, 10)
+        assert end is None and whole == "one\ntwo\nthree\n"
+        # A digest from another state refuses instead of returning bytes.
+        stale = we.SourceEntry(entry.path, entry.kind, entry.executable, entry.size, "sha256:" + "0" * 64)
+        with pytest.raises(we.WorkerExecutionRefused) as excinfo:
+            we._read_file_page(root, ["multi.py"], stale, 1, 1)
+    assert excinfo.value.code == "source_changed"
 
 
 def test_read_pages_and_binary_refusal(fixture):
@@ -352,7 +433,9 @@ def test_read_pages_and_binary_refusal(fixture):
 
 
 def test_diff_only_accepts_the_granted_review_pair(fixture):
-    authority = _authority(fixture, review={"base": fixture.base, "head": fixture.head})
+    authority = _authority(
+        fixture, status="review", review={"base": fixture.base, "head": fixture.head},
+    )
     args = {"operation": "diff", "base": fixture.base, "head": fixture.head}
     result = we._inspect_diff(args, authority)
     assert result["ok"] is True and result["mode"] == "commit"

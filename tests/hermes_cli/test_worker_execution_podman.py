@@ -90,8 +90,9 @@ def _inspect_for(spec: podman._Spec, *, overrides=None) -> dict:
 
 
 class _FakeEngine:
-    def __init__(self, payload: dict) -> None:
+    def __init__(self, payload: dict, run_root: Path) -> None:
         self.payload = payload
+        self.run_root = run_root
 
     def text(self, args, *, timeout=60.0):  # noqa: ANN001 - test double
         return json.dumps([self.payload])
@@ -103,17 +104,27 @@ def _container() -> podman.Container:
     return container
 
 
-def _attest(tmp_path, spec, **overrides):
+def _attest(tmp_path, spec, *, host_pid_inode: int = 1001, **overrides):
     payload = _inspect_for(spec, overrides=overrides)
-    engine = _FakeEngine(payload)
+    engine = _FakeEngine(payload, tmp_path / "run")
+    engine.run_root.mkdir(parents=True, exist_ok=True)
     container = _container()
-    podman._attest(
-        engine, container, spec, image_id=IMAGE_ID, keeper_id="d" * 64,
-        keeper_net_inode=payload["NetworkSettings"]["SandboxKey"] and os.stat(
-            f"/proc/{os.getpid()}/ns/net").st_ino,
-        worker_cgroup=podman._process_cgroup(os.getpid()) or "",
-        expect_waiting_gate=False,
+    # Real conmon pidfile contents for the fake conmon pid.
+    (engine.run_root / (spec.name + ".conmon.pid")).write_text(str(payload["State"]["ConmonPid"]))
+    real_namespace_inode = podman._namespace_inode
+    podman._namespace_inode = lambda pid, name: (
+        5000 if name == "pid" else real_namespace_inode(pid, name)
     )
+    try:
+        podman._attest(
+            engine, container, spec, image_id=IMAGE_ID, keeper_id="d" * 64,
+            keeper_net_inode=os.stat(f"/proc/{os.getpid()}/ns/net").st_ino,
+            host_pid_inode=host_pid_inode,
+            worker_cgroup=podman._process_cgroup(os.getpid()) or "",
+            expect_waiting_gate=False,
+        )
+    finally:
+        podman._namespace_inode = real_namespace_inode
     return container
 
 
@@ -121,6 +132,14 @@ def test_attest_accepts_the_constructed_boundary(tmp_path):
     spec = _spec(tmp_path)
     container = _attest(tmp_path, spec)
     assert container.pid == os.getpid()
+    assert container.pid_inode == 5000
+
+
+def test_attest_refuses_a_container_in_the_host_pid_namespace(tmp_path):
+    spec = _spec(tmp_path)
+    with pytest.raises(podman.VerificationFailure) as excinfo:
+        _attest(tmp_path, spec, host_pid_inode=5000)
+    assert excinfo.value.code == "attestation_failed"
 
 
 @pytest.mark.parametrize(
@@ -226,6 +245,8 @@ def test_cleanup_journal_requires_unchanged_root_identity(tmp_path):
     info = os.lstat(root)
     payload["run_root"] = {"path": str(root), "device": int(info.st_dev), "inode": int(info.st_ino)}
     journal.write_text(json.dumps(payload), encoding="utf-8")
+    # A real (empty) private engine store so the inventory is readable.
+    podman.Engine(root).prepare()
     ok, reason = podman.cleanup_journal(journal)
     assert ok is True and reason == "cleaned"
 
