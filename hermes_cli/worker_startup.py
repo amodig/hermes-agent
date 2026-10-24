@@ -23,7 +23,7 @@ import json
 import os
 import sqlite3
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -81,6 +81,8 @@ class WorkerGrantContext:
     preparation_id: str
     claim_lock: str
     runtime_identity: "RuntimeIdentity"
+    #: Frozen explicit execution authority, when the dispatcher granted one.
+    execution: Any = None
 
 
 _GRANT: Optional[WorkerGrantContext] = None
@@ -140,6 +142,11 @@ def _retain_worker_grant(grant: dict, actual: "RuntimeIdentity") -> None:
         claim_lock=_require_text(grant.get("claim_lock"), "claim lock"),
         runtime_identity=actual,
     )
+    section = grant.get("worker_execution")
+    if section is not None:
+        from hermes_cli.worker_execution import parse_grant_section
+
+        candidate = replace(candidate, execution=parse_grant_section(section, candidate))
     if _GRANT is not None:
         if _GRANT == candidate:
             return

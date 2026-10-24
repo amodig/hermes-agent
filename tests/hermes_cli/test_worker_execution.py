@@ -1,0 +1,478 @@
+"""Behavioral authority and inspection regressions for the granted worker capabilities.
+
+The real dispatcher/container proof lives in ``scripts/verify_worker_execution.py``; these
+tests pin the policy schema, the frozen grant, source selection/digests, Git inspection
+refusals and the final-argument boundary without needing a board or an engine.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+import subprocess
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from hermes_cli import worker_execution as we
+
+pytestmark = pytest.mark.skipif(not __import__("sys").platform.startswith("linux"), reason="Linux-only boundary")
+
+PYTHON = __import__("sys").executable
+PINNED_PY = "docker.io/library/python@sha256:" + "a" * 64
+PINNED_PG = "docker.io/library/postgres@sha256:" + "b" * 64
+
+
+def _git(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True,
+    )
+    return result.stdout.strip()
+
+
+def _policy_section(workspace: Path, image_store, *, recipes=None, inspect=True, extras=None):
+    return {
+        "protocol": 1,
+        "image_store": str(image_store) if image_store else None,
+        "workspaces": [{
+            "path": str(workspace),
+            "inspect": inspect,
+            "extra_source_paths": list(extras or []),
+            "recipes": recipes or {},
+        }],
+    }
+
+
+def _write_config(home: Path, section) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "kanban:\n  worker_execution:\n" + "".join(
+            f"    {line}\n" for line in json.dumps(section, indent=2).splitlines()
+        ),
+        encoding="utf-8",
+    )
+
+
+def _stage_plugin(home: Path, *, module: str = "# guard\n", manifest: str = 'name: cto-consequence-guard\n'):
+    plugin = home / "plugins" / "cto-consequence-guard"
+    plugin.mkdir(parents=True, exist_ok=True)
+    (plugin / "__init__.py").write_text(module, encoding="utf-8")
+    (plugin / "plugin.yaml").write_text(manifest, encoding="utf-8")
+
+
+@pytest.fixture()
+def fixture(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    for name in ("home", "config", "cache", "data", "hermes", "kanban"):
+        (tmp_path / name).mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
+    (tmp_path / "tmp").mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "fixture@example.invalid")
+    _git(repo, "config", "user.name", "Fixture")
+    (repo / "app.py").write_text("print('base')\n", encoding="utf-8")
+    (repo / "docs").mkdir()
+    (repo / "docs" / "readme.md").write_text("hello\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+    (repo / "app.py").write_text("print('changed')\n", encoding="utf-8")
+    _git(repo, "add", "app.py")
+    _git(repo, "commit", "-qm", "head")
+    head = _git(repo, "rev-parse", "HEAD")
+    (repo / "app.py").write_text("print('dirty')\n", encoding="utf-8")
+    (repo / "notes.txt").write_text("staged\n", encoding="utf-8")
+    _git(repo, "add", "notes.txt")
+    image_store = tmp_path / "images"
+    image_store.mkdir(mode=0o700)
+    (image_store / "inventory.json").write_text('{"images": {}}', encoding="utf-8")
+    return SimpleNamespace(
+        root=tmp_path, home=home, repo=repo, base=base, head=head,
+        hermes=tmp_path / "hermes", images=image_store,
+    )
+
+
+def _authority(fixture, *, recipes=None, inspect=True, extras=None, review=None, image_store=True):
+    section = _policy_section(
+        fixture.repo, fixture.images if image_store else None,
+        recipes=recipes, inspect=inspect, extras=extras,
+    )
+    _write_config(fixture.hermes, section)
+    _stage_plugin(fixture.hermes)
+    (fixture.hermes / "kanban.db").write_bytes(b"")
+    identity = SimpleNamespace(
+        generation="gen", dependency_fingerprint="dep", code_sha="sha",
+        pid=os.getpid(), start_time=0, as_dict=lambda: {"generation": "gen"},
+    )
+    grant, refusal = we.resolve_execution_grant(
+        profile_home=str(fixture.hermes), workspace=str(fixture.repo), task_id="t_fixture",
+        profile="reviewer", board="fixture", db_path=str(fixture.hermes / "kanban.db"),
+        preparation_id="prep-fixture", runtime_identity=identity,
+    )
+    assert refusal is None, refusal
+    assert grant is not None
+    section = grant.bind(7, "claim-fixture")
+    if review is not None:
+        body = dict(section)
+        body.pop("digest")
+        body["review"] = review
+        body["digest"] = we.digest_of(body)
+        section = body
+    stub = SimpleNamespace(
+        task_id="t_fixture", profile="reviewer", board="fixture", preparation_id="prep-fixture",
+        run_id=7, claim_lock="claim-fixture", workspace=str(fixture.repo),
+        db_path=str(fixture.hermes / "kanban.db"), runtime_identity=identity,
+    )
+    return we.parse_grant_section(section, stub)
+
+
+# ---- policy schema -------------------------------------------------------
+
+
+def test_policy_rejects_unknown_keys_and_bad_images(fixture):
+    base = _policy_section(fixture.repo, fixture.images)
+    bad = json.loads(json.dumps(base))
+    bad["extra"] = True
+    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
+        we.parse_policy(bad)
+    assert excinfo.value.code == "policy_malformed"
+
+    bad = json.loads(json.dumps(base))
+    bad["workspaces"][0]["recipes"] = {"r": {"image": "python:3.14", "argv": ["/bin/x"], "timeout_seconds": 1, "services": []}}
+    with pytest.raises(we.WorkerExecutionRefused):
+        we.parse_policy(bad)
+
+    policy = we.parse_policy(base)
+    assert policy.digest.startswith("sha256:")
+
+
+def test_policy_service_and_timeout_bounds(fixture):
+    recipe = {
+        "image": PINNED_PY, "argv": ["/bin/true"], "timeout_seconds": 300,
+        "services": [{"id": "db", "image": PINNED_PG, "argv": ["/bin/true"],
+                      "ready_argv": ["/bin/true"], "port": 55432}],
+    }
+    section = _policy_section(fixture.repo, fixture.images, recipes={"check": recipe})
+    assert we.parse_policy(section).recipes()["check"].services[0].port == 55432
+
+    for mutate in (
+        lambda r: r.update(timeout_seconds=0),
+        lambda r: r.update(timeout_seconds=True),
+        lambda r: r.update(timeout_seconds=3601),
+        lambda r: r["services"][0].update(port=80),
+        lambda r: r["services"][0].update(id="DB"),
+        lambda r: r["services"][0].update(argv=[]),
+        lambda r: r["services"].append(dict(r["services"][0], id="db2")),
+        lambda r: r.update(extra=True),
+        lambda r: r["services"][0].update(mount="/data"),
+    ):
+        bad = json.loads(json.dumps(section))
+        mutate(bad["workspaces"][0]["recipes"]["check"])
+        with pytest.raises(we.WorkerExecutionRefused):
+            we.parse_policy(bad)
+
+    no_store = _policy_section(fixture.repo, None, recipes={"check": recipe})
+    with pytest.raises(we.WorkerExecutionRefused):
+        we.parse_policy(no_store)
+
+
+def test_policy_extra_source_paths_are_strict(fixture):
+    for extra in ("/abs/file", "../escape", "a//b", "a/./b", "a\\b"):
+        section = _policy_section(fixture.repo, fixture.images, extras=[extra])
+        with pytest.raises(we.WorkerExecutionRefused):
+            we.parse_policy(section)
+
+
+# ---- frozen grant --------------------------------------------------------
+
+
+def test_grant_digest_and_identities_are_frozen(fixture):
+    authority = _authority(fixture)
+    assert authority.inspect is True
+    assert authority.workspace_path == str(fixture.repo)
+
+    section = _policy_section(fixture.repo, fixture.images)
+    _write_config(fixture.hermes, section)
+    identity = SimpleNamespace(generation="gen", dependency_fingerprint="dep", code_sha="sha", pid=os.getpid())
+    grant, refusal = we.resolve_execution_grant(
+        profile_home=str(fixture.hermes), workspace=str(fixture.repo), task_id="t_fixture",
+        profile="reviewer", board="fixture", db_path=str(fixture.hermes / "kanban.db"),
+        preparation_id="prep-fixture", runtime_identity=identity,
+    )
+    assert refusal is None
+    bound = grant.bind(7, "claim-fixture")
+    body = dict(bound)
+    body["inspect"] = False
+    stub = SimpleNamespace(
+        task_id="t_fixture", profile="reviewer", board="fixture", preparation_id="prep-fixture",
+        run_id=7, claim_lock="claim-fixture", workspace=str(fixture.repo),
+        db_path=str(fixture.hermes / "kanban.db"), runtime_identity=identity,
+    )
+    with pytest.raises(we.WorkerExecutionUnavailable):
+        we.parse_grant_section(body, stub)
+
+
+def test_grant_withheld_for_unmatched_workspace_and_missing_plugin(fixture):
+    section = _policy_section(fixture.root / "elsewhere", fixture.images)
+    _write_config(fixture.hermes, section)
+    _stage_plugin(fixture.hermes)
+    identity = SimpleNamespace(generation="gen", dependency_fingerprint="dep", code_sha="sha", pid=os.getpid())
+    grant, refusal = we.resolve_execution_grant(
+        profile_home=str(fixture.hermes), workspace=str(fixture.repo), task_id="t_fixture",
+        profile="reviewer", board="fixture", db_path=str(fixture.hermes / "kanban.db"),
+        preparation_id="prep-fixture", runtime_identity=identity,
+    )
+    assert grant is None and refusal == "workspace_not_granted"
+
+    _write_config(fixture.hermes, _policy_section(fixture.repo, fixture.images))
+    for path in (fixture.hermes / "plugins").rglob("*"):
+        if path.is_file():
+            path.unlink()
+    grant, refusal = we.resolve_execution_grant(
+        profile_home=str(fixture.hermes), workspace=str(fixture.repo), task_id="t_fixture",
+        profile="reviewer", board="fixture", db_path=str(fixture.hermes / "kanban.db"),
+        preparation_id="prep-fixture", runtime_identity=identity,
+    )
+    assert grant is None and refusal == "policy_plugin_unavailable"
+
+
+# ---- source inventory and inspection -------------------------------------
+
+
+def test_scan_digest_is_stable_and_content_addressed(fixture):
+    authority = _authority(fixture, extras=["notes.txt"])
+    first = we._scan_source(authority)
+    second = we._scan_source(authority)
+    assert first.source_digest == second.source_digest
+    assert first.head == fixture.head
+    assert first.branch is not None and not first.detached
+    assert {entry.path for entry in first.entries} == {"app.py", "docs/readme.md", "notes.txt"}
+
+    (fixture.repo / "app.py").write_text("print('changed again')\n", encoding="utf-8")
+    third = we._scan_source(authority)
+    assert third.source_digest != first.source_digest
+
+
+def test_reserved_tracked_path_refuses_the_whole_inventory(fixture):
+    (fixture.repo / ".env").write_text("SECRET=1\n", encoding="utf-8")
+    _git(fixture.repo, "add", ".env")
+    _git(fixture.repo, "commit", "-qm", "secret")
+    authority = _authority(fixture)
+    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
+        we._scan_source(authority)
+    assert excinfo.value.code == "reserved_source_paths"
+
+
+def test_hardlinked_and_escaping_symlink_sources_refuse(fixture):
+    os.link(fixture.repo / "app.py", fixture.repo / "copy.py")
+    _git(fixture.repo, "add", "copy.py")
+    _git(fixture.repo, "commit", "-qm", "hardlink")
+    authority = _authority(fixture)
+    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
+        we._scan_source(authority)
+    assert excinfo.value.code == "hardlinked_source"
+
+    (fixture.repo / "copy.py").unlink()
+    os.symlink("/etc/passwd", fixture.repo / "escape")
+    _git(fixture.repo, "add", "-A")
+    _git(fixture.repo, "commit", "-qm", "symlink")
+    authority = _authority(fixture)
+    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
+        we._scan_source(authority)
+    assert excinfo.value.code == "unsafe_symlink"
+
+
+def test_deleted_tracked_paths_are_recorded(fixture):
+    (fixture.repo / "gone.py").write_text("x = 1\n", encoding="utf-8")
+    _git(fixture.repo, "add", "gone.py")
+    _git(fixture.repo, "commit", "-qm", "gone")
+    (fixture.repo / "gone.py").unlink()
+    authority = _authority(fixture)
+    snapshot = we._scan_source(authority)
+    entry = snapshot.entry("gone.py")
+    assert entry is not None and entry.kind == "deleted"
+
+
+def test_non_repository_is_explicitly_unavailable(fixture):
+    plain = fixture.root / "plain"
+    plain.mkdir()
+    section = _policy_section(plain, fixture.images)
+    _write_config(fixture.hermes, section)
+    _stage_plugin(fixture.hermes)
+    (fixture.hermes / "kanban.db").write_bytes(b"")
+    identity = SimpleNamespace(generation="gen", dependency_fingerprint="dep", code_sha="sha", pid=os.getpid())
+    grant, refusal = we.resolve_execution_grant(
+        profile_home=str(fixture.hermes), workspace=str(plain), task_id="t_fixture",
+        profile="reviewer", board="fixture", db_path=str(fixture.hermes / "kanban.db"),
+        preparation_id="prep-fixture", runtime_identity=identity,
+    )
+    assert refusal is None and grant is not None
+    stub = SimpleNamespace(
+        task_id="t_fixture", profile="reviewer", board="fixture", preparation_id="prep-fixture",
+        run_id=7, claim_lock="claim-fixture", workspace=str(plain),
+        db_path=str(fixture.hermes / "kanban.db"), runtime_identity=identity,
+    )
+    authority = we.parse_grant_section(grant.bind(7, "claim-fixture"), stub)
+    assert authority.git is None
+    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
+        we._scan_source(authority)
+    assert excinfo.value.code == "workspace_not_a_repository"
+
+
+def test_read_pages_and_binary_refusal(fixture):
+    authority = _authority(fixture)
+    snapshot = we._scan_source(authority)
+    entry = snapshot.entry("app.py")
+    assert entry is not None
+    with we.SafeRoot(authority.workspace_path) as root:
+        text, next_line = we._read_file_page(root, ["app.py"], entry, 1, 1)
+    assert text == "print('dirty')\n"
+    assert next_line is None
+
+    (fixture.repo / "blob.bin").write_bytes(b"\x00\x01\x02")
+    _git(fixture.repo, "add", "blob.bin")
+    _git(fixture.repo, "commit", "-qm", "blob")
+    authority = _authority(fixture)
+    snapshot = we._scan_source(authority)
+    blob = snapshot.entry("blob.bin")
+    with we.SafeRoot(authority.workspace_path) as root:
+        with pytest.raises(we.WorkerExecutionRefused) as excinfo:
+            we._read_file_page(root, ["blob.bin"], blob, 1, 10)
+    assert excinfo.value.code == "binary_content"
+
+
+def test_diff_only_accepts_the_granted_review_pair(fixture):
+    authority = _authority(fixture, review={"base": fixture.base, "head": fixture.head})
+    args = {"operation": "diff", "base": fixture.base, "head": fixture.head}
+    result = we._inspect_diff(args, authority)
+    assert result["ok"] is True and result["mode"] == "commit"
+    assert "changed" in result["patch"]
+    assert result["diff_digest"].startswith("sha256:")
+
+    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
+        we._inspect_diff({"operation": "diff", "base": fixture.head, "head": fixture.base}, authority)
+    assert excinfo.value.code == "diff_not_granted"
+
+    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
+        we._inspect_diff({"operation": "diff", "mode": "working"}, authority)
+    assert excinfo.value.code == "diff_not_granted"
+
+    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
+        we._inspect_diff(dict(args, expected_diff_digest="sha256:" + "c" * 64), authority)
+    assert excinfo.value.code == "source_changed"
+
+
+def test_working_diff_requires_implementation_claim(fixture):
+    authority = _authority(fixture)
+    result = we._inspect_diff({"operation": "diff", "mode": "working"}, authority)
+    assert "dirty" in result["patch"]
+    staged = we._inspect_diff({"operation": "diff", "mode": "staged"}, authority)
+    assert "notes.txt" in staged["patch"]
+    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
+        we._inspect_diff({"operation": "diff", "base": fixture.base, "head": fixture.head}, authority)
+    assert excinfo.value.code == "diff_not_granted"
+
+
+def test_diff_refuses_reserved_paths_and_option_injection(fixture):
+    authority = _authority(fixture)
+    with pytest.raises(we.WorkerExecutionRefused):
+        we._validate_inspect_args({"operation": "diff", "base": "--output=/tmp/x", "head": fixture.head})
+    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
+        we._inspect_diff({"operation": "diff", "mode": "working", "path": ".env"}, authority)
+    assert excinfo.value.code == "reserved_source_paths"
+
+
+def test_inspect_argument_origin_is_enforced(fixture):
+    result = we.worker_inspect({"operation": "summary"}, original_args={"operation": "read"})
+    assert json.loads(result)["error"] == "arguments_changed"
+    result = we.worker_inspect({"operation": "summary"}, original_args=None)
+    assert json.loads(result)["error"] in {"worker_execution_unavailable", "worker_execution_failed"}
+
+
+# ---- registry reservation ------------------------------------------------
+
+
+def test_reserved_native_tools_cannot_be_replaced_or_removed():
+    from tools import registry as registry_module
+
+    registry_module.discover_builtin_tools()
+    registry = registry_module.registry
+    assert registry.get_entry("kanban_worker_inspect") is not None
+    assert registry.get_entry("kanban_worker_verify") is not None
+
+    def _lookalike(args, **kwargs):
+        return json.dumps({"ok": True})
+
+    with pytest.raises(PermissionError):
+        registry.register(
+            name="kanban_worker_inspect", toolset="kanban",
+            schema={"name": "kanban_worker_inspect", "parameters": {"type": "object"}},
+            handler=_lookalike, override=True,
+        )
+    with pytest.raises(PermissionError):
+        registry.deregister("kanban_worker_inspect")
+    with pytest.raises(PermissionError):
+        registry.register(
+            name="kanban_worker_verify", toolset="kanban",
+            schema={"name": "kanban_worker_verify", "parameters": {"type": "object"}},
+            handler=_lookalike, scope="/tmp/scope",
+        )
+
+
+# ---- hook ownership ------------------------------------------------------
+
+
+def test_required_hook_requires_the_owned_callback_bytes(tmp_path, monkeypatch):
+    from hermes_cli import plugins as plugins_module
+    from hermes_cli import plugins_dispatch
+
+    module = tmp_path / "guard.py"
+    module.write_text("def _on_pre_worker_execution(**kwargs):\n    return None\n", encoding="utf-8")
+    manifest = tmp_path / "plugin.yaml"
+    manifest.write_text("name: cto-consequence-guard\n", encoding="utf-8")
+    spec = __import__("importlib.util", fromlist=["spec_from_file_location"]).spec_from_file_location(
+        "guard_fixture_module", module,
+    )
+    loaded = __import__("importlib.util", fromlist=["module_from_spec"]).module_from_spec(spec)
+    __import__("sys").modules["guard_fixture_module"] = loaded
+    spec.loader.exec_module(loaded)
+
+    class _Manager(plugins_dispatch.PluginDispatchMixin):
+        def __init__(self):
+            self._hooks = {"pre_worker_execution": [loaded._on_pre_worker_execution]}
+            self._hook_failures_reported = set()
+            self._hook_timeout_lock = __import__("threading").RLock()
+            self._hook_timeout_suppressed_until = {}
+            self._hook_running_callbacks = set()
+            self._hook_abandoned = {}
+
+    manager = _Manager()
+    plugins_module.REQUIRED_HOOK_CALLBACK_OWNERS[loaded._on_pre_worker_execution] = "cto-consequence-guard"
+    try:
+        import hashlib
+
+        owner = {
+            "id": "cto-consequence-guard",
+            "module_sha256": hashlib.sha256(module.read_bytes()).hexdigest(),
+            "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+        }
+        callback, reason = manager.required_hook_callback("pre_worker_execution", owner)
+        assert callback is loaded._on_pre_worker_execution, reason
+        tampered = dict(owner, module_sha256="0" * 64)
+        callback, reason = manager.required_hook_callback("pre_worker_execution", tampered)
+        assert callback is None and reason
+        renamed = dict(owner, id="other-plugin")
+        callback, reason = manager.required_hook_callback("pre_worker_execution", renamed)
+        assert callback is None and reason
+    finally:
+        plugins_module.REQUIRED_HOOK_CALLBACK_OWNERS.pop(loaded._on_pre_worker_execution, None)

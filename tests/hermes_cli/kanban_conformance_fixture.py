@@ -39,7 +39,10 @@ def _make_runtime_fixture(root: Path) -> None:
     package = root / "hermes_cli"
     package.mkdir(parents=True)
     for name in ("kanban_runtime.py", "kanban_runtime_generation.py",
-                 "plugin_isolation.py", "worker_startup.py"):
+                 "plugin_isolation.py", "worker_startup.py",
+                 # The granted execution modules ride with the startup module: the
+                 # dispatcher grant retention imports the parsing helpers there.
+                 "worker_execution.py", "worker_execution_podman.py"):
         shutil.copy2(RUNTIME_ROOT / "hermes_cli" / name, package / name)
     (package / "__init__.py").write_text('__version__ = "fixture"\n', encoding="utf-8")
     # Synthetic profiles use JSON configs; plugin isolation still reads the

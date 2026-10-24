@@ -2558,7 +2558,8 @@ def switch_model(
 
 
 def _pre_tool_block_message(agent, function_name, function_args, effective_task_id, tool_call_id, middleware_trace):
-    """Plugin pre-tool-call hook verdict: ``(block_message, function_args)``; failures never block."""
+    """Plugin pre-tool-call hook verdict: ``(block_message, function_args)``; failures never
+    block, except for the runtime-owned worker-execution tools, which fail closed."""
     try:
         from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
         block_message, modified_args = _dispatch_pre_tool_call_hooks(
@@ -2570,6 +2571,10 @@ def _pre_tool_block_message(agent, function_name, function_args, effective_task_
         )
         return block_message, (modified_args if modified_args is not None else function_args)
     except Exception:
+        from model_tools import WORKER_EXECUTION_TOOLS
+
+        if function_name in WORKER_EXECUTION_TOOLS:
+            return "worker-execution-unavailable: pre_tool_call authorization failed", function_args
         return None, function_args
 
 
@@ -2578,14 +2583,18 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                  pre_tool_block_checked: bool = False,
                  skip_tool_request_middleware: bool = False,
                  tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
-                 skip_tool_execution_middleware: bool = False) -> str:
+                 skip_tool_execution_middleware: bool = False,
+                 original_args: Optional[Dict[str, Any]] = None) -> str:
     """Invoke a single tool (agent-level or registry-dispatched) and return the result string;
     no display logic. Used by the concurrent path; the sequential path keeps its own inline
-    invocation for display."""
+    invocation for display. ``original_args`` is the model-facing request snapshot the
+    runtime-owned worker-execution handlers compare against their final arguments."""
     from agent.inline_tool_executors import (
         InlineToolContext, apply_transform_tool_result, emit_terminal_post_tool_call,
         resolve_invoke_tool_executor, tool_hook_ids
     )
+    if not isinstance(original_args, dict):
+        original_args = None
     if not isinstance(function_args, dict):
         function_args = {}
     hook_ids = tool_hook_ids(agent, effective_task_id, tool_call_id)
@@ -2644,6 +2653,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
             )
+            if original_args is not None:
+                dispatch_kwargs["original_args"] = original_args
             if skip_tool_execution_middleware:
                 dispatch_kwargs["skip_tool_execution_middleware"] = True
             import model_tools

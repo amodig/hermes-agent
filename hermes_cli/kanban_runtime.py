@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 from pathlib import Path
 import queue
@@ -20,6 +21,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Mapping, Optional
 import uuid
 
+logger = logging.getLogger("hermes_cli.kanban_runtime")
 
 RUNTIME_IDENTITY_PROTOCOL = 1
 _BOOTSTRAP_TIMEOUT_SECONDS = 10.0
@@ -593,8 +595,13 @@ def _retain_worker_startup_grant(grant: Mapping[str, Any], actual: RuntimeIdenti
     """
     from hermes_cli.worker_startup import WorkerStartupUnavailable, _retain_worker_grant
 
-    with contextlib.suppress(WorkerStartupUnavailable):
+    try:
         _retain_worker_grant(dict(grant), actual)
+    except WorkerStartupUnavailable as exc:
+        # Additive metadata: a mismatch removes the tools (fail closed) instead of
+        # failing a worker that already owns its run. Leave a bounded trace so an
+        # operator can see why the capability disappeared.
+        logger.warning("kanban worker startup/execution grant withheld: %s", exc)
 
 
 def _finish_worker_bootstrap_grant(
@@ -635,15 +642,19 @@ def _publish_granted_worker_tools(agent: Any) -> None:
     """
     if agent is None:
         return
-    with contextlib.suppress(Exception):
+    try:
         from hermes_cli.worker_startup import worker_startup_available
 
         if not worker_startup_available():
+            logger.warning("kanban worker grant publication skipped: capability reports unavailable")
             return
         from tools.mcp_tool_agent import refresh_agent_mcp_tools, reprobe_tool_availability
 
         reprobe_tool_availability()
-        refresh_agent_mcp_tools(agent, quiet_mode=True, preserve_prefix=True)
+        added = refresh_agent_mcp_tools(agent, quiet_mode=True, preserve_prefix=True)
+        logger.debug("kanban worker grant publication added tools: %s", sorted(added or ()))
+    except Exception as exc:  # never fail a worker that already owns its run
+        logger.warning("kanban worker grant publication failed: %s", exc)
 
 
 def worker_bootstrap_after_constructor(agent: Any = None) -> None:

@@ -277,6 +277,8 @@ class _ToolCallRef:
     task_id: str
     call_id: str
     trace: list
+    #: Deep JSON snapshot of the model's original arguments (runtime-owned tools only).
+    original_args: Optional[dict] = None
 
     def middleware_kwargs(self) -> dict[str, Any]:
         """Keyword form ``_run_agent_tool_execution_middleware`` (and tests patching it) expect."""
@@ -666,7 +668,8 @@ def _blocked_tool_result(agent, ref: _ToolCallRef, *, block_body: dict[str, Any]
 
 def _pre_tool_block(agent, ref: _ToolCallRef):
     """Run ``pre_tool_call`` plugin hooks; returns ``(block_message, final_args)`` with any
-    hook-modified args applied. Hook failures never block."""
+    hook-modified args applied. Hook failures never block — except for the runtime-owned
+    worker-execution tools, where an undecided guard must refuse rather than run."""
     try:
         from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
 
@@ -678,6 +681,10 @@ def _pre_tool_block(agent, ref: _ToolCallRef):
         )
         return block_msg, (ref.args if modified_args is None else modified_args)
     except Exception:
+        from model_tools import WORKER_EXECUTION_TOOLS
+
+        if ref.name in WORKER_EXECUTION_TOOLS:
+            return "worker-execution-unavailable: pre_tool_call authorization failed", ref.args
         return None, ref.args
 
 
@@ -772,6 +779,9 @@ def _run_agent_tool_execution_middleware(
     )
 
     trace = middleware_trace if middleware_trace is not None else []
+    from model_tools import worker_original_args_snapshot
+
+    original_args = worker_original_args_snapshot(function_name, function_args)
     state = _ManagedToolResult(result=None, args=function_args, middleware_trace=trace, blocked=False, dispatched=False)
     dispatch_lock = threading.Lock()
 
@@ -785,7 +795,10 @@ def _run_agent_tool_execution_middleware(
         return _dispatch_authorized_once(
             agent,
             state,
-            _ToolCallRef(function_name, final_args, effective_task_id, tool_call_id, trace),
+            _ToolCallRef(
+                function_name, final_args, effective_task_id, tool_call_id, trace,
+                original_args=original_args,
+            ),
             execute=execute,
             scope_block=scope_block,
             display_index=display_index,
@@ -908,7 +921,12 @@ def _run_sequential_tool_execution_middleware(
     are ``_NEVER_PARALLEL_TOOLS`` and run inline below, before any deadline is armed, so
     they need no ``_SEQUENTIAL_DEADLINE_EXEMPT_TOOLS`` entry."""
     timeout_s = None if function_name in _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS else _resolve_sequential_tool_timeout()
-    ref = _ToolCallRef(function_name, function_args, effective_task_id, tool_call_id, middleware_trace)
+    from model_tools import worker_original_args_snapshot
+
+    ref = _ToolCallRef(
+        function_name, function_args, effective_task_id, tool_call_id, middleware_trace,
+        original_args=worker_original_args_snapshot(function_name, function_args),
+    )
     kwargs = dict(ref.middleware_kwargs(), execute=execute, scope_block=scope_block, display_index=display_index)
     from agent.terminal_approval_batch import take_prepared_call
     prepared = take_prepared_call(tool_call_id)
@@ -1331,6 +1349,7 @@ class _ConcurrentBatch:
                     skip_tool_request_middleware=True,
                     skip_tool_execution_middleware=True,
                     tool_request_middleware_trace=list(ref.trace),
+                    original_args=ref.original_args,
                 ),
                 scope_block=scope_block,
                 display_index=index + 1,
@@ -1697,6 +1716,7 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
                 tool_request_middleware_trace=list(middleware_trace),
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                original_args=ref.original_args,
             )
 
     return _SequentialDispatch(

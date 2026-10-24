@@ -32,6 +32,9 @@ _HERMES_CORE_TOOLS = [
     "kanban_request_changes",
     "kanban_heartbeat",
     "kanban_worker_startup",  # read-only authenticated startup metadata for this worker
+    # Granted source/Git inspection and disposable verification: visible only after the
+    # dispatcher retains execution authority, and authorized again inside each handler.
+    "kanban_worker_inspect", "kanban_worker_verify",
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
     "kanban_update",  # orchestrator CAS revision: direct, not tool-search-only (#41)
