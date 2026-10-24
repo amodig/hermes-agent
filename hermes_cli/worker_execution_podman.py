@@ -159,6 +159,25 @@ def _process_state(pid: int) -> Optional[str]:
     return None
 
 
+def _process_identity(pid: Any, start: Any) -> str:
+    """``match``, ``gone`` or ``unknown`` for one recorded process identity."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return "gone"
+    if isinstance(start, bool) or not isinstance(start, int):
+        return "unknown"
+    if not Path(f"/proc/{pid}").exists():
+        return "gone"
+    observed = _process_start_time(pid)
+    if observed is None:
+        return "unknown"
+    if observed != start:
+        return "gone"
+    state = _process_state(pid)
+    if state is None:
+        return "unknown"
+    return "gone" if state in {"Z", "X", "x"} else "match"
+
+
 def _process_running(pid: Any, start: Any) -> bool:
     """True only for a live (non-zombie) process whose start time matches *start*.
 
@@ -166,21 +185,8 @@ def _process_running(pid: Any, start: Any) -> bool:
     it; a zombie executes nothing, holds no namespace and must not fail teardown. An
     unreadable process entry is NOT evidence of absence: it counts as running.
     """
-    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-        return False
-    if isinstance(start, bool) or not isinstance(start, int):
-        return True
-    if not Path(f"/proc/{pid}").exists():
-        return False
-    observed = _process_start_time(pid)
-    if observed is None:
-        return True  # exists but unreadable: fail closed, never "gone"
-    if observed != start:
-        return False
-    state = _process_state(pid)
-    if state is None:
-        return True
-    return state not in {"Z", "X", "x"}
+    identity = _process_identity(pid, start)
+    return identity != "gone"  # an unreadable identity counts as alive
 
 
 def _process_cgroup(pid: int) -> Optional[str]:
@@ -424,7 +430,15 @@ class ImageStore:
         return {"archive": self.path / archive, "tag": tag, "image_id": image_id, "sha256": digest}
 
 
-def _load_images(engine: Engine, store: ImageStore, references: list[str]) -> dict[str, dict[str, Any]]:
+def _load_images(
+    engine: Engine,
+    store: ImageStore,
+    references: list[str],
+    *,
+    deadline: Optional[float] = None,
+    claim_check: Optional[Callable[[], None]] = None,
+    space_check: Optional[Callable[[], int]] = None,
+) -> dict[str, dict[str, Any]]:
     loaded: dict[str, dict[str, Any]] = {}
     for reference in references:
         if reference in loaded:
@@ -441,7 +455,17 @@ def _load_images(engine: Engine, store: ImageStore, references: list[str]) -> di
             raise VerificationFailure("image_archive_changed", "image archive bytes do not match the inventory")
         loaded[reference] = entry
     for reference, entry in loaded.items():
-        result = engine.run(["load", "-i", str(entry["archive"])], timeout=600.0)
+        if claim_check is not None:
+            claim_check()
+        if space_check is not None:
+            space_check()
+        timeout = 600.0
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise VerificationFailure("deadline_exhausted", "the verification deadline elapsed while loading images")
+            timeout = max(1.0, min(timeout, remaining))
+        result = engine.run(["load", "-i", str(entry["archive"])], timeout=timeout)
         if result.returncode != 0:
             raise VerificationFailure(
                 "image_load_failed", _bounded(result.stderr.decode("utf-8", "replace")) or "image load failed",
@@ -865,6 +889,7 @@ def _wait_ready(
     deadline: float,
     claim_check: Optional[Callable[[], None]],
     startup_deadline: float,
+    space_check: Optional[Callable[[], int]] = None,
 ) -> None:
     pending = list(services)
     while pending:
@@ -873,6 +898,8 @@ def _wait_ready(
             raise VerificationFailure("readiness_timeout", "declared services did not become ready")
         if claim_check is not None:
             claim_check()
+        if space_check is not None:
+            space_check()
         still: list[tuple[Mapping[str, Any], Container]] = []
         for service, container in pending:
             argv = [str(item) for item in service.get("ready_argv") or ()]
@@ -988,12 +1015,6 @@ def run_verification(
         raise VerificationFailure("isolation_unavailable", "the worker cgroup is unreadable")
     engine = Engine(run_root)
     engine.worker_cgroup = worker_cgroup
-    engine.prepare()
-    _verify_local_rootless(engine)
-    if _free_bytes(run_root) < ADMISSION_FREE_BYTES:
-        raise VerificationFailure("insufficient_disk", "verification requires at least 1 GiB free")
-    limits = _inherited_limits(worker_cgroup)
-    host_pid_inode = _namespace_inode(os.getpid(), "pid")
     images: dict[str, dict[str, Any]] = {}
 
     journal: dict[str, Any] = {
@@ -1027,20 +1048,31 @@ def run_verification(
         "truncated": False,
     }
     keeper_id: Optional[str] = None
+    limits: dict[str, int] = {}
+    host_pid_inode: Optional[int] = None
     try:
         # Everything that can allocate is inside the journal's protection: a failure
         # here still reaches the cleanup path, and the reaper can finish the job if
         # this process dies first.
+        engine.prepare()
+        _verify_local_rootless(engine)
+        if _free_bytes(run_root) < ADMISSION_FREE_BYTES:
+            raise VerificationFailure("insufficient_disk", "verification requires at least 1 GiB free")
+        limits = _inherited_limits(worker_cgroup)
+        host_pid_inode = _namespace_inode(os.getpid(), "pid")
         store = ImageStore(authority)
         services = list(recipe.get("services") or ())
         references = [KEEPER_IMAGE, str(recipe.get("image"))] + [str(service.get("image")) for service in services]
-        images = _load_images(engine, store, references)
+        claim_check = _claim_check(grant)
+        images = _load_images(
+            engine, store, references, deadline=deadline, claim_check=claim_check,
+            space_check=lambda: _require_space(run_root),
+        )
         _require_space(run_root)
         keeper = Container("keeper", "keeper", KEEPER_IMAGE, images[KEEPER_IMAGE]["tag"])
         identity = _write_synthetic_identity(run_root)
         workspace = _stage_workspace(run_root, Path(source_dir))
         keeper_scratch = _make_scratch(run_root, "keeper")
-        claim_check = _claim_check(grant)
         keeper_seconds = _deadline_seconds(deadline) + int(CLEANUP_GRACE_SECONDS) + 30
         keeper_spec = _Spec(
             name="keeper", kind="keeper", image_reference=KEEPER_IMAGE,
@@ -1152,6 +1184,7 @@ def run_verification(
         _wait_ready(
             engine, service_containers, deadline=deadline, claim_check=claim_check,
             startup_deadline=min(deadline, time.monotonic() + STARTUP_DEADLINE_SECONDS),
+            space_check=lambda: _require_space(run_root),
         )
         claim_check()
         _require_space(run_root)
@@ -1267,7 +1300,7 @@ def _wait_exit(
 def _cleanup(engine: Engine, containers: list[Container]) -> tuple[bool, list[str]]:
     ok = True
     reasons: list[str] = []
-    listed = engine.run(["ps", "-a", "--format", "{{.ID}}"], timeout=30.0)
+    listed = engine.run(["ps", "-a", "--no-trunc", "--format", "{{.ID}}"], timeout=30.0)
     if listed.returncode != 0:
         # An unreadable inventory is not an empty one: never claim cleanup on it.
         ok = False
@@ -1291,7 +1324,7 @@ def _cleanup(engine: Engine, containers: list[Container]) -> tuple[bool, list[st
             reasons.append(f"kill_failed:{container.name}")
         if container.conmon_pid:
             _terminate_recorded(container.conmon_pid, container.conmon_start)
-    listed = engine.run(["ps", "-a", "--format", "{{.ID}}"], timeout=30.0)
+    listed = engine.run(["ps", "-a", "--no-trunc", "--format", "{{.ID}}"], timeout=30.0)
     if listed.returncode != 0:
         ok = False
         reasons.append("listing_failed_after_rm")
@@ -1354,8 +1387,12 @@ def _terminate_recorded(pid: Any, start: Any) -> bool:
         return True
     if isinstance(start, bool) or not isinstance(start, int):
         return False
-    if not _process_running(pid, start):
+    identity = _process_identity(pid, start)
+    if identity == "gone":
         return True
+    if identity != "match":
+        # Never signal a process whose identity is not proven.
+        return False
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -1444,52 +1481,64 @@ def cleanup_journal(journal_path: Path, *, home: Optional[Path] = None) -> tuple
         return True, "already_cleaned"
     engine = Engine(root)
     ok = True
-    listed = engine.run(["ps", "-a", "--format", "{{.ID}}"], timeout=60.0)
+    listed = engine.run(["ps", "-a", "--no-trunc", "--format", "{{.ID}}"], timeout=60.0)
     if listed.returncode != 0:
         return False, "listing_failed"
     present = {
         line.strip().lower() for line in listed.stdout.decode("utf-8", "replace").splitlines() if line.strip()
     }
-    for record in payload.get("containers") or []:
+    failures: list[str] = []
+    # Children share the keeper's network namespace: remove them first.
+    for record in reversed(payload.get("containers") or []):
         container_id = str(record.get("id") or "")
         if not _CONTAINER_ID_RE.match(container_id):
             ok = False
+            failures.append(f"invalid_id:{record.get('name')}")
             continue
         if container_id.lower() not in present:
             continue  # already gone (engine deadline or an earlier pass)
         result = engine.run(["rm", "-f", "-t", "2", container_id], timeout=60.0)
         if result.returncode != 0:
             ok = False
+            failures.append(f"rm:{record.get('name')}")
+    worker_cgroup = str(payload.get("worker_cgroup") or "")
     for record in payload.get("containers") or []:
-        pid = record.get("pid")
-        start = record.get("pid_start")
-        if not _terminate_recorded(pid, start):
+        if not _terminate_recorded(record.get("pid"), record.get("pid_start")):
             ok = False
+            failures.append(f"unverified_pid:{record.get('name')}")
         if not _terminate_recorded(record.get("conmon_pid"), record.get("conmon_start")):
             ok = False
-        if _process_running(pid, start):
-            ok = False
-        conmon = record.get("conmon_pid")
-        conmon_start = record.get("conmon_start")
-        if _process_running(conmon, conmon_start):
-            ok = False
-        inode = record.get("net_inode")
-        if isinstance(inode, int) and _namespace_inodes_in_use(
-            inode, worker_cgroup=str(payload.get("worker_cgroup") or ""),
-        ):
-            ok = False
-        pid_inode = record.get("pid_inode")
-        if isinstance(pid_inode, int) and _namespace_inodes_in_use(
-            pid_inode, name="pid", worker_cgroup=str(payload.get("worker_cgroup") or ""),
-        ):
-            ok = False
+            failures.append(f"unverified_conmon:{record.get('name')}")
+    # Kernel teardown is asynchronous: wait out the recorded processes and namespace
+    # references before judging, exactly like the in-process cleanup path.
+    grace_deadline = time.monotonic() + CLEANUP_GRACE_SECONDS
+    while True:
+        reasons: list[str] = []
+        for record in payload.get("containers") or []:
+            if _process_running(record.get("pid"), record.get("pid_start")):
+                reasons.append(f"pid:{record.get('name')}")
+            if _process_running(record.get("conmon_pid"), record.get("conmon_start")):
+                reasons.append(f"conmon:{record.get('name')}")
+            inode = record.get("net_inode")
+            if isinstance(inode, int) and _namespace_inodes_in_use(inode, worker_cgroup=worker_cgroup):
+                reasons.append(f"netns:{record.get('name')}")
+            pid_inode = record.get("pid_inode")
+            if isinstance(pid_inode, int) and _namespace_inodes_in_use(
+                pid_inode, name="pid", worker_cgroup=worker_cgroup,
+            ):
+                reasons.append(f"pidns:{record.get('name')}")
+        if not reasons:
+            break
+        if time.monotonic() >= grace_deadline:
+            return False, "leftover_processes:" + ",".join(sorted(set(reasons)))
+        time.sleep(0.2)
     if ok:
         if not remove_tree(root):
             return False, "store_not_removed"
         with contextlib.suppress(OSError):
             journal_path.unlink()
         return True, "cleaned"
-    return False, "leftover_processes"
+    return False, "leftover_processes:" + ",".join(sorted(set(failures)))
 
 
 def reap_journals(journal_dir: Path, *, max_journals: int = MAX_REAP_JOURNALS) -> list[dict[str, Any]]:

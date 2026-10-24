@@ -374,6 +374,66 @@ def test_nested_relative_symlink_resolves_against_its_parent(fixture):
     assert excinfo.value.code == "unsafe_symlink"
 
 
+def test_validation_card_resolves_review_role(fixture):
+    from hermes_cli import kanban_db as kb
+
+    db_path = fixture.hermes / "kanban.db"
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.executescript(kb.SCHEMA_SQL)
+        kb._ensure_lifecycle_schema(connection)
+        implementation = kb.create_task(
+            connection, title="candidate", assignee="implementer",
+            workspace_kind="dir", workspace_path=str(fixture.repo),
+            lifecycle_contract={
+                "kind": "code", "review_mode": "same_card", "reviewer": "reviewer",
+                "validation_required": True,
+            },
+        )
+        validation = kb.create_task(
+            connection, title="validate", assignee="validator",
+            lifecycle_contract={"kind": "validation", "candidate_task_id": implementation},
+        )
+        connection.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (validation,))
+        connection.execute(
+            "INSERT INTO task_runs (task_id, profile, status, outcome, metadata, started_at) "
+            "VALUES (?, 'implementer', 'done', 'completed', ?, 1)",
+            (implementation, json.dumps({"base_sha": fixture.base, "head_sha": fixture.head})),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    role, pair = we.resolve_review_context(str(db_path), validation)
+    assert role == "review"
+    assert pair == {"base": fixture.base, "head": fixture.head}
+
+
+def test_symlink_cycle_is_refused(fixture):
+    os.symlink("b.py", fixture.repo / "a.py")
+    os.symlink("a.py", fixture.repo / "b.py")
+    _git(fixture.repo, "add", "a.py", "b.py")
+    _git(fixture.repo, "commit", "-qm", "cycle")
+    authority = _authority(fixture)
+    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
+        we._scan_source(authority)
+    assert excinfo.value.code == "unsafe_symlink"
+
+
+def test_symlink_digest_binds_the_exact_link_text(fixture):
+    os.symlink("app.py", fixture.repo / "alias")
+    _git(fixture.repo, "add", "alias")
+    _git(fixture.repo, "commit", "-qm", "alias")
+    authority = _authority(fixture)
+    first = we._scan_source(authority).entry("alias")
+    assert first is not None and first.digest.startswith("sha256:")
+    # Same destination, different text: the copied workspace differs, so the digest must.
+    (fixture.repo / "alias").unlink()
+    os.symlink("./app.py", fixture.repo / "alias")
+    second = we._scan_source(authority).entry("alias")
+    assert second is not None and second.digest != first.digest
+
+
 def test_tracked_symlink_replaced_by_file_is_hashed_not_omitted(fixture):
     os.symlink("app.py", fixture.repo / "alias")
     _git(fixture.repo, "add", "alias")

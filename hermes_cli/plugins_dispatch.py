@@ -707,6 +707,8 @@ def dispatch_required_worker_execution(
             if verdict is None:
                 continue
             if isinstance(verdict, Mapping) and verdict.get("action") in {"allow", "pass"}:
+                if "modify" in verdict or "args" in verdict:
+                    return False, "a policy callback may not modify arguments"
                 continue
             return False, "another policy callback refused this invocation"
     except (Exception, SystemExit) as exc:

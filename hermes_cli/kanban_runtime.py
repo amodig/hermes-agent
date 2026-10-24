@@ -400,9 +400,18 @@ def assert_runtime_import_root(
         raise RuntimeIdentityError("runtime code changed during startup")
     generation = os.environ.get("HERMES_KANBAN_RUNTIME_GENERATION")
     if generation:
-        from hermes_cli.kanban_runtime_generation import generation_manifest, _is_stdlib
+        from hermes_cli.kanban_runtime_generation import (
+            _MANIFEST,
+            _is_stdlib,
+            _validate_published_generation,
+        )
         generation_root = Path(generation).resolve()
-        sealed = RuntimeIdentity.from_value(generation_manifest(generation, verify=True)["identity"])
+        # Verify the sealed payload through the cached publication check: the digest
+        # work is identical, but re-hashing a multi-gigabyte generation on every
+        # authorization would make each granted tool call cost tens of seconds.
+        manifest_json = (generation_root / _MANIFEST).read_text(encoding="utf-8-sig")
+        _validate_published_generation(generation_root, manifest_json)
+        sealed = RuntimeIdentity.from_value(json.loads(manifest_json)["identity"])
         if not same_code_identity(sealed, observed):
             raise RuntimeIdentityError("runtime generation identity mismatch")
         for module in tuple(sys.modules.values()):

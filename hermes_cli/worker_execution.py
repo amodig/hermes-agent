@@ -561,29 +561,35 @@ def resolve_review_context(db_path: str, task_id: str) -> tuple[str, Optional[di
         if row is None:
             return "unknown", None
         status = str(row["status"] or "")
-        if status != "review":
-            return "implementation", None
         raw = row["lifecycle_contract"]
-        contract = {}
+        contract: dict[str, Any] = {}
         if raw:
             try:
                 contract = json.loads(raw) if isinstance(raw, str) else dict(raw)
             except (TypeError, ValueError):
-                return "review", None
+                return ("review" if status == "review" else "unknown"), None
         if not isinstance(contract, Mapping):
-            return "review", None
-        if contract.get("kind") in ("review", "validation"):
+            return ("review" if status == "review" else "unknown"), None
+        kind = contract.get("kind")
+        # A typed role card (review or validation, which dispatches through the ready
+        # lane) is a review claim; a same-card review keeps `kind: code` and is
+        # recognized by its review status.
+        if kind in ("review", "validation"):
+            role = "review"
             candidate_id = contract.get("candidate_task_id")
-        else:
+        elif status == "review":
+            role = "review"
             candidate_id = task_id
+        else:
+            return "implementation", None
         if not isinstance(candidate_id, str) or not candidate_id:
-            return "review", None
+            return role, None
         handoff = kanban_db.latest_handoff(connection, candidate_id)
         base = str(handoff.get("base_sha") or "").strip()
         head = str(handoff.get("head_sha") or "").strip()
         if not _OBJECT_ID_RE.match(base) or not _OBJECT_ID_RE.match(head):
-            return "review", None
-        return "review", {"base": base, "head": head}
+            return role, None
+        return role, {"base": base, "head": head}
     except Exception:
         return "unknown", None
     finally:
@@ -1105,6 +1111,7 @@ def _reauthorize_live_claim(grant: Any) -> None:
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 
 class SafeRoot:
@@ -1136,6 +1143,10 @@ class SafeRoot:
             for index, part in enumerate(parts):
                 last = index == len(parts) - 1
                 flags = os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC
+                if last and not final_dir:
+                    # A non-regular entry (FIFO/device) must fail on fstat, never block
+                    # the open itself.
+                    flags |= _O_NONBLOCK
                 if not last or final_dir:
                     flags |= _O_DIRECTORY
                 next_fd = os.open(part, flags, dir_fd=fd)
@@ -1269,7 +1280,7 @@ class SyntheticGit:
         different file.
         """
         try:
-            fd = os.open(source, os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC)
+            fd = os.open(source, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC)
         except FileNotFoundError:
             return False
         except OSError as exc:
@@ -1366,7 +1377,7 @@ class SyntheticGit:
             info = os.lstat(source)
             if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
                 _refuse("git_metadata_unsafe", "Git config is not a bounded regular file")
-            fd = os.open(source, os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC)
+            fd = os.open(source, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC)
         except OSError as exc:
             _refuse("git_metadata_unsafe", _bounded(exc))
         try:
@@ -1557,6 +1568,7 @@ def _scan_source(
                 continue
             accepted[name] = "file"
         entries: list[SourceEntry] = []
+        link_targets: dict[str, tuple[str, str]] = {}
         total_bytes = 0
         if len(accepted) > MAX_INVENTORY_ENTRIES:
             raise WorkerExecutionRefused("source_too_large", "the granted source set exceeds the entry bound")
@@ -1587,7 +1599,10 @@ def _scan_source(
                         raise WorkerExecutionRefused("unsafe_symlink", "the granted source set contains an unaccepted symlink target")
                     if normalized == name:
                         raise WorkerExecutionRefused("unsafe_symlink", "the granted source set contains a symlink cycle")
-                    digest = "sha256:" + sha256_hex(normalized.encode("utf-8", "surrogateescape"))
+                    # The digest binds the exact link text that is copied; normalization
+                    # is only for containment and graph validation.
+                    digest = "sha256:" + sha256_hex(target.encode("utf-8", "surrogateescape"))
+                    link_targets[name] = (target, normalized)
                     entries.append(SourceEntry(name, "link", False, len(target), digest))
                     if materialize is not None:
                         target_path = materialize / name
@@ -1636,6 +1651,7 @@ def _scan_source(
                 if materialize is not None:
                     with contextlib.suppress(OSError):
                         os.chmod(materialize / name, 0o755 if executable else 0o644)
+        _validate_link_graph(link_targets, accepted)
         digests = sorted(entry.digest_line() for entry in entries)
         source_digest = "sha256:" + sha256_hex(b"".join(digests) + b"HEAD\x00" + head.encode("ascii"))
         return SourceSnapshot(
@@ -1649,6 +1665,26 @@ def _scan_source(
         )
     finally:
         git.close()
+
+
+def _validate_link_graph(
+    link_targets: Mapping[str, tuple[str, str]], accepted: Mapping[str, str],
+) -> None:
+    """Every accepted link chain must terminate in an accepted non-link entry."""
+    for name in sorted(link_targets):
+        seen = {name}
+        current = link_targets[name][1]
+        for _ in range(64):
+            if current not in accepted:
+                raise WorkerExecutionRefused("unsafe_symlink", "the granted source set contains an unaccepted symlink target")
+            if current not in link_targets:
+                break
+            if current in seen:
+                raise WorkerExecutionRefused("unsafe_symlink", "the granted source set contains a symlink cycle")
+            seen.add(current)
+            current = link_targets[current][1]
+        else:
+            raise WorkerExecutionRefused("unsafe_symlink", "the granted source set contains a symlink chain")
 
 
 def _porcelain_status(authority: ExecutionAuthority) -> list[dict[str, str]]:
@@ -2089,8 +2125,12 @@ def _inspect_diff(args: Mapping[str, Any], authority: ExecutionAuthority) -> dic
         # The inventory and HEAD identity must be stable across the two Git passes.
         _diff_text(git, scope, path, patch_path)
         after = _scan_source(authority)
-        if after.source_digest != snapshot.source_digest or after.head.lower() != snapshot.head.lower():
-            raise WorkerExecutionRefused("source_changed", "source changed during diff rendering")
+        if (
+            after.source_digest != snapshot.source_digest
+            or after.head.lower() != snapshot.head.lower()
+            or after.index_digest != snapshot.index_digest
+        ):
+            raise WorkerExecutionRefused("source_changed", "source or index changed during diff rendering")
         data = patch_path.read_bytes()
     finally:
         shutil.rmtree(patch_path.parent, ignore_errors=True)

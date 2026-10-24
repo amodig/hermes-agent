@@ -735,21 +735,56 @@ def _launch(
                     f"last_tool={state.last_tool_content}; journals={[str(p) for p in journals]}; "
                     f"logs={_log_tail(root)}"
                 )
-            # Prove the detached child is live before the worker dies.
-            payload_pids = [
-                record.get("pid") for record in stall_journal.get("containers") or []
-                if record.get("kind") == "verifier" and record.get("pid")
-            ]
-            if not payload_pids:
+            # Prove the payload and its detached child are live before the worker dies.
+            verifier = next(
+                (record for record in stall_journal.get("containers") or []
+                 if record.get("kind") == "verifier" and record.get("pid")),
+                None,
+            )
+            if verifier is None:
                 fail(f"the stall journal has no verifier process: {stall_journal}")
-            if "sleep 600" not in _proc_cmdline(int(payload_pids[0])):
+            init_pid = int(verifier["pid"])
+            init_start = int(verifier.get("pid_start") or 0)
+            if "sleep 600" not in _proc_cmdline(init_pid):
                 fail("the stall payload did not start before the worker was killed")
+            others = [
+                (pid, start) for pid, start in _descendant_pids(verifier.get("pid_inode"))
+                if pid != init_pid
+            ]
+            if not others:
+                fail("the stall payload has no detached child to observe")
+            descendants = others
             receipt["stall_journal"] = stall_journal
-            receipt["payload_pids"] = payload_pids
+            receipt["payload_pids"] = [init_pid, *[pid for pid, _ in others]]
             if worker_pid:
                 with __import__("contextlib").suppress(ProcessLookupError):
                     os.kill(worker_pid, signal.SIGKILL)
             receipt["worker_killed"] = True
+
+            # Observe payload teardown WITHOUT invoking any reaper first: this is
+            # conmon's deadline killing the container and its detached children.
+            from hermes_cli.worker_execution_podman import _process_identity
+
+            deadline_epoch = float(stall_journal.get("deadline_epoch") or 0)
+            watch_deadline = time.monotonic() + max(60.0, deadline_epoch - time.time() + 60.0)
+            expired_at = 0.0
+            while time.monotonic() < watch_deadline:
+                alive = _process_identity(init_pid, init_start) != "gone"
+                alive = alive or any(
+                    _process_identity(pid, start) != "gone" for pid, start in descendants
+                )
+                if not alive:
+                    expired_at = time.time()
+                    break
+                time.sleep(0.2)
+            if not expired_at:
+                fail("the stall payload or its detached child survived the conmon deadline")
+            receipt["payload_expired_epoch"] = expired_at
+            if expired_at < deadline_epoch - 2.0:
+                fail(
+                    "the payload expired before the recorded conmon deadline: "
+                    f"expired={expired_at} deadline={deadline_epoch}"
+                )
             cleaned, cleanup_results, cleaned_at = _await_cleanup(
                 journal_roots, deadline=time.monotonic() + 300,
             )
@@ -870,6 +905,43 @@ def _journal_payload(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _descendant_pids(pid_inode: Any) -> list[tuple[int, int]]:
+    """Processes of this UID inside one recorded PID namespace (excluding its init)."""
+    if not isinstance(pid_inode, int):
+        return []
+    found: list[tuple[int, int]] = []
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            info = os.stat(f"/proc/{pid}")
+        except OSError:
+            continue
+        if int(info.st_uid) != os.getuid():
+            continue
+        try:
+            observed = int(os.stat(f"/proc/{pid}/ns/pid").st_ino)
+        except OSError:
+            continue
+        if observed != pid_inode:
+            continue
+        start = _proc_start_time(pid)
+        if start is not None:
+            found.append((pid, start))
+    return found
+
+
+def _proc_start_time(pid: int) -> int | None:
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="strict")
+    except OSError:
+        return None
+    with __import__("contextlib").suppress(IndexError, ValueError):
+        return int(text.rsplit(")", 1)[1].split()[19])
+    return None
+
+
 def _proc_cmdline(pid: int) -> str:
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
@@ -960,7 +1032,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
     finally:
         _cancel_worker()
-        _remove_tree(root)
+        if os.environ.get("HERMES_ISSUE76_KEEP") == "1":
+            print(f"worker execution fixture kept: {root}", flush=True)
+        else:
+            _remove_tree(root)
     if args.receipt:
         print(f"worker execution receipt: {args.receipt}", flush=True)
     print("worker execution surface: ok")
