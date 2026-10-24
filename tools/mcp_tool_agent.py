@@ -117,6 +117,13 @@ def refresh_agent_mcp_tools(
     # OLDER set must not clobber a newer one); definitions computed OUTSIDE the lock.
     snapshot_generation = registry._generation
     new_defs = list(get_tool_definitions(enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=quiet_mode) or [])
+    # A finite one-shot session pruned tools at build time; this rebuild also feeds the
+    # session pin and later compaction refreshes, so re-apply the same restriction here
+    # (identity for every interactive/gateway session) rather than letting a rebuild
+    # restore a tool the session deliberately does not offer.
+    from agent.oneshot_footprint import prune_oneshot_tools
+
+    new_defs = prune_oneshot_tools(new_defs)
     new_names = {_def_name(t) for t in new_defs}
     # Post-build families re-appended on LOCALS only; live attributes untouched until publish.
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)

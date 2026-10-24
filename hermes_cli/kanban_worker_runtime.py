@@ -1127,6 +1127,38 @@ def _worker_project_plugins_enabled(env: dict[str, str]) -> bool:
     return is_truthy_value(values.get("HERMES_ENABLE_PROJECT_PLUGINS"))
 
 
+def _worker_startup_context(
+    task_id: str,
+    profile: str,
+    board: str,
+    workspace: str,
+    db_path: str,
+) -> Optional[dict[str, str]]:
+    """Startup metadata to ship with the FINAL grant, or None when it is not exact.
+
+    Authority for the worker's ``kanban_worker_startup`` tool is this grant, so it
+    may only be sent when every value is already resolved exactly: the selected
+    task, normalized profile, resolved board, an absolute existing workspace and
+    the pinned board path the child environment also uses. Values come from the
+    dispatcher's own resolution, never from tool arguments or the child's later
+    environment.
+    """
+    values = {
+        "task_id": task_id,
+        "profile": profile,
+        "board": board,
+        "workspace": workspace,
+        "db_path": db_path,
+    }
+    if not all(isinstance(value, str) and value.strip() for value in values.values()):
+        return None
+    if not (os.path.isabs(workspace) and os.path.isdir(workspace)):
+        return None
+    if not (os.path.isabs(db_path) and os.path.isfile(db_path)):
+        return None
+    return {name: value.strip() for name, value in values.items()}
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -1421,11 +1453,18 @@ def _default_spawn(
         else:
             os.set_blocking(grant_fd, False)
         # Encode the potentially large identity before entering the grant lock.
-        grant_prefix = (json.dumps({
+        startup_context = _worker_startup_context(
+            task.id, profile_arg, env.get("HERMES_KANBAN_BOARD", ""), workspace,
+            env.get("HERMES_KANBAN_DB", ""),
+        )
+        grant_payload = {
             "grant": True,
             "preparation_id": preparation_id,
             "runtime_identity": actual.as_dict(),
-        }, sort_keys=True)[:-1] + ", ").encode("utf-8")
+        }
+        if startup_context is not None:
+            grant_payload["worker_context"] = startup_context
+        grant_prefix = (json.dumps(grant_payload, sort_keys=True)[:-1] + ", ").encode("utf-8")
         def _grant(run_id: int, claim_lock: Optional[str]) -> None:
             if proc is None or proc.stdin is None:
                 raise RuntimeError("worker bootstrap pipe unavailable")

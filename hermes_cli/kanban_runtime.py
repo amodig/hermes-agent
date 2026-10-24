@@ -535,6 +535,7 @@ def worker_bootstrap_from_env() -> Optional[dict[str, Any]]:
             or not same_runtime_identity(message.get("runtime_identity", {}), actual)
         ):
             raise RuntimeIdentityError("worker bootstrap grant mismatch")
+        _retain_worker_startup_grant(message, actual)
         if message.get("run_id") is not None:
             os.environ["HERMES_KANBAN_RUN_ID"] = str(message["run_id"])
         if message.get("claim_lock"):
@@ -581,6 +582,21 @@ def worker_bootstrap_post_import(*, wait_for_grant: bool = True) -> Optional[dic
         _finish_worker_bootstrap_grant(expected, preparation_id, actual)
     return payload
 
+def _retain_worker_startup_grant(grant: Mapping[str, Any], actual: RuntimeIdentity) -> None:
+    """Keep this worker's optional startup-metadata authority.
+
+    The identity/claim checks around each call site are the grant's authorization;
+    this only retains the dispatcher-supplied ``worker_context`` that
+    ``kanban_worker_startup`` reports. It is additive metadata, so a missing or
+    mismatched context removes that tool (fail closed) instead of failing a worker
+    that is already authorized and about to receive its run.
+    """
+    from hermes_cli.worker_startup import WorkerStartupUnavailable, _retain_worker_grant
+
+    with contextlib.suppress(WorkerStartupUnavailable):
+        _retain_worker_grant(dict(grant), actual)
+
+
 def _finish_worker_bootstrap_grant(
     expected: RuntimeIdentity,
     preparation_id: str,
@@ -595,6 +611,7 @@ def _finish_worker_bootstrap_grant(
         or not same_runtime_identity(final, actual)
     ):
         raise RuntimeIdentityError("worker bootstrap grant mismatch")
+    _retain_worker_startup_grant(grant, actual)
     if grant.get("run_id") is not None:
         os.environ["HERMES_KANBAN_RUN_ID"] = str(grant["run_id"])
     if grant.get("claim_lock"):
@@ -606,7 +623,30 @@ def _finish_worker_bootstrap_grant(
         os.environ.pop(key, None)
 
 
-def worker_bootstrap_after_constructor() -> None:
+def _publish_granted_worker_tools(agent: Any) -> None:
+    """Re-derive the model-facing tool snapshot once the final grant is retained.
+
+    ``agent_init`` builds ``agent.tools`` BEFORE this handshake, and
+    ``kanban_worker_startup`` is authorized by the grant itself rather than by the
+    environment, so the grant must republish the snapshot or a worker could hold
+    authority the model never sees. Existing tools keep their slots
+    (``preserve_prefix``); any failure here can only hide the tool, never widen
+    authority, so it must not fail a worker that already owns its run.
+    """
+    if agent is None:
+        return
+    with contextlib.suppress(Exception):
+        from hermes_cli.worker_startup import worker_startup_available
+
+        if not worker_startup_available():
+            return
+        from tools.mcp_tool_agent import refresh_agent_mcp_tools, reprobe_tool_availability
+
+        reprobe_tool_availability()
+        refresh_agent_mcp_tools(agent, quiet_mode=True, preserve_prefix=True)
+
+
+def worker_bootstrap_after_constructor(agent: Any = None) -> None:
     """Grant Kanban access only after the worker agent constructor completes."""
     path_raw = os.environ.get("HERMES_KANBAN_BOOTSTRAP_PATH", "").strip()
     if not path_raw:
@@ -618,6 +658,7 @@ def worker_bootstrap_after_constructor() -> None:
     expected = decode_identity(expected_raw)
     actual = assert_runtime_import_root(expected=expected)
     _finish_worker_bootstrap_grant(expected, preparation_id, actual)
+    _publish_granted_worker_tools(agent)
 
 def runtime_identity_json(module_root: Optional[os.PathLike[str] | str] = None) -> str:
     return encode_identity(runtime_identity(module_root))

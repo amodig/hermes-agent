@@ -107,7 +107,8 @@ def installation(tmp_path, monkeypatch, runtime_storage):
     plugins = tmp_path / "home" / "plugins"
     external = tmp_path / "external"
     native_probe = tmp_path / "native_probe.py"
-    for name in ("kanban_runtime.py", "kanban_runtime_generation.py", "plugin_isolation.py"):
+    for name in ("kanban_runtime.py", "kanban_runtime_generation.py",
+                 "plugin_isolation.py", "worker_startup.py"):
         destination = source / "hermes_cli" / name
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(REPOSITORY / "hermes_cli" / name, destination)

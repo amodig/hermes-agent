@@ -2525,6 +2525,8 @@ def init_agent(
 
     if os.environ.get("HERMES_KANBAN_BOOTSTRAP_PATH"):
         from hermes_cli.kanban_runtime import worker_bootstrap_after_constructor
-        worker_bootstrap_after_constructor()
+        # Passing the agent lets a retained startup grant republish the tool snapshot
+        # built above; a worker must not hold authority the model cannot see.
+        worker_bootstrap_after_constructor(agent=agent)
 
 __all__ = ["init_agent"]
