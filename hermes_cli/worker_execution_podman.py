@@ -341,6 +341,8 @@ class Engine:
         invocation deadline and the caller's supervision callback (claim ownership,
         free space) are polled, so a slow load cannot outlive its authority.
         """
+        if supervise is not None:
+            supervise()
         try:
             process = subprocess.Popen(  # noqa: S603 -- fixed executable and constructed argv
                 [*self.prefix, *args], cwd=str(self.run_root), env=self.env(),
@@ -384,6 +386,10 @@ class Engine:
                             process.kill()
                             process.wait(timeout=5)
                         raise
+        # A command that finished inside the poll interval still must not carry work
+        # past cancellation: re-check supervision before returning it.
+        if supervise is not None:
+            supervise()
         result = subprocess.CompletedProcess(
             [*self.prefix, *args], process.returncode, stdout, stderr,
         )
@@ -1236,11 +1242,11 @@ def run_verification(
             container.log_path = spec.log_path
             journal["containers"].append(container.record())
             _journal_write(journal_path, journal)
-            _start(engine, container, deadline=deadline, supervise=supervise)
-            _attest_expiry(container, spec, deadline)
+            containers.append(container)
             service_containers.append((service, container))
             service_specs.append((service, container, spec))
-            containers.append(container)
+            _start(engine, container, deadline=deadline, supervise=supervise)
+            _attest_expiry(container, spec, deadline)
 
         verifier = Container("verifier", "verifier", str(recipe["image"]), images[str(recipe["image"])]["tag"])
         verifier_scratch = _make_scratch(run_root, "verifier")
@@ -1260,9 +1266,9 @@ def run_verification(
         verifier.log_path = verifier_spec.log_path
         journal["containers"].append(verifier.record())
         _journal_write(journal_path, journal)
+        containers.append(verifier)
         _start(engine, verifier, deadline=deadline, supervise=supervise)
         _attest_expiry(verifier, verifier_spec, deadline)
-        containers.append(verifier)
 
         journal["phase"] = "started"
         _journal_write(journal_path, journal)
@@ -1289,6 +1295,7 @@ def run_verification(
         # Services must run before readiness can succeed; the verifier stays gated
         # until every declared service has answered its readiness check.
         for index, (_service, _container) in enumerate(service_containers):
+            supervise()
             _release(run_root / f"scratch-service-{index}" / "release")
         journal["phase"] = "services-released"
         _journal_write(journal_path, journal)
@@ -1296,8 +1303,7 @@ def run_verification(
             engine, service_containers, deadline=deadline, claim_check=supervise,
             startup_deadline=min(deadline, time.monotonic() + STARTUP_DEADLINE_SECONDS),
         )
-        claim_check()
-        _require_space(run_root)
+        supervise()
         journal["phase"] = "released"
         _journal_write(journal_path, journal)
         _release(verifier_scratch / "release")

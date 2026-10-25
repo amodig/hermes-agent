@@ -1031,8 +1031,8 @@ def main(argv: list[str] | None = None) -> int:
     receipts: dict[str, Any] = {}
     directory = tempfile.mkdtemp(prefix="worker-execution-smoke-")
     root = Path(directory)
+    cases = ["main", "death"] if args.case == "all" else [args.case]
     try:
-        cases = ["main", "death"] if args.case == "all" else [args.case]
         for case in cases:
             try:
                 receipts[case] = _run_case(
@@ -1050,7 +1050,21 @@ def main(argv: list[str] | None = None) -> int:
                 )
     finally:
         _cancel_worker()
-        if os.environ.get("HERMES_ISSUE76_KEEP") == "1":
+        # Reconcile every fixture-owned execution journal before deleting the fixture
+        # home: a failed (for example never-started) payload must not lose the only
+        # metadata that reclaims its private engine store.
+        reconciled = True
+        for case_root in (root / case for case in cases):
+            ok, _records, _epoch = _await_cleanup(
+                _journal_roots(case_root), deadline=time.monotonic() + 120.0,
+            )
+            if not ok:
+                reconciled = False
+                remaining = [str(path) for path in _journal_files(_journal_roots(case_root))]
+                print(f"worker execution journals unreconciled: {remaining}", flush=True)
+        if not reconciled:
+            print(f"worker execution fixture preserved with its journals: {root}", flush=True)
+        elif os.environ.get("HERMES_ISSUE76_KEEP") == "1":
             print(f"worker execution fixture kept: {root}", flush=True)
         else:
             _remove_tree(root)
