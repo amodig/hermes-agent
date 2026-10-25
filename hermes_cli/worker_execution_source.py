@@ -170,6 +170,16 @@ def _split_relative(path: str, label: str = "path") -> list[str]:
     return parts
 
 
+def _validate_source_name(name: str) -> None:
+    """A repository-controlled path must stay a plain relative POSIX path."""
+    parts = name.split("/")
+    if (
+        not name or "\\" in name or "\x00" in name or name.startswith("/")
+        or any(part in ("", ".", "..") for part in parts)
+    ):
+        _refuse("git_unsupported", "the repository names an unsafe source path")
+
+
 def _reserved(parts: list[str]) -> bool:
     if not parts:
         return False
@@ -226,8 +236,12 @@ class SyntheticGit:
         self.common_dir = Path(str(git["common_dir"]))
         self.root = Path(tempfile.mkdtemp(prefix="synthetic-git-", dir=_scratch_dir()))
         self.path = self.root / "git"
-        self.path.mkdir(mode=0o700)
-        self._write_metadata()
+        try:
+            self.path.mkdir(mode=0o700)
+            self._write_metadata()
+        except BaseException:
+            shutil.rmtree(self.root, ignore_errors=True)
+            raise
 
     def _scratch_dir(self) -> Path:
         return self.root
@@ -471,6 +485,7 @@ def _git_tracked(git: SyntheticGit) -> dict[str, tuple[str, str]]:
             _refuse("git_unsupported", "Git index contains a non-UTF-8 path")
         if len(fields) != 3:
             _refuse("git_unsupported", "Git index entry is malformed")
+        _validate_source_name(name)
         tracked[name] = (fields[0], fields[1])
     return tracked
 
@@ -892,6 +907,7 @@ def _diff_preflight(git: SyntheticGit, scope: list[str], path: Optional[str]) ->
             name = path_bytes.decode("utf-8", "strict")
         except UnicodeDecodeError:
             _refuse("not_utf8", "the diff names a non-UTF-8 path")
+        _validate_source_name(name)
         if _reserved(name.split("/")):
             _refuse("reserved_source_paths", "the diff touches a reserved path")
         letter = status_code[:1]

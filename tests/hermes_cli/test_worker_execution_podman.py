@@ -251,6 +251,38 @@ def test_cleanup_journal_requires_unchanged_root_identity(tmp_path):
     assert ok is True and reason == "cleaned"
 
 
+def test_absent_run_root_keeps_a_journal_while_recorded_process_lives(tmp_path):
+    journal = tmp_path / "journal.json"
+    journal.write_text(json.dumps({
+        "protocol": podman.JOURNAL_PROTOCOL, "collection": "x", "phase": "started",
+        "host_epoch": podman._host_epoch(),
+        "run_root_path": str(tmp_path / "missing"), "run_root": {"device": 1, "inode": 2},
+        "containers": [{
+            "name": "verifier", "pid": os.getpid(),
+            "pid_start": podman._process_start_time(os.getpid()),
+        }],
+    }), encoding="utf-8")
+    ok, reason = podman.cleanup_journal(journal)
+    assert ok is False and reason == "root_absent_processes_alive"
+    assert journal.exists()
+
+
+def test_stale_boot_never_reuses_recorded_process_identity(tmp_path):
+    journal = tmp_path / "journal.json"
+    journal.write_text(json.dumps({
+        "protocol": podman.JOURNAL_PROTOCOL, "collection": "x", "phase": "started",
+        "host_epoch": "a-previous-boot",
+        "run_root_path": str(tmp_path / "missing"), "run_root": {"device": 1, "inode": 2},
+        "containers": [{
+            "name": "verifier", "pid": os.getpid(),
+            "pid_start": podman._process_start_time(os.getpid()),
+        }],
+    }), encoding="utf-8")
+    ok, reason = podman.cleanup_journal(journal)
+    assert ok is True and reason == "absent"
+    assert not journal.exists()
+
+
 def test_reap_skips_live_owner_and_unelapsed_deadlines(tmp_path):
     journal_dir = tmp_path / "journals"
     journal_dir.mkdir()

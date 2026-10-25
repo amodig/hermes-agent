@@ -472,6 +472,15 @@ def test_read_reports_next_line_and_matches_the_digest(fixture):
     assert excinfo.value.code == "source_changed"
 
 
+def test_repository_paths_must_stay_relative_and_component_clean():
+    """A crafted index or diff cannot name an escaping path."""
+    for name in ("../outside.txt", "/etc/passwd", "a//b", "a/./b", "a/../b", "a\\b", ""):
+        with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+            wes._validate_source_name(name)
+        assert excinfo.value.code == "git_unsupported"
+    wes._validate_source_name("src/app.py")
+
+
 def test_read_pages_and_binary_refusal(fixture):
     authority = _authority(fixture)
     snapshot = wes._scan_source(authority)

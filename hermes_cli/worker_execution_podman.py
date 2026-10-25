@@ -1656,10 +1656,18 @@ def cleanup_journal(journal_path: Path, *, home: Optional[Path] = None) -> tuple
         return False, "journal_unreadable"
     root = Path(str(payload.get("run_root_path") or ""))
     record = payload.get("run_root") or {}
+    stale_boot = payload.get("host_epoch") != _host_epoch()
     try:
         info = os.lstat(root)
     except FileNotFoundError:
-        # Positively absent: nothing can still be running from this root.
+        # The store is gone, but recorded processes may still run (start times are
+        # boot-relative, so a prior boot proves nothing survives).
+        if not stale_boot:
+            for record in payload.get("containers") or []:
+                if _process_identity(record.get("pid"), record.get("pid_start")) == "match":
+                    return False, "root_absent_processes_alive"
+                if _process_identity(record.get("conmon_pid"), record.get("conmon_start")) == "match":
+                    return False, "root_absent_processes_alive"
         with contextlib.suppress(OSError):
             journal_path.unlink()
         return True, "absent"
@@ -1719,19 +1727,22 @@ def cleanup_journal(journal_path: Path, *, home: Optional[Path] = None) -> tuple
             ok = False
             failures.append(f"rm:{record.get('name')}")
     worker_cgroup = str(payload.get("worker_cgroup") or "")
-    for record in payload.get("containers") or []:
-        if not _terminate_recorded(record.get("pid"), record.get("pid_start")):
-            ok = False
-            failures.append(f"unverified_pid:{record.get('name')}")
-        if not _terminate_recorded(record.get("conmon_pid"), record.get("conmon_start")):
-            ok = False
-            failures.append(f"unverified_conmon:{record.get('name')}")
+    if not stale_boot:
+        for record in payload.get("containers") or []:
+            if not _terminate_recorded(record.get("pid"), record.get("pid_start")):
+                ok = False
+                failures.append(f"unverified_pid:{record.get('name')}")
+            if not _terminate_recorded(record.get("conmon_pid"), record.get("conmon_start")):
+                ok = False
+                failures.append(f"unverified_conmon:{record.get('name')}")
     # Kernel teardown is asynchronous: wait out the recorded processes and namespace
     # references before judging, exactly like the in-process cleanup path.
     grace_deadline = time.monotonic() + CLEANUP_GRACE_SECONDS
     while True:
         reasons: list[str] = []
         for record in payload.get("containers") or []:
+            if stale_boot:
+                continue
             if _process_running(record.get("pid"), record.get("pid_start")):
                 reasons.append(f"pid:{record.get('name')}")
             if _process_running(record.get("conmon_pid"), record.get("conmon_start")):
