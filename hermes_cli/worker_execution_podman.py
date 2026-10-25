@@ -307,7 +307,8 @@ class Engine:
         ]
 
     def env(self) -> dict[str, str]:
-        runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"  # windows-footgun: ok — rootless Podman is POSIX-only
+        uid = os.getuid() if hasattr(os, "getuid") else -1  # windows-footgun: ok — hasattr-guarded; rootless Podman is POSIX-only
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{uid}"
         return {
             "PATH": "/usr/local/bin:/usr/bin:/bin",
             "HOME": str(self.home),
@@ -838,7 +839,7 @@ def _attest(
         raise VerificationFailure("attestation_failed", "conmon process identity is unreadable")
     container.conmon_path = engine.run_root / (spec.name + ".conmon.pid")
     try:
-        recorded = int(container.conmon_path.read_text(encoding="utf-8-sig").strip())
+        recorded = int(container.conmon_path.read_bytes().decode("utf-8").strip())
     except (OSError, ValueError):
         raise VerificationFailure("attestation_failed", "conmon pidfile is missing or malformed")
     if recorded != container.conmon_pid:
@@ -1075,7 +1076,7 @@ def _cgroup_limit(cgroup: str, name: str) -> Optional[int]:
     while True:
         path = Path("/sys/fs/cgroup") / ("/".join(parts) if parts else "") / name
         try:
-            text = path.read_text(encoding="utf-8-sig").strip()
+            text = path.read_bytes().decode("utf-8").strip()
         except OSError:
             text = ""
         if text and text != "max":
@@ -1426,7 +1427,7 @@ def run_verification(
 def _recover_cid(engine: Engine, spec: _Spec) -> Optional[str]:
     """The exact id Podman wrote for a create that was interrupted or ambiguous."""
     try:
-        text = (engine.run_root / (spec.name + ".cid")).read_text(encoding="utf-8-sig").strip()
+        text = (engine.run_root / (spec.name + ".cid")).read_bytes().decode("utf-8").strip()
     except OSError:
         return None
     return text.lower() if _CONTAINER_ID_RE.match(text) else None
@@ -1589,7 +1590,7 @@ def _terminate_recorded(pid: Any, start: Any) -> bool:
         # Never signal a process whose identity is not proven.
         return False
     try:
-        os.kill(pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only teardown
+        os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
     except ProcessLookupError:
         return True
     except OSError:
@@ -1618,7 +1619,7 @@ def _namespace_inodes_in_use(inode: int, *, name: str = "net", worker_cgroup: st
             info = os.stat(f"/proc/{pid}")
         except OSError:
             continue
-        if int(info.st_uid) != os.getuid():  # windows-footgun: ok — POSIX-only /proc scan
+        if int(info.st_uid) != (os.getuid() if hasattr(os, "getuid") else -1):  # windows-footgun: ok — hasattr-guarded; POSIX-only /proc scan
             continue
         try:
             observed = int(os.stat(f"/proc/{pid}/ns/{name}").st_ino)
@@ -1690,7 +1691,7 @@ def cleanup_journal(journal_path: Path, *, home: Optional[Path] = None) -> tuple
     recovered: list[tuple[str, str]] = []
     for name in [str(item) for item in payload.get("creates") or []]:
         try:
-            candidate = (root / f"{name}.cid").read_text(encoding="utf-8-sig").strip().lower()
+            candidate = (root / f"{name}.cid").read_bytes().decode("utf-8").strip().lower()
         except OSError:
             candidate = ""
         if _CONTAINER_ID_RE.match(candidate) and candidate not in recorded:

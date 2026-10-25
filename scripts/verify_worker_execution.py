@@ -154,7 +154,7 @@ def _cancel_worker() -> None:
     if not pid:
         return
     try:
-        os.kill(int(pid), signal.SIGKILL)  # windows-footgun: ok — POSIX-only teardown
+        os.kill(int(pid), getattr(signal, "SIGKILL", signal.SIGTERM))
     except (ProcessLookupError, PermissionError, ValueError):
         return
     try:
@@ -215,7 +215,8 @@ def _enter_autonomous_scope() -> None:
         ]
         environment = dict(os.environ)
         environment[_SCOPE_MARKER] = "1"
-        runtime_dir = environment.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"  # windows-footgun: ok — POSIX-only scope setup
+        uid = os.getuid() if hasattr(os, "getuid") else -1  # windows-footgun: ok — hasattr-guarded; scope setup is Linux-only
+        runtime_dir = environment.get("XDG_RUNTIME_DIR") or f"/run/user/{uid}"
         environment["XDG_RUNTIME_DIR"] = runtime_dir
         environment.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={runtime_dir}/bus")
         try:
@@ -289,7 +290,7 @@ def _validate_images(store: Path) -> None:
     inventory_path = store / "inventory.json"
     if not inventory_path.is_file():
         fail("image store is not prepared; run with --prepare-images first")
-    inventory = json.loads(inventory_path.read_text(encoding="utf-8-sig"))
+    inventory = json.loads(inventory_path.read_bytes())
     images = inventory.get("images") if isinstance(inventory, dict) else None
     if not isinstance(images, dict):
         fail("image store inventory is malformed")
@@ -308,7 +309,7 @@ def prepare_images(store: Path) -> dict[str, Any]:
     os.chmod(store, 0o700)
     inventory_path = store / "inventory.json"
     if inventory_path.is_file():
-        existing = json.loads(inventory_path.read_text(encoding="utf-8-sig"))
+        existing = json.loads(inventory_path.read_bytes())
         images = existing.get("images") or {}
         if all(reference in images for reference in IMAGE_TAGS):
             verified = True
@@ -776,7 +777,7 @@ def _launch(
             receipt["payload_pids"] = [init_pid, *[pid for pid, _ in others]]
             if worker_pid:
                 with __import__("contextlib").suppress(ProcessLookupError):
-                    os.kill(worker_pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only teardown
+                    os.kill(worker_pid, getattr(signal, "SIGKILL", signal.SIGTERM))
             receipt["worker_killed"] = True
 
             # Observe payload teardown WITHOUT invoking any reaper first: this is
@@ -853,7 +854,7 @@ def _launch(
             f"a granted call was refused: {state.failure}; steps={state.steps}; "
             f"last_tool={state.last_tool_content}; logs={_log_tail(root)}"
         )
-    if outside.read_text(encoding="utf-8-sig") != "untouched\n":
+    if outside.read_bytes() != b"untouched\n":
         fail("an outside sentinel was modified")
     if receipt["tree_before"] != receipt["tree_after"]:
         fail("the granted workspace changed during verification")
@@ -917,7 +918,7 @@ def _tree_digest(root: Path) -> str:
 
 def _journal_payload(path: Path) -> dict[str, Any] | None:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        payload = json.loads(path.read_bytes())
     except (OSError, ValueError):
         return None
     return payload if isinstance(payload, dict) else None
@@ -936,7 +937,7 @@ def _descendant_pids(pid_inode: Any) -> list[tuple[int, int]]:
             info = os.stat(f"/proc/{pid}")
         except OSError:
             continue
-        if int(info.st_uid) != os.getuid():  # windows-footgun: ok — POSIX-only process scan
+        if int(info.st_uid) != (os.getuid() if hasattr(os, "getuid") else -1):  # windows-footgun: ok — hasattr-guarded; POSIX-only process scan
             continue
         try:
             observed = int(os.stat(f"/proc/{pid}/ns/pid").st_ino)
