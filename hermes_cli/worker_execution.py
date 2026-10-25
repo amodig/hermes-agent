@@ -1491,7 +1491,7 @@ class SyntheticGit:
 
 
 def _scratch_dir() -> str:
-    base = os.environ.get("TMPDIR") or "/tmp"
+    base = os.environ.get("TMPDIR") or tempfile.gettempdir()
     parent = Path(base) / "hermes-worker-inspect"
     parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     return str(parent)
