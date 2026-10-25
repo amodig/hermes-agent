@@ -523,7 +523,7 @@ def _policy_plugin_digests(profile_home: Optional[str]) -> Optional[dict[str, An
         try:
             if directory.is_symlink() or not manifest.is_file() or not module.is_file():
                 continue
-            text = manifest.read_bytes().decode("utf-8")
+            text = manifest.read_bytes().decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
         except OSError:
             return None
         if not re.search(r"^name:\s*" + re.escape(POLICY_PLUGIN_ID) + r"\s*$", text, re.MULTILINE):

@@ -290,7 +290,7 @@ def _validate_images(store: Path) -> None:
     inventory_path = store / "inventory.json"
     if not inventory_path.is_file():
         fail("image store is not prepared; run with --prepare-images first")
-    inventory = json.loads(inventory_path.read_bytes())
+    inventory = json.loads(inventory_path.read_bytes().decode("utf-8"))
     images = inventory.get("images") if isinstance(inventory, dict) else None
     if not isinstance(images, dict):
         fail("image store inventory is malformed")
@@ -309,7 +309,7 @@ def prepare_images(store: Path) -> dict[str, Any]:
     os.chmod(store, 0o700)
     inventory_path = store / "inventory.json"
     if inventory_path.is_file():
-        existing = json.loads(inventory_path.read_bytes())
+        existing = json.loads(inventory_path.read_bytes().decode("utf-8"))
         images = existing.get("images") or {}
         if all(reference in images for reference in IMAGE_TAGS):
             verified = True
@@ -918,7 +918,7 @@ def _tree_digest(root: Path) -> str:
 
 def _journal_payload(path: Path) -> dict[str, Any] | None:
     try:
-        payload = json.loads(path.read_bytes())
+        payload = json.loads(path.read_bytes().decode("utf-8"))
     except (OSError, ValueError):
         return None
     return payload if isinstance(payload, dict) else None
