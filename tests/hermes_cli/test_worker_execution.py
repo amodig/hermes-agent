@@ -481,22 +481,29 @@ def test_repository_paths_must_stay_relative_and_component_clean():
     wes._validate_source_name("src/app.py")
 
 
-def test_image_store_rejects_a_symlinked_ancestor(tmp_path):
-    workspace = tmp_path / "workspace"
-    (workspace / "images").mkdir(parents=True)
-    link = tmp_path / "link"
-    link.symlink_to(workspace, target_is_directory=True)
-    policy = wep.WorkerExecutionPolicy(
-        image_store=str(link / "images"), workspaces=(), digest="sha256:" + "0" * 64,
-    )
-    with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
-        wep._resolve_image_store(policy)
-    assert excinfo.value.code == "policy_malformed"
-
+def test_image_store_rejects_symlinked_leaf_and_ancestor(tmp_path):
     real = tmp_path / "images"
     real.mkdir(mode=0o700)
+    policy = wep.WorkerExecutionPolicy
+
+    leaf = tmp_path / "leaf"
+    leaf.symlink_to(real, target_is_directory=True)
+    with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+        wep._resolve_image_store(policy(image_store=str(leaf), workspaces=(), digest="sha256:" + "0" * 64))
+    assert excinfo.value.code == "policy_malformed"
+
+    workspace = tmp_path / "workspace"
+    (workspace / "images").mkdir(parents=True, mode=0o700)
+    ancestor = tmp_path / "link"
+    ancestor.symlink_to(workspace, target_is_directory=True)
+    with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+        wep._resolve_image_store(
+            policy(image_store=str(ancestor / "images"), workspaces=(), digest="sha256:" + "0" * 64),
+        )
+    assert excinfo.value.code == "policy_malformed"
+
     resolved = wep._resolve_image_store(
-        wep.WorkerExecutionPolicy(image_store=str(real), workspaces=(), digest="sha256:" + "0" * 64),
+        policy(image_store=str(real), workspaces=(), digest="sha256:" + "0" * 64),
     )
     assert resolved["path"] == str(real.resolve())
 

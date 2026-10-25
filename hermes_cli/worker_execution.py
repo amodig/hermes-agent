@@ -70,12 +70,7 @@ from hermes_cli.worker_execution_common import (
     _freeze_mapping, _freeze_recipes, _record_value, _refuse, canonical_bytes, digest_of,
     sha256_hex,
 )
-from hermes_cli.worker_execution_policy import parse_grant_section, resolve_execution_grant
-from hermes_cli.worker_execution_source import (
-    _inspect_diff, _inspect_list, _inspect_read, _inspect_summary, _materialize_source,
-    _scan_source, _validate_inspect_args,
-)
-from hermes_cli.worker_execution_policy import parse_grant_section, resolve_execution_grant
+from hermes_cli.worker_execution_policy import parse_grant_section
 from hermes_cli.worker_execution_source import (
     _inspect_diff, _inspect_list, _inspect_read, _inspect_summary, _materialize_source,
     _scan_source, _validate_inspect_args,

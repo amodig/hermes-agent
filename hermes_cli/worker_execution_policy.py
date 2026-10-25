@@ -403,21 +403,21 @@ def _resolve_image_store(policy: WorkerExecutionPolicy) -> Optional[dict[str, An
     if policy.image_store is None:
         return None
     lexical = Path(policy.image_store)
-    try:
-        path = lexical.resolve(strict=True)
-    except OSError:
-        _refuse("policy_malformed", "image_store does not exist")
-    # A symlinked ancestor would let the canonical store live under the workspace or
-    # profile while the lexical path looks unrelated: every component must be real.
-    current = Path(path.anchor)
-    for part in path.parts[1:]:
+    # Walk the CONFIGURED path: a symlink at the leaf or any ancestor is refused, so a
+    # resolved target cannot substitute itself for the operator's declared store.
+    current = Path(lexical.anchor)
+    for part in lexical.parts[1:]:
         current = current / part
         try:
             component = os.lstat(current)
         except OSError:
             _refuse("policy_malformed", "image_store does not exist")
         if stat.S_ISLNK(component.st_mode):
-            _refuse("policy_malformed", "image_store must not have symlinked components")
+            _refuse("policy_malformed", "image_store must not be or have a symlinked component")
+    try:
+        path = lexical.resolve(strict=True)
+    except OSError:
+        _refuse("policy_malformed", "image_store does not exist")
     try:
         info = os.lstat(path)
     except OSError:

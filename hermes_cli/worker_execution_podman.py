@@ -1677,7 +1677,15 @@ def cleanup_journal(journal_path: Path, *, home: Optional[Path] = None) -> tuple
         return False, "journal_unreadable"
     root = Path(str(payload.get("run_root_path") or ""))
     record = payload.get("run_root") or {}
-    stale_boot = payload.get("host_epoch") != _host_epoch()
+    recorded_epoch = payload.get("host_epoch")
+    current_epoch = _host_epoch()
+    stale_boot = False
+    if isinstance(recorded_epoch, str) and recorded_epoch and recorded_epoch != current_epoch:
+        if recorded_epoch == "unknown" or current_epoch == "unknown":
+            # An unreadable identity proves nothing about the old processes: keep the
+            # journal, and never signal PIDs that may belong to unrelated work.
+            return False, "boot_identity_unknown"
+        stale_boot = True
     try:
         info = os.lstat(root)
     except FileNotFoundError:
