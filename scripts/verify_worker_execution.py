@@ -1032,6 +1032,8 @@ def main(argv: list[str] | None = None) -> int:
     directory = tempfile.mkdtemp(prefix="worker-execution-smoke-")
     root = Path(directory)
     cases = ["main", "death"] if args.case == "all" else [args.case]
+    reconciled = True
+    preserved: str | None = None
     try:
         for case in cases:
             try:
@@ -1063,11 +1065,28 @@ def main(argv: list[str] | None = None) -> int:
                 remaining = [str(path) for path in _journal_files(_journal_roots(case_root))]
                 print(f"worker execution journals unreconciled: {remaining}", flush=True)
         if not reconciled:
+            preserved = str(root)
             print(f"worker execution fixture preserved with its journals: {root}", flush=True)
         elif os.environ.get("HERMES_ISSUE76_KEEP") == "1":
             print(f"worker execution fixture kept: {root}", flush=True)
         else:
             _remove_tree(root)
+        if args.receipt:
+            receipt_path = Path(args.receipt)
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            receipt_path.write_text(json.dumps(
+                {
+                    "cases": receipts,
+                    "reconciliation": {"ok": reconciled, "preserved": preserved},
+                },
+                indent=2, sort_keys=True,
+            ), encoding="utf-8")
+    if not reconciled:
+        print(
+            "worker execution surface: FAILED (execution journals were not reconciled; the fixture is preserved)",
+            flush=True,
+        )
+        return 1
     if args.receipt:
         print(f"worker execution receipt: {args.receipt}", flush=True)
     print("worker execution surface: ok")

@@ -332,6 +332,7 @@ class Engine:
         check: bool = False,
         deadline: Optional[float] = None,
         supervise: Optional[Callable[[], None]] = None,
+        supervise_after: bool = True,
     ) -> subprocess.CompletedProcess:
         """Run one engine command under live identity/placement supervision.
 
@@ -363,7 +364,9 @@ class Engine:
             with contextlib.suppress(Exception):
                 process.kill()
                 process.wait(timeout=5)
-            raise VerificationFailure(reason, f"engine command stopped: {reason}")
+            raise VerificationFailure(
+                reason, f"engine command stopped: {reason} ({' '.join(args[:3])})",
+            )
 
         stdout = stderr = b""
         while True:
@@ -387,8 +390,9 @@ class Engine:
                             process.wait(timeout=5)
                         raise
         # A command that finished inside the poll interval still must not carry work
-        # past cancellation: re-check supervision before returning it.
-        if supervise is not None:
+        # past cancellation: re-check supervision before returning it, unless the caller
+        # must first take ownership of the created resource (_create owns its id first).
+        if supervise is not None and supervise_after:
             supervise()
         result = subprocess.CompletedProcess(
             [*self.prefix, *args], process.returncode, stdout, stderr,
@@ -1010,10 +1014,18 @@ def _wait_ready(
             if shared - now <= 0:
                 raise VerificationFailure("readiness_timeout", "declared services did not become ready")
             budget = max(0.5, min(READINESS_PER_EXEC_SECONDS, shared - now))
-            result = engine.run(
-                ["exec", container.id or "", *argv], timeout=budget,
-                deadline=shared, supervise=lambda: claim_check() if claim_check else None,
-            )
+            try:
+                result = engine.run(
+                    ["exec", container.id or "", *argv], timeout=budget,
+                    deadline=shared, supervise=lambda: claim_check() if claim_check else None,
+                )
+            except VerificationFailure as exc:
+                # A slow engine exec is a not-ready probe, not a service failure: the
+                # startup deadline still bounds the wait, and cancellation re-raises.
+                if exc.code != "engine_timeout":
+                    raise
+                still.append((service, container))
+                continue
             if result.returncode != 0:
                 still.append((service, container))
         if not still:
@@ -1240,11 +1252,12 @@ def run_verification(
             )
             container.id = _create(engine, spec, deadline=deadline, supervise=supervise)
             container.log_path = spec.log_path
-            journal["containers"].append(container.record())
-            _journal_write(journal_path, journal)
             containers.append(container)
             service_containers.append((service, container))
             service_specs.append((service, container, spec))
+            supervise()
+            journal["containers"].append(container.record())
+            _journal_write(journal_path, journal)
             _start(engine, container, deadline=deadline, supervise=supervise)
             _attest_expiry(container, spec, deadline)
 
@@ -1264,9 +1277,10 @@ def run_verification(
         )
         verifier.id = _create(engine, verifier_spec, deadline=deadline, supervise=supervise)
         verifier.log_path = verifier_spec.log_path
+        containers.append(verifier)
+        supervise()
         journal["containers"].append(verifier.record())
         _journal_write(journal_path, journal)
-        containers.append(verifier)
         _start(engine, verifier, deadline=deadline, supervise=supervise)
         _attest_expiry(verifier, verifier_spec, deadline)
 
@@ -1306,6 +1320,7 @@ def run_verification(
         supervise()
         journal["phase"] = "released"
         _journal_write(journal_path, journal)
+        supervise()
         _release(verifier_scratch / "release")
 
         exit_code, timed_out = _wait_exit(
@@ -1391,6 +1406,7 @@ def _create(
         spec.timeout_seconds = _deadline_seconds(deadline)
     result = engine.run(
         _create_args(engine, spec), timeout=120.0, deadline=deadline, supervise=supervise,
+        supervise_after=False,
     )
     if result.returncode != 0:
         raise VerificationFailure(
