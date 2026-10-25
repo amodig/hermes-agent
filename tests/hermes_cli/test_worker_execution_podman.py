@@ -237,6 +237,7 @@ def test_cleanup_journal_requires_unchanged_root_identity(tmp_path):
         "protocol": podman.JOURNAL_PROTOCOL, "collection": "x",
         "run_root": {"path": str(root), "device": 1, "inode": 2},
         "run_root_path": str(root), "phase": "created", "containers": [],
+        "host_epoch": podman._host_epoch(),
     }
     journal.write_text(json.dumps(payload), encoding="utf-8")
     ok, reason = podman.cleanup_journal(journal)
@@ -311,6 +312,19 @@ def test_absent_run_root_keeps_a_journal_while_recorded_process_lives(tmp_path):
     }), encoding="utf-8")
     ok, reason = podman.cleanup_journal(journal)
     assert ok is False and reason == "root_absent_processes_alive"
+    assert journal.exists()
+
+
+def test_both_unknown_boot_identities_retain_the_journal(tmp_path, monkeypatch):
+    journal = tmp_path / "journal.json"
+    journal.write_text(json.dumps({
+        "protocol": podman.JOURNAL_PROTOCOL, "collection": "x", "phase": "started",
+        "run_root_path": str(tmp_path / "missing"), "run_root": {"device": 1, "inode": 2},
+        "containers": [], "host_epoch": "",
+    }), encoding="utf-8")
+    monkeypatch.setattr(podman, "_host_epoch", lambda: "unknown")
+    ok, reason = podman.cleanup_journal(journal)
+    assert ok is False and reason == "boot_identity_unknown"
     assert journal.exists()
 
 
