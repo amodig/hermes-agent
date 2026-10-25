@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import stat
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -18,6 +17,9 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import worker_execution as we
+from hermes_cli import worker_execution_common as wec
+from hermes_cli import worker_execution_policy as wep
+from hermes_cli import worker_execution_source as wes
 
 pytestmark = pytest.mark.skipif(not __import__("sys").platform.startswith("linux"), reason="Linux-only boundary")
 
@@ -139,7 +141,7 @@ def _authority(
         generation="gen", dependency_fingerprint="dep", code_sha="sha",
         pid=os.getpid(), start_time=0, as_dict=lambda: {"generation": "gen"},
     )
-    grant, refusal = we.resolve_execution_grant(
+    grant, refusal = wep.resolve_execution_grant(
         profile_home=str(fixture.hermes), workspace=str(fixture.repo), task_id=task_id,
         profile="reviewer", board="fixture", db_path=db_path,
         preparation_id="prep-fixture", runtime_identity=identity,
@@ -151,14 +153,14 @@ def _authority(
         body = dict(section)
         body.pop("digest")
         body["review"] = review
-        body["digest"] = we.digest_of(body)
+        body["digest"] = wec.digest_of(body)
         section = body
     stub = SimpleNamespace(
         task_id=task_id, profile="reviewer", board="fixture", preparation_id="prep-fixture",
         run_id=7, claim_lock="claim-fixture", workspace=str(fixture.repo),
         db_path=db_path, runtime_identity=identity,
     )
-    return we.parse_grant_section(section, stub)
+    return wep.parse_grant_section(section, stub)
 
 
 # ---- policy schema -------------------------------------------------------
@@ -168,16 +170,16 @@ def test_policy_rejects_unknown_keys_and_bad_images(fixture):
     base = _policy_section(fixture.repo, fixture.images)
     bad = json.loads(json.dumps(base))
     bad["extra"] = True
-    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
-        we.parse_policy(bad)
+    with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+        wep.parse_policy(bad)
     assert excinfo.value.code == "policy_malformed"
 
     bad = json.loads(json.dumps(base))
     bad["workspaces"][0]["recipes"] = {"r": {"image": "python:3.14", "argv": ["/bin/x"], "timeout_seconds": 1, "services": []}}
-    with pytest.raises(we.WorkerExecutionRefused):
-        we.parse_policy(bad)
+    with pytest.raises(wec.WorkerExecutionRefused):
+        wep.parse_policy(bad)
 
-    policy = we.parse_policy(base)
+    policy = wep.parse_policy(base)
     assert policy.digest.startswith("sha256:")
 
 
@@ -188,7 +190,7 @@ def test_policy_service_and_timeout_bounds(fixture):
                       "ready_argv": ["/bin/true"], "port": 55432}],
     }
     section = _policy_section(fixture.repo, fixture.images, recipes={"check": recipe})
-    assert we.parse_policy(section).recipes()["check"].services[0].port == 55432
+    assert wep.parse_policy(section).recipes()["check"].services[0].port == 55432
 
     for mutate in (
         lambda r: r.update(timeout_seconds=0),
@@ -203,19 +205,19 @@ def test_policy_service_and_timeout_bounds(fixture):
     ):
         bad = json.loads(json.dumps(section))
         mutate(bad["workspaces"][0]["recipes"]["check"])
-        with pytest.raises(we.WorkerExecutionRefused):
-            we.parse_policy(bad)
+        with pytest.raises(wec.WorkerExecutionRefused):
+            wep.parse_policy(bad)
 
     no_store = _policy_section(fixture.repo, None, recipes={"check": recipe})
-    with pytest.raises(we.WorkerExecutionRefused):
-        we.parse_policy(no_store)
+    with pytest.raises(wec.WorkerExecutionRefused):
+        wep.parse_policy(no_store)
 
 
 def test_policy_extra_source_paths_are_strict(fixture):
     for extra in ("/abs/file", "../escape", "a//b", "a/./b", "a\\b"):
         section = _policy_section(fixture.repo, fixture.images, extras=[extra])
-        with pytest.raises(we.WorkerExecutionRefused):
-            we.parse_policy(section)
+        with pytest.raises(wec.WorkerExecutionRefused):
+            wep.parse_policy(section)
 
 
 # ---- frozen grant --------------------------------------------------------
@@ -230,7 +232,7 @@ def test_grant_digest_and_identities_are_frozen(fixture):
     _write_config(fixture.hermes, section)
     task_id, db_path = _board(fixture)
     identity = SimpleNamespace(generation="gen", dependency_fingerprint="dep", code_sha="sha", pid=os.getpid())
-    grant, refusal = we.resolve_execution_grant(
+    grant, refusal = wep.resolve_execution_grant(
         profile_home=str(fixture.hermes), workspace=str(fixture.repo), task_id=task_id,
         profile="reviewer", board="fixture", db_path=db_path,
         preparation_id="prep-fixture", runtime_identity=identity,
@@ -244,8 +246,8 @@ def test_grant_digest_and_identities_are_frozen(fixture):
         run_id=7, claim_lock="claim-fixture", workspace=str(fixture.repo),
         db_path=db_path, runtime_identity=identity,
     )
-    with pytest.raises(we.WorkerExecutionUnavailable):
-        we.parse_grant_section(body, stub)
+    with pytest.raises(wec.WorkerExecutionUnavailable):
+        wep.parse_grant_section(body, stub)
 
 
 def test_grant_withheld_for_unmatched_workspace_and_missing_plugin(fixture):
@@ -253,7 +255,7 @@ def test_grant_withheld_for_unmatched_workspace_and_missing_plugin(fixture):
     _write_config(fixture.hermes, section)
     _stage_plugin(fixture.hermes)
     identity = SimpleNamespace(generation="gen", dependency_fingerprint="dep", code_sha="sha", pid=os.getpid())
-    grant, refusal = we.resolve_execution_grant(
+    grant, refusal = wep.resolve_execution_grant(
         profile_home=str(fixture.hermes), workspace=str(fixture.repo), task_id="t_fixture",
         profile="reviewer", board="fixture", db_path=str(fixture.hermes / "kanban.db"),
         preparation_id="prep-fixture", runtime_identity=identity,
@@ -264,7 +266,7 @@ def test_grant_withheld_for_unmatched_workspace_and_missing_plugin(fixture):
     for path in (fixture.hermes / "plugins").rglob("*"):
         if path.is_file():
             path.unlink()
-    grant, refusal = we.resolve_execution_grant(
+    grant, refusal = wep.resolve_execution_grant(
         profile_home=str(fixture.hermes), workspace=str(fixture.repo), task_id="t_fixture",
         profile="reviewer", board="fixture", db_path=str(fixture.hermes / "kanban.db"),
         preparation_id="prep-fixture", runtime_identity=identity,
@@ -277,15 +279,15 @@ def test_grant_withheld_for_unmatched_workspace_and_missing_plugin(fixture):
 
 def test_scan_digest_is_stable_and_content_addressed(fixture):
     authority = _authority(fixture, extras=["notes.txt"])
-    first = we._scan_source(authority)
-    second = we._scan_source(authority)
+    first = wes._scan_source(authority)
+    second = wes._scan_source(authority)
     assert first.source_digest == second.source_digest
     assert first.head == fixture.head
     assert first.branch is not None and not first.detached
     assert {entry.path for entry in first.entries} == {"app.py", "docs/readme.md", "notes.txt"}
 
     (fixture.repo / "app.py").write_text("print('changed again')\n", encoding="utf-8")
-    third = we._scan_source(authority)
+    third = wes._scan_source(authority)
     assert third.source_digest != first.source_digest
 
 
@@ -294,8 +296,8 @@ def test_reserved_tracked_path_refuses_the_whole_inventory(fixture):
     _git(fixture.repo, "add", ".env")
     _git(fixture.repo, "commit", "-qm", "secret")
     authority = _authority(fixture)
-    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
-        we._scan_source(authority)
+    with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+        wes._scan_source(authority)
     assert excinfo.value.code == "reserved_source_paths"
 
 
@@ -304,8 +306,8 @@ def test_hardlinked_and_escaping_symlink_sources_refuse(fixture):
     _git(fixture.repo, "add", "copy.py")
     _git(fixture.repo, "commit", "-qm", "hardlink")
     authority = _authority(fixture)
-    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
-        we._scan_source(authority)
+    with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+        wes._scan_source(authority)
     assert excinfo.value.code == "hardlinked_source"
 
     (fixture.repo / "copy.py").unlink()
@@ -313,8 +315,8 @@ def test_hardlinked_and_escaping_symlink_sources_refuse(fixture):
     _git(fixture.repo, "add", "-A")
     _git(fixture.repo, "commit", "-qm", "symlink")
     authority = _authority(fixture)
-    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
-        we._scan_source(authority)
+    with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+        wes._scan_source(authority)
     assert excinfo.value.code == "unsafe_symlink"
 
 
@@ -324,7 +326,7 @@ def test_deleted_tracked_paths_are_recorded(fixture):
     _git(fixture.repo, "commit", "-qm", "gone")
     (fixture.repo / "gone.py").unlink()
     authority = _authority(fixture)
-    snapshot = we._scan_source(authority)
+    snapshot = wes._scan_source(authority)
     entry = snapshot.entry("gone.py")
     assert entry is not None and entry.kind == "deleted"
 
@@ -337,7 +339,7 @@ def test_non_repository_is_explicitly_unavailable(fixture):
     _stage_plugin(fixture.hermes)
     task_id, db_path = _board(fixture)
     identity = SimpleNamespace(generation="gen", dependency_fingerprint="dep", code_sha="sha", pid=os.getpid())
-    grant, refusal = we.resolve_execution_grant(
+    grant, refusal = wep.resolve_execution_grant(
         profile_home=str(fixture.hermes), workspace=str(plain), task_id=task_id,
         profile="reviewer", board="fixture", db_path=db_path,
         preparation_id="prep-fixture", runtime_identity=identity,
@@ -348,10 +350,10 @@ def test_non_repository_is_explicitly_unavailable(fixture):
         run_id=7, claim_lock="claim-fixture", workspace=str(plain),
         db_path=db_path, runtime_identity=identity,
     )
-    authority = we.parse_grant_section(grant.bind(7, "claim-fixture"), stub)
+    authority = wep.parse_grant_section(grant.bind(7, "claim-fixture"), stub)
     assert authority.git is None
-    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
-        we._scan_source(authority)
+    with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+        wes._scan_source(authority)
     assert excinfo.value.code == "workspace_not_a_repository"
 
 
@@ -361,7 +363,7 @@ def test_nested_relative_symlink_resolves_against_its_parent(fixture):
     _git(fixture.repo, "add", "docs/link")
     _git(fixture.repo, "commit", "-qm", "link")
     authority = _authority(fixture)
-    snapshot = we._scan_source(authority)
+    snapshot = wes._scan_source(authority)
     entry = snapshot.entry("docs/link")
     assert entry is not None and entry.kind == "link"
 
@@ -369,8 +371,8 @@ def test_nested_relative_symlink_resolves_against_its_parent(fixture):
     _git(fixture.repo, "add", "docs/link2")
     _git(fixture.repo, "commit", "-qm", "escape-link")
     authority = _authority(fixture)
-    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
-        we._scan_source(authority)
+    with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+        wes._scan_source(authority)
     assert excinfo.value.code == "unsafe_symlink"
 
 
@@ -404,7 +406,7 @@ def test_validation_card_resolves_review_role(fixture):
         connection.commit()
     finally:
         connection.close()
-    role, pair = we.resolve_review_context(str(db_path), validation)
+    role, pair = wep.resolve_review_context(str(db_path), validation)
     assert role == "review"
     assert pair == {"base": fixture.base, "head": fixture.head}
 
@@ -415,8 +417,8 @@ def test_symlink_cycle_is_refused(fixture):
     _git(fixture.repo, "add", "a.py", "b.py")
     _git(fixture.repo, "commit", "-qm", "cycle")
     authority = _authority(fixture)
-    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
-        we._scan_source(authority)
+    with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+        wes._scan_source(authority)
     assert excinfo.value.code == "unsafe_symlink"
 
 
@@ -425,12 +427,12 @@ def test_symlink_digest_binds_the_exact_link_text(fixture):
     _git(fixture.repo, "add", "alias")
     _git(fixture.repo, "commit", "-qm", "alias")
     authority = _authority(fixture)
-    first = we._scan_source(authority).entry("alias")
+    first = wes._scan_source(authority).entry("alias")
     assert first is not None and first.digest.startswith("sha256:")
     # Same destination, different text: the copied workspace differs, so the digest must.
     (fixture.repo / "alias").unlink()
     os.symlink("./app.py", fixture.repo / "alias")
-    second = we._scan_source(authority).entry("alias")
+    second = wes._scan_source(authority).entry("alias")
     assert second is not None and second.digest != first.digest
 
 
@@ -441,12 +443,12 @@ def test_tracked_symlink_replaced_by_file_is_hashed_not_omitted(fixture):
     (fixture.repo / "alias").unlink()
     (fixture.repo / "alias").write_text("print('real file')\n", encoding="utf-8")
     authority = _authority(fixture)
-    snapshot = we._scan_source(authority)
+    snapshot = wes._scan_source(authority)
     entry = snapshot.entry("alias")
     assert entry is not None and entry.kind == "file"
     first = snapshot.source_digest
     (fixture.repo / "alias").write_text("print('changed file')\n", encoding="utf-8")
-    second = we._scan_source(authority).source_digest
+    second = wes._scan_source(authority).source_digest
     assert second != first
 
 
@@ -455,28 +457,28 @@ def test_read_reports_next_line_and_matches_the_digest(fixture):
     _git(fixture.repo, "add", "multi.py")
     _git(fixture.repo, "commit", "-qm", "multi")
     authority = _authority(fixture)
-    snapshot = we._scan_source(authority)
+    snapshot = wes._scan_source(authority)
     entry = snapshot.entry("multi.py")
-    with we.SafeRoot(authority.workspace_path) as root:
-        text, next_line = we._read_file_page(root, ["multi.py"], entry, 1, 1)
+    with wes.SafeRoot(authority.workspace_path) as root:
+        text, next_line = wes._read_file_page(root, ["multi.py"], entry, 1, 1)
         assert text == "one\n"
         assert next_line == 2
-        whole, end = we._read_file_page(root, ["multi.py"], entry, 1, 10)
+        whole, end = wes._read_file_page(root, ["multi.py"], entry, 1, 10)
         assert end is None and whole == "one\ntwo\nthree\n"
         # A digest from another state refuses instead of returning bytes.
-        stale = we.SourceEntry(entry.path, entry.kind, entry.executable, entry.size, "sha256:" + "0" * 64)
-        with pytest.raises(we.WorkerExecutionRefused) as excinfo:
-            we._read_file_page(root, ["multi.py"], stale, 1, 1)
+        stale = wes.SourceEntry(entry.path, entry.kind, entry.executable, entry.size, "sha256:" + "0" * 64)
+        with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+            wes._read_file_page(root, ["multi.py"], stale, 1, 1)
     assert excinfo.value.code == "source_changed"
 
 
 def test_read_pages_and_binary_refusal(fixture):
     authority = _authority(fixture)
-    snapshot = we._scan_source(authority)
+    snapshot = wes._scan_source(authority)
     entry = snapshot.entry("app.py")
     assert entry is not None
-    with we.SafeRoot(authority.workspace_path) as root:
-        text, next_line = we._read_file_page(root, ["app.py"], entry, 1, 1)
+    with wes.SafeRoot(authority.workspace_path) as root:
+        text, next_line = wes._read_file_page(root, ["app.py"], entry, 1, 1)
     assert text == "print('dirty')\n"
     assert next_line is None
 
@@ -484,11 +486,11 @@ def test_read_pages_and_binary_refusal(fixture):
     _git(fixture.repo, "add", "blob.bin")
     _git(fixture.repo, "commit", "-qm", "blob")
     authority = _authority(fixture)
-    snapshot = we._scan_source(authority)
+    snapshot = wes._scan_source(authority)
     blob = snapshot.entry("blob.bin")
-    with we.SafeRoot(authority.workspace_path) as root:
-        with pytest.raises(we.WorkerExecutionRefused) as excinfo:
-            we._read_file_page(root, ["blob.bin"], blob, 1, 10)
+    with wes.SafeRoot(authority.workspace_path) as root:
+        with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+            wes._read_file_page(root, ["blob.bin"], blob, 1, 10)
     assert excinfo.value.code == "binary_content"
 
 
@@ -497,41 +499,41 @@ def test_diff_only_accepts_the_granted_review_pair(fixture):
         fixture, status="review", review={"base": fixture.base, "head": fixture.head},
     )
     args = {"operation": "diff", "base": fixture.base, "head": fixture.head}
-    result = we._inspect_diff(args, authority)
+    result = wes._inspect_diff(args, authority)
     assert result["ok"] is True and result["mode"] == "commit"
     assert "changed" in result["patch"]
     assert result["diff_digest"].startswith("sha256:")
 
-    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
-        we._inspect_diff({"operation": "diff", "base": fixture.head, "head": fixture.base}, authority)
+    with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+        wes._inspect_diff({"operation": "diff", "base": fixture.head, "head": fixture.base}, authority)
     assert excinfo.value.code == "diff_not_granted"
 
-    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
-        we._inspect_diff({"operation": "diff", "mode": "working"}, authority)
+    with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+        wes._inspect_diff({"operation": "diff", "mode": "working"}, authority)
     assert excinfo.value.code == "diff_not_granted"
 
-    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
-        we._inspect_diff(dict(args, expected_diff_digest="sha256:" + "c" * 64), authority)
+    with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+        wes._inspect_diff(dict(args, expected_diff_digest="sha256:" + "c" * 64), authority)
     assert excinfo.value.code == "source_changed"
 
 
 def test_working_diff_requires_implementation_claim(fixture):
     authority = _authority(fixture)
-    result = we._inspect_diff({"operation": "diff", "mode": "working"}, authority)
+    result = wes._inspect_diff({"operation": "diff", "mode": "working"}, authority)
     assert "dirty" in result["patch"]
-    staged = we._inspect_diff({"operation": "diff", "mode": "staged"}, authority)
+    staged = wes._inspect_diff({"operation": "diff", "mode": "staged"}, authority)
     assert "notes.txt" in staged["patch"]
-    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
-        we._inspect_diff({"operation": "diff", "base": fixture.base, "head": fixture.head}, authority)
+    with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+        wes._inspect_diff({"operation": "diff", "base": fixture.base, "head": fixture.head}, authority)
     assert excinfo.value.code == "diff_not_granted"
 
 
 def test_diff_refuses_reserved_paths_and_option_injection(fixture):
     authority = _authority(fixture)
-    with pytest.raises(we.WorkerExecutionRefused):
-        we._validate_inspect_args({"operation": "diff", "base": "--output=/tmp/x", "head": fixture.head})
-    with pytest.raises(we.WorkerExecutionRefused) as excinfo:
-        we._inspect_diff({"operation": "diff", "mode": "working", "path": ".env"}, authority)
+    with pytest.raises(wec.WorkerExecutionRefused):
+        wes._validate_inspect_args({"operation": "diff", "base": "--output=/tmp/x", "head": fixture.head})
+    with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+        wes._inspect_diff({"operation": "diff", "mode": "working", "path": ".env"}, authority)
     assert excinfo.value.code == "reserved_source_paths"
 
 

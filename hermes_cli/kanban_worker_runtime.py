@@ -1492,7 +1492,7 @@ def _default_spawn(
         )
         execution_grant = None
         if startup_context is not None:
-            from hermes_cli.worker_execution import resolve_execution_grant
+            from hermes_cli.worker_execution_policy import resolve_execution_grant
 
             try:
                 execution_grant, execution_refusal = resolve_execution_grant(

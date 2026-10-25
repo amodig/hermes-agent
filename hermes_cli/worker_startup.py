@@ -144,7 +144,7 @@ def _retain_worker_grant(grant: dict, actual: "RuntimeIdentity") -> None:
     )
     section = grant.get("worker_execution")
     if section is not None:
-        from hermes_cli.worker_execution import parse_grant_section
+        from hermes_cli.worker_execution_policy import parse_grant_section
 
         candidate = replace(candidate, execution=parse_grant_section(section, candidate))
     if _GRANT is not None:
