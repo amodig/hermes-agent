@@ -2326,6 +2326,11 @@ def worker_verify(args: dict, *, original_args: dict | None = None) -> str:
             final = _scan_source(authority)
             if final.source_digest != snapshot.source_digest or final.head != snapshot.head:
                 raise WorkerExecutionRefused("source_changed", "the granted source changed during verification")
+            from tools.interrupt import is_interrupted
+
+            if is_interrupted():
+                result["cancelled"] = True
+                result["accepted"] = False
             result["source_digest"] = snapshot.source_digest
             result["head"] = snapshot.head
             result["invocation_digest"] = _args_digest(normalized)

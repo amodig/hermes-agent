@@ -750,18 +750,27 @@ def _launch(
                 fail(f"the stall journal has no verifier process: {stall_journal}")
             init_pid = int(verifier["pid"])
             init_start = int(verifier.get("pid_start") or 0)
-            init_cmd = _proc_cmdline(init_pid)
-            if "sleep 600" not in init_cmd or "until [ -e /scratch/release ]" in init_cmd:
-                fail(f"the verifier init is still the waiting gate: {init_cmd[:200]!r}")
-            # The intended long-lived child is the exact `sleep 600`, not the gate's
-            # transient `sleep 0.2` helper.
-            others = [
-                (pid, start)
-                for pid, start in _descendant_pids(verifier.get("pid_inode"))
-                if pid != init_pid and _proc_cmdline(pid).strip() == "sleep 600"
-            ]
+            # The backend writes `released` just before the marker is created and the
+            # gate polls it every 0.2s: observe until the payload and its long-lived
+            # child are actually running, rather than racing the release.
+            observation_deadline = time.monotonic() + 20.0
+            others: list[tuple[int, int]] = []
+            while time.monotonic() < observation_deadline:
+                init_cmd = _proc_cmdline(init_pid)
+                if "until [ -e /scratch/release ]" not in init_cmd and "sleep 600" in init_cmd:
+                    others = [
+                        (pid, start)
+                        for pid, start in _descendant_pids(verifier.get("pid_inode"))
+                        if pid != init_pid and _proc_cmdline(pid).strip() == "sleep 600"
+                    ]
+                    if others:
+                        break
+                time.sleep(0.2)
             if not others:
-                fail("the stall payload has no long-lived detached child to observe")
+                fail(
+                    "the stall payload did not reach its long-lived child before the worker was killed: "
+                    f"init={_proc_cmdline(init_pid)[:200]!r} journals={[str(p) for p in journals]}"
+                )
             descendants = others
             receipt["stall_journal"] = stall_journal
             receipt["payload_pids"] = [init_pid, *[pid for pid, _ in others]]

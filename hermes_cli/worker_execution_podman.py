@@ -49,6 +49,7 @@ VISIBLE_OUTPUT_BYTES = 64 * 1024
 LOG_CAP_BYTES = 1024 * 1024
 STARTUP_DEADLINE_SECONDS = 60.0
 READINESS_PER_EXEC_SECONDS = 5.0
+CONTAINER_TIMER_GRACE_SECONDS = 30.0  # create/start latency admitted before a payload timer
 CLEANUP_GRACE_SECONDS = 10.0
 JOURNAL_PROTOCOL = 1
 MAX_REAP_JOURNALS = 64
@@ -602,6 +603,7 @@ class Container:
         self.net_inode: Optional[int] = None
         self.pid_inode: Optional[int] = None
         self.conmon_path: Optional[Path] = None
+        self.expiry_epoch: Optional[float] = None
         self.exit_code: Optional[int] = None
         self.timed_out = False
         self.log_path: Optional[Path] = None
@@ -613,6 +615,7 @@ class Container:
             "conmon_pid": self.conmon_pid, "conmon_start": self.conmon_start,
             "conmon_path": str(self.conmon_path) if self.conmon_path else None,
             "net_inode": self.net_inode, "pid_inode": self.pid_inode,
+            "expiry_epoch": self.expiry_epoch,
             "log_path": str(self.log_path) if self.log_path else None,
         }
 
@@ -941,6 +944,26 @@ def _make_scratch(run_root: Path, name: str) -> Path:
     return scratch
 
 
+def _attest_expiry(
+    container: Container, spec: "_Spec", deadline: float, *, keeper: bool = False,
+) -> None:
+    """Every container's own conmon deadline must fit the invocation deadline.
+
+    Podman's ``--timeout`` counts running time from start, while the value was computed
+    before ``create``; creation/start latency therefore pushes the real expiry later.
+    Refuse release when that latency would let a payload outlive the invocation.
+    """
+    started = time.monotonic()
+    expiry = started + int(spec.timeout_seconds)
+    permitted = deadline + CONTAINER_TIMER_GRACE_SECONDS + (60.0 if keeper else 0.0)
+    if expiry > permitted:
+        raise VerificationFailure(
+            "isolation_unavailable",
+            f"{container.name} container deadline exceeds the invocation deadline",
+        )
+    container.expiry_epoch = float(started) + (time.time() - time.monotonic()) + int(spec.timeout_seconds)
+
+
 def _start(
     engine: Engine,
     container: Container,
@@ -1098,8 +1121,11 @@ def run_verification(
     images: dict[str, dict[str, Any]] = {}
 
     claim_check = _claim_check(grant)
+    from tools.interrupt import is_interrupted
 
     def supervise() -> None:
+        if is_interrupted():
+            raise VerificationFailure("cancelled", "verification was interrupted")
         claim_check()
         _require_space(run_root)
 
@@ -1150,8 +1176,7 @@ def run_verification(
         services = list(recipe.get("services") or ())
         references = [KEEPER_IMAGE, str(recipe.get("image"))] + [str(service.get("image")) for service in services]
         images = _load_images(
-            engine, store, references, deadline=deadline, claim_check=claim_check,
-            space_check=lambda: _require_space(run_root),
+            engine, store, references, deadline=deadline, claim_check=supervise,
         )
         _require_space(run_root)
         keeper = Container("keeper", "keeper", KEEPER_IMAGE, images[KEEPER_IMAGE]["tag"])
@@ -1176,6 +1201,7 @@ def run_verification(
         journal["phase"] = "keeper-started"
         _journal_write(journal_path, journal)
         _start(engine, keeper, deadline=deadline, supervise=supervise)
+        _attest_expiry(keeper, keeper_spec, deadline, keeper=True)
         _attest(
             engine, keeper, keeper_spec, image_id=images[KEEPER_IMAGE]["image_id"],
             keeper_id=None, keeper_net_inode=None,
@@ -1203,13 +1229,15 @@ def run_verification(
                     source_dir=source_dir, workspace=None, scratch=scratch, data=data, identity=identity,
                 ),
                 network=f"container:{keeper_id}",
-                timeout_seconds=_deadline_seconds(deadline),
+                timeout_seconds=0,
                 log_path=engine.logs / f"{name}.log",
             )
             container.id = _create(engine, spec, deadline=deadline, supervise=supervise)
             container.log_path = spec.log_path
             journal["containers"].append(container.record())
             _journal_write(journal_path, journal)
+            _start(engine, container, deadline=deadline, supervise=supervise)
+            _attest_expiry(container, spec, deadline)
             service_containers.append((service, container))
             service_specs.append((service, container, spec))
             containers.append(container)
@@ -1225,19 +1253,17 @@ def run_verification(
                 source_dir=source_dir, workspace=workspace, scratch=verifier_scratch, data=None, identity=identity,
             ),
             network=f"container:{keeper_id}",
-            timeout_seconds=_deadline_seconds(deadline),
+            timeout_seconds=0,
             log_path=engine.logs / "verifier.log",
         )
         verifier.id = _create(engine, verifier_spec, deadline=deadline, supervise=supervise)
         verifier.log_path = verifier_spec.log_path
         journal["containers"].append(verifier.record())
         _journal_write(journal_path, journal)
+        _start(engine, verifier, deadline=deadline, supervise=supervise)
+        _attest_expiry(verifier, verifier_spec, deadline)
         containers.append(verifier)
 
-        journal["phase"] = "created"
-        _journal_write(journal_path, journal)
-        for container in containers:
-            _start(engine, container, deadline=deadline, supervise=supervise)
         journal["phase"] = "started"
         _journal_write(journal_path, journal)
 
@@ -1267,9 +1293,8 @@ def run_verification(
         journal["phase"] = "services-released"
         _journal_write(journal_path, journal)
         _wait_ready(
-            engine, service_containers, deadline=deadline, claim_check=claim_check,
+            engine, service_containers, deadline=deadline, claim_check=supervise,
             startup_deadline=min(deadline, time.monotonic() + STARTUP_DEADLINE_SECONDS),
-            space_check=lambda: _require_space(run_root),
         )
         claim_check()
         _require_space(run_root)
@@ -1278,8 +1303,7 @@ def run_verification(
         _release(verifier_scratch / "release")
 
         exit_code, timed_out = _wait_exit(
-            engine, verifier, deadline=deadline, claim_check=claim_check,
-            space_check=lambda: _require_space(run_root),
+            engine, verifier, deadline=deadline, claim_check=supervise,
         )
         result["exit_code"] = exit_code
         result["timed_out"] = timed_out
@@ -1354,6 +1378,11 @@ def _create(
     deadline: Optional[float] = None,
     supervise: Optional[Callable[[], None]] = None,
 ) -> str:
+    # Podman's --timeout bounds running time from start, and the value is frozen at
+    # create. The remaining budget is bound here so the conmon expiry lands on the
+    # invocation deadline plus at most the create/start latency (attested below).
+    if spec.kind != "keeper" and deadline is not None:
+        spec.timeout_seconds = _deadline_seconds(deadline)
     result = engine.run(
         _create_args(engine, spec), timeout=120.0, deadline=deadline, supervise=supervise,
     )
@@ -1412,7 +1441,8 @@ def _cleanup(engine: Engine, containers: list[Container]) -> tuple[bool, list[st
         result = engine.run(["rm", "-f", "-t", "2", container.id], timeout=60.0)
         if result.returncode != 0:
             ok = False
-            reasons.append(f"rm_failed:{container.name}")
+            detail = result.stderr.decode("utf-8", "replace").strip().replace("\n", " | ")[:200]
+            reasons.append(f"rm_failed:{container.name}:{detail}")
     for container in reversed(containers):
         if not _terminate_recorded(container.pid, container.pid_start):
             ok = False
