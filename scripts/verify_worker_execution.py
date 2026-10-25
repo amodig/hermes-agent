@@ -713,11 +713,16 @@ def _launch(
                 journals = _journal_files(journal_roots)
                 for path in journals:
                     payload = _journal_payload(path)
+                    # Only the verifier release (not the earlier service release) and a
+                    # recorded verifier process qualify.
                     if (
                         payload
                         and payload.get("recipe") == "stall"
-                        and payload.get("phase") in {"released", "services-released"}
-                        and any(record.get("pid") for record in payload.get("containers") or [])
+                        and payload.get("phase") == "released"
+                        and any(
+                            record.get("kind") == "verifier" and record.get("pid")
+                            for record in payload.get("containers") or []
+                        )
                     ):
                         stall_journal = payload
                         break
@@ -745,14 +750,18 @@ def _launch(
                 fail(f"the stall journal has no verifier process: {stall_journal}")
             init_pid = int(verifier["pid"])
             init_start = int(verifier.get("pid_start") or 0)
-            if "sleep 600" not in _proc_cmdline(init_pid):
-                fail("the stall payload did not start before the worker was killed")
+            init_cmd = _proc_cmdline(init_pid)
+            if "sleep 600" not in init_cmd or "until [ -e /scratch/release ]" in init_cmd:
+                fail(f"the verifier init is still the waiting gate: {init_cmd[:200]!r}")
+            # The intended long-lived child is the exact `sleep 600`, not the gate's
+            # transient `sleep 0.2` helper.
             others = [
-                (pid, start) for pid, start in _descendant_pids(verifier.get("pid_inode"))
-                if pid != init_pid
+                (pid, start)
+                for pid, start in _descendant_pids(verifier.get("pid_inode"))
+                if pid != init_pid and _proc_cmdline(pid).strip() == "sleep 600"
             ]
             if not others:
-                fail("the stall payload has no detached child to observe")
+                fail("the stall payload has no long-lived detached child to observe")
             descendants = others
             receipt["stall_journal"] = stall_journal
             receipt["payload_pids"] = [init_pid, *[pid for pid, _ in others]]

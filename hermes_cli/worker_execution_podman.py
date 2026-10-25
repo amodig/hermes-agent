@@ -323,12 +323,22 @@ class Engine:
             "HTTP_PROXY": "", "HTTPS_PROXY": "", "NO_PROXY": "",
         }
 
-    def run(self, args: list[str], *, timeout: float = 60.0, check: bool = False) -> subprocess.CompletedProcess:
+    def run(
+        self,
+        args: list[str],
+        *,
+        timeout: float = 60.0,
+        check: bool = False,
+        deadline: Optional[float] = None,
+        supervise: Optional[Callable[[], None]] = None,
+    ) -> subprocess.CompletedProcess:
         """Run one engine command under live identity/placement supervision.
 
         The child is started with ``Popen`` and its PID start-time and cgroup are read
         before waiting: an engine command that is not in the authenticated worker's
-        cgroup is killed and refused, never trusted.
+        cgroup is killed and refused, never trusted. While it runs, the absolute
+        invocation deadline and the caller's supervision callback (claim ownership,
+        free space) are polled, so a slow load cannot outlive its authority.
         """
         try:
             process = subprocess.Popen(  # noqa: S603 -- fixed executable and constructed argv
@@ -344,13 +354,35 @@ class Engine:
                 process.kill()
                 process.wait(timeout=5)
             raise VerificationFailure("attestation_failed", "engine command is outside the authenticated worker cgroup")
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
+        command_deadline = time.monotonic() + max(0.1, timeout)
+
+        def _stop(reason: str) -> None:
             with contextlib.suppress(Exception):
                 process.kill()
                 process.wait(timeout=5)
-            raise VerificationFailure("engine_timeout", "engine command exceeded its time bound")
+            raise VerificationFailure(reason, f"engine command stopped: {reason}")
+
+        stdout = stderr = b""
+        while True:
+            now = time.monotonic()
+            limits = [command_deadline]
+            if deadline is not None:
+                limits.append(deadline)
+            remaining = min(limits) - now
+            if remaining <= 0:
+                _stop("engine_timeout" if now >= command_deadline else "deadline_exhausted")
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.25, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                if supervise is not None:
+                    try:
+                        supervise()
+                    except BaseException:
+                        with contextlib.suppress(Exception):
+                            process.kill()
+                            process.wait(timeout=5)
+                        raise
         result = subprocess.CompletedProcess(
             [*self.prefix, *args], process.returncode, stdout, stderr,
         )
@@ -360,13 +392,25 @@ class Engine:
             )
         return result
 
-    def text(self, args: list[str], *, timeout: float = 60.0) -> str:
-        result = self.run(args, timeout=timeout, check=True)
+    def text(
+        self,
+        args: list[str],
+        *,
+        timeout: float = 60.0,
+        deadline: Optional[float] = None,
+        supervise: Optional[Callable[[], None]] = None,
+    ) -> str:
+        result = self.run(args, timeout=timeout, check=True, deadline=deadline, supervise=supervise)
         return result.stdout.decode("utf-8", "replace").strip()
 
 
-def _verify_local_rootless(engine: Engine) -> None:
-    result = engine.run(["info", "--format", "{{.Host.Security.Rootless}}"], timeout=60.0)
+def _verify_local_rootless(
+    engine: Engine, *, deadline: Optional[float] = None, supervise: Optional[Callable[[], None]] = None,
+) -> None:
+    result = engine.run(
+        ["info", "--format", "{{.Host.Security.Rootless}}"], timeout=60.0,
+        deadline=deadline, supervise=supervise,
+    )
     if result.returncode != 0:
         raise VerificationFailure("engine_unavailable", "podman is not usable")
     if result.stdout.strip().decode("utf-8", "replace").lower() != "true":
@@ -454,24 +498,33 @@ def _load_images(
         if _sha256_file(archive) != entry["sha256"]:
             raise VerificationFailure("image_archive_changed", "image archive bytes do not match the inventory")
         loaded[reference] = entry
-    for reference, entry in loaded.items():
+    def _supervise() -> None:
         if claim_check is not None:
             claim_check()
         if space_check is not None:
             space_check()
+
+    for reference, entry in loaded.items():
+        _supervise()
         timeout = 600.0
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise VerificationFailure("deadline_exhausted", "the verification deadline elapsed while loading images")
             timeout = max(1.0, min(timeout, remaining))
-        result = engine.run(["load", "-i", str(entry["archive"])], timeout=timeout)
+        result = engine.run(
+            ["load", "-i", str(entry["archive"])], timeout=timeout,
+            deadline=deadline, supervise=_supervise,
+        )
         if result.returncode != 0:
             raise VerificationFailure(
                 "image_load_failed", _bounded(result.stderr.decode("utf-8", "replace")) or "image load failed",
             )
     for reference, entry in loaded.items():
-        image_id = engine.text(["image", "inspect", "--format", "{{.Id}}", entry["tag"]], timeout=60.0)
+        image_id = engine.text(
+            ["image", "inspect", "--format", "{{.Id}}", entry["tag"]], timeout=60.0,
+            deadline=deadline, supervise=_supervise,
+        )
         if image_id != entry["image_id"].lower():
             raise VerificationFailure("image_identity_mismatch", "imported image identity does not match the inventory")
     return loaded
@@ -654,9 +707,17 @@ def _gate_command(argv: list[str]) -> list[str]:
     ]
 
 
-def _inspect_json(engine: Engine, container_id: str) -> dict[str, Any]:
+def _inspect_json(
+    engine: Engine,
+    container_id: str,
+    *,
+    deadline: Optional[float] = None,
+    supervise: Optional[Callable[[], None]] = None,
+) -> dict[str, Any]:
     try:
-        raw = engine.text(["inspect", container_id], timeout=30.0)
+        raw = engine.text(
+            ["inspect", container_id], timeout=30.0, deadline=deadline, supervise=supervise,
+        )
     except VerificationFailure:
         raise VerificationFailure("attestation_failed", "container could not be inspected")
     try:
@@ -679,8 +740,12 @@ def _attest(
     host_pid_inode: Optional[int],
     worker_cgroup: str,
     expect_waiting_gate: bool,
+    deadline: Optional[float] = None,
+    supervise: Optional[Callable[[], None]] = None,
 ) -> None:
-    data = _inspect_json(engine, container.id or "")
+    data = _inspect_json(
+        engine, container.id or "", deadline=deadline, supervise=supervise,
+    )
     if str(data.get("Id", "")).lower() != (container.id or "").lower():
         raise VerificationFailure("attestation_failed", "container id does not match the created id")
     state = data.get("State") or {}
@@ -876,8 +941,16 @@ def _make_scratch(run_root: Path, name: str) -> Path:
     return scratch
 
 
-def _start(engine: Engine, container: Container) -> None:
-    result = engine.run(["start", container.id or ""], timeout=120.0)
+def _start(
+    engine: Engine,
+    container: Container,
+    *,
+    deadline: Optional[float] = None,
+    supervise: Optional[Callable[[], None]] = None,
+) -> None:
+    result = engine.run(
+        ["start", container.id or ""], timeout=120.0, deadline=deadline, supervise=supervise,
+    )
     if result.returncode != 0:
         raise VerificationFailure("engine_failed", _bounded(result.stderr.decode("utf-8", "replace")) or "container start failed")
 
@@ -903,8 +976,15 @@ def _wait_ready(
         still: list[tuple[Mapping[str, Any], Container]] = []
         for service, container in pending:
             argv = [str(item) for item in service.get("ready_argv") or ()]
-            budget = min(READINESS_PER_EXEC_SECONDS, max(0.5, min(deadline, startup_deadline) - now))
-            result = engine.run(["exec", container.id or "", *argv], timeout=budget)
+            now = time.monotonic()
+            shared = min(deadline, startup_deadline)
+            if shared - now <= 0:
+                raise VerificationFailure("readiness_timeout", "declared services did not become ready")
+            budget = max(0.5, min(READINESS_PER_EXEC_SECONDS, shared - now))
+            result = engine.run(
+                ["exec", container.id or "", *argv], timeout=budget,
+                deadline=shared, supervise=lambda: claim_check() if claim_check else None,
+            )
             if result.returncode != 0:
                 still.append((service, container))
         if not still:
@@ -1017,6 +1097,12 @@ def run_verification(
     engine.worker_cgroup = worker_cgroup
     images: dict[str, dict[str, Any]] = {}
 
+    claim_check = _claim_check(grant)
+
+    def supervise() -> None:
+        claim_check()
+        _require_space(run_root)
+
     journal: dict[str, Any] = {
         "protocol": JOURNAL_PROTOCOL,
         "invocation": run_root.name,
@@ -1055,7 +1141,7 @@ def run_verification(
         # here still reaches the cleanup path, and the reaper can finish the job if
         # this process dies first.
         engine.prepare()
-        _verify_local_rootless(engine)
+        _verify_local_rootless(engine, deadline=deadline, supervise=supervise)
         if _free_bytes(run_root) < ADMISSION_FREE_BYTES:
             raise VerificationFailure("insufficient_disk", "verification requires at least 1 GiB free")
         limits = _inherited_limits(worker_cgroup)
@@ -1063,7 +1149,6 @@ def run_verification(
         store = ImageStore(authority)
         services = list(recipe.get("services") or ())
         references = [KEEPER_IMAGE, str(recipe.get("image"))] + [str(service.get("image")) for service in services]
-        claim_check = _claim_check(grant)
         images = _load_images(
             engine, store, references, deadline=deadline, claim_check=claim_check,
             space_check=lambda: _require_space(run_root),
@@ -1084,18 +1169,18 @@ def run_verification(
             network="none", timeout_seconds=keeper_seconds,
             log_path=engine.logs / "keeper.log",
         )
-        keeper.id = _create(engine, keeper_spec)
+        keeper.id = _create(engine, keeper_spec, deadline=deadline, supervise=supervise)
         keeper.log_path = keeper_spec.log_path
         journal["containers"].append(keeper.record())
         _journal_write(journal_path, journal)
         journal["phase"] = "keeper-started"
         _journal_write(journal_path, journal)
-        _start(engine, keeper)
+        _start(engine, keeper, deadline=deadline, supervise=supervise)
         _attest(
             engine, keeper, keeper_spec, image_id=images[KEEPER_IMAGE]["image_id"],
             keeper_id=None, keeper_net_inode=None,
             host_pid_inode=host_pid_inode, worker_cgroup=worker_cgroup,
-            expect_waiting_gate=False,
+            expect_waiting_gate=False, deadline=deadline, supervise=supervise,
         )
         keeper_id = keeper.id
         journal["keeper"] = keeper.record()
@@ -1121,7 +1206,7 @@ def run_verification(
                 timeout_seconds=_deadline_seconds(deadline),
                 log_path=engine.logs / f"{name}.log",
             )
-            container.id = _create(engine, spec)
+            container.id = _create(engine, spec, deadline=deadline, supervise=supervise)
             container.log_path = spec.log_path
             journal["containers"].append(container.record())
             _journal_write(journal_path, journal)
@@ -1143,7 +1228,7 @@ def run_verification(
             timeout_seconds=_deadline_seconds(deadline),
             log_path=engine.logs / "verifier.log",
         )
-        verifier.id = _create(engine, verifier_spec)
+        verifier.id = _create(engine, verifier_spec, deadline=deadline, supervise=supervise)
         verifier.log_path = verifier_spec.log_path
         journal["containers"].append(verifier.record())
         _journal_write(journal_path, journal)
@@ -1152,7 +1237,7 @@ def run_verification(
         journal["phase"] = "created"
         _journal_write(journal_path, journal)
         for container in containers:
-            _start(engine, container)
+            _start(engine, container, deadline=deadline, supervise=supervise)
         journal["phase"] = "started"
         _journal_write(journal_path, journal)
 
@@ -1162,13 +1247,13 @@ def run_verification(
                 engine, container, spec, image_id=images[str(service["image"])]["image_id"],
                 keeper_id=keeper_id, keeper_net_inode=keeper.net_inode,
                 host_pid_inode=host_pid_inode, worker_cgroup=worker_cgroup,
-                expect_waiting_gate=True,
+                expect_waiting_gate=True, deadline=deadline, supervise=supervise,
             )
         _attest(
             engine, verifier, verifier_spec, image_id=images[str(recipe["image"])]["image_id"],
             keeper_id=keeper_id, keeper_net_inode=keeper.net_inode,
             host_pid_inode=host_pid_inode, worker_cgroup=worker_cgroup,
-            expect_waiting_gate=True,
+            expect_waiting_gate=True, deadline=deadline, supervise=supervise,
         )
         # Persist the identity tuples the reaper needs before anything is released.
         journal["containers"] = [container.record() for container in ([keeper] if keeper is not None else []) + containers]
@@ -1262,8 +1347,16 @@ def run_verification(
     return result
 
 
-def _create(engine: Engine, spec: _Spec) -> str:
-    result = engine.run(_create_args(engine, spec), timeout=120.0)
+def _create(
+    engine: Engine,
+    spec: _Spec,
+    *,
+    deadline: Optional[float] = None,
+    supervise: Optional[Callable[[], None]] = None,
+) -> str:
+    result = engine.run(
+        _create_args(engine, spec), timeout=120.0, deadline=deadline, supervise=supervise,
+    )
     if result.returncode != 0:
         raise VerificationFailure(
             "engine_failed", _bounded(result.stderr.decode("utf-8", "replace")) or "container create failed",
@@ -1289,7 +1382,9 @@ def _wait_exit(
         if space_check is not None and time.monotonic() - last_space > 2.0:
             space_check()
             last_space = time.monotonic()
-        data = _inspect_json(engine, container.id or "")
+        data = _inspect_json(
+            engine, container.id or "", deadline=deadline, supervise=claim_check,
+        )
         state = data.get("State") or {}
         if state.get("Status") != "running":
             return int(state.get("ExitCode") or 0), False

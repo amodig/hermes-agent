@@ -1072,8 +1072,20 @@ def _retained_grant_quiet() -> Any:
 
 
 def worker_execution_policy_summary() -> dict[str, Any]:
-    """What the mandatory pre-execution callback may authorize, from the grant only."""
-    _grant, authority = _authorize_execution()
+    """What the mandatory pre-execution callback may authorize, from the grant only.
+
+    The native handler called :func:`_authorize_execution` (including the full runtime
+    provenance check) immediately before invoking this hook and re-checks the final
+    arguments afterwards, so the callback reads the retained authority's summary
+    instead of repeating the expensive sealed-payload verification.
+    """
+    from hermes_cli import worker_startup
+
+    grant = worker_startup._retained_grant()
+    authority = getattr(grant, "execution", None)
+    if not isinstance(authority, ExecutionAuthority):
+        raise WorkerExecutionUnavailable("worker_execution_unavailable", "no worker execution grant for this process")
+    authority.verify_static_identities()
     return {
         "policy_digest": authority.policy_digest,
         "inspect": authority.inspect,
@@ -1378,6 +1390,10 @@ class SyntheticGit:
             if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
                 _refuse("git_metadata_unsafe", "Git config is not a bounded regular file")
             fd = os.open(source, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC)
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode) or opened.st_size > 1024 * 1024:
+                os.close(fd)
+                _refuse("git_metadata_unsafe", "Git config is not a bounded regular file")
         except OSError as exc:
             _refuse("git_metadata_unsafe", _bounded(exc))
         try:
@@ -1445,6 +1461,8 @@ class SyntheticGit:
                     _refuse("git_metadata_unsafe", _bounded(exc))
                 if stat.S_ISLNK(entry_info.st_mode):
                     _refuse("git_metadata_unsafe", "Git object storage contains a symlink")
+                if not (stat.S_ISDIR(entry_info.st_mode) or stat.S_ISREG(entry_info.st_mode)):
+                    _refuse("git_metadata_unsafe", "Git object storage contains a non-regular entry")
             dirnames[:] = [name for name in dirnames if not (base / name).is_symlink()]
         return objects
 
@@ -1964,11 +1982,34 @@ def _diff_text(git: SyntheticGit, scope: list[str], path: Optional[str], target:
             )
         except OSError as exc:
             raise WorkerExecutionRefused("git_unavailable", _bounded(exc))
+        import select
+
         try:
             assert process.stdout is not None
+            fd = process.stdout.fileno()
+            os.set_blocking(fd, False)
             deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
             while True:
-                chunk = process.stdout.read(1024 * 1024)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    process.kill()
+                    process.wait()
+                    raise WorkerExecutionRefused("git_timeout", "the diff exceeded its time bound")
+                ready, _, _ = select.select([fd], [], [], min(0.25, remaining))
+                if not ready:
+                    if process.poll() is not None:
+                        # Drain whatever is buffered, then finish.
+                        with contextlib.suppress(BlockingIOError):
+                            chunk = os.read(fd, 1024 * 1024)
+                            while chunk:
+                                drained += len(chunk)
+                                if drained > MAX_GIT_OUTPUT_BYTES:
+                                    raise WorkerExecutionRefused("diff_too_large", "the diff exceeds the drained output bound")
+                                sink.write(chunk)
+                                chunk = os.read(fd, 1024 * 1024)
+                        break
+                    continue
+                chunk = os.read(fd, 1024 * 1024)
                 if not chunk:
                     break
                 drained += len(chunk)
@@ -1976,13 +2017,11 @@ def _diff_text(git: SyntheticGit, scope: list[str], path: Optional[str], target:
                     process.kill()
                     process.wait()
                     raise WorkerExecutionRefused("diff_too_large", "the diff exceeds the drained output bound")
-                if time.monotonic() > deadline:
-                    process.kill()
-                    process.wait()
-                    raise WorkerExecutionRefused("git_timeout", "the diff exceeded its time bound")
                 sink.write(chunk)
         finally:
             if process.poll() is None:
+                process.kill()
+            with contextlib.suppress(Exception):
                 process.wait(timeout=GIT_TIMEOUT_SECONDS)
     if process.returncode != 0:
         _refuse("git_unavailable", "Git diff failed")
@@ -2257,14 +2296,12 @@ def worker_verify(args: dict, *, original_args: dict | None = None) -> str:
             run_root = Path(str(_record_value(authority.execution_parent, "path", ""))) / invocation
             run_root.mkdir(mode=0o700)
             journal_path = Path(str(_record_value(authority.journal_dir, "path", ""))) / f"{invocation}.json"
-            backend_entered = False
             try:
                 snapshot, source_dir = _materialize_source(authority, run_root)
                 if snapshot.source_digest != normalized["source_digest"]:
                     raise WorkerExecutionRefused("source_changed", "the granted source does not match the requested digest")
                 from hermes_cli import worker_execution_podman as backend
 
-                backend_entered = True
                 result = backend.run_verification(
                     authority=authority,
                     recipe=recipe,
@@ -2274,14 +2311,13 @@ def worker_verify(args: dict, *, original_args: dict | None = None) -> str:
                     grant=grant,
                 )
             except BaseException:
-                # Before the backend owns the journal, this call owns the allocation:
-                # a refused digest must not leave a source copy behind.
-                if not backend_entered:
+                # Ownership transfers only once the backend's journal exists; before
+                # that (materialization, digest refusal, engine/cgroup/journal setup
+                # failures) this call removes its own allocation.
+                if not journal_path.exists():
                     from hermes_cli.worker_execution_podman import remove_tree
 
                     remove_tree(run_root)
-                    with contextlib.suppress(OSError):
-                        journal_path.unlink()
                 raise
             # Revalidate the claim and source identity at finish; anything that changed
             # makes the evidence unusable rather than silently accepted.

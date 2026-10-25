@@ -94,7 +94,7 @@ class _FakeEngine:
         self.payload = payload
         self.run_root = run_root
 
-    def text(self, args, *, timeout=60.0):  # noqa: ANN001 - test double
+    def text(self, args, *, timeout=60.0, deadline=None, supervise=None):  # noqa: ANN001 - test double
         return json.dumps([self.payload])
 
 
