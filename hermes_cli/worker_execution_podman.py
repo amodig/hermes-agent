@@ -1035,8 +1035,15 @@ def _wait_ready(
 
 
 def _release(marker: Path) -> None:
-    fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    os.close(fd)
+    """Create the gate marker atomically with native interruption."""
+    from tools.interrupt import run_if_not_interrupted
+
+    def _create() -> None:
+        fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+
+    if not run_if_not_interrupted(_create):
+        raise VerificationFailure("cancelled", "verification was interrupted before release")
 
 
 def _collect_log(engine: Engine, container: Container) -> tuple[str, bool]:
@@ -1142,10 +1149,14 @@ def run_verification(
     from tools.interrupt import is_interrupted
 
     def supervise() -> None:
+        if time.monotonic() >= deadline:
+            raise VerificationFailure("deadline_exhausted", "the verification deadline elapsed")
         if is_interrupted():
             raise VerificationFailure("cancelled", "verification was interrupted")
         claim_check()
         _require_space(run_root)
+        if time.monotonic() >= deadline:
+            raise VerificationFailure("deadline_exhausted", "the verification deadline elapsed")
 
     journal: dict[str, Any] = {
         "protocol": JOURNAL_PROTOCOL,
@@ -1212,10 +1223,13 @@ def run_verification(
             network="none", timeout_seconds=keeper_seconds,
             log_path=engine.logs / "keeper.log",
         )
-        keeper.id = _create(engine, keeper_spec, deadline=deadline, supervise=supervise)
+        keeper.id, keeper_error = _create(engine, keeper_spec, deadline=deadline, supervise=supervise)
         keeper.log_path = keeper_spec.log_path
-        journal["containers"].append(keeper.record())
-        _journal_write(journal_path, journal)
+        if keeper.id:
+            journal["containers"].append(keeper.record())
+            _journal_write(journal_path, journal)
+        if keeper_error is not None:
+            raise keeper_error
         journal["phase"] = "keeper-started"
         _journal_write(journal_path, journal)
         _start(engine, keeper, deadline=deadline, supervise=supervise)
@@ -1250,14 +1264,19 @@ def run_verification(
                 timeout_seconds=0,
                 log_path=engine.logs / f"{name}.log",
             )
-            container.id = _create(engine, spec, deadline=deadline, supervise=supervise)
+            container.id, container_error = _create(
+                engine, spec, deadline=deadline, supervise=supervise,
+            )
             container.log_path = spec.log_path
             containers.append(container)
             service_containers.append((service, container))
             service_specs.append((service, container, spec))
+            if container.id:
+                journal["containers"].append(container.record())
+                _journal_write(journal_path, journal)
+            if container_error is not None:
+                raise container_error
             supervise()
-            journal["containers"].append(container.record())
-            _journal_write(journal_path, journal)
             _start(engine, container, deadline=deadline, supervise=supervise)
             _attest_expiry(container, spec, deadline)
 
@@ -1275,12 +1294,17 @@ def run_verification(
             timeout_seconds=0,
             log_path=engine.logs / "verifier.log",
         )
-        verifier.id = _create(engine, verifier_spec, deadline=deadline, supervise=supervise)
+        verifier.id, verifier_error = _create(
+            engine, verifier_spec, deadline=deadline, supervise=supervise,
+        )
         verifier.log_path = verifier_spec.log_path
         containers.append(verifier)
+        if verifier.id:
+            journal["containers"].append(verifier.record())
+            _journal_write(journal_path, journal)
+        if verifier_error is not None:
+            raise verifier_error
         supervise()
-        journal["containers"].append(verifier.record())
-        _journal_write(journal_path, journal)
         _start(engine, verifier, deadline=deadline, supervise=supervise)
         _attest_expiry(verifier, verifier_spec, deadline)
 
@@ -1392,30 +1416,43 @@ def run_verification(
     return result
 
 
+def _recover_cid(engine: Engine, spec: _Spec) -> Optional[str]:
+    """The exact id Podman wrote for a create that was interrupted or ambiguous."""
+    try:
+        text = (engine.run_root / (spec.name + ".cid")).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return text.lower() if _CONTAINER_ID_RE.match(text) else None
+
+
 def _create(
     engine: Engine,
     spec: _Spec,
     *,
     deadline: Optional[float] = None,
     supervise: Optional[Callable[[], None]] = None,
-) -> str:
+) -> tuple[Optional[str], Optional[BaseException]]:
+    """Create one container, returning its exact id even when the wait is aborted."""
     # Podman's --timeout bounds running time from start, and the value is frozen at
     # create. The remaining budget is bound here so the conmon expiry lands on the
     # invocation deadline plus at most the create/start latency (attested below).
     if spec.kind != "keeper" and deadline is not None:
         spec.timeout_seconds = _deadline_seconds(deadline)
-    result = engine.run(
-        _create_args(engine, spec), timeout=120.0, deadline=deadline, supervise=supervise,
-        supervise_after=False,
-    )
+    try:
+        result = engine.run(
+            _create_args(engine, spec), timeout=120.0, deadline=deadline, supervise=supervise,
+            supervise_after=False,
+        )
+    except BaseException as exc:
+        return _recover_cid(engine, spec), exc
     if result.returncode != 0:
-        raise VerificationFailure(
+        return _recover_cid(engine, spec), VerificationFailure(
             "engine_failed", _bounded(result.stderr.decode("utf-8", "replace")) or "container create failed",
         )
     container_id = result.stdout.decode("ascii", "replace").strip()
     if not _CONTAINER_ID_RE.match(container_id):
-        raise VerificationFailure("attestation_failed", "container create returned no exact id")
-    return container_id
+        return None, VerificationFailure("attestation_failed", "container create returned no exact id")
+    return container_id, None
 
 
 def _wait_exit(

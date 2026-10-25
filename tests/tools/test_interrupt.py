@@ -61,6 +61,22 @@ class TestInterruptModule:
             assert other_tid in _interrupted_threads  # other thread untouched
             _interrupted_threads.discard(other_tid)
 
+    def test_run_if_not_interrupted_honors_the_acting_tool_thread(self):
+        import tools.interrupt as interrupt
+        from tools.interrupt import run_if_not_interrupted, set_interrupt
+
+        callbacks: list[str] = []
+        other_tid = 999_999_999
+        set_interrupt(True, other_tid)
+        token = interrupt.acting_for_tid.set(other_tid)
+        try:
+            assert run_if_not_interrupted(lambda: callbacks.append("claimed")) is False
+        finally:
+            interrupt.acting_for_tid.reset(token)
+            set_interrupt(False, other_tid)
+
+        assert callbacks == []
+
     def test_run_if_not_interrupted_skips_callback_when_already_interrupted(self):
         from tools.interrupt import run_if_not_interrupted, set_interrupt
 
