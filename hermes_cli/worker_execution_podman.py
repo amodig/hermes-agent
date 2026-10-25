@@ -1381,6 +1381,7 @@ def run_verification(
     finally:
         cleanup_ok, cleanup_reasons = _cleanup(
             engine, ([keeper] if keeper is not None else []) + containers,
+            creates=tuple(str(name) for name in journal.get("creates") or ()),
         )
         result["cleanup_ok"] = cleanup_ok
         result["cleanup_detail"] = cleanup_reasons
@@ -1488,10 +1489,27 @@ def _wait_exit(
     return None, True
 
 
-def _cleanup(engine: Engine, containers: list[Container]) -> tuple[bool, list[str]]:
+def _engine_step(engine: Engine, argv: list[str], *, timeout: float) -> Optional[subprocess.CompletedProcess]:
+    """Run one cleanup command; an engine that cannot start is a failed step, not a crash."""
+    try:
+        return engine.run(argv, timeout=timeout)
+    except VerificationFailure:
+        return None
+
+
+def _cleanup(
+    engine: Engine, containers: list[Container], *, creates: tuple[str, ...] = (),
+) -> tuple[bool, list[str]]:
     ok = True
     reasons: list[str] = []
-    listed = engine.run(["ps", "-a", "--no-trunc", "--format", "{{.ID}}"], timeout=30.0)
+    try:
+        listed = engine.run(["ps", "-a", "--no-trunc", "--format", "{{.ID}}"], timeout=30.0)
+    except VerificationFailure as exc:
+        # An engine that cannot start proves nothing was allocated only when this
+        # invocation never asked for a container; otherwise the journal must survive.
+        if not containers and not creates and remove_tree(engine.run_root):
+            return True, [f"engine_unavailable_no_allocation:{exc.code}"]
+        return False, [f"engine_unavailable:{exc.code}"]
     if listed.returncode != 0:
         # An unreadable inventory is not an empty one: never claim cleanup on it.
         ok = False
@@ -1505,8 +1523,8 @@ def _cleanup(engine: Engine, containers: list[Container]) -> tuple[bool, list[st
     for container in reversed(containers):
         if not container.id or container.id.lower() not in present:
             continue
-        result = engine.run(["rm", "-f", "-t", "2", container.id], timeout=60.0)
-        if result.returncode != 0:
+        result = _engine_step(engine, ["rm", "-f", "-t", "2", container.id], timeout=60.0)
+        if result is None or result.returncode != 0:
             ok = False
             detail = result.stderr.decode("utf-8", "replace").strip().replace("\n", " | ")[:200]
             reasons.append(f"rm_failed:{container.name}:{detail}")
@@ -1516,8 +1534,8 @@ def _cleanup(engine: Engine, containers: list[Container]) -> tuple[bool, list[st
             reasons.append(f"kill_failed:{container.name}")
         if container.conmon_pid:
             _terminate_recorded(container.conmon_pid, container.conmon_start)
-    listed = engine.run(["ps", "-a", "--no-trunc", "--format", "{{.ID}}"], timeout=30.0)
-    if listed.returncode != 0:
+    listed = _engine_step(engine, ["ps", "-a", "--no-trunc", "--format", "{{.ID}}"], timeout=30.0)
+    if listed is None or listed.returncode != 0:
         ok = False
         reasons.append("listing_failed_after_rm")
         remaining: set[str] = set()
@@ -1685,7 +1703,10 @@ def cleanup_journal(journal_path: Path, *, home: Optional[Path] = None) -> tuple
         return True, "already_cleaned"
     engine = Engine(root)
     ok = True
-    listed = engine.run(["ps", "-a", "--no-trunc", "--format", "{{.ID}}"], timeout=60.0)
+    try:
+        listed = engine.run(["ps", "-a", "--no-trunc", "--format", "{{.ID}}"], timeout=60.0)
+    except VerificationFailure as exc:
+        return False, f"engine_unavailable:{exc.code}"
     if listed.returncode != 0:
         return False, "listing_failed"
     present = {
@@ -1710,8 +1731,8 @@ def cleanup_journal(journal_path: Path, *, home: Optional[Path] = None) -> tuple
     for name, candidate in reversed(recovered):
         if candidate not in present:
             continue
-        result = engine.run(["rm", "-f", "-t", "2", candidate], timeout=60.0)
-        if result.returncode != 0:
+        result = _engine_step(engine, ["rm", "-f", "-t", "2", candidate], timeout=60.0)
+        if result is None or result.returncode != 0:
             ok = False
             failures.append(f"rm:{name}")
     for record in reversed(payload.get("containers") or []):
@@ -1722,8 +1743,8 @@ def cleanup_journal(journal_path: Path, *, home: Optional[Path] = None) -> tuple
             continue
         if container_id.lower() not in present:
             continue  # already gone (engine deadline or an earlier pass)
-        result = engine.run(["rm", "-f", "-t", "2", container_id], timeout=60.0)
-        if result.returncode != 0:
+        result = _engine_step(engine, ["rm", "-f", "-t", "2", container_id], timeout=60.0)
+        if result is None or result.returncode != 0:
             ok = False
             failures.append(f"rm:{record.get('name')}")
     worker_cgroup = str(payload.get("worker_cgroup") or "")
@@ -1760,8 +1781,8 @@ def cleanup_journal(journal_path: Path, *, home: Optional[Path] = None) -> tuple
         if time.monotonic() >= grace_deadline:
             return False, "leftover_processes:" + ",".join(sorted(set(reasons)))
         time.sleep(0.2)
-    final = engine.run(["ps", "-a", "--no-trunc", "--format", "{{.ID}}"], timeout=60.0)
-    if final.returncode != 0:
+    final = _engine_step(engine, ["ps", "-a", "--no-trunc", "--format", "{{.ID}}"], timeout=60.0)
+    if final is None or final.returncode != 0:
         return False, "listing_failed_after_rm"
     leftovers = {
         line.strip().lower() for line in final.stdout.decode("utf-8", "replace").splitlines() if line.strip()
@@ -1808,7 +1829,10 @@ def reap_journals(journal_dir: Path, *, max_journals: int = MAX_REAP_JOURNALS) -
         deadline = payload.get("deadline_epoch")
         if isinstance(deadline, (int, float)) and time.time() < float(deadline):
             continue
-        ok, reason = cleanup_journal(path)
+        try:
+            ok, reason = cleanup_journal(path)
+        except Exception as exc:  # one bad journal must not stop the sweep
+            ok, reason = False, f"cleanup_error:{_bounded(exc, 120)}"
         results.append({"journal": path.name, "ok": ok, "reason": reason})
         processed += 1
     return results

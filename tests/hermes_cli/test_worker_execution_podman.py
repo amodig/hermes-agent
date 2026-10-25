@@ -251,6 +251,30 @@ def test_cleanup_journal_requires_unchanged_root_identity(tmp_path):
     assert ok is True and reason == "cleaned"
 
 
+class _UnstartableEngine:
+    """An engine whose executable cannot be started at all."""
+
+    def __init__(self, run_root):
+        self.run_root = run_root
+
+    def run(self, *_args, **_kwargs):
+        raise podman.VerificationFailure("engine_unavailable", "podman is not installed")
+
+
+def test_cleanup_removes_the_tree_only_when_nothing_was_allocated(tmp_path):
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    engine = _UnstartableEngine(run_root)
+    ok, reasons = podman._cleanup(engine, [])
+    assert ok is True and reasons == ["engine_unavailable_no_allocation:engine_unavailable"]
+    assert not run_root.exists()
+
+    run_root.mkdir()
+    ok, reasons = podman._cleanup(engine, [], creates=("verifier",))
+    assert ok is False and reasons == ["engine_unavailable:engine_unavailable"]
+    assert run_root.exists()
+
+
 def test_absent_run_root_keeps_a_journal_while_recorded_process_lives(tmp_path):
     journal = tmp_path / "journal.json"
     journal.write_text(json.dumps({
