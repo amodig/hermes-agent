@@ -17,6 +17,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 import types
 from pathlib import Path
 from dataclasses import dataclass
@@ -691,6 +692,9 @@ def dispatch_required_worker_execution(
             "args_digest": args_digest,
             "operation": operation,
             "recipe": recipe,
+            # Concurrent tool calls are different work: without a per-call identity the
+            # bounded runner treats the second one as a duplicate and refuses it.
+            "tool_call_id": f"worker-execution:{uuid.uuid4().hex}",
         }
         timeout = min(_resolve_hook_callback_timeout(), 30.0)
         result: Any = None
@@ -698,7 +702,11 @@ def dispatch_required_worker_execution(
         # the frozen guard's own callback may supply the allow; the others can abstain
         # or veto, never authorize.
         for callback in list(manager._hooks.get(hook_name, [])):
-            verdict = manager._run_hook_callback_bounded(hook_name, callback, payload, timeout)
+            if timeout <= 0:
+                # The operator disabled the threaded timeout path: run synchronously.
+                verdict = callback(**manager._hook_callback_kwargs(callback, payload))
+            else:
+                verdict = manager._run_hook_callback_bounded(hook_name, callback, payload, timeout)
             if verdict is _HOOK_SKIPPED:
                 return False, "required approval callback timed out or is unavailable"
             if callback is required:

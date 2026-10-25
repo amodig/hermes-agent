@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -272,6 +273,28 @@ def test_cleanup_removes_the_tree_only_when_nothing_was_allocated(tmp_path):
     run_root.mkdir()
     ok, reasons = podman._cleanup(engine, [], creates=("verifier",))
     assert ok is False and reasons == ["engine_unavailable:engine_unavailable"]
+    assert run_root.exists()
+
+
+def test_cleanup_survives_an_engine_that_dies_mid_removal(tmp_path):
+    class VanishingEngine:
+        def __init__(self, run_root):
+            self.run_root = run_root
+            self.calls = 0
+
+        def run(self, argv, **_kwargs):
+            self.calls += 1
+            if argv[0] == "ps":
+                return subprocess.CompletedProcess(argv, 0, b"a" * 64 + b"\n", b"")
+            raise podman.VerificationFailure("engine_unavailable", "podman disappeared")
+
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    container = podman.Container("verifier", "verifier", "image", "tag")
+    container.id = "a" * 64
+    ok, reasons = podman._cleanup(VanishingEngine(run_root), [container])
+    assert ok is False
+    assert reasons[:2] == ["rm_failed:verifier:engine_unavailable", "still_listed:verifier"]
     assert run_root.exists()
 
 

@@ -481,6 +481,44 @@ def test_repository_paths_must_stay_relative_and_component_clean():
     wes._validate_source_name("src/app.py")
 
 
+def test_required_approval_survives_disabled_timeouts_and_concurrent_calls(monkeypatch):
+    from hermes_cli import plugins, plugins_dispatch
+
+    calls: list[dict] = []
+
+    def callback(**kwargs):
+        calls.append(kwargs)
+        return {
+            "action": "allow",
+            "policy_digest": kwargs["policy_digest"],
+            "args_digest": kwargs["args_digest"],
+        }
+
+    class Manager:
+        _hooks = {"pre_worker_execution": [callback]}
+
+        def required_hook_callback(self, hook_name, owner):
+            return callback, "ok"
+
+        @staticmethod
+        def _hook_callback_kwargs(cb, payload):
+            return dict(payload)
+
+        def _run_hook_callback_bounded(self, *args):
+            raise AssertionError("the threaded path is disabled")
+
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: Manager())
+    monkeypatch.setattr(plugins, "_resolve_hook_callback_timeout", lambda: 0.0)
+    for _ in range(2):
+        ok, reason = plugins_dispatch.dispatch_required_worker_execution(
+            owner=object(), tool_name="kanban_worker_inspect", args={},
+            policy_digest="policy", args_digest="args", operation="summary", recipe=None,
+        )
+        assert ok, reason
+    assert len(calls) == 2
+    assert calls[0]["tool_call_id"] != calls[1]["tool_call_id"]
+
+
 def test_read_pages_and_binary_refusal(fixture):
     authority = _authority(fixture)
     snapshot = wes._scan_source(authority)

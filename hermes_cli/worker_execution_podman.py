@@ -1524,7 +1524,10 @@ def _cleanup(
         if not container.id or container.id.lower() not in present:
             continue
         result = _engine_step(engine, ["rm", "-f", "-t", "2", container.id], timeout=60.0)
-        if result is None or result.returncode != 0:
+        if result is None:
+            ok = False
+            reasons.append(f"rm_failed:{container.name}:engine_unavailable")
+        elif result.returncode != 0:
             ok = False
             detail = result.stderr.decode("utf-8", "replace").strip().replace("\n", " | ")[:200]
             reasons.append(f"rm_failed:{container.name}:{detail}")
