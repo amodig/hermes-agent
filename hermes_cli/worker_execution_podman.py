@@ -1664,10 +1664,12 @@ def _namespace_inodes_in_use(inode: int, *, name: str = "net", worker_cgroup: st
 
 
 def _host_epoch() -> str:
+    """The current boot identity, or ``"unknown"`` when it cannot be established."""
     try:
-        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
     except OSError:
         return "unknown"
+    return value or "unknown"
 
 
 def cleanup_journal(journal_path: Path, *, home: Optional[Path] = None) -> tuple[bool, str]:
@@ -1681,7 +1683,8 @@ def cleanup_journal(journal_path: Path, *, home: Optional[Path] = None) -> tuple
     current_epoch = _host_epoch()
     if (
         not isinstance(recorded_epoch, str) or not recorded_epoch
-        or recorded_epoch == "unknown" or current_epoch == "unknown"
+        or recorded_epoch == "unknown"
+        or not current_epoch or current_epoch == "unknown"
     ):
         # Process identity is boot-relative: without two known boot identities nothing
         # can be concluded, so keep the journal and never signal a possibly reused PID.
