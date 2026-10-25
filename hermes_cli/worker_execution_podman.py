@@ -1172,6 +1172,7 @@ def run_verification(
         "phase": "provisioning",
         "recipe": str(recipe.get("id")),
         "containers": [],
+        "creates": [],
     }
     _journal_write(journal_path, journal)
 
@@ -1223,6 +1224,8 @@ def run_verification(
             network="none", timeout_seconds=keeper_seconds,
             log_path=engine.logs / "keeper.log",
         )
+        journal["creates"].append(keeper_spec.name)
+        _journal_write(journal_path, journal)
         keeper.id, keeper_error = _create(engine, keeper_spec, deadline=deadline, supervise=supervise)
         keeper.log_path = keeper_spec.log_path
         if keeper.id:
@@ -1264,6 +1267,8 @@ def run_verification(
                 timeout_seconds=0,
                 log_path=engine.logs / f"{name}.log",
             )
+            journal["creates"].append(spec.name)
+            _journal_write(journal_path, journal)
             container.id, container_error = _create(
                 engine, spec, deadline=deadline, supervise=supervise,
             )
@@ -1294,6 +1299,8 @@ def run_verification(
             timeout_seconds=0,
             log_path=engine.logs / "verifier.log",
         )
+        journal["creates"].append(verifier_spec.name)
+        _journal_write(journal_path, journal)
         verifier.id, verifier_error = _create(
             engine, verifier_spec, deadline=deadline, supervise=supervise,
         )
@@ -1521,6 +1528,10 @@ def _cleanup(engine: Engine, containers: list[Container]) -> tuple[bool, list[st
         if container.id and container.id.lower() in remaining:
             ok = False
             reasons.append(f"still_listed:{container.name}")
+    known = {container.id.lower() for container in containers if container.id}
+    for container_id in sorted(remaining - known):
+        ok = False
+        reasons.append(f"unaccounted_container:{container_id}")
     # Teardown is asynchronous at the kernel level; give the recorded processes a
     # bounded grace window, then judge. A process or namespace that survives it is
     # evidence, never a retry.
@@ -1671,8 +1682,29 @@ def cleanup_journal(journal_path: Path, *, home: Optional[Path] = None) -> tuple
     present = {
         line.strip().lower() for line in listed.stdout.decode("utf-8", "replace").splitlines() if line.strip()
     }
+    # Creation intent is journaled before `create`, and the engine writes a CID file
+    # per container. Both are identity-checked evidence from this invocation's own
+    # store, so an interrupted create stays reclaimable; a missing CID is unknown
+    # allocation, never "nothing created".
+    recorded = {str(record.get("id") or "").lower() for record in payload.get("containers") or []}
+    recovered: list[tuple[str, str]] = []
+    for name in [str(item) for item in payload.get("creates") or []]:
+        try:
+            candidate = (root / f"{name}.cid").read_text(encoding="utf-8").strip().lower()
+        except OSError:
+            candidate = ""
+        if _CONTAINER_ID_RE.match(candidate) and candidate not in recorded:
+            recovered.append((name, candidate))
+            recorded.add(candidate)
     failures: list[str] = []
     # Children share the keeper's network namespace: remove them first.
+    for name, candidate in reversed(recovered):
+        if candidate not in present:
+            continue
+        result = engine.run(["rm", "-f", "-t", "2", candidate], timeout=60.0)
+        if result.returncode != 0:
+            ok = False
+            failures.append(f"rm:{name}")
     for record in reversed(payload.get("containers") or []):
         container_id = str(record.get("id") or "")
         if not _CONTAINER_ID_RE.match(container_id):
@@ -1716,6 +1748,16 @@ def cleanup_journal(journal_path: Path, *, home: Optional[Path] = None) -> tuple
         if time.monotonic() >= grace_deadline:
             return False, "leftover_processes:" + ",".join(sorted(set(reasons)))
         time.sleep(0.2)
+    final = engine.run(["ps", "-a", "--no-trunc", "--format", "{{.ID}}"], timeout=60.0)
+    if final.returncode != 0:
+        return False, "listing_failed_after_rm"
+    leftovers = {
+        line.strip().lower() for line in final.stdout.decode("utf-8", "replace").splitlines() if line.strip()
+    }
+    if leftovers:
+        # Never delete the store or the journal while an owned container remains
+        # outside exact-ID reclamation.
+        return False, "unaccounted_containers:" + ",".join(sorted(leftovers))
     if ok:
         if not remove_tree(root):
             return False, "store_not_removed"
