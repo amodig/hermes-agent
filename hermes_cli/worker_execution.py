@@ -471,7 +471,7 @@ def _resolve_image_store(policy: WorkerExecutionPolicy) -> Optional[dict[str, An
         _refuse("policy_malformed", "image_store must be a real directory")
     if info.st_mode & 0o077:
         _refuse("policy_malformed", "image_store must be owner-only")
-    if int(info.st_uid) != os.getuid():
+    if int(info.st_uid) != os.getuid():  # windows-footgun: ok — POSIX-only ownership check
         _refuse("policy_malformed", "image_store must be owned by this user")
     inventory = path / "inventory.json"
     try:
@@ -522,7 +522,7 @@ def _policy_plugin_digests(profile_home: Optional[str]) -> Optional[dict[str, An
         try:
             if directory.is_symlink() or not manifest.is_file() or not module.is_file():
                 continue
-            text = manifest.read_text(encoding="utf-8", errors="strict")
+            text = manifest.read_text(encoding="utf-8-sig", errors="strict")
         except OSError:
             return None
         if not re.search(r"^name:\s*" + re.escape(POLICY_PLUGIN_ID) + r"\s*$", text, re.MULTILINE):
@@ -771,7 +771,7 @@ def _workspace_head_from_identity(git: Mapping[str, Any]) -> Optional[str]:
         info = os.lstat(head_path)
         if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
             return None
-        raw = head_path.read_text(encoding="utf-8", errors="strict").strip()
+        raw = head_path.read_text(encoding="utf-8-sig", errors="strict").strip()
     except OSError:
         return None
     if not raw.startswith("ref:"):
@@ -781,7 +781,7 @@ def _workspace_head_from_identity(git: Mapping[str, Any]) -> Optional[str]:
         candidate = base / ref
         try:
             if candidate.is_file() and not candidate.is_symlink():
-                value = candidate.read_text(encoding="utf-8", errors="strict").strip()
+                value = candidate.read_text(encoding="utf-8-sig", errors="strict").strip()
                 if _OBJECT_ID_RE.match(value):
                     return value
         except OSError:
@@ -789,7 +789,7 @@ def _workspace_head_from_identity(git: Mapping[str, Any]) -> Optional[str]:
         packed = base / "packed-refs"
         try:
             if packed.is_file() and not packed.is_symlink():
-                for line in packed.read_text(encoding="utf-8", errors="strict").splitlines():
+                for line in packed.read_text(encoding="utf-8-sig", errors="strict").splitlines():
                     if line.startswith(("#", "^")):
                         continue
                     fields = line.split(" ", 1)
