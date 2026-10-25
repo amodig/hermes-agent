@@ -17,7 +17,7 @@ import pytest
 
 from hermes_cli import worker_execution_podman as podman
 
-pytestmark = pytest.mark.skipif(not __import__("sys").platform.startswith("linux"), reason="Linux-only boundary")
+pytestmark = pytest.mark.platforms("linux")  # procfs, namespaces and rootless Podman are Linux-only
 
 IMAGE = "docker.io/library/postgres@sha256:" + "b" * 64
 IMAGE_ID = "c" * 64

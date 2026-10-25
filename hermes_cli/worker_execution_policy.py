@@ -402,12 +402,27 @@ def _resolve_workspace(policy_entry: WorkspacePolicy) -> Optional[dict[str, Any]
 def _resolve_image_store(policy: WorkerExecutionPolicy) -> Optional[dict[str, Any]]:
     if policy.image_store is None:
         return None
-    path = Path(policy.image_store)
+    lexical = Path(policy.image_store)
+    try:
+        path = lexical.resolve(strict=True)
+    except OSError:
+        _refuse("policy_malformed", "image_store does not exist")
+    # A symlinked ancestor would let the canonical store live under the workspace or
+    # profile while the lexical path looks unrelated: every component must be real.
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            component = os.lstat(current)
+        except OSError:
+            _refuse("policy_malformed", "image_store does not exist")
+        if stat.S_ISLNK(component.st_mode):
+            _refuse("policy_malformed", "image_store must not have symlinked components")
     try:
         info = os.lstat(path)
     except OSError:
         _refuse("policy_malformed", "image_store does not exist")
-    if path.is_symlink() or not stat.S_ISDIR(info.st_mode):
+    if not stat.S_ISDIR(info.st_mode):
         _refuse("policy_malformed", "image_store must be a real directory")
     if info.st_mode & 0o077:
         _refuse("policy_malformed", "image_store must be owner-only")

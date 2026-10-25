@@ -21,7 +21,7 @@ from hermes_cli import worker_execution_common as wec
 from hermes_cli import worker_execution_policy as wep
 from hermes_cli import worker_execution_source as wes
 
-pytestmark = pytest.mark.skipif(not __import__("sys").platform.startswith("linux"), reason="Linux-only boundary")
+pytestmark = pytest.mark.platforms("linux")  # procfs, namespaces and rootless Podman are Linux-only
 
 PYTHON = __import__("sys").executable
 PINNED_PY = "docker.io/library/python@sha256:" + "a" * 64
@@ -479,6 +479,26 @@ def test_repository_paths_must_stay_relative_and_component_clean():
             wes._validate_source_name(name)
         assert excinfo.value.code == "git_unsupported"
     wes._validate_source_name("src/app.py")
+
+
+def test_image_store_rejects_a_symlinked_ancestor(tmp_path):
+    workspace = tmp_path / "workspace"
+    (workspace / "images").mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(workspace, target_is_directory=True)
+    policy = wep.WorkerExecutionPolicy(
+        image_store=str(link / "images"), workspaces=(), digest="sha256:" + "0" * 64,
+    )
+    with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+        wep._resolve_image_store(policy)
+    assert excinfo.value.code == "policy_malformed"
+
+    real = tmp_path / "images"
+    real.mkdir(mode=0o700)
+    resolved = wep._resolve_image_store(
+        wep.WorkerExecutionPolicy(image_store=str(real), workspaces=(), digest="sha256:" + "0" * 64),
+    )
+    assert resolved["path"] == str(real.resolve())
 
 
 def test_required_approval_survives_disabled_timeouts_and_concurrent_calls(monkeypatch):

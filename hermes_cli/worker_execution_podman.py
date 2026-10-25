@@ -1815,6 +1815,7 @@ def reap_journals(journal_dir: Path, *, max_journals: int = MAX_REAP_JOURNALS) -
         payload = _journal_read(path)
         if payload is None:
             results.append({"journal": path.name, "ok": False, "reason": "journal_unreadable"})
+            processed += 1
             continue
         worker_pid = payload.get("worker_pid")
         worker_start = payload.get("worker_start")
