@@ -385,6 +385,29 @@ def test_stale_boot_never_reuses_recorded_process_identity(tmp_path):
     assert not journal.exists()
 
 
+def test_retained_prefix_cannot_starve_a_later_journal(tmp_path, monkeypatch):
+    import hermes_cli.kanban_worker_runtime as runtime
+
+    home = tmp_path / "home"
+    prep = home / "worker-executions" / "prep"
+    prep.mkdir(parents=True)
+    for index in range(podman.MAX_REAP_JOURNALS):
+        (prep / f"{index:03d}.json").write_text("{not json", encoding="utf-8")
+    eligible = prep / "zzz.json"
+    eligible.write_text(json.dumps({
+        "protocol": podman.JOURNAL_PROTOCOL, "phase": "started",
+        "host_epoch": podman._host_epoch(), "deadline_epoch": 0,
+        "run_root_path": str(tmp_path / "missing"), "run_root": {"device": 1, "inode": 2},
+        "containers": [],
+    }), encoding="utf-8")
+    monkeypatch.setattr("hermes_constants.get_process_hermes_home", lambda: home)
+
+    runtime._reap_worker_execution_journals()
+    assert eligible.exists()  # the retained prefix owns this pass's whole budget
+    runtime._reap_worker_execution_journals()
+    assert not eligible.exists()
+
+
 def test_dispatch_reap_rotates_across_preparation_roots(tmp_path, monkeypatch):
     import hermes_cli.kanban_worker_runtime as runtime
     from hermes_cli import worker_execution_podman
@@ -413,18 +436,20 @@ def test_dispatch_reap_rotates_across_preparation_roots(tmp_path, monkeypatch):
 
 
 def test_reap_counts_skipped_journals_and_rotates_the_start(tmp_path):
-    for name in ("a.json", "b.json"):
-        (tmp_path / name).write_text(json.dumps({
-            "protocol": podman.JOURNAL_PROTOCOL, "worker_pid": os.getpid(),
-            "worker_start": podman._process_start_time(os.getpid()),
-            "host_epoch": podman._host_epoch(), "deadline_epoch": 0,
-            "run_root_path": str(tmp_path / "missing"), "run_root": {}, "containers": [],
-        }), encoding="utf-8")
+    (tmp_path / "a.json").write_text("{not json", encoding="utf-8")
+    (tmp_path / "b.json").write_text(json.dumps({
+        "protocol": podman.JOURNAL_PROTOCOL, "worker_pid": os.getpid(),
+        "worker_start": podman._process_start_time(os.getpid()),
+        "host_epoch": podman._host_epoch(), "deadline_epoch": 0,
+        "run_root_path": str(tmp_path / "missing"), "run_root": {}, "containers": [],
+    }), encoding="utf-8")
     results, examined = podman.reap_journals(tmp_path, max_journals=1)
-    assert results == [] and examined == 1
+    assert examined == 1
+    assert [row["journal"] for row in results] == ["a.json"]
 
     results, examined = podman.reap_journals(tmp_path, max_journals=1, start=1)
-    assert results == [] and examined == 1
+    assert examined == 1
+    assert results == []
 
 
 def test_reap_skips_live_owner_and_unelapsed_deadlines(tmp_path):
