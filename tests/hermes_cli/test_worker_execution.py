@@ -508,7 +508,7 @@ def test_image_store_rejects_symlinked_leaf_and_ancestor(tmp_path):
     assert resolved["path"] == str(real.resolve())
 
 
-def test_required_approval_resolves_async_callbacks_and_hosted_sources(monkeypatch, tmp_path):
+def test_required_approval_resolves_async_callbacks(monkeypatch):
     from hermes_cli import plugins, plugins_dispatch
 
     async def async_callback(**kwargs):
@@ -517,8 +517,6 @@ def test_required_approval_resolves_async_callbacks_and_hosted_sources(monkeypat
             "policy_digest": kwargs["policy_digest"],
             "args_digest": kwargs["args_digest"],
         }
-
-    async_callback.__module__ = "consequence_guard_hosted_only"
 
     class Manager:
         _hooks = {"pre_worker_execution": [async_callback]}
@@ -541,27 +539,53 @@ def test_required_approval_resolves_async_callbacks_and_hosted_sources(monkeypat
     )
     assert ok, reason
 
-    # A hosted proxy names a module the parent never imports: the source recorded at
-    # registration is what the dispatcher verifies.
+
+def test_required_approval_verifies_hosted_sources_without_the_module(tmp_path):
+    """A proxy names a module the parent never imports; recorded bytes must verify."""
+    import sys
+
+    from hermes_cli import plugins
+    from hermes_cli.plugins_dispatch import PluginDispatchMixin
+
+    class Manager(PluginDispatchMixin):
+        def __init__(self, hooks):
+            self._hooks = hooks
+
     plugin_dir = tmp_path / "guard"
     plugin_dir.mkdir()
     module = plugin_dir / "__init__.py"
     manifest = plugin_dir / "plugin.yaml"
     module.write_text("def callback():\n    return {}\n", encoding="utf-8")
     manifest.write_text("name: cto-consequence-guard\n", encoding="utf-8")
+
+    def callback(**kwargs):
+        return {}
+
+    callback.__module__ = "guard_hosted_only"
+    assert callback.__module__ not in sys.modules
     owner = {
         "id": "cto-consequence-guard",
         "module_sha256": wec.sha256_hex(module.read_bytes()),
         "manifest_sha256": wec.sha256_hex(manifest.read_bytes()),
     }
-    plugins.REQUIRED_HOOK_CALLBACK_OWNERS[async_callback] = "cto-consequence-guard"
-    plugins.REQUIRED_HOOK_CALLBACK_SOURCES[async_callback] = (str(module), str(manifest))
+    plugins.REQUIRED_HOOK_CALLBACK_OWNERS[callback] = "cto-consequence-guard"
+    plugins.REQUIRED_HOOK_CALLBACK_SOURCES[callback] = (str(module), str(manifest))
     try:
-        found, reason = Manager().required_hook_callback("pre_worker_execution", owner)
-        assert found is async_callback, reason
+        manager = Manager({"pre_worker_execution": [callback]})
+        found, reason = manager.required_hook_callback("pre_worker_execution", owner)
+        assert found is callback, reason
+
+        module.write_bytes(module.read_bytes() + b"\n# tampered\n")
+        found, reason = manager.required_hook_callback("pre_worker_execution", owner)
+        assert found is None and "do not match" in reason
+
+        module.write_text("def callback():\n    return {}\n", encoding="utf-8")
+        manifest.unlink()
+        found, reason = manager.required_hook_callback("pre_worker_execution", owner)
+        assert found is None and "do not match" in reason
     finally:
-        plugins.REQUIRED_HOOK_CALLBACK_OWNERS.pop(async_callback, None)
-        plugins.REQUIRED_HOOK_CALLBACK_SOURCES.pop(async_callback, None)
+        plugins.REQUIRED_HOOK_CALLBACK_OWNERS.pop(callback, None)
+        plugins.REQUIRED_HOOK_CALLBACK_SOURCES.pop(callback, None)
 
 
 def test_required_approval_survives_disabled_timeouts_and_concurrent_calls(monkeypatch):
