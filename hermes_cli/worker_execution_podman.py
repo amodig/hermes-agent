@@ -1818,23 +1818,29 @@ def cleanup_journal(journal_path: Path, *, home: Optional[Path] = None) -> tuple
 
 
 def reap_journals(
-    journal_dir: Path, *, max_journals: int = MAX_REAP_JOURNALS,
+    journal_dir: Path, *, max_journals: int = MAX_REAP_JOURNALS, start: int = 0,
 ) -> tuple[list[dict[str, Any]], int]:
     """Reconcile one directory; return ``(results, journals_examined)``.
 
-    Callers carry the budget across directories so a dispatcher pass stays bounded.
+    Callers carry the budget across directories so a dispatcher pass stays bounded,
+    and advance ``start`` between passes: retained failures (unreadable journals, a live
+    owner) must not monopolise every sweep from the same sorted prefix.
     """
     results: list[dict[str, Any]] = []
     if not journal_dir.is_dir() or journal_dir.is_symlink():
         return results, 0
+    candidates = sorted(journal_dir.glob("*.json"))
+    if candidates:
+        offset = start % len(candidates)
+        candidates = candidates[offset:] + candidates[:offset]
     processed = 0
-    for path in sorted(journal_dir.glob("*.json")):
+    for path in candidates:
         if processed >= max_journals:
             break
+        processed += 1
         payload = _journal_read(path)
         if payload is None:
             results.append({"journal": path.name, "ok": False, "reason": "journal_unreadable"})
-            processed += 1
             continue
         worker_pid = payload.get("worker_pid")
         worker_start = payload.get("worker_start")
@@ -1857,5 +1863,4 @@ def reap_journals(
         except Exception as exc:  # one bad journal must not stop the sweep
             ok, reason = False, f"cleanup_error:{_bounded(exc, 120)}"
         results.append({"journal": path.name, "ok": ok, "reason": reason})
-        processed += 1
     return results, processed

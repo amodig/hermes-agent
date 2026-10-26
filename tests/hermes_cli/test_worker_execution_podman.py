@@ -385,6 +385,48 @@ def test_stale_boot_never_reuses_recorded_process_identity(tmp_path):
     assert not journal.exists()
 
 
+def test_dispatch_reap_rotates_across_preparation_roots(tmp_path, monkeypatch):
+    import hermes_cli.kanban_worker_runtime as runtime
+    from hermes_cli import worker_execution_podman
+
+    home = tmp_path / "home"
+    for profile in ("alpha", "beta"):
+        (home / "profiles" / profile / "worker-executions" / "prep").mkdir(parents=True)
+
+    calls: list[tuple[str, int]] = []
+
+    def fake(directory, *, max_journals, start=0):
+        calls.append((str(directory), start))
+        return [], 1
+
+    monkeypatch.setattr(worker_execution_podman, "reap_journals", fake)
+    monkeypatch.setattr("hermes_constants.get_process_hermes_home", lambda: home)
+    runtime._reap_worker_execution_journals()
+    first = list(calls)
+    calls.clear()
+    runtime._reap_worker_execution_journals()
+    second = list(calls)
+    assert first and second
+    assert len({name for name, _ in first}) == 2
+    assert first[0][0] != second[0][0]
+    assert first[0][1] != second[0][1]
+
+
+def test_reap_counts_skipped_journals_and_rotates_the_start(tmp_path):
+    for name in ("a.json", "b.json"):
+        (tmp_path / name).write_text(json.dumps({
+            "protocol": podman.JOURNAL_PROTOCOL, "worker_pid": os.getpid(),
+            "worker_start": podman._process_start_time(os.getpid()),
+            "host_epoch": podman._host_epoch(), "deadline_epoch": 0,
+            "run_root_path": str(tmp_path / "missing"), "run_root": {}, "containers": [],
+        }), encoding="utf-8")
+    results, examined = podman.reap_journals(tmp_path, max_journals=1)
+    assert results == [] and examined == 1
+
+    results, examined = podman.reap_journals(tmp_path, max_journals=1, start=1)
+    assert results == [] and examined == 1
+
+
 def test_reap_skips_live_owner_and_unelapsed_deadlines(tmp_path):
     journal_dir = tmp_path / "journals"
     journal_dir.mkdir()

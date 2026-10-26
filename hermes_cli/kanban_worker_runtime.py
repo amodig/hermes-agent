@@ -253,12 +253,18 @@ _worker_runtime_snapshots: "dict[int, Path]" = {}
 """Runtime generations retained until their worker's actual process exits."""
 
 
+#: Rotates across dispatcher passes so a directory full of retained failures cannot
+#: permanently consume the whole reap budget ahead of later preparation roots.
+_REAP_ROTATION = 0
+
+
 def _reap_worker_execution_journals() -> None:
     """Reconcile dead-owner verification journals before reclaiming runtime generations.
 
     Only journals from this dispatcher home are considered; each is cleaned through its
     own recorded private engine store and exact container IDs.
     """
+    global _REAP_ROTATION
     try:
         from hermes_cli.worker_execution_podman import MAX_REAP_JOURNALS, reap_journals
         from hermes_constants import get_process_hermes_home
@@ -274,18 +280,27 @@ def _reap_worker_execution_journals() -> None:
                 for profile in sorted(profiles.iterdir())
                 if profile.is_dir() and not profile.is_symlink()
             )
+        directories = [
+            directory
+            for root in roots
+            if root.is_dir() and not root.is_symlink()
+            for directory in sorted(root.iterdir())
+            if directory.is_dir() and not directory.is_symlink()
+        ]
+        if not directories:
+            return
+        rotation = _REAP_ROTATION
+        _REAP_ROTATION = rotation + 1
+        offset = rotation % len(directories)
+        directories = directories[offset:] + directories[:offset]
         remaining = MAX_REAP_JOURNALS
-        for root in roots:
+        for index, directory in enumerate(directories):
             if remaining <= 0:
                 break
-            if not root.is_dir() or root.is_symlink():
-                continue
-            for directory in sorted(root.iterdir()):
-                if remaining <= 0:
-                    break
-                if directory.is_dir() and not directory.is_symlink():
-                    _results, examined = reap_journals(directory, max_journals=remaining)
-                    remaining -= examined
+            _results, examined = reap_journals(
+                directory, max_journals=remaining, start=rotation + index,
+            )
+            remaining -= examined
     except Exception:
         return
 
