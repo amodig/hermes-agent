@@ -533,6 +533,14 @@ def resolve_review_context(db_path: str, task_id: str) -> tuple[str, Optional[di
         if kind in ("review", "validation"):
             role = "review"
             candidate_id = contract.get("candidate_task_id")
+        elif kind == "code" and str(contract.get("review_mode") or "").casefold() == "same_card":
+            # A same-card review keeps ``kind: code`` and is recognized by its review
+            # lane. A claimed run reads ``running``, so consult the recorded resume
+            # status instead of requiring the literal ``review`` status at spawn time.
+            if status != "review" and kanban_db._resume_status_from_events(connection, task_id) != "review":
+                return "implementation", None
+            role = "review"
+            candidate_id = task_id
         elif status == "review":
             role = "review"
             candidate_id = task_id
