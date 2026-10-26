@@ -112,7 +112,9 @@ def _attest(tmp_path, spec, *, host_pid_inode: int = 1001, **overrides):
     engine.run_root.mkdir(parents=True, exist_ok=True)
     container = _container()
     # Real conmon pidfile contents for the fake conmon pid.
-    (engine.run_root / (spec.name + ".conmon.pid")).write_text(str(payload["State"]["ConmonPid"]))
+    (engine.run_root / (spec.name + ".conmon.pid")).write_text(
+        str(payload["State"]["ConmonPid"]), encoding="utf-8",
+    )
     real_namespace_inode = podman._namespace_inode
     podman._namespace_inode = lambda pid, name: (
         5000 if name == "pid" else real_namespace_inode(pid, name)
