@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -388,7 +389,9 @@ def test_stale_boot_never_reuses_recorded_process_identity(tmp_path):
 def test_reap_stamps_stay_monotonic_across_sweeps(tmp_path):
     future = tmp_path / "a.json"
     future.write_text("{not json", encoding="utf-8")
-    now = 1_700_000_000.0
+    # Relative to the real clock: a frozen past timestamp would let the unseeded
+    # implementation pass, because its wall-clock stamp already exceeds it.
+    now = time.time()
     os.utime(future, (now + 3600, now + 3600))
     older = tmp_path / "b.json"
     older.write_text(json.dumps({
@@ -397,7 +400,7 @@ def test_reap_stamps_stay_monotonic_across_sweeps(tmp_path):
         "host_epoch": podman._host_epoch(), "deadline_epoch": 0,
         "run_root_path": str(tmp_path / "missing"), "run_root": {}, "containers": [],
     }), encoding="utf-8")
-    os.utime(older, (now, now))
+    os.utime(older, (now - 10, now - 10))
 
     results, examined = podman.reap_journals(tmp_path, max_journals=1)
     assert examined == 1 and results == []  # the older live-owner journal
