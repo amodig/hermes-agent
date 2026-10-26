@@ -9,13 +9,17 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import copy
+import hashlib
 import inspect
 import logging
 import queue
 import re
+import sys
 import threading
 import time
+import uuid
 import types
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Union
 
@@ -46,7 +50,7 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: Set[str] = {
 }
 
 # Policy hooks: timeout / still-running must fail closed (block the tool).
-_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call"}
+_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call", "pre_worker_execution"}
 # Documented parent-thread serialization contract — never run on a timeout worker (hooks.md).
 _HOOK_CALLER_THREAD_HOOKS: Set[str] = {"subagent_stop"}
 # After a timeout, suppress the same callback this long so a hung hook cannot pile up threads.
@@ -600,3 +604,140 @@ class PluginDispatchMixin:
                 # Runs once per tool call like a hook, so a mis-declared callback floods identically.
                 self._report_hook_failure(kind, cb, kwargs, exc, surface="Middleware")
         return results
+
+    # ---- mandatory required-hook dispatch -------------------------------
+
+    def required_hook_callback(self, hook_name: str, owner: Any) -> "tuple[Optional[Callable], str]":
+        """The callback registered by the frozen plugin identity *owner*, or a refusal.
+
+        Ownership is the registration-time ledger (``REQUIRED_HOOK_CALLBACK_OWNERS``), and
+        the callback's live module bytes and manifest must still match the digests the
+        dispatcher bound into the grant. A same-named project plugin, a shell hook or an
+        unrelated callback cannot supply the approval.
+        """
+        from hermes_cli.plugins import REQUIRED_HOOK_CALLBACK_OWNERS, REQUIRED_HOOK_CALLBACK_SOURCES
+
+        owner_id = _owner_field(owner, "id")
+        module_digest = _owner_field(owner, "module_sha256")
+        manifest_digest = _owner_field(owner, "manifest_sha256")
+        if not (owner_id and module_digest and manifest_digest):
+            return None, "required-hook owner is not bound to the grant"
+        candidates = [
+            callback for callback in self._hooks.get(hook_name, [])
+            if REQUIRED_HOOK_CALLBACK_OWNERS.get(callback) == owner_id
+        ]
+        if not candidates:
+            return None, f"no required {hook_name} callback owned by {owner_id}"
+        verified: List[Callable] = []
+        for callback in candidates:
+            sources = REQUIRED_HOOK_CALLBACK_SOURCES.get(callback)
+            if sources is not None:
+                module_path, manifest_path = Path(sources[0]), Path(sources[1])
+            else:
+                module = sys.modules.get(getattr(callback, "__module__", ""))
+                location = getattr(module, "__file__", None) if module is not None else None
+                if not location:
+                    continue
+                module_path = Path(location)
+                manifest_path = module_path.parent / "plugin.yaml"
+            try:
+                if hashlib.sha256(module_path.read_bytes()).hexdigest() != module_digest:
+                    continue
+                if hashlib.sha256(manifest_path.read_bytes()).hexdigest() != manifest_digest:
+                    continue
+            except OSError:
+                continue
+            verified.append(callback)
+        if len(verified) != 1:
+            return None, f"required {hook_name} callback bytes do not match the grant"
+        return verified[0], ""
+
+
+def _owner_field(owner: Any, key: str) -> str:
+    if isinstance(owner, Mapping):
+        value = owner.get(key)
+    else:
+        value = None
+        for entry in owner or ():
+            if isinstance(entry, (tuple, list)) and len(entry) == 2 and entry[0] == key:
+                value = entry[1]
+                break
+    return value if isinstance(value, str) else ""
+
+
+def dispatch_required_worker_execution(
+    *,
+    owner: Any,
+    tool_name: str,
+    args: Mapping[str, Any],
+    policy_digest: str,
+    args_digest: str,
+    operation: Optional[str],
+    recipe: Optional[str],
+) -> "tuple[bool, str]":
+    """Require the frozen guard's explicit allow before host inspection or provisioning.
+
+    Fail-closed: a missing/unowned callback, an exception, a timeout, a malformed return,
+    a digest mismatch or any ``modify`` directive refuses. Observer-hook fail-open
+    semantics deliberately do not apply.
+    """
+    from hermes_cli.plugins import _resolve_hook_callback_timeout, get_plugin_manager
+
+    hook_name = "pre_worker_execution"
+    try:
+        manager = get_plugin_manager()
+        required, reason = manager.required_hook_callback(hook_name, owner)
+        if required is None:
+            return False, reason or "required approval callback is unavailable"
+        payload = {
+            "tool_name": tool_name,
+            "args": dict(args),
+            "policy_digest": policy_digest,
+            "args_digest": args_digest,
+            "operation": operation,
+            "recipe": recipe,
+            # Concurrent tool calls are different work: without a per-call identity the
+            # bounded runner treats the second one as a duplicate and refuses it.
+            "tool_call_id": f"worker-execution:{uuid.uuid4().hex}",
+        }
+        timeout = min(_resolve_hook_callback_timeout(), 30.0)
+        result: Any = None
+        # Every registered policy callback runs, and any veto/failure refuses. Only
+        # the frozen guard's own callback may supply the allow; the others can abstain
+        # or veto, never authorize.
+        for callback in list(manager._hooks.get(hook_name, [])):
+            if timeout <= 0:
+                # The operator disabled the threaded timeout path: run synchronously, but
+                # still resolve an async callback instead of comparing a coroutine.
+                from hermes_cli.plugins import resolve_plugin_command_result
+
+                verdict = callback(**manager._hook_callback_kwargs(callback, payload))
+                if inspect.isawaitable(verdict):
+                    verdict = resolve_plugin_command_result(verdict)
+            else:
+                verdict = manager._run_hook_callback_bounded(hook_name, callback, payload, timeout)
+            if verdict is _HOOK_SKIPPED:
+                return False, "required approval callback timed out or is unavailable"
+            if callback is required:
+                result = verdict
+                continue
+            if verdict is None:
+                continue
+            if isinstance(verdict, Mapping) and verdict.get("action") in {"allow", "pass"}:
+                if "modify" in verdict or "args" in verdict:
+                    return False, "a policy callback may not modify arguments"
+                continue
+            return False, "another policy callback refused this invocation"
+    except (Exception, SystemExit) as exc:
+        return False, f"required approval callback failed: {str(exc)[:200]}"
+    if not isinstance(result, Mapping):
+        return False, "required approval callback returned no decision"
+    if result.get("action") != "allow":
+        return False, "required approval callback refused this invocation"
+    if "modify" in result or "args" in result:
+        return False, "required approval callback may not modify arguments"
+    if result.get("policy_digest") != policy_digest:
+        return False, "required approval digest does not match the granted policy"
+    if result.get("args_digest") != args_digest:
+        return False, "required approval digest does not match the final arguments"
+    return True, ""

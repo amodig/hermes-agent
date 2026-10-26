@@ -231,6 +231,37 @@ _OVERRIDE_DENIED_MSG = (
     "Plugin module {owner!r} cannot override built-in tool {name!r} "
     "without operator opt-in (allow_tool_override).")
 
+#: Runtime-owned capabilities whose global entry may only belong to the exact native
+#: handler object in :mod:`tools.worker_execution_tool`. Authority for them comes from
+#: the dispatcher's retained grant, so a plugin replacement or overlay could turn a
+#: refusal into execution; registration and deregistration are reserved accordingly.
+RESERVED_NATIVE_EXECUTION_TOOLS = {
+    "kanban_worker_inspect": "_inspect",
+    "kanban_worker_verify": "_verify",
+}
+_RESERVED_NATIVE_MODULE = "tools.worker_execution_tool"
+_reserved_native_handlers: Dict[str, Callable] = {}
+
+
+def _claim_reserved_native_tool(
+    name: str, handler: Callable, *, scope: Optional[str], override: bool, owner: Optional[str],
+) -> None:
+    """Refuse anything but the single native handler for a reserved name."""
+    expected = RESERVED_NATIVE_EXECUTION_TOOLS[name]
+    if (
+        owner is not None or scope is not None or override
+        or getattr(handler, "__module__", "") != _RESERVED_NATIVE_MODULE
+        or getattr(handler, "__name__", "") != expected
+    ):
+        raise PermissionError(
+            f"Tool {name!r} is reserved to the native worker-execution runtime; "
+            "plugin, scoped and override registrations are refused.")
+    existing = _reserved_native_handlers.get(name)
+    if existing is not None and existing is not handler:
+        raise PermissionError(f"Tool {name!r} is already owned by the native worker-execution runtime.")
+    _reserved_native_handlers[name] = handler
+
+
 
 # ---- check_fn TTL cache ----------------------------------------------------
 # check_fns probe external state (Docker, Modal SDK, playwright) that changes on human
@@ -710,6 +741,8 @@ class ToolRegistry:
         if scope is None and owner is not None:
             scope = self._plugin_scope_of(owner)
         scope = normalize_scope(scope)
+        if name in RESERVED_NATIVE_EXECUTION_TOOLS:
+            _claim_reserved_native_tool(name, handler, scope=scope, override=override, owner=owner)
         with self._lock:
             target = self._slot(scope, create=True)
             existing = self._lookup(name, scope)
@@ -772,6 +805,9 @@ class ToolRegistry:
         ``register(override=True)``, else a plugin could deregister a tool it doesn't own
         and re-register over the empty slot (the override check only runs when an entry
         exists). ``mcp-*`` toolsets are exempt — discovery repaves its own tools per refresh."""
+        if name in RESERVED_NATIVE_EXECUTION_TOOLS:
+            raise PermissionError(
+                f"Tool {name!r} is reserved to the native worker-execution runtime and cannot be deregistered.")
         scope = normalize_scope(scope)
         with self._lock:
             caller_mod = self._caller_module()

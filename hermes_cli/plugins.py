@@ -202,11 +202,27 @@ VALID_HOOKS: Set[str] = {
     # IGNORED in v1 — a plugin returning a directive-shaped dict gets a debug log so future block/rewrite
     # adopters are discoverable once the middleware variant ships against the #64231 taxonomy.
     "pre_command",
+    # pre_worker_execution: the mandatory, fail-closed approval for the native
+    # kanban_worker_inspect / kanban_worker_verify capabilities. Fired only by the
+    # runtime's required-hook dispatcher, which requires the callback owned by the
+    # frozen consequence-guard plugin identity bound into the worker grant (and an
+    # explicit {"action": "allow"} echoing both digests). Kwargs: tool_name, args,
+    # policy_digest, args_digest, operation, recipe.
+    "pre_worker_execution",
 }
 
 # Hooks whose directive the shell-hook response parser has no channel for. VALID_HOOKS doubles as
 # the shell-hook allow-list, so these are refused loudly instead of having output silently ignored.
-SHELL_UNSUPPORTED_HOOKS: Set[str] = {"transform_api_error_classification"}
+SHELL_UNSUPPORTED_HOOKS: Set[str] = {"transform_api_error_classification", "pre_worker_execution"}
+
+#: Callback -> owning plugin key, recorded at registration for the mandatory
+#: pre-execution approval only. Generic hooks keep their existing ledger; ownership is
+#: never inferred from ``__name__``.
+REQUIRED_HOOK_CALLBACK_OWNERS: Dict[Callable, str] = {}
+#: Callback -> (module file, manifest file) captured at registration. Hosted-proxy
+#: callbacks name a module that exists only in the plugin host, so the dispatcher must be
+#: able to verify the registered source without ``sys.modules``.
+REQUIRED_HOOK_CALLBACK_SOURCES: Dict[Callable, "tuple[str, str]"] = {}
 
 _env_enabled = env_var_enabled
 _UNSET = object()
@@ -993,7 +1009,26 @@ class PluginContext:
             logger.warning("Plugin '%s' registered unknown %s '%s' (valid: %s)", self.manifest.name, kind,
                            key, ", ".join(sorted(valid)))
         mapping.setdefault(key, []).append(callback)
-        handle = self._track(kind, key, lambda: self._manager._remove_callback(mapping, key, callback))
+        if kind == "hook" and key == "pre_worker_execution":
+            # Ownership binds the callback to the registering plugin key so the runtime can
+            # require the frozen consequence-guard callback instead of any look-alike.
+            REQUIRED_HOOK_CALLBACK_OWNERS[callback] = self.plugin_id
+            plugin_dir = getattr(self.manifest, "path", None)
+            if plugin_dir:
+                REQUIRED_HOOK_CALLBACK_SOURCES[callback] = (
+                    str(Path(plugin_dir) / "__init__.py"),
+                    str(Path(plugin_dir) / "plugin.yaml"),
+                )
+
+            def _release_required() -> None:
+                self._manager._remove_callback(mapping, key, callback)
+                if REQUIRED_HOOK_CALLBACK_OWNERS.get(callback) == self.plugin_id:
+                    REQUIRED_HOOK_CALLBACK_OWNERS.pop(callback, None)
+                REQUIRED_HOOK_CALLBACK_SOURCES.pop(callback, None)
+
+            handle = self._track(kind, key, _release_required)
+        else:
+            handle = self._track(kind, key, lambda: self._manager._remove_callback(mapping, key, callback))
         logger.debug("Plugin %s registered %s: %s", self.manifest.name, kind, key)
         return handle
 

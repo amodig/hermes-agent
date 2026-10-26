@@ -108,7 +108,7 @@ def run_if_not_interrupted(callback: Callable[[], None]) -> bool:
     """
     tid = threading.current_thread().ident
     with _lock:
-        if tid in _interrupted_threads:
+        if tid in _interrupted_threads or acting_for_tid.get() in _interrupted_threads:
             return False
         callback()
         return True

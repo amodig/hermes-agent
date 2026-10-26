@@ -622,6 +622,24 @@ _LEGACY_TOOL_ALIASES = {
 }
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
 
+#: Runtime-owned tools whose handlers refuse any difference between the model's original
+#: arguments and the final (hook/middleware-rewritten) ones.
+WORKER_EXECUTION_TOOLS = frozenset({"kanban_worker_inspect", "kanban_worker_verify"})
+
+
+def worker_original_args_snapshot(function_name: str, function_args: Any) -> Optional[Dict[str, Any]]:
+    """Deep JSON snapshot of the request arguments for the runtime-owned tools only.
+
+    Returns ``None`` for every other tool (no extra serialization on the hot path). An
+    unserializable payload becomes a snapshot that can never equal the final arguments.
+    """
+    if function_name not in WORKER_EXECUTION_TOOLS:
+        return None
+    try:
+        return json.loads(json.dumps(function_args, sort_keys=True, allow_nan=False))
+    except (TypeError, ValueError):
+        return {"__unserializable_request_arguments__": True}
+
 
 @dataclass(frozen=True)
 class _CallIds:
@@ -765,6 +783,11 @@ def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip
                 function_args = modified_args
         except Exception as _hook_err:
             logger.debug("pre_tool_call hook error: %s", _hook_err)
+            if function_name in WORKER_EXECUTION_TOOLS:
+                return function_args, (
+                    tool_error("worker-execution-unavailable: pre_tool_call authorization failed"),
+                    "worker_execution_hook_error", "pre_tool_call authorization failed",
+                )
         if block_message is not None:
             return function_args, (tool_error(block_message), "plugin_block", block_message)
 
@@ -802,10 +825,15 @@ def _approval_observability(ids: _CallIds):
 
 
 def _execute_tool(function_name: str, function_args: Dict[str, Any], original_args: Dict[str, Any], ids: _CallIds,
-                  *, user_task: Optional[str], enabled_tools: Optional[List[str]], skip_tool_execution_middleware: bool) -> Any:
+                  *, user_task: Optional[str], enabled_tools: Optional[List[str]], skip_tool_execution_middleware: bool,
+                  worker_original_args: Optional[Dict[str, Any]] = None) -> Any:
     """Run the registry handler (through tool-execution middleware unless skipped)
     with the approval observability context bound for the duration."""
     dispatch_kwargs: Dict[str, Any] = {"task_id": ids.task_id, "session_id": ids.session_id}
+    if function_name in WORKER_EXECUTION_TOOLS and worker_original_args is not None:
+        # The runtime-owned handlers refuse any difference between the model's original
+        # arguments and the final ones; hooks may not rewrite their way into authority.
+        dispatch_kwargs["original_args"] = worker_original_args
     if function_name == "execute_code":
         # Prefer the caller's list so subagents can't overwrite the parent's
         # tool set via the process-global.
@@ -855,9 +883,11 @@ def handle_function_call(
     function_name: str, function_args: Dict[str, Any], task_id: Optional[str] = None,
     tool_call_id: Optional[str] = None, session_id: Optional[str] = None, turn_id: Optional[str] = None,
     api_request_id: Optional[str] = None, user_task: Optional[str] = None, enabled_tools: Optional[List[str]] = None,
-    skip_pre_tool_call_hook: bool = False, skip_tool_request_middleware: bool = False,
+    skip_pre_tool_call_hook: bool = False,
+    skip_tool_request_middleware: bool = False,
     skip_tool_execution_middleware: bool = False, tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None, disabled_toolsets: Optional[List[str]] = None,
+    original_args: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Route a tool call through hooks/middleware to the registry; returns a JSON string.
 
@@ -865,13 +895,19 @@ def handle_function_call(
     enabled_tools picks execute_code's sandbox tools (default: the process-global
     ``_last_resolved_tool_names``). skip_pre_tool_call_hook: caller already fired
     it (single-fire contract). enabled/disabled_toolsets scope the Tool Search
-    bridge catalog to this session's grant (None = unrestricted).
+    bridge catalog to this session's grant (None = unrestricted). original_args is
+    the model-facing request snapshot carried from the agent loop for the two
+    runtime-owned worker-execution tools; absent, the direct arguments are the origin.
     """
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}
     trace = list(tool_request_middleware_trace or [])
     function_name = _LEGACY_TOOL_ALIASES.get(function_name, function_name)
+    worker_original = (
+        original_args if isinstance(original_args, dict)
+        else worker_original_args_snapshot(function_name, function_args)
+    )
     ids = _CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id)
     start = time.monotonic()
 
@@ -901,6 +937,7 @@ def handle_function_call(
             skip_pre_tool_call_hook=skip_pre_tool_call_hook, skip_tool_request_middleware=skip_tool_request_middleware,
             skip_tool_execution_middleware=skip_tool_execution_middleware, tool_request_middleware_trace=list(trace),
             enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
+            original_args=worker_original_args_snapshot(underlying[0], underlying[1]),
         )
 
     from tools.connectors import is_connector_name
@@ -935,7 +972,8 @@ def handle_function_call(
         # duration_ms (monotonic) is exposed to post_tool_call / transform_tool_result.
         start = time.monotonic()
         result = _execute_tool(function_name, function_args, original_args, ids, user_task=user_task,
-                               enabled_tools=enabled_tools, skip_tool_execution_middleware=skip_tool_execution_middleware)
+                               enabled_tools=enabled_tools, skip_tool_execution_middleware=skip_tool_execution_middleware,
+                               worker_original_args=worker_original)
         duration_ms = _elapsed_ms(start)
         _emit(result, duration_ms=duration_ms)
         return _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)

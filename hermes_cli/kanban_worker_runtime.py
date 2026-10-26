@@ -253,8 +253,62 @@ _worker_runtime_snapshots: "dict[int, Path]" = {}
 """Runtime generations retained until their worker's actual process exits."""
 
 
+#: Rotates directory order across dispatcher passes so a directory full of retained
+#: failures cannot permanently consume the whole reap budget ahead of later roots.
+_REAP_ROTATION = 0
+#: Journal progress inside a directory is carried by mtimes (oldest first, bumped on
+#: examination), so no per-directory state is needed and a retained prefix rotates
+#: behind newer work on the next pass.
+
+
+def _reap_worker_execution_journals() -> None:
+    """Reconcile dead-owner verification journals before reclaiming runtime generations.
+
+    Only journals from this dispatcher home are considered; each is cleaned through its
+    own recorded private engine store and exact container IDs.
+    """
+    global _REAP_ROTATION
+    try:
+        from hermes_cli.worker_execution_podman import MAX_REAP_JOURNALS, reap_journals
+        from hermes_constants import get_process_hermes_home
+
+        home = Path(get_process_hermes_home())
+        roots = [home / "worker-executions"]
+        # A dispatcher launches workers for named profiles, whose process home is
+        # ``<root>/profiles/<name>``; their journals must still be reconciled here.
+        profiles = home / "profiles"
+        if profiles.is_dir() and not profiles.is_symlink():
+            roots.extend(
+                profile / "worker-executions"
+                for profile in sorted(profiles.iterdir())
+                if profile.is_dir() and not profile.is_symlink()
+            )
+        directories = [
+            directory
+            for root in roots
+            if root.is_dir() and not root.is_symlink()
+            for directory in sorted(root.iterdir())
+            if directory.is_dir() and not directory.is_symlink()
+        ]
+        if not directories:
+            return
+        rotation = _REAP_ROTATION
+        _REAP_ROTATION = rotation + 1
+        offset = rotation % len(directories)
+        directories = directories[offset:] + directories[:offset]
+        remaining = MAX_REAP_JOURNALS
+        for directory in directories:
+            if remaining <= 0:
+                break
+            _results, examined = reap_journals(directory, max_journals=remaining)
+            remaining -= examined
+    except Exception:
+        return
+
+
 def _record_worker_exit(pid: int, raw_status: int) -> None:
     """Record a reaped worker exit under its verified Hermes PID."""
+    _reap_worker_execution_journals()
     launcher_pid = int(pid)
     snapshot = _worker_runtime_snapshots.pop(launcher_pid, None)
     if snapshot is not None:
@@ -305,6 +359,7 @@ def reap_worker_zombies() -> "list[int]":
     """Reap exited workers without blocking; poll retained handles on Windows."""
     from hermes_cli.kanban_runtime_generation import sweep_runtime_generations
 
+    _reap_worker_execution_journals()
     sweep_runtime_generations()
     reaped: "list[int]" = []
     if os.name != "nt":
@@ -1457,6 +1512,27 @@ def _default_spawn(
             task.id, profile_arg, env.get("HERMES_KANBAN_BOARD", ""), workspace,
             env.get("HERMES_KANBAN_DB", ""),
         )
+        execution_grant = None
+        if startup_context is not None:
+            from hermes_cli.worker_execution_policy import resolve_execution_grant
+
+            try:
+                execution_grant, execution_refusal = resolve_execution_grant(
+                    profile_home=env.get("HERMES_HOME"),
+                    workspace=workspace,
+                    task_id=task.id,
+                    profile=profile_arg,
+                    board=env.get("HERMES_KANBAN_BOARD", ""),
+                    db_path=env.get("HERMES_KANBAN_DB", ""),
+                    preparation_id=preparation_id,
+                    runtime_identity=actual,
+                )
+            except Exception as exc:  # a broken policy grants nothing, never fails the launch
+                execution_grant, execution_refusal = None, f"resolution_failed: {exc}"
+            if execution_refusal:
+                _kb()._log.warning(
+                    "kanban worker execution: withheld for %s (%s)", task.id, execution_refusal,
+                )
         grant_payload = {
             "grant": True,
             "preparation_id": preparation_id,
@@ -1464,7 +1540,7 @@ def _default_spawn(
         }
         if startup_context is not None:
             grant_payload["worker_context"] = startup_context
-        grant_prefix = (json.dumps(grant_payload, sort_keys=True)[:-1] + ", ").encode("utf-8")
+
         def _grant(run_id: int, claim_lock: Optional[str]) -> None:
             if proc is None or proc.stdin is None:
                 raise RuntimeError("worker bootstrap pipe unavailable")
@@ -1476,8 +1552,15 @@ def _default_spawn(
                 from tools.autonomous_resources import check_autonomous_worker
 
                 check_autonomous_worker(actual.pid)
-            suffix = json.dumps({"run_id": run_id, "claim_lock": claim_lock})[1:].encode("utf-8")
-            _write_worker_grant(grant_fd, grant_prefix + suffix + b"\n")
+            payload = dict(grant_payload)
+            # The claim arrives only now (it is taken after the deferred launch), so it
+            # is part of the frame, not of the earlier prefix.
+            payload["run_id"] = int(run_id)
+            payload["claim_lock"] = claim_lock
+            if execution_grant is not None:
+                payload["worker_execution"] = execution_grant.bind(run_id, claim_lock)
+            frame = json.dumps(payload, sort_keys=True).encode("utf-8") + b"\n"
+            _write_worker_grant(grant_fd, frame)
             # The buffered import handshake was already flushed. Only close an
             # empty, now-nonblocking pipe here; filesystem cleanup is child-owned.
             with contextlib.suppress(Exception):
