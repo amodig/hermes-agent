@@ -1838,6 +1838,12 @@ def reap_journals(
     if not journal_dir.is_dir() or journal_dir.is_symlink():
         return results, 0
     candidates = sorted(journal_dir.glob("*.json"), key=_oldest_first)
+    # Seed above wall time AND every existing candidate stamp: a later sweep with a
+    # smaller budget must still push what it examined behind everything it did not.
+    stamp_base = time.time()
+    for candidate in candidates:
+        with contextlib.suppress(OSError):
+            stamp_base = max(stamp_base, candidate.stat().st_mtime)
     processed = 0
     for path in candidates:
         if processed >= max_journals:
@@ -1845,7 +1851,7 @@ def reap_journals(
         processed += 1
         # Strictly increasing stamps put every examined journal behind all unexamined
         # ones, even on filesystems with coarse timestamp resolution.
-        stamp = time.time() + processed
+        stamp = stamp_base + processed
         with contextlib.suppress(OSError):
             os.utime(path, (stamp, stamp))
         payload = _journal_read(path)
