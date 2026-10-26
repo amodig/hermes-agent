@@ -193,7 +193,10 @@ def _reserved(parts: list[str]) -> bool:
         return False
     if name in RESERVED_BASENAMES:
         return True
-    return name.startswith(RESERVED_BASENAME_PREFIX)
+    if name.startswith(RESERVED_BASENAME_PREFIX):
+        # ``.env.<profile>.example`` / ``.sample`` are templates, not credentials.
+        return not name.endswith((".example", ".sample"))
+    return False
 
 
 @dataclass

@@ -512,6 +512,14 @@ def test_inspection_accepts_repository_worktree_config_extension(fixture):
     assert snapshot.head == fixture.head
 
 
+def test_env_example_templates_are_not_reserved_but_env_files_are():
+    """`.env.<profile>.example` is a template; `.env` and `.env.local` stay reserved."""
+    for allowed in (".env.example", ".env.sample", ".env.development.example", ".env.production.example"):
+        assert wes._reserved(allowed.split("/")) is False
+    for refused in (".env", ".env.local", ".env.production", ".env.development"):
+        assert wes._reserved(refused.split("/")) is True
+
+
 def test_repository_paths_must_stay_relative_and_component_clean():
     """A crafted index or diff cannot name an escaping path."""
     for name in ("../outside.txt", "/etc/passwd", "a//b", "a/./b", "a/../b", "a\\b", ""):
