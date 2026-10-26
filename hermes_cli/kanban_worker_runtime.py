@@ -256,11 +256,9 @@ _worker_runtime_snapshots: "dict[int, Path]" = {}
 #: Rotates directory order across dispatcher passes so a directory full of retained
 #: failures cannot permanently consume the whole reap budget ahead of later roots.
 _REAP_ROTATION = 0
-#: Per-directory journal progress. It advances per VISIT, not per global pass: with a
-#: directory cycle longer than the budget a directory is only revisited every N passes,
-#: and a shared counter would restart it at the same journal forever.
-_REAP_VISITS: "dict[str, int]" = {}
-_REAP_VISITS_MAX = 256
+#: Journal progress inside a directory is carried by mtimes (oldest first, bumped on
+#: examination), so no per-directory state is needed and a retained prefix rotates
+#: behind newer work on the next pass.
 
 
 def _reap_worker_execution_journals() -> None:
@@ -302,14 +300,7 @@ def _reap_worker_execution_journals() -> None:
         for directory in directories:
             if remaining <= 0:
                 break
-            key = str(directory)
-            start = _REAP_VISITS.pop(key, 0)
-            if len(_REAP_VISITS) >= _REAP_VISITS_MAX:
-                _REAP_VISITS.pop(next(iter(_REAP_VISITS)), None)
-            _REAP_VISITS[key] = start + 1
-            _results, examined = reap_journals(
-                directory, max_journals=remaining, start=start,
-            )
+            _results, examined = reap_journals(directory, max_journals=remaining)
             remaining -= examined
     except Exception:
         return

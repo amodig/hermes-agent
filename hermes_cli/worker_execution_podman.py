@@ -1817,27 +1817,37 @@ def cleanup_journal(journal_path: Path, *, home: Optional[Path] = None) -> tuple
     return False, "leftover_processes:" + ",".join(sorted(set(failures)))
 
 
+def _oldest_first(path: Path) -> tuple[float, str]:
+    try:
+        return (path.stat().st_mtime, path.name)
+    except OSError:
+        return (0.0, path.name)
+
+
 def reap_journals(
-    journal_dir: Path, *, max_journals: int = MAX_REAP_JOURNALS, start: int = 0,
+    journal_dir: Path, *, max_journals: int = MAX_REAP_JOURNALS,
 ) -> tuple[list[dict[str, Any]], int]:
     """Reconcile one directory; return ``(results, journals_examined)``.
 
-    Callers carry the budget across directories so a dispatcher pass stays bounded,
-    and advance ``start`` between passes: retained failures (unreadable journals, a live
-    owner) must not monopolise every sweep from the same sorted prefix.
+    Callers carry the budget across directories so a dispatcher pass stays bounded.
+    Candidates are examined least-recently-touched first and every examined journal's
+    mtime is bumped afterwards, so a prefix of retained failures (unreadable, live
+    owner) rotates behind newer work on the next pass without per-directory state.
     """
     results: list[dict[str, Any]] = []
     if not journal_dir.is_dir() or journal_dir.is_symlink():
         return results, 0
-    candidates = sorted(journal_dir.glob("*.json"))
-    if candidates:
-        offset = start % len(candidates)
-        candidates = candidates[offset:] + candidates[:offset]
+    candidates = sorted(journal_dir.glob("*.json"), key=_oldest_first)
     processed = 0
     for path in candidates:
         if processed >= max_journals:
             break
         processed += 1
+        # Strictly increasing stamps put every examined journal behind all unexamined
+        # ones, even on filesystems with coarse timestamp resolution.
+        stamp = time.time() + processed
+        with contextlib.suppress(OSError):
+            os.utime(path, (stamp, stamp))
         payload = _journal_read(path)
         if payload is None:
             results.append({"journal": path.name, "ok": False, "reason": "journal_unreadable"})

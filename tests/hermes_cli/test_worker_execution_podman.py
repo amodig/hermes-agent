@@ -416,10 +416,10 @@ def test_dispatch_reap_rotates_across_preparation_roots(tmp_path, monkeypatch):
     for profile in ("alpha", "beta"):
         (home / "profiles" / profile / "worker-executions" / "prep").mkdir(parents=True)
 
-    calls: list[tuple[str, int]] = []
+    calls: list[str] = []
 
-    def fake(directory, *, max_journals, start=0):
-        calls.append((str(directory), start))
+    def fake(directory, *, max_journals):
+        calls.append(str(directory))
         return [], 1
 
     monkeypatch.setattr(worker_execution_podman, "reap_journals", fake)
@@ -430,12 +430,11 @@ def test_dispatch_reap_rotates_across_preparation_roots(tmp_path, monkeypatch):
     runtime._reap_worker_execution_journals()
     second = list(calls)
     assert first and second
-    assert len({name for name, _ in first}) == 2
-    assert first[0][0] != second[0][0]
-    assert first[0][1] != second[0][1]
+    assert len(set(first)) == 2
+    assert first[0] != second[0]
 
 
-def test_reap_counts_skipped_journals_and_rotates_the_start(tmp_path):
+def test_reap_counts_skipped_journals_and_rotates_oldest_first(tmp_path):
     (tmp_path / "a.json").write_text("{not json", encoding="utf-8")
     (tmp_path / "b.json").write_text(json.dumps({
         "protocol": podman.JOURNAL_PROTOCOL, "worker_pid": os.getpid(),
@@ -447,7 +446,7 @@ def test_reap_counts_skipped_journals_and_rotates_the_start(tmp_path):
     assert examined == 1
     assert [row["journal"] for row in results] == ["a.json"]
 
-    results, examined = podman.reap_journals(tmp_path, max_journals=1, start=1)
+    results, examined = podman.reap_journals(tmp_path, max_journals=1)
     assert examined == 1
     assert results == []
 
