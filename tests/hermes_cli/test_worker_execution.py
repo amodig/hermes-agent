@@ -166,6 +166,53 @@ def _authority(
 # ---- policy schema -------------------------------------------------------
 
 
+def test_same_card_review_binds_the_handoff_from_a_claimed_run(fixture):
+    """A claimed same-card review reads `running`; the review lane must still bind."""
+    from hermes_cli import kanban_db
+
+    task_id, db_path = _board(fixture, status="running")
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute(
+            "UPDATE tasks SET lifecycle_contract = ? WHERE id = ?",
+            (json.dumps({
+                "kind": "code", "review_mode": "same_card",
+                "reviewer": "reviewer", "validation_required": True,
+            }), task_id),
+        )
+        connection.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, metadata) "
+            "VALUES (?, 'claimed', 'review_requested', ?, ?)",
+            (task_id, "2026-01-01T00:00:00Z", json.dumps({
+                "base_sha": fixture.base, "head_sha": fixture.head,
+                "changed_files": ["app.py"],
+            })),
+        )
+        connection.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'blocked', ?, ?)",
+            (task_id, json.dumps({"source_status": "review", "reason": "fixture"}),
+             "2026-01-01T00:00:00Z"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    role, pair = wep.resolve_review_context(db_path, task_id)
+    assert role == "review"
+    assert pair == {"base": fixture.base, "head": fixture.head}
+
+    # Without the recorded review lane the same card is implementation work.
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DELETE FROM task_events")
+        connection.commit()
+    finally:
+        connection.close()
+    role, pair = wep.resolve_review_context(db_path, task_id)
+    assert role == "implementation" and pair is None
+
+
 def test_worker_execution_key_is_registered_and_defaults_to_no_grant():
     from hermes_cli.config_defaults import DEFAULT_CONFIG
 

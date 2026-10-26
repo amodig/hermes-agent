@@ -536,3 +536,11 @@ class TestConfigAndSchema:
         describe_params = schemas["tool_describe"]["parameters"]
         assert describe_params["required"] == ["names"]
         assert describe_params["properties"]["names"]["type"] == "array"
+def test_describe_reports_a_registered_tool_missing_from_the_session_as_unavailable():
+    from tools import tool_search
+
+    payload = json.loads(tool_search.dispatch_tool_describe(
+        {"names": ["kanban_worker_verify"]}, current_tool_defs=[],
+    ))
+    assert "kanban_worker_verify" in payload.get("not_found", [])
+    assert "kanban_worker_verify" not in payload.get("errors", {})

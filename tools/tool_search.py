@@ -496,6 +496,7 @@ def dispatch_tool_describe(args: Dict[str, Any], *, current_tool_defs: List[Dict
     if err:
         return err
     deferrable = _deferrable_in(current_tool_defs)
+    listed = set(_tool_def_names(current_tool_defs))
     by_name = {name: _fn(td) for td, name in zip(deferrable, _tool_def_names(deferrable)) if name}
     remote_schemas, hosted_failure = remote_schemas_for(names, current_tool_defs, connector_describe)
 
@@ -516,8 +517,13 @@ def dispatch_tool_describe(args: Dict[str, Any], *, current_tool_defs: List[Dict
             (undescribed if hosted_failure else not_found).append(name)
         elif _registry_entry(name) is not None and not is_deferrable_tool_name(
             name, load_config_readonly().effective_defer_tools):
-            # Registered but bridge/core/GUI-surface: a real name, wrong door.
-            errors[name] = not_deferrable_error(name)
+            if name in listed:
+                # Directly listed in THIS session: a real name, wrong door.
+                errors[name] = not_deferrable_error(name)
+            else:
+                # Registered globally but not published here (availability check false,
+                # toolset not enabled): treat as unavailable, never as callable.
+                not_found.append(name)
         else:
             not_found.append(name)
     result: Dict[str, Any] = {"tools": tools}
