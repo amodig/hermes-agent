@@ -277,6 +277,26 @@ def test_cleanup_removes_the_tree_only_when_nothing_was_allocated(tmp_path):
     assert run_root.exists()
 
 
+def test_cleanup_removes_the_tree_when_the_engine_answers_with_an_error(tmp_path):
+    class FailingEngine:
+        def __init__(self, run_root):
+            self.run_root = run_root
+
+        def run(self, argv, **_kwargs):
+            return subprocess.CompletedProcess(argv, 125, b"", b"cannot connect to the engine")
+
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    ok, reasons = podman._cleanup(FailingEngine(run_root), [])
+    assert ok is True and reasons == ["listing_failed_no_allocation"]
+    assert not run_root.exists()
+
+    run_root.mkdir()
+    ok, reasons = podman._cleanup(FailingEngine(run_root), [], creates=("verifier",))
+    assert ok is False and reasons == ["listing_failed", "listing_failed_after_rm"]
+    assert run_root.exists()
+
+
 def test_cleanup_survives_an_engine_that_dies_mid_removal(tmp_path):
     class VanishingEngine:
         def __init__(self, run_root):

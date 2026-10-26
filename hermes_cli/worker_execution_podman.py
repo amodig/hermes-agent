@@ -1511,6 +1511,8 @@ def _cleanup(
             return True, [f"engine_unavailable_no_allocation:{exc.code}"]
         return False, [f"engine_unavailable:{exc.code}"]
     if listed.returncode != 0:
+        if not containers and not creates and remove_tree(engine.run_root):
+            return True, ["listing_failed_no_allocation"]
         # An unreadable inventory is not an empty one: never claim cleanup on it.
         ok = False
         reasons.append("listing_failed")

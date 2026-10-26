@@ -508,6 +508,62 @@ def test_image_store_rejects_symlinked_leaf_and_ancestor(tmp_path):
     assert resolved["path"] == str(real.resolve())
 
 
+def test_required_approval_resolves_async_callbacks_and_hosted_sources(monkeypatch, tmp_path):
+    from hermes_cli import plugins, plugins_dispatch
+
+    async def async_callback(**kwargs):
+        return {
+            "action": "allow",
+            "policy_digest": kwargs["policy_digest"],
+            "args_digest": kwargs["args_digest"],
+        }
+
+    async_callback.__module__ = "consequence_guard_hosted_only"
+
+    class Manager:
+        _hooks = {"pre_worker_execution": [async_callback]}
+
+        def required_hook_callback(self, hook_name, owner):
+            return async_callback, "ok"
+
+        @staticmethod
+        def _hook_callback_kwargs(cb, payload):
+            return dict(payload)
+
+        def _run_hook_callback_bounded(self, *args):
+            raise AssertionError("the threaded path is disabled")
+
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: Manager())
+    monkeypatch.setattr(plugins, "_resolve_hook_callback_timeout", lambda: 0.0)
+    ok, reason = plugins_dispatch.dispatch_required_worker_execution(
+        owner=object(), tool_name="kanban_worker_inspect", args={},
+        policy_digest="policy", args_digest="args", operation="summary", recipe=None,
+    )
+    assert ok, reason
+
+    # A hosted proxy names a module the parent never imports: the source recorded at
+    # registration is what the dispatcher verifies.
+    plugin_dir = tmp_path / "guard"
+    plugin_dir.mkdir()
+    module = plugin_dir / "__init__.py"
+    manifest = plugin_dir / "plugin.yaml"
+    module.write_text("def callback():\n    return {}\n", encoding="utf-8")
+    manifest.write_text("name: cto-consequence-guard\n", encoding="utf-8")
+    owner = {
+        "id": "cto-consequence-guard",
+        "module_sha256": wec.sha256_hex(module.read_bytes()),
+        "manifest_sha256": wec.sha256_hex(manifest.read_bytes()),
+    }
+    plugins.REQUIRED_HOOK_CALLBACK_OWNERS[async_callback] = "cto-consequence-guard"
+    plugins.REQUIRED_HOOK_CALLBACK_SOURCES[async_callback] = (str(module), str(manifest))
+    try:
+        found, reason = Manager().required_hook_callback("pre_worker_execution", owner)
+        assert found is async_callback, reason
+    finally:
+        plugins.REQUIRED_HOOK_CALLBACK_OWNERS.pop(async_callback, None)
+        plugins.REQUIRED_HOOK_CALLBACK_SOURCES.pop(async_callback, None)
+
+
 def test_required_approval_survives_disabled_timeouts_and_concurrent_calls(monkeypatch):
     from hermes_cli import plugins, plugins_dispatch
 

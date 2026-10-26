@@ -219,6 +219,10 @@ SHELL_UNSUPPORTED_HOOKS: Set[str] = {"transform_api_error_classification", "pre_
 #: pre-execution approval only. Generic hooks keep their existing ledger; ownership is
 #: never inferred from ``__name__``.
 REQUIRED_HOOK_CALLBACK_OWNERS: Dict[Callable, str] = {}
+#: Callback -> (module file, manifest file) captured at registration. Hosted-proxy
+#: callbacks name a module that exists only in the plugin host, so the dispatcher must be
+#: able to verify the registered source without ``sys.modules``.
+REQUIRED_HOOK_CALLBACK_SOURCES: Dict[Callable, "tuple[str, str]"] = {}
 
 _env_enabled = env_var_enabled
 _UNSET = object()
@@ -1009,11 +1013,18 @@ class PluginContext:
             # Ownership binds the callback to the registering plugin key so the runtime can
             # require the frozen consequence-guard callback instead of any look-alike.
             REQUIRED_HOOK_CALLBACK_OWNERS[callback] = self.plugin_id
+            plugin_dir = getattr(self.manifest, "path", None)
+            if plugin_dir:
+                REQUIRED_HOOK_CALLBACK_SOURCES[callback] = (
+                    str(Path(plugin_dir) / "__init__.py"),
+                    str(Path(plugin_dir) / "plugin.yaml"),
+                )
 
             def _release_required() -> None:
                 self._manager._remove_callback(mapping, key, callback)
                 if REQUIRED_HOOK_CALLBACK_OWNERS.get(callback) == self.plugin_id:
                     REQUIRED_HOOK_CALLBACK_OWNERS.pop(callback, None)
+                REQUIRED_HOOK_CALLBACK_SOURCES.pop(callback, None)
 
             handle = self._track(kind, key, _release_required)
         else:

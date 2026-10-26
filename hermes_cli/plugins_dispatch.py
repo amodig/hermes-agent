@@ -615,7 +615,7 @@ class PluginDispatchMixin:
         dispatcher bound into the grant. A same-named project plugin, a shell hook or an
         unrelated callback cannot supply the approval.
         """
-        from hermes_cli.plugins import REQUIRED_HOOK_CALLBACK_OWNERS
+        from hermes_cli.plugins import REQUIRED_HOOK_CALLBACK_OWNERS, REQUIRED_HOOK_CALLBACK_SOURCES
 
         owner_id = _owner_field(owner, "id")
         module_digest = _owner_field(owner, "module_sha256")
@@ -630,16 +630,20 @@ class PluginDispatchMixin:
             return None, f"no required {hook_name} callback owned by {owner_id}"
         verified: List[Callable] = []
         for callback in candidates:
-            module = sys.modules.get(getattr(callback, "__module__", ""))
-            location = getattr(module, "__file__", None) if module is not None else None
-            if not location:
-                continue
-            module_path = Path(location)
+            sources = REQUIRED_HOOK_CALLBACK_SOURCES.get(callback)
+            if sources is not None:
+                module_path, manifest_path = Path(sources[0]), Path(sources[1])
+            else:
+                module = sys.modules.get(getattr(callback, "__module__", ""))
+                location = getattr(module, "__file__", None) if module is not None else None
+                if not location:
+                    continue
+                module_path = Path(location)
+                manifest_path = module_path.parent / "plugin.yaml"
             try:
                 if hashlib.sha256(module_path.read_bytes()).hexdigest() != module_digest:
                     continue
-                manifest = module_path.parent / "plugin.yaml"
-                if hashlib.sha256(manifest.read_bytes()).hexdigest() != manifest_digest:
+                if hashlib.sha256(manifest_path.read_bytes()).hexdigest() != manifest_digest:
                     continue
             except OSError:
                 continue
@@ -703,8 +707,13 @@ def dispatch_required_worker_execution(
         # or veto, never authorize.
         for callback in list(manager._hooks.get(hook_name, [])):
             if timeout <= 0:
-                # The operator disabled the threaded timeout path: run synchronously.
+                # The operator disabled the threaded timeout path: run synchronously, but
+                # still resolve an async callback instead of comparing a coroutine.
+                from hermes_cli.plugins import resolve_plugin_command_result
+
                 verdict = callback(**manager._hook_callback_kwargs(callback, payload))
+                if inspect.isawaitable(verdict):
+                    verdict = resolve_plugin_command_result(verdict)
             else:
                 verdict = manager._run_hook_callback_bounded(hook_name, callback, payload, timeout)
             if verdict is _HOOK_SKIPPED:
