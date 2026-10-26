@@ -331,6 +331,13 @@ class SyntheticGit:
                 name = key.split(".", 1)[1]
                 if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", name):
                     _refuse("git_unsupported", "Git extension name is not supported for inspection")
+                if name == "worktreeconfig":
+                    # Per-worktree config only overrides core.worktree/bare; the synthetic
+                    # repo supplies its own config and every Git call pins --work-tree, so
+                    # the extension is accepted and not reproduced.
+                    if value.lower() not in {"true", "false"}:
+                        _refuse("git_unsupported", "Git worktreeConfig value is not supported")
+                    continue
                 if name not in {"objectformat"}:
                     _refuse("git_unsupported", f"Git extension {name} is not supported for inspection")
                 if value.lower() not in {"sha1", "sha256"}:
