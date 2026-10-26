@@ -166,6 +166,37 @@ def _authority(
 # ---- policy schema -------------------------------------------------------
 
 
+def test_worker_execution_key_is_registered_and_defaults_to_no_grant():
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    assert "worker_execution" in DEFAULT_CONFIG["kanban"]
+    assert DEFAULT_CONFIG["kanban"]["worker_execution"] is None
+
+    explicit = wep.parse_policy({"protocol": 1, "image_store": None, "workspaces": []})
+    assert explicit.workspaces == () and explicit.recipes() == {}
+
+
+def test_worker_execution_policy_loads_through_the_config_loader(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "kanban:\n  worker_execution:\n    protocol: 1\n    image_store: null\n    workspaces: []\n",
+        encoding="utf-8",
+    )
+    root = Path(__file__).resolve().parents[2]
+    script = (
+        "from hermes_cli.worker_execution_policy import load_policy\n"
+        "policy = load_policy()\n"
+        "print(len(policy.workspaces), policy.recipes())\n"
+    )
+    completed = subprocess.run(
+        [__import__("sys").executable, "-c", script],
+        env={**os.environ, "HERMES_HOME": str(home), "PYTHONPATH": str(root), "PYTHONDONTWRITEBYTECODE": "1"},
+        capture_output=True, text=True, check=True,
+    )
+    assert completed.stdout.strip() == "0 {}"
+
+
 def test_policy_rejects_unknown_keys_and_bad_images(fixture):
     base = _policy_section(fixture.repo, fixture.images)
     bad = json.loads(json.dumps(base))

@@ -260,7 +260,7 @@ def _reap_worker_execution_journals() -> None:
     own recorded private engine store and exact container IDs.
     """
     try:
-        from hermes_cli.worker_execution_podman import reap_journals
+        from hermes_cli.worker_execution_podman import MAX_REAP_JOURNALS, reap_journals
         from hermes_constants import get_process_hermes_home
 
         home = Path(get_process_hermes_home())
@@ -274,12 +274,18 @@ def _reap_worker_execution_journals() -> None:
                 for profile in sorted(profiles.iterdir())
                 if profile.is_dir() and not profile.is_symlink()
             )
+        remaining = MAX_REAP_JOURNALS
         for root in roots:
+            if remaining <= 0:
+                break
             if not root.is_dir() or root.is_symlink():
                 continue
             for directory in sorted(root.iterdir()):
+                if remaining <= 0:
+                    break
                 if directory.is_dir() and not directory.is_symlink():
-                    reap_journals(directory)
+                    _results, examined = reap_journals(directory, max_journals=remaining)
+                    remaining -= examined
     except Exception:
         return
 

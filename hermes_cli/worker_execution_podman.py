@@ -1817,11 +1817,16 @@ def cleanup_journal(journal_path: Path, *, home: Optional[Path] = None) -> tuple
     return False, "leftover_processes:" + ",".join(sorted(set(failures)))
 
 
-def reap_journals(journal_dir: Path, *, max_journals: int = MAX_REAP_JOURNALS) -> list[dict[str, Any]]:
-    """Reconcile dead-owner, elapsed-deadline journals for one dispatcher home."""
+def reap_journals(
+    journal_dir: Path, *, max_journals: int = MAX_REAP_JOURNALS,
+) -> tuple[list[dict[str, Any]], int]:
+    """Reconcile one directory; return ``(results, journals_examined)``.
+
+    Callers carry the budget across directories so a dispatcher pass stays bounded.
+    """
     results: list[dict[str, Any]] = []
     if not journal_dir.is_dir() or journal_dir.is_symlink():
-        return results
+        return results, 0
     processed = 0
     for path in sorted(journal_dir.glob("*.json")):
         if processed >= max_journals:
@@ -1853,4 +1858,4 @@ def reap_journals(journal_dir: Path, *, max_journals: int = MAX_REAP_JOURNALS) -
             ok, reason = False, f"cleanup_error:{_bounded(exc, 120)}"
         results.append({"journal": path.name, "ok": ok, "reason": reason})
         processed += 1
-    return results
+    return results, processed

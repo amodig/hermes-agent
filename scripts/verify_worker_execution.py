@@ -1001,7 +1001,8 @@ def _await_cleanup(
             if root.is_dir():
                 for directory in sorted(root.iterdir()):
                     if directory.is_dir() and not directory.is_symlink():
-                        last.extend(reap_journals(directory))
+                        entries, _examined = reap_journals(directory)
+                        last.extend(entries)
         if not _journal_files(journal_roots):
             return True, last, time.time()
         time.sleep(1.0)

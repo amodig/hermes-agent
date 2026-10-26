@@ -395,6 +395,6 @@ def test_reap_skips_live_owner_and_unelapsed_deadlines(tmp_path):
         "run_root_path": str(tmp_path / "missing"), "run_root": {}, "containers": [],
     }
     (journal_dir / "alive.json").write_text(json.dumps(alive), encoding="utf-8")
-    results = podman.reap_journals(journal_dir)
+    results, _examined = podman.reap_journals(journal_dir)
     assert results == []
     assert (journal_dir / "alive.json").exists()
