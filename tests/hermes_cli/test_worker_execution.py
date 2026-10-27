@@ -987,6 +987,45 @@ def test_opt_in_refuses_a_forged_sibling_registration_and_a_symlink(fixture):
     assert grant is None and refusal == "workspace_not_granted"
 
 
+def test_opt_in_refuses_a_retargeted_checkout_behind_a_registration(fixture):
+    """The genuine registration for this path must not vouch for another worktree."""
+    task_id, db_path, target = _task_worktree(fixture)
+    other = fixture.repo / ".worktrees" / "other"
+    _git(fixture.repo, "worktree", "add", "--detach", str(other), fixture.head)
+    # `target` keeps its own registration in Git's registry; only its pointer moved.
+    (target / ".git").write_text(
+        f"gitdir: {(fixture.repo / '.git' / 'worktrees' / 'other').resolve()}\n",
+        encoding="utf-8",
+    )
+    grant, refusal = _resolve(
+        fixture, _opt_in_section(fixture.repo, fixture.images),
+        workspace=str(target), task_id=task_id, db_path=db_path)
+    assert grant is None and refusal == "workspace_not_granted"
+
+
+def test_claimed_legacy_review_card_still_has_the_review_role(fixture):
+    """A claimed review reads ``running``; its lane is the recorded resume status."""
+    from hermes_cli import kanban_db
+
+    task_id, db_path = _board(fixture, status="running")
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'blocked', ?, ?)",
+            (task_id, json.dumps({"source_status": "review", "reason": "fixture"}),
+             "2026-01-01T00:00:00Z"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    role, pair = wep.resolve_review_context(db_path, task_id)
+    assert role == "review"
+    assert pair is None
+    assert kanban_db is not None
+
+
 def test_opt_in_refuses_a_nested_clone_anchor(fixture):
     task_id, db_path, _target = _task_worktree(fixture)
     clone = fixture.repo / "nested"

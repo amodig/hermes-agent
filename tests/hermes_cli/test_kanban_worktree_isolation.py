@@ -144,6 +144,12 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _claim_args(task_id: str):
+    import argparse
+
+    return argparse.Namespace(task_id=task_id, ttl=None)
+
+
 def _head(repo: Path) -> str:
     return subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
@@ -345,3 +351,114 @@ def test_role_directory_workspace_is_checked_in_place(kanban_home, tmp_path):
     with pytest.raises(ValueError, match="candidate_workspace_unavailable"):
         kbw.resolve_workspace(task, candidate_head=head)
     assert _head(repo) == later
+
+
+def test_role_worktree_resolves_from_its_own_persisted_path(kanban_home, tmp_path):
+    """The dispatcher persists the canonical worktree, so a retry names that path."""
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+
+    with kbc.connect() as conn:
+        implementation = _candidate_card(conn, repo, base=base, head=candidate)
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        task = kb.get_task(conn, review)
+        head = kbw.candidate_head_for_task(conn, task)
+        first, branch = kbw._resolve_worktree_workspace(task, candidate_head=head)
+        assert branch == ""
+        kbw.set_workspace_path(conn, review, str(first))
+        persisted = kb.get_task(conn, review)
+        again, branch = kbw._resolve_worktree_workspace(persisted, candidate_head=head)
+
+    assert again == first
+    assert branch == ""
+    assert _head(first) == candidate
+
+
+def test_role_worktree_refuses_to_detach_a_branch_holding_unique_work(kanban_home, tmp_path):
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+
+    with kbc.connect() as conn:
+        implementation = _candidate_card(conn, repo, base=base, head=candidate)
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        task = kb.get_task(conn, review)
+        head = kbw.candidate_head_for_task(conn, task)
+        target = repo / ".worktrees" / review
+        _git(repo, "worktree", "add", str(target), "-b", f"wt/{review}", base)
+        (target / "unique.txt").write_text("only here\n", encoding="utf-8")
+        _git(target, "add", "unique.txt")
+        _git(target, "commit", "-m", "work the candidate does not contain")
+        unique = _head(target)
+
+        with pytest.raises(ValueError, match="candidate_workspace_unavailable"):
+            kbw._resolve_worktree_workspace(task, candidate_head=head)
+
+        # Nothing moved: the commit, the branch and the files are all still there.
+        assert _head(target) == unique
+        branch = subprocess.run(
+            ["git", "-C", str(target), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        assert branch == f"wt/{review}"
+        assert (target / "unique.txt").read_text(encoding="utf-8") == "only here\n"
+
+        # A branch the candidate already contains is safe to leave dangling.
+        _git(repo, "worktree", "add", str(repo / ".worktrees" / f"{review}-contained"),
+             "-b", "wt/contained", base)
+        with kbc.connect() as conn:
+            other_review = _role_card(conn, "review", implementation, repo, "reviewer")
+            other = kb.get_task(conn, other_review)
+            other_head = kbw.candidate_head_for_task(conn, other)
+        contained = kbw._resolve_worktree_workspace(other, candidate_head=other_head)
+    assert contained[1] == ""
+    assert _head(contained[0]) == candidate
+
+
+def test_claim_cli_leaves_a_role_card_unclaimed_when_its_candidate_is_missing(
+    kanban_home, tmp_path, capsys,
+):
+    """The candidate is resolved before the claim, so a refusal strands no card."""
+    from hermes_cli import kanban as kc
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+
+    with kbc.connect() as conn:
+        implementation = kb.create_task(
+            conn, title="implementation", assignee="coder", workspace_kind="worktree",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code", "review_mode": "separate_card", "reviewer": "reviewer",
+                "validation_required": True,
+            })
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        kb.link_tasks(conn, implementation, review, requirement="phase_finished")
+        run = kb.claim_task(conn, implementation, claimer=kb._claimer_id())
+        assert run is not None
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=run.current_run_id,
+            summary="implementation handoff",
+            metadata={"base_sha": base, "head_sha": candidate, "changed_files": []})
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, review).status == "review"
+        # The candidate's own handoff now records a base that is not a commit, so the
+        # board cannot name one immutable commit to work from.
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE task_id = ?",
+            (json.dumps({
+                "base_sha": "not-a-commit", "head_sha": candidate,
+                "lifecycle": {"head_sha": candidate, "base_sha": "not-a-commit"},
+            }), implementation))
+        conn.commit()
+
+    assert kc._cmd_claim(_claim_args(review)) != 0
+    captured = capsys.readouterr()
+    assert "candidate_workspace_unavailable" in captured.out + captured.err
+    with kbc.connect() as conn:
+        after = kb.get_task(conn, review)
+    assert after.status == "review"
+    assert after.claim_lock is None
+    assert after.current_run_id is None

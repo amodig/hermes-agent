@@ -74,8 +74,6 @@ _WORKSPACE_REQUIRED_KEYS = frozenset({"path", "inspect", "extra_source_paths", "
 # of the named repository. Absent means exact-path authority, exactly as before.
 _WORKSPACE_OPTIONAL_KEYS = frozenset({"include_worktrees"})
 _WORKSPACE_KEYS = _WORKSPACE_REQUIRED_KEYS | _WORKSPACE_OPTIONAL_KEYS
-# Bounded scan of Git's own worktree registry (<common>/worktrees/*/gitdir).
-MAX_WORKTREE_REGISTRATIONS = 4096
 _RECIPE_KEYS = frozenset({"image", "argv", "timeout_seconds", "services"})
 _SERVICE_KEYS = frozenset({"id", "image", "argv", "ready_argv", "port"})
 
@@ -417,37 +415,34 @@ def _resolve_workspace(policy_entry: WorkspacePolicy) -> Optional[dict[str, Any]
     return _held_directory(policy_entry.path)
 
 
-def _worktree_registration_is_this_checkout(common_dir: str, workspace: str) -> bool:
-    """True when Git's own registry backlinks *workspace* from *common_dir*.
+def _worktree_registration_backlinks(common_dir: str, git_dir: str, workspace: str) -> bool:
+    """True when Git's registry entry FOR THIS git directory backlinks this checkout.
 
-    A ``gitdir`` pointer is the only proof that a linked checkout belongs to this
-    repository: two paths can share a common directory while the second is a
-    hand-forged ``.git`` file, and a registration pointing somewhere else is not
-    membership. Bounded, regular files only, no symlinks and no directory walking
-    beyond one listing.
+    The registration is addressed by the captured git directory itself
+    (``<common>/worktrees/<name>``), never by scanning for a pointer that happens to
+    name this path: a stale registration left behind for the same path would
+    otherwise vouch for a checkout whose ``.git`` was retargeted at a sibling
+    worktree, and the grant would bind this directory to another worktree's index
+    and HEAD. Regular bounded files only, no symlinks.
     """
     registry = Path(common_dir) / "worktrees"
-    wanted = os.path.normpath(os.path.join(workspace, ".git"))
+    captured = Path(git_dir)
     try:
         if registry.is_symlink() or not registry.is_dir():
             return False
-        entries = sorted(registry.iterdir())[:MAX_WORKTREE_REGISTRATIONS]
-    except OSError:
+        if captured.is_symlink() or not captured.is_dir():
+            return False
+        if os.path.normpath(str(captured.parent)) != os.path.normpath(str(registry)):
+            return False
+        pointer = captured / "gitdir"
+        info = os.lstat(pointer)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+            return False
+        recorded = pointer.read_bytes().decode("utf-8", "strict").strip()
+    except (OSError, UnicodeDecodeError):
         return False
-    for entry in entries:
-        try:
-            if entry.is_symlink() or not entry.is_dir():
-                continue
-            pointer = entry / "gitdir"
-            info = os.lstat(pointer)
-            if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
-                continue
-            recorded = pointer.read_bytes().decode("utf-8", "strict").strip()
-        except (OSError, UnicodeDecodeError):
-            continue
-        if recorded and os.path.normpath(recorded) == wanted:
-            return True
-    return False
+    wanted = os.path.normpath(os.path.join(workspace, ".git"))
+    return bool(recorded) and os.path.normpath(recorded) == wanted
 
 
 def _resolve_worktree_opt_in(
@@ -493,7 +488,9 @@ def _resolve_worktree_opt_in(
         # git directory means this is not a linked checkout at all.
         if actual_git["git_dir"] == actual_git["common_dir"]:
             continue
-        if not _worktree_registration_is_this_checkout(anchor_git["common_dir"], actual["path"]):
+        if not _worktree_registration_backlinks(
+            anchor_git["common_dir"], actual_git["git_dir"], actual["path"]
+        ):
             continue
         candidates.append((entry, actual, actual_git))
     if not candidates:
@@ -646,7 +643,10 @@ def resolve_review_context(db_path: str, task_id: str) -> tuple[str, Optional[di
                 return "implementation", None
             role = "review"
             candidate_id = task_id
-        elif status == "review":
+        elif status == "review" or kanban_db._resume_status_from_events(connection, task_id) == "review":
+            # A claimed review reads ``running``; the recorded resume status is the
+            # only evidence of the lane it came from. Missing it would hand a
+            # legacy reviewer implementation authority with no candidate pair.
             role = "review"
             candidate_id = task_id
         else:

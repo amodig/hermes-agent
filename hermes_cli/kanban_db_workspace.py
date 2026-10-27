@@ -817,8 +817,23 @@ def _role_repo_root(task: Task, board: Optional[str]) -> Path:
                 f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: role worktree path "
                 f"{task.workspace_path!r} is not absolute")
         requested_resolved = requested.resolve(strict=False)
-        repo_root = _git_toplevel(requested) if requested.exists() else None
-        if repo_root is None or _path_key(repo_root) != _path_key(requested_resolved):
+        repo_root = None
+        if requested.exists() and _is_linked_worktree_checkout(requested):
+            # A dispatch persists this card's own canonical worktree, so a retry
+            # names that checkout instead of the repository root. Resolve it back to
+            # the main checkout it belongs to rather than pretending it is one.
+            common = _git_common_dir(requested)
+            if common is None or common.name != ".git":
+                raise ValueError(
+                    f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: role worktree path "
+                    f"{task.workspace_path!r} is a linked checkout whose main repository "
+                    "cannot be identified")
+            repo_root = common.parent.resolve(strict=False)
+        elif requested.exists():
+            toplevel = _git_toplevel(requested)
+            if toplevel is not None and _path_key(toplevel) == _path_key(requested_resolved):
+                repo_root = toplevel
+        if repo_root is None:
             # Not a repository root: only this card's own canonical worktree anchors.
             repo_root = _repo_root_for_worktree_target(requested.parent)
             if repo_root is None:
@@ -892,6 +907,14 @@ def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Pa
             f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is detached at "
             f"{current or 'an unknown commit'}, not the candidate {head}; moving it would "
             "strand work that is reachable from no branch")
+    # Detaching leaves the branch ref behind, and the completion cleanup deletes a
+    # ``wt/<id>`` branch once the *detached* HEAD is clean and pushed. So only move a
+    # branch whose tip the candidate already contains: anything else is unique work.
+    if _git(target, "merge-base", "--is-ancestor", current, head, timeout=60).returncode != 0:
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is checked out on {branch} at "
+            f"{current}, which the candidate {head} does not contain; detaching would "
+            "strand that work")
     result = _git(target, "checkout", "--detach", head, timeout=120)
     if result.returncode != 0:
         raise ValueError(
