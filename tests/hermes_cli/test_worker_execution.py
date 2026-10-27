@@ -743,10 +743,13 @@ def test_read_pages_and_binary_refusal(fixture):
     assert excinfo.value.code == "binary_content"
 
 
-def test_diff_only_accepts_the_granted_review_pair(fixture):
-    authority = _authority(
-        fixture, status="review", review={"base": fixture.base, "head": fixture.head},
-    )
+def test_diff_only_accepts_the_granted_review_pair(fixture, monkeypatch):
+    # A review claim only keeps execution authority while the board names the
+    # immutable pair and the workspace HEAD is on it; this test is about the diff
+    # capability, so it supplies that pair and then pins the diff itself.
+    pair = {"base": fixture.base, "head": fixture.head}
+    monkeypatch.setattr(wep, "resolve_review_context", lambda *_a, **_k: ("review", pair))
+    authority = _authority(fixture, status="review", review=pair)
     args = {"operation": "diff", "base": fixture.base, "head": fixture.head}
     result = wes._inspect_diff(args, authority)
     assert result["ok"] is True and result["mode"] == "commit"
@@ -870,3 +873,212 @@ def test_required_hook_requires_the_owned_callback_bytes(tmp_path, monkeypatch):
         assert callback is None and reason
     finally:
         plugins_module.REQUIRED_HOOK_CALLBACK_OWNERS.pop(loaded._on_pre_worker_execution, None)
+
+
+# ---- include_worktrees opt-in ------------------------------------------
+
+
+def _identity():
+    return SimpleNamespace(
+        generation="gen", dependency_fingerprint="dep", code_sha="sha", pid=os.getpid())
+
+
+def _opt_in_section(repo: Path, images, *, include_worktrees=True, inspect=True, recipes=None):
+    entry = {
+        "path": str(repo),
+        "inspect": inspect,
+        "extra_source_paths": [],
+        "recipes": recipes or {},
+    }
+    if include_worktrees is not None:
+        entry["include_worktrees"] = include_worktrees
+    return {"protocol": 1, "image_store": str(images), "workspaces": [entry]}
+
+
+def _task_worktree(fixture, rev: str | None = None) -> tuple[str, str, Path]:
+    """A real board task with its canonical native worktree at the given commit."""
+    task_id, db_path = _board(fixture)
+    target = fixture.repo / ".worktrees" / task_id
+    target.parent.mkdir(mode=0o700, exist_ok=True)
+    _git(fixture.repo, "worktree", "add", "--detach", str(target), rev or fixture.head)
+    return task_id, db_path, target
+
+
+def _resolve(fixture, section, *, workspace: str, task_id: str, db_path: str):
+    _write_config(fixture.hermes, section)
+    _stage_plugin(fixture.hermes)
+    return wep.resolve_execution_grant(
+        profile_home=str(fixture.hermes), workspace=workspace, task_id=task_id,
+        profile="tester", board="fixture", db_path=db_path,
+        preparation_id="prep-fixture", runtime_identity=_identity(),
+    )
+
+
+def test_opt_in_covers_the_native_task_worktree_only(fixture):
+    task_id, db_path, target = _task_worktree(fixture)
+
+    grant, refusal = _resolve(
+        fixture, _opt_in_section(fixture.repo, fixture.images),
+        workspace=str(target), task_id=task_id, db_path=db_path)
+    assert refusal is None
+    assert grant is not None
+    # The grant describes the checkout the worker actually runs in, not the anchor.
+    assert grant.workspace["path"] == str(target)
+    assert grant.git["git_dir"] != grant.git["common_dir"]
+    assert grant.git["common_dir"] == str((fixture.repo / ".git").resolve())
+
+    # No opt-in, explicit false, and a plain exact-path policy all refuse it.
+    for include in (None, False):
+        grant, refusal = _resolve(
+            fixture, _opt_in_section(fixture.repo, fixture.images, include_worktrees=include),
+            workspace=str(target), task_id=task_id, db_path=db_path)
+        assert grant is None and refusal == "workspace_not_granted"
+
+    # The opt-in does not widen the anchor itself: another task's worktree, an
+    # ordinary subdirectory and an unrelated repository all stay ungranted.
+    sibling = fixture.repo / ".worktrees" / "someone-else"
+    _git(fixture.repo, "worktree", "add", "--detach", str(sibling), fixture.head)
+    (fixture.repo / "sub").mkdir()
+    for path in (str(sibling), str(fixture.repo / "sub")):
+        _write_config(fixture.hermes, _opt_in_section(fixture.repo, fixture.images))
+        _stage_plugin(fixture.hermes)
+        grant, refusal = wep.resolve_execution_grant(
+            profile_home=str(fixture.hermes), workspace=path, task_id=task_id,
+            profile="tester", board="fixture", db_path=db_path,
+            preparation_id="prep-fixture", runtime_identity=_identity())
+        assert grant is None, path
+
+
+def test_exact_entry_wins_over_the_repository_opt_in(fixture):
+    task_id, db_path, target = _task_worktree(fixture)
+    section = _opt_in_section(fixture.repo, fixture.images, inspect=True)
+    section["workspaces"].append({
+        "path": str(target), "inspect": False, "extra_source_paths": [], "recipes": {},
+    })
+    grant, refusal = _resolve(
+        fixture, section, workspace=str(target), task_id=task_id, db_path=db_path)
+    assert refusal is None and grant is not None
+    assert grant.inspect is False
+
+
+def test_opt_in_refuses_a_forged_sibling_registration_and_a_symlink(fixture):
+    task_id, db_path = _board(fixture)
+    other = fixture.repo / ".worktrees" / "other"
+    _git(fixture.repo, "worktree", "add", "--detach", str(other), fixture.head)
+
+    forged = fixture.repo / ".worktrees" / task_id
+    forged.parent.mkdir(mode=0o700, exist_ok=True)
+    forged.mkdir(mode=0o700)
+    # A .git pointer at another worktree's git directory: capture_git_identity
+    # resolves it happily, but Git's registry never links it to this path.
+    (forged / ".git").write_text(
+        f"gitdir: {(fixture.repo / '.git' / 'worktrees' / 'other').resolve()}\n", encoding="utf-8")
+    grant, refusal = _resolve(
+        fixture, _opt_in_section(fixture.repo, fixture.images),
+        workspace=str(forged), task_id=task_id, db_path=db_path)
+    assert grant is None and refusal == "workspace_not_granted"
+
+    # A symlink onto a genuine checkout is not that checkout.
+    forged.rename(fixture.repo / ".worktrees" / f"{task_id}-forged")
+    os.symlink(other, fixture.repo / ".worktrees" / task_id)
+    grant, refusal = _resolve(
+        fixture, _opt_in_section(fixture.repo, fixture.images),
+        workspace=str(fixture.repo / ".worktrees" / task_id), task_id=task_id, db_path=db_path)
+    assert grant is None and refusal == "workspace_not_granted"
+
+
+def test_opt_in_refuses_a_nested_clone_anchor(fixture):
+    task_id, db_path, _target = _task_worktree(fixture)
+    clone = fixture.repo / "nested"
+    subprocess.run(
+        ["git", "clone", "-q", str(fixture.repo), str(clone)],
+        check=True, capture_output=True, text=True,
+    )
+    # The clone is a main checkout of its own repository; the entry names the outer
+    # one, so this card's worktree is not covered by it.
+    target = clone / ".worktrees" / task_id
+    target.parent.mkdir(mode=0o700, exist_ok=True)
+    _git(clone, "worktree", "add", "--detach", str(target), "HEAD")
+    grant, refusal = _resolve(
+        fixture, _opt_in_section(fixture.repo, fixture.images),
+        workspace=str(target), task_id=task_id, db_path=db_path)
+    assert grant is None and refusal == "workspace_not_granted"
+
+
+def test_opt_in_rechecks_held_identity_before_granting(fixture, monkeypatch):
+    task_id, db_path, target = _task_worktree(fixture)
+    real = wep._held_directory
+    calls = {"n": 0}
+
+    def drifting(path):
+        held = real(path)
+        calls["n"] += 1
+        # The anchor, the worktree, then the pre-grant recheck: only the last drifts.
+        if held is not None and calls["n"] > 2:
+            return dict(held, inode=held["inode"] + 1)
+        return held
+
+    monkeypatch.setattr(wep, "_held_directory", drifting)
+    grant, refusal = _resolve(
+        fixture, _opt_in_section(fixture.repo, fixture.images),
+        workspace=str(target), task_id=task_id, db_path=db_path)
+    assert grant is None and refusal.startswith("workspace_not_granted")
+
+
+def test_review_authority_requires_the_granted_candidate_head(fixture, monkeypatch):
+    task_id, db_path, target = _task_worktree(fixture, rev=fixture.base)
+    section = _opt_in_section(fixture.repo, fixture.images)
+    pair = {"base": fixture.base, "head": fixture.base}
+    monkeypatch.setattr(wep, "resolve_review_context", lambda *_a, **_k: ("review", pair))
+    grant, refusal = _resolve(
+        fixture, section, workspace=str(target), task_id=task_id, db_path=db_path)
+    assert refusal is None and grant is not None
+    assert grant.review == pair
+
+    # The workspace moved off the candidate: metadata may still start a worker, but
+    # no verifier gets to run there.
+    monkeypatch.setattr(
+        wep, "resolve_review_context",
+        lambda *_a, **_k: ("review", {"base": fixture.base, "head": fixture.head}))
+    grant, refusal = _resolve(
+        fixture, section, workspace=str(target), task_id=task_id, db_path=db_path)
+    assert grant is None and refusal == "candidate_workspace_unavailable"
+
+    monkeypatch.setattr(wep, "resolve_review_context", lambda *_a, **_k: ("review", None))
+    grant, refusal = _resolve(
+        fixture, section, workspace=str(target), task_id=task_id, db_path=db_path)
+    assert grant is None and refusal == "candidate_workspace_unavailable"
+
+
+def test_materialized_review_source_must_be_the_reviewed_commit(fixture, monkeypatch):
+    monkeypatch.setattr(
+        wep, "resolve_review_context",
+        lambda *_a, **_k: ("review", {"base": fixture.base, "head": fixture.head}))
+    authority = _authority(fixture)
+    assert authority.role == "review"
+    # Inspection still works against a dirty reviewed candidate — that is how a
+    # reviewer explains the dirt.
+    assert wes._scan_source(authority).head == fixture.head
+    run_root = fixture.root / "run"
+    run_root.mkdir()
+    with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+        wes._materialize_source(authority, run_root)
+    assert excinfo.value.code == "source_changed"
+
+    _git(fixture.repo, "reset", "-q")
+    _git(fixture.repo, "checkout", "--", "app.py")
+    (fixture.repo / "notes.txt").unlink()
+    clean_root = fixture.root / "clean-run"
+    clean_root.mkdir()
+    snapshot, _source_dir = wes._materialize_source(authority, clean_root)
+    assert snapshot.head == fixture.head
+
+    # The candidate moved after the grant was retained: the same authority may not
+    # copy the new HEAD and call it the reviewed commit.
+    (fixture.repo / "app.py").write_text("print('moved on')\n", encoding="utf-8")
+    _git(fixture.repo, "commit", "-qam", "move on")
+    moved_root = fixture.root / "moved-run"
+    moved_root.mkdir()
+    with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+        wes._materialize_source(authority, moved_root)
+    assert excinfo.value.code == "source_changed"
