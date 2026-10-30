@@ -83,9 +83,39 @@ class WorkerGrantContext:
     runtime_identity: "RuntimeIdentity"
     #: Frozen explicit execution authority, when the dispatcher granted one.
     execution: Any = None
+    #: Why the dispatcher withheld execution authority; descriptive, never authority.
+    execution_refusal: Optional[str] = None
 
 
 _GRANT: Optional[WorkerGrantContext] = None
+
+#: The only shape an execution-refusal code may take across the grant pipe.
+_REFUSAL_CODE_MAX = 64
+
+
+def _execution_refusal_field(grant: dict) -> Optional[str]:
+    """The dispatcher's execution-refusal code from this frame.
+
+    ``None`` means "a usable grant, no refusal". An explicit ``null`` is the
+    dispatcher's normal frame: it always sends the field next to the authority it
+    granted, so null beside a section is not a refusal and must not be read as one.
+    A frame carrying neither field predates the diagnostic, so it reports
+    ``execution_unavailable`` rather than inventing a configuration diagnosis. The
+    value is descriptive only — it never widens what this process may execute.
+    """
+    section = grant.get("worker_execution")
+    if "worker_execution_refusal" not in grant:
+        return None if section is not None else "execution_unavailable"
+    value = grant.get("worker_execution_refusal")
+    if value is None:
+        return None if section is not None else "execution_unavailable"
+    if (
+        not isinstance(value, str) or not value or len(value) > _REFUSAL_CODE_MAX
+        or not value.isascii() or not value.islower() or not value[0].isalpha()
+        or not value.replace("_", "").isalnum()
+    ):
+        raise WorkerStartupUnavailable("grant execution refusal is malformed")
+    return value
 
 
 def _require_text(value: Any, label: str, *, limit: int = 4096) -> str:
@@ -143,10 +173,25 @@ def _retain_worker_grant(grant: dict, actual: "RuntimeIdentity") -> None:
         runtime_identity=actual,
     )
     section = grant.get("worker_execution")
+    refusal = _execution_refusal_field(grant)
     if section is not None:
+        if refusal is not None:
+            raise WorkerStartupUnavailable(
+                "grant reports both execution authority and a refusal")
+        from hermes_cli.worker_execution_common import WorkerExecutionError
         from hermes_cli.worker_execution_policy import parse_grant_section
 
-        candidate = replace(candidate, execution=parse_grant_section(section, candidate))
+        try:
+            candidate = replace(candidate, execution=parse_grant_section(section, candidate))
+        except WorkerExecutionError as exc:
+            # Fail closed, not fatal: the bootstrap call site removes the capability
+            # only for WorkerStartupUnavailable, and a worker that already owns its
+            # run must lose the tools instead of crashing. The stable code is
+            # descriptive; the underlying message can carry paths, so it stays out.
+            raise WorkerStartupUnavailable(
+                f"worker execution grant is not usable: {exc.code}") from exc
+    if refusal is not None:
+        candidate = replace(candidate, execution_refusal=refusal)
     if _GRANT is not None:
         if _GRANT == candidate:
             return
@@ -306,6 +351,32 @@ def _spawn_receipt(connection: sqlite3.Connection, grant: WorkerGrantContext) ->
     return "verified" if verified else "pending"
 
 
+def _execution_summary(grant: WorkerGrantContext) -> dict[str, Any]:
+    """Bounded capability roster from retained authority only.
+
+    ``granted`` means authority was retained at startup — not permission to skip
+    the per-call checks the executor still applies. Recipe ids only: argv, images,
+    targets and every other configured detail stay out of a worker-visible payload.
+    """
+    authority = grant.execution
+    if authority is None:
+        return {
+            "granted": False,
+            "inspect": False,
+            "recipes": [],
+            "refusal": grant.execution_refusal or "execution_unavailable",
+        }
+    ids = sorted(
+        {str(recipe["id"]) for recipe in authority.recipes if recipe.get("id")}
+    )
+    return {
+        "granted": True,
+        "inspect": bool(authority.inspect),
+        "recipes": ids,
+        "refusal": None,
+    }
+
+
 def _read_startup(connection: sqlite3.Connection, grant: WorkerGrantContext) -> dict:
     from hermes_cli import kanban_db
     from hermes_cli.kanban_runtime import same_runtime_identity
@@ -361,6 +432,9 @@ def _read_startup(connection: sqlite3.Connection, grant: WorkerGrantContext) -> 
         "preparation_id": grant.preparation_id,
         "runtime_identity": identity.as_dict(),
         "spawn_receipt": _spawn_receipt(connection, grant),
+        # Why this worker can or cannot execute: the only finite diagnostic route a
+        # withdrawn capability has. Descriptive; never a grant.
+        "execution": _execution_summary(grant),
     }
     encoded = json.dumps(snapshot, sort_keys=True)
     if len(encoded.encode("utf-8")) > _MAX_SNAPSHOT_BYTES:

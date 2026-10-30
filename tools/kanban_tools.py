@@ -714,9 +714,88 @@ def inject_new_comments_from_env(agent: Any) -> bool:
 
 # --- Handlers ---
 
+def _handle_bounded_show(args: dict) -> str:
+    """Authenticate before opening the retained board; never initialize a reader."""
+    import sqlite3
+    from pathlib import Path
+    from agent.delegation_context import KANBAN_ENV_KEYS, is_delegated_child_process_context
+    from hermes_cli import kanban_db as kb, kanban_db_evidence as evidence, worker_startup
+
+    def refuse(code):
+        return tool_error(code, ok=False, code=code)
+
+    options = {key: value for key, value in args.items() if key not in ("task_id", "board")}
+    try:
+        if ("item" in args and ("after" in args or args["item"] is None)
+                or "snapshot" in args and args["snapshot"] is None
+                or "after" in args and args.get("section") not in evidence._HISTORY):
+            return refuse("invalid_evidence_request")
+        evidence._validate(
+            options.get("section"), options.get("after", 0), options.get("item"),
+            options.get("pointer", ""), options.get("offset", 0), options.get("limit", 20),
+            options.get("chars", 4096), options.get("snapshot"),
+        )
+        grant = None
+        if (worker_startup._GRANT is not None or is_delegated_child_process_context()
+                or any(os.environ.get(key) for key in KANBAN_ENV_KEYS)):
+            grant = worker_startup._authorize()
+            if args.get("board", grant.board) != grant.board or _resolved_board(None) != grant.board:
+                return refuse("invalid_evidence_request")
+            inherited_db = os.environ.get("HERMES_KANBAN_DB", "").strip()
+            if inherited_db and os.path.abspath(os.path.expanduser(inherited_db)) != os.path.abspath(grant.db_path):
+                return refuse("invalid_evidence_request")
+            preparation = os.environ.get("HERMES_KANBAN_PREPARATION_ID")
+            if preparation and preparation != grant.preparation_id:
+                return refuse("invalid_evidence_request")
+        tid = _default_task_id(args.get("task_id"))
+        if not tid:
+            return _handle_show({})
+        board = grant.board if grant is not None else _resolved_board(args.get("board"))
+        path = Path(grant.db_path) if grant is not None else kb.kanban_db_path(
+            board=args.get("board") if os.environ.get("HERMES_KANBAN_DB", "").strip() else board)
+        path = path.absolute()
+        before = path.stat()
+    except evidence._Unavailable as exc:
+        return refuse(exc.code)
+    except (worker_startup.WorkerStartupUnavailable, ValueError, TypeError):
+        return refuse("invalid_evidence_request")
+    except OSError:
+        return refuse("board_unavailable")
+    try:
+        conn = worker_startup._open_board(str(path))
+    except worker_startup.WorkerStartupUnavailable:
+        return refuse("board_unavailable")
+    try:
+        evidence._preflight(conn)
+        if grant is not None:
+            worker_startup._read_startup(conn, grant)
+        result = evidence.read_evidence(conn, board=board, task_id=tid, **options)
+        after = path.stat()
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            return refuse("stale_snapshot" if args.get("snapshot") else "board_unavailable")
+        return json.dumps(result, ensure_ascii=False)
+    except evidence._Unavailable as exc:
+        return refuse(exc.code)
+    except worker_startup.WorkerStartupUnavailable:
+        return refuse("invalid_evidence_request")
+    except (sqlite3.Error, OSError):
+        return refuse("board_unavailable")
+    except (ValueError, TypeError, KeyError, OverflowError, RecursionError):
+        return refuse("evidence_unavailable")
+    finally:
+        try:
+            conn.execute("ROLLBACK")
+        finally:
+            conn.close()
+
+
 @_kanban_handler("kanban_show")
 def _handle_show(args: dict, **kw) -> str:
     """Full task state: row, parents, children, comments, runs, last 50 events."""
+    if "section" in args:
+        return _handle_bounded_show(args)
+    if any(key in args for key in ("after", "item", "pointer", "offset", "limit", "chars", "snapshot")):
+        return tool_error("invalid_evidence_request", ok=False, code="invalid_evidence_request")
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         # No dispatcher task in scope and no explicit id: the caller asked "what
@@ -1431,8 +1510,23 @@ def _handle_unblock(args: dict, **kw) -> str:
     _check(tid, "task_id is required")
     tid = str(tid)
     _enforce_worker_task_ownership(tid)
+    expected_version = args.get("expected_version")
+    fenced = expected_version is not None
+    if fenced:
+        if isinstance(expected_version, bool):
+            raise _Reject("expected_version must be an integer")
+        try:
+            expected_version = int(expected_version)
+        except (TypeError, ValueError):
+            raise _Reject("expected_version must be an integer")
     with _board(args.get("board")) as (kb, conn):
-        _check(kb.unblock_task(conn, tid), f"could not unblock {tid} (not blocked or unknown)")
+        # A fenced refusal must say so: "not blocked" would hide a stale version or a
+        # surviving claim, which is exactly what the caller needs to act on.
+        _check(
+            kb.unblock_task(conn, tid, expected_version=expected_version),
+            (f"could not unblock {tid}: stale version, changed state, or active claim"
+             if fenced else f"could not unblock {tid} (not blocked or unknown)"),
+        )
         return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)))
 
 

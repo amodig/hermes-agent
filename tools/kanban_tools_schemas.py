@@ -83,10 +83,54 @@ KANBAN_SHOW_SCHEMA = _schema(
         "pre-formatted ``worker_context`` string suitable for inclusion "
         "verbatim in your reasoning. Outside a dispatcher-spawned worker "
         "there is no default task: a bare call returns a pointer to "
-        "``kanban_list`` instead of task state."
+        "``kanban_list`` instead of task state. These legacy promises apply "
+        "when section is omitted. Opt in with section for read-only structured "
+        "evidence pages (at most 32768 UTF-8 bytes), without worker_context. "
+        "Follow every continuation object as kanban_show arguments, including "
+        "deferred entries/rows, until next_offset/next_after is null. Keep one "
+        "snapshot across sections of this task; stale_snapshot means restart "
+        "the evidence set. Tokens establish consistency, not permission. "
+        "dispatch_guard is evaluated_at reporting, not claim-time authorization."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "section": {
+            "type": "string",
+            "enum": [
+                "task", "lifecycle", "effective_goal", "provenance", "dependencies",
+                "dispatch_guard", "parents", "children", "comments", "events",
+                "runs", "active_handoff",
+            ],
+            "description": "Select bounded mode. All other pagination arguments require section.",
+        },
+        "after": {
+            "type": "integer", "minimum": 0, "default": 0,
+            "description": "Exclusive stable row-id cursor for comments/events/runs only; mutually exclusive with item.",
+        },
+        "item": {
+            "type": "integer", "minimum": 1,
+            "description": "Drill into this task's comment/event/run id. Requires snapshot; cannot accompany after.",
+        },
+        "pointer": {
+            "type": "string", "default": "",
+            "description": "RFC 6901 pointer relative to the section or selected item (max 64 segments); nonempty requires snapshot.",
+        },
+        "offset": {
+            "type": "integer", "minimum": 0, "default": 0,
+            "description": "Unicode-codepoint offset in strings, entry offset in objects/arrays; positive requires snapshot.",
+        },
+        "limit": {
+            "type": "integer", "minimum": 1, "maximum": 200, "default": 20,
+            "description": "Maximum rows or entries per page.",
+        },
+        "chars": {
+            "type": "integer", "minimum": 1, "maximum": 8192, "default": 4096,
+            "description": "Maximum string codepoints per chunk; envelope escaping may reduce it.",
+        },
+        "snapshot": {
+            "type": "string",
+            "description": "Opaque token from an earlier bounded call for this task/board. Required for after>0, offset>0, nonempty pointer, or item; reuse across sections.",
+        },
     },
     [],
 )
@@ -722,6 +766,12 @@ KANBAN_UNBLOCK_SCHEMA = _schema(
     ),
     {
         "task_id": _prop("string", "Blocked task id to move to ready or parent-gated todo."),
+        "expected_version": _prop(
+            "integer",
+            "Recovery fence: require this current task version. The call refuses a "
+            "stale version or any surviving claim instead of reclaiming ownership, "
+            "and changes nothing when it refuses. Omit for the ordinary unblock.",
+        ),
     },
     ["task_id"],
 )

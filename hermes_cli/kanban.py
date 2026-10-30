@@ -1277,12 +1277,29 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     if rc:
         return rc
     reason = _stripped_or_none(getattr(args, "reason", None))
-    author = _profile_author() if reason else None
+    expected_version = getattr(args, "expected_version", None)
+    author = _profile_author() if (reason or expected_version is not None) else None
     suffix = f": {reason}" if reason else ""
+    if expected_version is not None and len(ids) != 1:
+        return _err("kanban unblock: --expected-version requires exactly one task id", 2)
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
+        def op(tid):
+            if expected_version is None:
+                return kb.unblock_task(conn, tid)
+            # Fenced recovery: the audit comment is written by the transition itself,
+            # so a stale refusal leaves no comment before the mutation it describes.
+            return kb.unblock_task(
+                conn, tid, expected_version=expected_version, reason=reason, author=author,
+            )
+
+        if expected_version is None:
+            op = _commented(conn, reason, author, "UNBLOCK", op)
+        failure = (
+            "cannot unblock {} (not blocked/scheduled?)" if expected_version is None
+            else "cannot unblock {}: stale version, changed state, or active claim"
+        )
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
-                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+                           lambda tid: failure.format(tid))
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
