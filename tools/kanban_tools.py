@@ -1512,13 +1512,11 @@ def _handle_unblock(args: dict, **kw) -> str:
     _enforce_worker_task_ownership(tid)
     expected_version = args.get("expected_version")
     fenced = expected_version is not None
-    if fenced:
-        if isinstance(expected_version, bool):
-            raise _Reject("expected_version must be an integer")
-        try:
-            expected_version = int(expected_version)
-        except (TypeError, ValueError):
-            raise _Reject("expected_version must be an integer")
+    if fenced and (isinstance(expected_version, bool)
+                   or not isinstance(expected_version, int) or expected_version < 1):
+        # No coercion: a fractional or string version must never be truncated into a
+        # fence that then matches a card the caller did not name.
+        raise _Reject("expected_version must be an integer >= 1")
     # Why the recovery happened is part of the audit trail, and only the fenced path
     # writes it: the caller names the intent, the persisted identity is the actor.
     reason = args.get("reason")

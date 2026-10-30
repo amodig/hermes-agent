@@ -502,10 +502,11 @@ def test_claim_cli_leaves_a_role_card_unclaimed_when_its_workspace_is_refused(
         assert advanced != candidate
         # The operator pinned the review card to that checkout.
         with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET workspace_kind = 'dir' WHERE id = ?", (review,))
-        kb.recompute_ready(conn)
+            conn.execute(
+                "UPDATE tasks SET workspace_kind = 'dir', status = 'ready' WHERE id = ?",
+                (review,))
         pinned = kb.get_task(conn, review)
-        assert pinned.status == "review"
+        assert pinned.status == "ready"
         assert _head(repo) == advanced
 
     assert kc._cmd_claim(_claim_args(review)) != 0
@@ -513,7 +514,7 @@ def test_claim_cli_leaves_a_role_card_unclaimed_when_its_workspace_is_refused(
     assert "candidate_workspace_unavailable" in captured.out + captured.err
     with kbc.connect() as conn:
         after = kb.get_task(conn, review)
-    assert after.status == "review"
+    assert after.status == "ready"
     assert after.claim_lock is None
     assert after.current_run_id is None
     assert after.worker_pid is None
@@ -680,3 +681,52 @@ def test_cleanup_of_a_converted_role_card_uses_the_worktree_path(kanban_home, tm
     ).stdout
     assert str(path) not in leftover   # removed with git worktree remove, not rmtree
     assert not path.exists()
+
+def test_claim_refuses_an_unclaimable_card_before_materializing_anything(
+    kanban_home, tmp_path, capsys,
+):
+    """A refused claim must not leave a checkout (or a branch) behind.
+
+    Materializing first meant a card that was already running, claimed, or still
+    dependency-blocked still created ``.worktrees/<id>``; for a role card the leftover
+    detached checkout could then refuse a later retry against a newer candidate.
+    """
+    from hermes_cli import kanban as kc
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+
+    with kbc.connect() as conn:
+        implementation = kb.create_task(
+            conn, title="implementation", assignee="coder", workspace_kind="worktree",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code", "review_mode": "separate_card", "reviewer": "reviewer",
+                "validation_required": True,
+            })
+        review = kb.create_task(
+            conn, title="review the candidate", assignee="reviewer",
+            workspace_path=str(repo),
+            lifecycle_contract={"kind": "review", "candidate_task_id": implementation})
+        run = kb.claim_task(conn, implementation, claimer=kb._claimer_id())
+        assert run is not None
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=run.current_run_id,
+            summary="implementation handoff",
+            metadata={"base_sha": base, "head_sha": candidate, "changed_files": []})
+        # The card is claim-eligible by dependency, but a live claim already owns it.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = 'someone-else', "
+                "current_run_id = 999 WHERE id = ?", (review,))
+        target = repo / ".worktrees" / review
+        assert not target.exists()
+
+    assert kc._cmd_claim(_claim_args(review)) != 0
+    assert "already claimed" in capsys.readouterr().err
+    assert not target.exists()
+    with kbc.connect() as conn:
+        after = kb.get_task(conn, review)
+    assert after.claim_lock == "someone-else"
+    assert after.workspace_path == str(repo)

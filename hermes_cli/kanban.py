@@ -903,6 +903,25 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
                       f"Unlinked {args.parent_id} -> {args.child_id}")
 
 
+def _claim_preflight(conn, task) -> Optional[str]:
+    """Why this card cannot be claimed, without writing or materializing anything.
+
+    Mirrors the cheap half of ``claim_task``: status, an existing claim, and unmet
+    dependencies. A concurrent edit can still land after this check — the claim itself
+    is fenced to ``task`` — but the common refusals no longer create a workspace.
+    """
+    if task.status != "ready":
+        return f"status={task.status} lock={task.claim_lock or '(none)'}"
+    if task.claim_lock or task.current_run_id:
+        return f"already claimed (lock={task.claim_lock or '(none)'})"
+    blockers = kb.evaluate_dependencies(conn, task.id)["blockers"]
+    if blockers:
+        detail = ", ".join(
+            f"{item['parent_id']} ({item['code']})" for item in blockers[:3])
+        return f"unsatisfied dependencies: {detail}"
+    return None
+
+
 def _cmd_claim(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         # Derive the candidate AND materialize the workspace before claiming: either
@@ -912,8 +931,17 @@ def _cmd_claim(args: argparse.Namespace) -> int:
         # worker holding it. Resolution reads only fields the claim does not change.
         pending = kb.get_task(conn, args.task_id)
         try:
+            # Two non-mutating steps, then the one that creates a directory:
+            # 1. the candidate is resolved first, so an unresolvable role card fails
+            #    without materializing anything;
+            # 2. claimability is preflighted before materialization — a card that cannot
+            #    be claimed must not leave a checkout (and branch) behind, because a stale
+            #    detached role checkout can refuse the retry against a newer candidate.
             candidate_head = (
                 kbw.candidate_head_for_task(conn, pending) if pending is not None else None)
+            blocked = _claim_preflight(conn, pending) if pending is not None else None
+            if blocked:
+                return _err(f"cannot claim {args.task_id}: {blocked}")
             workspace = (
                 kbw.resolve_workspace(pending, candidate_head=candidate_head)
                 if pending is not None else None)
