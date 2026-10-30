@@ -580,3 +580,103 @@ def test_typed_role_card_with_the_default_scratch_kind_gets_the_candidate(
         assert path.is_dir()
         assert _head(path) == candidate  # the candidate checkout, never the moving tree
         assert path != repo
+
+def test_a_converted_role_card_is_recorded_as_a_worktree(kanban_home, tmp_path):
+    """The kind that cleanup branches on must match the workspace that was resolved.
+
+    ``scratch`` is create_task's default, so a role card resolves a linked worktree while
+    the column still says scratch. Completion cleanup branches on the column: scratch is
+    a plain directory delete, worktree is ``git worktree remove`` — so both call sites
+    (``hermes kanban claim`` and the dispatcher) persist the effective kind.
+    """
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+
+    with kbc.connect() as conn:
+        implementation = kb.create_task(
+            conn, title="implementation", assignee="coder", workspace_kind="worktree",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code", "review_mode": "separate_card", "reviewer": "reviewer",
+                "validation_required": True,
+            })
+        review = kb.create_task(
+            conn, title="review the candidate", assignee="reviewer",
+            lifecycle_contract={"kind": "review", "candidate_task_id": implementation})
+        plain = kb.create_task(conn, title="plain scratch work", assignee="worker")
+        # A role card with no explicit path anchors on the board's repository.
+        kb.write_board_metadata(None, default_workdir=str(repo))
+        run = kb.claim_task(conn, implementation, claimer=kb._claimer_id())
+        assert run is not None
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=run.current_run_id,
+            summary="implementation handoff",
+            metadata={"base_sha": base, "head_sha": candidate, "changed_files": []})
+        task = kb.get_task(conn, review)
+        head = kbw.candidate_head_for_task(conn, task)
+        workspace = kbw.resolve_workspace(task, candidate_head=head)
+
+        # A role card always resolves as a worktree; ordinary scratch work does not.
+        assert kbw.effective_workspace_kind(task) == "worktree"
+        assert kbw.effective_workspace_kind(kb.get_task(conn, plain)) == "scratch"
+
+        # Persisting exactly what the claim paths persist: path plus the effective kind.
+        effective = kbw.effective_workspace_kind(task)
+        kbw.set_workspace_path(
+            conn, review, str(workspace),
+            kind=effective if effective != (task.workspace_kind or "scratch") else None,
+        )
+        recorded = kb.get_task(conn, review)
+
+    assert recorded.workspace_kind == "worktree"
+    assert recorded.workspace_path == str(workspace)
+    assert _head(Path(recorded.workspace_path)) == candidate
+
+
+def test_cleanup_of_a_converted_role_card_uses_the_worktree_path(kanban_home, tmp_path):
+    """The recorded kind is what decides cleanup, so a converted card removes cleanly."""
+    from hermes_cli import kanban_db_workspace as workspace_module
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+
+    with kbc.connect() as conn:
+        implementation = kb.create_task(
+            conn, title="implementation", assignee="coder", workspace_kind="worktree",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code", "review_mode": "separate_card", "reviewer": "reviewer",
+                "validation_required": True,
+            })
+        review = kb.create_task(
+            conn, title="review the candidate", assignee="reviewer",
+            workspace_path=str(repo),
+            lifecycle_contract={"kind": "review", "candidate_task_id": implementation})
+        run = kb.claim_task(conn, implementation, claimer=kb._claimer_id())
+        assert run is not None
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=run.current_run_id,
+            summary="implementation handoff",
+            metadata={"base_sha": base, "head_sha": candidate, "changed_files": []})
+        task = kb.get_task(conn, review)
+        head = kbw.candidate_head_for_task(conn, task)
+        path = kbw.resolve_workspace(task, candidate_head=head)
+        kbw.set_workspace_path(conn, review, str(path), kind="worktree")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (review,))
+        registered = subprocess.run(
+            ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        assert str(path) in registered
+
+        workspace_module._cleanup_workspace(conn, review)
+
+    leftover = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert str(path) not in leftover   # removed with git worktree remove, not rmtree
+    assert not path.exists()

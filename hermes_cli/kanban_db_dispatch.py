@@ -2961,7 +2961,10 @@ def _dispatch_lane_task(
             return False
         try:
             candidate_head = _kbw.candidate_head_for_task(conn, claimed)
-            if claimed.workspace_kind == "worktree":
+            # A typed role card resolves as a worktree even from the scratch default, so
+            # branch bookkeeping and cleanup must follow the effective kind, not the column.
+            role_kind = _kbw.effective_workspace_kind(claimed)
+            if role_kind == "worktree":
                 workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(
                     claimed, board=board, candidate_head=candidate_head)
             else:
@@ -2978,8 +2981,15 @@ def _dispatch_lane_task(
     try:
         assert claimed is not None
         assert workspace is not None
-        _kbw.set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
+        # Persist the kind the workspace was resolved as: a role card converted from the
+        # scratch default is a worktree, and completion cleanup follows the recorded kind.
+        workspace_kind = _kbw.effective_workspace_kind(claimed)
+        _kbw.set_workspace_path(
+            conn, claimed.id, str(workspace),
+            kind=(workspace_kind
+                  if workspace_kind != (claimed.workspace_kind or "scratch") else None),
+        )
+        if workspace_kind == "worktree":
             # A role worktree is normally detached at the candidate, and "" is the
             # truth to persist there — the historical "or wt/<id>" fallback would
             # record a branch that does not exist.

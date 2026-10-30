@@ -932,7 +932,13 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                         f"lock={existing.claim_lock or '(none)'} "
                         f"(the task changed while its workspace was resolved)")
         # A successful claim proves the row still existed, so resolution above ran.
-        kbw.set_workspace_path(conn, task.id, str(workspace))
+        # Persist the kind it was resolved as: a role card converted from the scratch
+        # default is a worktree now, and completion cleanup follows the recorded kind.
+        resolved_kind = kbw.effective_workspace_kind(pending)
+        kbw.set_workspace_path(
+            conn, task.id, str(workspace),
+            kind=resolved_kind if resolved_kind != (pending.workspace_kind or "scratch") else None,
+        )
     print(f"Claimed {task.id}\nWorkspace: {workspace}")
     return 0
 

@@ -1040,16 +1040,13 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None,
     and an explicit ``dir`` workspace is verified in place against that commit.
     Persist via ``set_workspace_path``.
     """
-    kind = task.workspace_kind or "scratch"
+    kind = effective_workspace_kind(task)
     if kind == "worktree":
-        return _resolve_worktree_workspace(
-            task, board=board, candidate_head=candidate_head)[0]
-    if kind == "scratch" and _role_contract(task) is not None:
         # ``scratch`` is the create_task default, so a typed review/validation card can
         # arrive here without a checkout. An empty scratch directory is not evidence:
         # the role would either inspect nothing or — with a legacy explicit path — the
-        # repository's current tree instead of the candidate. A role card always gets
-        # its own worktree at the candidate commit, or a named refusal.
+        # repository's current tree instead of the candidate. A role card therefore
+        # always resolves a worktree at the candidate commit, or a named refusal.
         return _resolve_worktree_workspace(
             task, board=board, candidate_head=candidate_head)[0]
     if kind == "scratch" and not task.workspace_path:
@@ -1086,8 +1083,25 @@ def _set_task_column(conn: sqlite3.Connection, task_id: str, column: str, value:
         conn.execute(f"UPDATE tasks SET {column} = ? WHERE id = ?", (value, task_id))
 
 
-def set_workspace_path(conn: sqlite3.Connection, task_id: str, path: Path | str) -> None:
+def effective_workspace_kind(task: Task) -> str:
+    """The kind a workspace resolves as, which is what must be persisted.
+
+    A typed role card is never ``scratch``: resolution gives it a linked worktree at the
+    candidate commit, so recording it as scratch would send completion through scratch
+    cleanup — an ``rmtree`` of a registered worktree instead of ``git worktree remove``.
+    """
+    kind = task.workspace_kind or "scratch"
+    if kind == "scratch" and _role_contract(task) is not None:
+        return "worktree"
+    return kind
+
+
+def set_workspace_path(
+    conn: sqlite3.Connection, task_id: str, path: Path | str, *, kind: Optional[str] = None,
+) -> None:
     _set_task_column(conn, task_id, "workspace_path", str(path))
+    if kind is not None:
+        _set_task_column(conn, task_id, "workspace_kind", kind)
 
 
 def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str) -> None:
