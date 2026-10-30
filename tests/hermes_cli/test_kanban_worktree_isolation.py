@@ -462,3 +462,58 @@ def test_claim_cli_leaves_a_role_card_unclaimed_when_its_candidate_is_missing(
     assert after.status == "review"
     assert after.claim_lock is None
     assert after.current_run_id is None
+
+
+def test_claim_cli_leaves_a_role_card_unclaimed_when_its_workspace_is_refused(
+    kanban_home, tmp_path, capsys,
+):
+    """Workspace resolution can refuse too, and it must refuse before the claim.
+
+    A role card pinned to an operator ``dir`` sitting on another commit is a real
+    refusal (that directory is never moved for you). Resolving it after
+    ``claim_task`` committed ready->running would strand the card running with no
+    worker holding it, so the fence has to come first.
+    """
+    from hermes_cli import kanban as kc
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+
+    with kbc.connect() as conn:
+        implementation = kb.create_task(
+            conn, title="implementation", assignee="coder", workspace_kind="worktree",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code", "review_mode": "separate_card", "reviewer": "reviewer",
+                "validation_required": True,
+            })
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        kb.link_tasks(conn, implementation, review, requirement="phase_finished")
+        run = kb.claim_task(conn, implementation, claimer=kb._claimer_id())
+        assert run is not None
+        # The handoff is recorded while the checkout still sits on the candidate…
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=run.current_run_id,
+            summary="implementation handoff",
+            metadata={"base_sha": base, "head_sha": candidate, "changed_files": []})
+        # …and the operator's repository checkout advances afterwards, past it.
+        advanced = _commit(repo, "later.txt", "later\n")
+        assert advanced != candidate
+        # The operator pinned the review card to that checkout.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET workspace_kind = 'dir' WHERE id = ?", (review,))
+        kb.recompute_ready(conn)
+        pinned = kb.get_task(conn, review)
+        assert pinned.status == "review"
+        assert _head(repo) == advanced
+
+    assert kc._cmd_claim(_claim_args(review)) != 0
+    captured = capsys.readouterr()
+    assert "candidate_workspace_unavailable" in captured.out + captured.err
+    with kbc.connect() as conn:
+        after = kb.get_task(conn, review)
+    assert after.status == "review"
+    assert after.claim_lock is None
+    assert after.current_run_id is None
+    assert after.worker_pid is None

@@ -1519,11 +1519,25 @@ def _handle_unblock(args: dict, **kw) -> str:
             expected_version = int(expected_version)
         except (TypeError, ValueError):
             raise _Reject("expected_version must be an integer")
+    # Why the recovery happened is part of the audit trail, and only the fenced path
+    # writes it: the caller names the intent, the persisted identity is the actor.
+    reason = args.get("reason")
+    if reason is not None:
+        if not isinstance(reason, str):
+            raise _Reject("reason must be a string")
+        reason = reason.strip() or None
+    if reason and not fenced:
+        raise _Reject(
+            "kanban_unblock: reason requires expected_version — the ordinary unblock "
+            "writes no audit comment")
     with _board(args.get("board")) as (kb, conn):
         # A fenced refusal must say so: "not blocked" would hide a stale version or a
         # surviving claim, which is exactly what the caller needs to act on.
         _check(
-            kb.unblock_task(conn, tid, expected_version=expected_version),
+            kb.unblock_task(
+                conn, tid, expected_version=expected_version,
+                reason=reason, author=_persisted_identity() if reason else None,
+            ),
             (f"could not unblock {tid}: stale version, changed state, or active claim"
              if fenced else f"could not unblock {tid} (not blocked or unknown)"),
         )

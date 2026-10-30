@@ -2656,3 +2656,58 @@ def test_orchestrator_fenced_unblock_requires_the_current_version(monkeypatch, t
         assert kb.get_task(check, other).version == plain_version
     finally:
         check.close()
+
+
+def test_orchestrator_fenced_unblock_records_the_reason_it_was_given(monkeypatch, tmp_path):
+    """The tool path must be able to say why recovery happened, with a real actor."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    from pathlib import Path
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="fenced recovery", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
+        assert kb.block_task(conn, tid, reason="needs an operator")
+        # Two versions, so the stale fence below is still a valid version number.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET version = version + 1 WHERE id = ?", (tid,))
+        version = kb.get_task(conn, tid).version
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+
+    # A reason without the fence is refused: the ordinary unblock writes no comment.
+    refused = json.loads(kt._handle_unblock({"task_id": tid, "reason": "no fence"}))
+    assert "requires expected_version" in refused.get("error", ""), refused
+
+    stale = json.loads(kt._handle_unblock(
+        {"task_id": tid, "expected_version": version - 1, "reason": "too early"}))
+    assert "stale version" in stale.get("error", ""), stale
+    check = kbc.connect()
+    try:
+        assert not [c for c in kb.list_comments(check, tid) if c.body.startswith("UNBLOCK:")]
+    finally:
+        check.close()
+
+    fenced = json.loads(kt._handle_unblock(
+        {"task_id": tid, "expected_version": version, "reason": "policy installed"}))
+    assert fenced.get("ok") is True, fenced
+    final = kbc.connect()
+    try:
+        comment = [c for c in kb.list_comments(final, tid) if c.body.startswith("UNBLOCK:")][-1]
+        assert comment.body == "UNBLOCK: policy installed"
+        assert comment.author and comment.author.strip()
+    finally:
+        final.close()

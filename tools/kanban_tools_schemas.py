@@ -772,6 +772,12 @@ KANBAN_UNBLOCK_SCHEMA = _schema(
             "stale version or any surviving claim instead of reclaiming ownership, "
             "and changes nothing when it refuses. Omit for the ordinary unblock.",
         ),
+        "reason": _prop(
+            "string",
+            "Why this fenced recovery is happening. Recorded as an `UNBLOCK: <reason>` "
+            "comment under your persisted identity, and only once the transition lands. "
+            "Requires expected_version; the ordinary unblock writes no comment.",
+        ),
     },
     ["task_id"],
 )
