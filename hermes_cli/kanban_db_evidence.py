@@ -222,7 +222,10 @@ def _node(base, value, *, item, pointer, parts, offset, limit, chars):
 
         def chunk(length):
             end = offset + length
-            result = {**base, "chunk": {"pointer": pointer, "offset": offset,
+            # ``complete`` says in the result whether this value is fully delivered:
+            # an unfinished read must never look finished to the caller.
+            result = {**base, "complete": end >= len(value),
+                      "chunk": {"pointer": pointer, "offset": offset,
                       "text": value[offset:end], "total_chars": len(value),
                       "next_offset": end if end < len(value) else None}}
             if end < len(value):
@@ -241,17 +244,18 @@ def _node(base, value, *, item, pointer, parts, offset, limit, chars):
         return result
     if not isinstance(value, (dict, list)):
         _require(offset == 0)
-        result = {**base, "value": value}
+        result = {**base, "complete": True, "value": value}
         _require(_fits(result), "evidence_unavailable")
         return result
     _require(offset <= len(value))
     if offset == 0 and len(value) <= limit and _fits({**base, "value": value}):
-        return {**base, "value": value}
+        return {**base, "complete": True, "value": value}
     keys = sorted(value) if isinstance(value, dict) else range(len(value))
     entries = []
 
     def page(end):
-        result = {**base, "entries": entries, "total_entries": len(value),
+        result = {**base, "complete": end >= len(value), "entries": entries,
+                  "total_entries": len(value),
                   "next_offset": end if end < len(value) else None}
         if end < len(value):
             result["continuation"] = _continuation(base, item=item, pointer=pointer, offset=end)
@@ -303,8 +307,8 @@ def _history(conn, base, *, after, item, pointer, parts, offset, limit, chars, w
     last = after
 
     def page(more):
-        result = {**base, "items": items, "returned": len(items), "has_more": more,
-                  "next_after": last if more else None}
+        result = {**base, "complete": not more, "items": items, "returned": len(items),
+                  "has_more": more, "next_after": last if more else None}
         if more:
             result["continuation"] = _continuation(base, after=last)
         return result

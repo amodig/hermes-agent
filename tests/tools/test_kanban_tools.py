@@ -2711,3 +2711,42 @@ def test_orchestrator_fenced_unblock_records_the_reason_it_was_given(monkeypatch
         assert comment.author and comment.author.strip()
     finally:
         final.close()
+
+
+def test_bounded_pages_always_say_whether_the_value_is_complete(evidence_board):
+    """An unfinished read must be visible in the result, never merely implied.
+
+    Pagination exists because the whole value cannot be delivered at all; every page
+    therefore states `complete`, so a caller cannot mistake a first page for the whole
+    section, the whole body, or the whole history.
+    """
+    kb, conn, tid = evidence_board
+    body = "restriction-free filler " * 1000 + "LATE-RESTRICTION: never authorize writes"
+    conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (body, tid))
+    for seq in range(3):
+        kb._append_event(conn, tid, "note", {"seq": seq})
+    conn.commit()
+
+    token = _evidence({"task_id": tid, "section": "lifecycle"})["snapshot"]
+    args = {"task_id": tid, "snapshot": token, "chars": 1024, "limit": 1}
+
+    # A section that fits in one page is complete.
+    whole = {"task_id": tid, "snapshot": token, "limit": 200, "chars": 8192}
+    assert _evidence({**whole, "section": "lifecycle"})["complete"] is True
+    # A chunked body is explicitly incomplete until its final chunk.
+    page = _evidence({**args, "section": "task", "pointer": "/body"})
+    assert page["complete"] is False
+    assert page["chunk"]["next_offset"] is not None
+    pages = 1
+    while page["chunk"]["next_offset"] is not None:
+        page = _evidence(page["continuation"])
+        pages += 1
+    assert pages > 1
+    assert page["complete"] is True
+    assert page["chunk"]["next_offset"] is None
+    # History is explicitly incomplete while rows remain, and complete at the end.
+    history = _evidence({**args, "section": "events", "limit": 1})
+    assert (history["complete"], history["has_more"]) == (False, True)
+    while history["has_more"]:
+        history = _evidence(history["continuation"])
+    assert (history["complete"], history["next_after"]) == (True, None)
