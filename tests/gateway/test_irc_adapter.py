@@ -605,6 +605,83 @@ def _coordination_config():
     })
 
 
+def _tunnel_config(**overrides):
+    """The same agents network over the sanctioned loopback SSH tunnel."""
+    from gateway.config import PlatformConfig
+    from gateway.irc_coordination import ALLOWED_ACCOUNTS, TUNNEL_COORDINATION_ENDPOINT
+    extra = {
+        "server": TUNNEL_COORDINATION_ENDPOINT[0], "port": TUNNEL_COORDINATION_ENDPOINT[1],
+        "channel": "#agents", "nickname": "agent-hermes-cto",
+        "sasl_account": "agent-hermes-cto", "sasl_password": "synthetic-only",
+        "coordination": True, "use_tls": False, "allowed_accounts": sorted(ALLOWED_ACCOUNTS),
+    }
+    extra.update(overrides)
+    return PlatformConfig(enabled=True, extra=extra)
+
+
+def test_public_endpoint_must_keep_tls():
+    """The pinned Serve endpoint carries SASL only inside TLS."""
+    config = _coordination_config()
+    config.extra["use_tls"] = False
+    assert IRCAdapter(config)._config_error() == "invalid-coordination-config"
+
+
+def test_tunnel_endpoint_is_the_only_plaintext_transport():
+    adapter = IRCAdapter(_tunnel_config())
+    assert adapter._config_error() is None
+
+    # A loopback host on any other port, or a remote host on the tunnel port, is
+    # not the documented tunnel and keeps the TLS requirement.
+    for extra in (
+        {"port": 6697},
+        {"server": "irc.example.org"},
+        {"server": "127.0.0.1", "port": 6667},
+    ):
+        config = _tunnel_config(**extra)
+        config.extra["coordination"] = False
+        config.extra["nickname"] = "probe"
+        assert IRCAdapter(config)._config_error() == "sasl-requires-tls-and-credentials", extra
+
+
+def test_tunnel_endpoint_keeps_every_coordination_pin():
+    for overrides in (
+        {"nickname": "hermes-bot"},
+        {"channel": "#chat"},
+        {"server": "127.0.0.1", "port": 6697},
+        {"allowed_accounts": ["amodig"]},
+    ):
+        if overrides.get("server") == "127.0.0.1":
+            # Same loopback host on a non-tunnel port: still refused.
+            assert IRCAdapter(_tunnel_config(**overrides))._config_error() == "invalid-coordination-config"
+            continue
+        assert IRCAdapter(_tunnel_config(**overrides))._config_error() == "invalid-coordination-config", overrides
+
+
+@pytest.mark.asyncio
+async def test_tunnel_endpoint_connects_plaintext_and_still_authenticates(monkeypatch):
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    conn = _NegotiatingIRCConnection()
+    opened = []
+
+    async def open_connection(*args, **kwargs):
+        opened.append(kwargs)
+        return conn.reader, conn
+
+    monkeypatch.setattr(_irc_mod.asyncio, "open_connection", open_connection)
+    adapter = IRCAdapter(_tunnel_config())
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *args: True)
+    connecting = asyncio.create_task(adapter.connect())
+    await asyncio.wait_for(conn.join_requested.wait(), 3)
+    conn.feed(":server 353 agent-hermes-cto = #agents :@agent-hermes-cto agent-jeeves")
+    assert await asyncio.wait_for(connecting, 3)
+    # The tunnel is the protection: no TLS layer, and SASL still runs in order.
+    assert opened[0]["ssl"] is None
+    lines = [line.decode().strip() for line in conn.writes]
+    assert lines.index("AUTHENTICATE PLAIN") < lines.index("CAP END") < lines.index("JOIN #agents")
+    assert "synthetic-only" not in repr(conn.writes)
+    await adapter.disconnect()
+
+
 @pytest.mark.asyncio
 async def test_sasl_cap_multiline_ping_split_frames_and_confirmed_join(monkeypatch, caplog):
     monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
