@@ -300,8 +300,15 @@ class IRCAdapter(BasePlatformAdapter):
         network transport. The loopback endpoint is the SSH tunnel an agent host
         without Tailscale uses instead: the credential crosses a loopback socket
         inside that tunnel, and nothing else is accepted here.
+
+        `use_tls` follows the endpoint rather than being a free choice. The tunnel
+        forwards to Ergo's *plaintext* listener, so requesting TLS there is not the
+        stricter option — it is a handshake that cannot complete, and accepting it
+        would surface as ``connect_failed`` after a configuration check said yes.
         """
-        return bool(self.use_tls) or self._endpoint == TUNNEL_COORDINATION_ENDPOINT
+        if self._endpoint == TUNNEL_COORDINATION_ENDPOINT:
+            return not self.use_tls
+        return bool(self.use_tls)
 
     def _config_error(self):
         if self.coordination and (

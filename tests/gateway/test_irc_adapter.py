@@ -1006,3 +1006,13 @@ async def test_connect_proxy_failures_preserve_retry_class(monkeypatch, coordina
     if failure != "tls":
         conn.start_tls.assert_not_awaited()
     assert not any(line.startswith((b"JOIN ", b"PASS ", b"AUTHENTICATE ")) for line in conn.writes)
+
+
+def test_tunnel_endpoint_refuses_tls():
+    """TLS on the sanctioned tunnel cannot complete: its target listener is plaintext.
+
+    Accepting `use_tls: true` here would pass the configuration check and then fail
+    the handshake at connect time, which reads as a runtime fault rather than the
+    configuration error it is.
+    """
+    assert IRCAdapter(_tunnel_config(use_tls=True))._config_error() == "invalid-coordination-config"
