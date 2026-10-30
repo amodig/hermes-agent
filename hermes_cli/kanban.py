@@ -919,13 +919,18 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                 if pending is not None else None)
         except ValueError as exc:
             return _err(f"kanban: {exc}")
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        # Fence the claim to the row this workspace was derived from: an operator edit
+        # that lands during resolution must refuse here rather than let a worker run in
+        # a workspace computed from the previous lifecycle/workspace fields.
+        task = kb.claim_task(
+            conn, args.task_id, ttl_seconds=args.ttl, expected_task=pending)
         if task is None:
             existing = kb.get_task(conn, args.task_id)
             if existing is None:
                 return _err(f"no such task: {args.task_id}")
             return _err(f"cannot claim {args.task_id}: status={existing.status} "
-                        f"lock={existing.claim_lock or '(none)'}")
+                        f"lock={existing.claim_lock or '(none)'} "
+                        f"(the task changed while its workspace was resolved)")
         # A successful claim proves the row still existed, so resolution above ran.
         kbw.set_workspace_path(conn, task.id, str(workspace))
     print(f"Claimed {task.id}\nWorkspace: {workspace}")

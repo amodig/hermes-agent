@@ -1044,6 +1044,14 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None,
     if kind == "worktree":
         return _resolve_worktree_workspace(
             task, board=board, candidate_head=candidate_head)[0]
+    if kind == "scratch" and _role_contract(task) is not None:
+        # ``scratch`` is the create_task default, so a typed review/validation card can
+        # arrive here without a checkout. An empty scratch directory is not evidence:
+        # the role would either inspect nothing or — with a legacy explicit path — the
+        # repository's current tree instead of the candidate. A role card always gets
+        # its own worktree at the candidate commit, or a named refusal.
+        return _resolve_worktree_workspace(
+            task, board=board, candidate_head=candidate_head)[0]
     if kind == "scratch" and not task.workspace_path:
         p = _kb.workspaces_root(board=board) / task.id
     elif kind == "scratch":

@@ -517,3 +517,66 @@ def test_claim_cli_leaves_a_role_card_unclaimed_when_its_workspace_is_refused(
     assert after.claim_lock is None
     assert after.current_run_id is None
     assert after.worker_pid is None
+
+
+def test_typed_role_card_with_the_default_scratch_kind_gets_the_candidate(
+    kanban_home, tmp_path,
+):
+    """``scratch`` is create_task's default, so a role card can arrive without one.
+
+    Before this fence the resolver returned the card's scratch path: empty, or — for a
+    legacy explicit path — the repository's current tree instead of the candidate the
+    card was created to review. Either way a verdict could be issued without ever
+    seeing the implementation.
+    """
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+
+    with kbc.connect() as conn:
+        implementation = kb.create_task(
+            conn, title="implementation", assignee="coder", workspace_kind="worktree",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code", "review_mode": "separate_card", "reviewer": "reviewer",
+                "validation_required": True,
+            })
+        # Deliberately the default kind: no workspace_kind argument at all.
+        review = kb.create_task(
+            conn, title="review the candidate", assignee="reviewer",
+            lifecycle_contract={"kind": "review", "candidate_task_id": implementation})
+        run = kb.claim_task(conn, implementation, claimer=kb._claimer_id())
+        assert run is not None
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=run.current_run_id,
+            summary="implementation handoff",
+            metadata={"base_sha": base, "head_sha": candidate, "changed_files": []})
+        task = kb.get_task(conn, review)
+        assert task.workspace_kind == "scratch"
+        head = kbw.candidate_head_for_task(conn, task)
+        # An unanchored board refuses the anonymous scratch card instead of handing a
+        # reviewer an empty directory to "review".
+        with pytest.raises(ValueError, match="candidate_workspace_unavailable"):
+            kbw.resolve_workspace(task, candidate_head=head)
+        # Anchored, the same card materializes its own worktree at the candidate.
+        kb.write_board_metadata(None, default_workdir=str(repo))
+        workspace = kbw.resolve_workspace(task, candidate_head=head)
+
+        # …and the same card with a legacy explicit scratch path.
+        pinned = kb.create_task(
+            conn, title="review from a pinned path", assignee="reviewer",
+            workspace_kind="scratch", workspace_path=str(repo),
+            lifecycle_contract={"kind": "review", "candidate_task_id": implementation})
+        pinned_task = kb.get_task(conn, pinned)
+        pinned_head = kbw.candidate_head_for_task(conn, pinned_task)
+        pinned_workspace = kbw.resolve_workspace(pinned_task, candidate_head=pinned_head)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET workspace_path = 'ignored' WHERE id = ?", (review,))
+        advanced = _commit(repo, "later.txt", "later\n")
+
+    assert advanced != candidate
+    assert _head(repo) == advanced
+    for path in (workspace, pinned_workspace):
+        assert path.is_dir()
+        assert _head(path) == candidate  # the candidate checkout, never the moving tree
+        assert path != repo
