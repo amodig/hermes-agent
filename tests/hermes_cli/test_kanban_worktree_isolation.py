@@ -986,3 +986,74 @@ def test_discard_prepared_worktree_only_removes_a_clean_checkout(
         (path / "app.py").write_text("dirty\n", encoding="utf-8")
         assert kbw.discard_prepared_worktree(task, path, candidate) is False
         assert path.exists()
+
+def test_discard_preserves_a_worktree_holding_ignored_content(kanban_home, tmp_path):
+    """`git worktree remove` deletes ignored files too, so any ignored entry preserves it."""
+    repo = _make_repo(tmp_path)
+    (repo / ".gitignore").write_text("private.tmp\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "ignore scratch state")
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+
+    with kbc.connect() as conn:
+        implementation = kb.create_task(
+            conn, title="implementation", assignee="coder", workspace_kind="worktree",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code", "review_mode": "separate_card", "reviewer": "reviewer",
+                "validation_required": True,
+            })
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        run = kb.claim_task(conn, implementation, claimer=kb._claimer_id())
+        assert run is not None
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=run.current_run_id,
+            summary="attempt",
+            metadata={"base_sha": base, "head_sha": candidate, "changed_files": []})
+        task = kb.get_task(conn, review)
+        path, _branch = kbw._resolve_worktree_workspace(
+            task, candidate_head=kbw.candidate_head_for_task(conn, task))
+        (path / "private.tmp").write_text("operator state\n", encoding="utf-8")
+        # Nothing is dirty to git: the file is ignored.
+        assert kbw.discard_prepared_worktree(task, path, candidate) is False
+    assert (path / "private.tmp").read_text(encoding="utf-8") == "operator state\n"
+
+
+def test_cleanup_preserves_an_adopted_branch_holding_unique_work(kanban_home, tmp_path):
+    """A recorded ``wt/*`` branch is deleted only when a remote ref already contains it."""
+    from hermes_cli import kanban_db_workspace as workspace_module
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+    # The adopted branch holds a commit no remote-tracking ref contains.
+    _git(repo, "branch", "wt/adopted", base)
+    _git(repo, "checkout", "-q", "wt/adopted")
+    unique = _commit(repo, "unique.txt", "only here\n")
+    _git(repo, "checkout", "-q", base)
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="worktree task", assignee="worker", workspace_kind="worktree",
+            workspace_path=str(repo))
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'done', workspace_path = ? WHERE id = ?",
+                (str(repo / ".worktrees" / tid), tid))
+    worktree = repo / ".worktrees" / tid
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    _git(repo, "worktree", "add", "-q", "--detach", str(worktree), candidate)
+    assert _head(worktree) == candidate
+
+    workspace_module._cleanup_worktree_workspace(tid, str(worktree), "wt/adopted")
+
+    survives = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--list", "wt/adopted"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert survives, "a branch with commits no remote contains must survive cleanup"
+    assert subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "wt/adopted"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip() == unique

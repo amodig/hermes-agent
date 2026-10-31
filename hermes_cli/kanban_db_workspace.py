@@ -505,7 +505,21 @@ def _cleanup_worktree_workspace(
         if not branch and current_branch == f"wt/{task_id}":
             branch = current_branch
         if branch.startswith("wt/"):
-            _git(repo_root, "branch", "-D", branch, timeout=30)
+            # The HEAD check above covers the checkout; the branch ref can still hold
+            # unique work (an adopted ``wt/*`` checkout that was later detached). Delete
+            # only a branch whose tip some remote-tracking ref already contains.
+            tip = _git(repo_root, "rev-parse", "--verify", branch, timeout=30)
+            reachable = False
+            if tip.returncode == 0 and (tip.stdout or "").strip():
+                contains = _git(
+                    repo_root, "branch", "-r", "--contains", (tip.stdout or "").strip(), timeout=60)
+                reachable = contains.returncode == 0 and bool((contains.stdout or "").strip())
+            if reachable:
+                _git(repo_root, "branch", "-D", branch, timeout=30)
+            else:
+                _kb._log.info(
+                    "Preserving branch %s for task %s: no remote-tracking ref contains it",
+                    branch, task_id)
     except Exception:
         pass  # best-effort — never block completion
 
@@ -796,16 +810,17 @@ def _ignored_paths_target_tracks(repo: Path, worktree: Path, head: str) -> list[
     tracked = _git(repo, "ls-tree", "-r", "--name-only", "-z", head, timeout=120)
     if tracked.returncode != 0:
         return []
-    paths = sorted({path.casefold() for path in (tracked.stdout or "").split("\0") if path})
+    # Exact matching only: case identity belongs to the filesystem, and git's own
+    # ``--no-overwrite-ignore`` guard already decides case-only conflicts correctly.
+    # Casefolding here would refuse a move that git would perform safely.
+    paths = sorted({path for path in (tracked.stdout or "").split("\0") if path})
     if not paths:
         return []
     hits = []
     for entry in present:
-        key = entry.casefold()
-        # A file/directory conflict overwrites too (ignored dir ``cache/local`` versus a
-        # tracked file ``cache``, or an ignored file ``cache`` versus ``cache/item``), and
-        # a case-insensitive filesystem makes ``Notes.txt`` and ``notes.txt`` the same
-        # path. Compare casefolded, both as an exact match and across that boundary.
+        key = entry
+        # A file/directory conflict overwrites too: ignored dir ``cache/local`` versus a
+        # tracked file ``cache``, or an ignored file ``cache`` versus ``cache/item``.
         index = bisect.bisect_left(paths, key)
         conflict = (index < len(paths) and paths[index] == key) or (
             index < len(paths) and paths[index].startswith(key + "/"))
@@ -1195,10 +1210,25 @@ def discard_prepared_worktree(
         if _git_head(target) != prepared_head:
             return False
         _clean_tree(target, str(target))
-        if _ignored_paths_target_tracks(repo_root, target, prepared_head):
+        # ``git worktree remove`` deletes untracked and ignored files with the directory,
+        # so ANY ignored entry means operator content: preserve, do not remove.
+        ignored = _git(
+            target, "ls-files", "--others", "--ignored", "--exclude-standard", "-z", timeout=60)
+        if ignored.returncode != 0:
+            return False          # cannot enumerate → preserve
+        if (ignored.stdout or "").strip("\0"):
             return False
-        return _git(repo_root, "worktree", "remove", str(target), timeout=60).returncode == 0
-    except Exception:
+        result = _git(repo_root, "worktree", "remove", str(target), timeout=60)
+        if result.returncode != 0:
+            # Not atomic: a partial removal leaves a checkout that resolves as dirty, so
+            # make the failure visible instead of silently poisoning every retry.
+            _kb._log.warning(
+                "prepared workspace at %s was not fully removed: %s",
+                target, (result.stderr or result.stdout or "").strip()[:300])
+            return False
+        return True
+    except Exception as exc:
+        _kb._log.warning("prepared workspace at %s was not removed: %s", path, exc)
         return False
 
 

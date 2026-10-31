@@ -979,9 +979,14 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             conn, args.task_id, ttl_seconds=args.ttl, expected_task=pending)
         if task is None:
             existing = kb.get_task(conn, args.task_id)
-            # A refusal after materialization must not leave the checkout behind: a clean
-            # prepared worktree is discarded so a retry is not blocked by its relic.
-            if workspace is not None and pending is not None and resolved_kind == "worktree":
+            # A refusal after materialization must not leave the checkout behind — but only
+            # when this attempt still owns it. Another dispatcher can win the claim CAS
+            # here; its worker may already be running in that worktree.
+            if (
+                workspace is not None and pending is not None
+                and resolved_kind == "worktree"
+                and (existing is None or (existing.status != "running" and not existing.claim_lock))
+            ):
                 kbw.discard_prepared_worktree(pending, workspace, candidate_head or "")
             if existing is None:
                 return _err(f"no such task: {args.task_id}")
