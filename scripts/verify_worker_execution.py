@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Real-dispatcher smoke for the granted worker verification boundary.
 
-Default execution performs every case below, each in its own disposable fixture
-home, board and Git repository:
+Default execution (``--case all``) retains main + death only, each in its own
+disposable fixture home, board and Git repository:
 
 1. ``main``     — dispatcher launch, retained grant, model-facing tools, source
                   inspection (summary/read/diff), an offline verification recipe and a
@@ -11,6 +11,10 @@ home, board and Git repository:
                   ``APPROVE`` completion bound to the fixture head.
 2. ``death``    — the dispatcher parent SIGKILLs the worker mid-verification, then
                   observes the journal's conmon deadline, payload teardown and cleanup.
+3. ``recovery`` — opt-in real implementer/reviewer/tester dispatch, bounded evidence
+                  traversal and exact-candidate validation; separate inspect-only
+                  and withheld-workspace graphs prove native capability blocking.
+                  This proves fixture criteria, never application acceptance.
 
 The harness re-executes itself inside ``autonomous.slice``, so host admission, worker
 scope placement and the concurrency slot are the real production checks. Every other
@@ -906,6 +910,458 @@ def _launch(
     return receipt
 
 
+def _recovery_git(path: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(path), *args], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _recovery_require(condition: Any, message: str) -> None:
+    if not condition:
+        fail("recovery: " + message)
+
+
+def _recovery_evidence(state: dict, task_id: str, section: str):
+    """Consume native values and every explicit continuation, without a runner."""
+    tokens = state["snapshots"]
+    args = {"task_id": task_id, "board": state["startup"]["board"], "section": section}
+    if task_id in tokens:
+        args["snapshot"] = tokens[task_id]
+
+    def page(arguments):
+        arguments = {**arguments, "limit": 20, "chars": 8192}
+        payload = yield ("kanban_show", arguments)
+        _recovery_require(payload.get("ok") is True, f"bounded read refused: {payload}")
+        token = payload["snapshot"]
+        _recovery_require(tokens.setdefault(task_id, token) == token, "snapshot changed")
+        size = len(json.dumps(payload, ensure_ascii=False).encode())
+        _recovery_require(size <= 32768, f"bounded envelope exceeded limit: {size}")
+        state["evidence_pages"].append({
+            "arguments": arguments, "snapshot": token, "bytes": size,
+            "continuations": [
+                value["continuation"] for value in
+                [payload, *payload.get("items", []), *payload.get("entries", [])]
+                if "continuation" in value
+            ],
+        })
+        return payload
+
+    def node(arguments):
+        result = yield from page(arguments)
+        if "value" in result:
+            return result["value"]
+        if "chunk" in result:
+            chunks = []
+            expected = arguments.get("offset", 0)
+            total = result["chunk"]["total_chars"]
+            while True:
+                chunk = result["chunk"]
+                _recovery_require(chunk["offset"] == expected, "string chunk gap")
+                chunks.append(chunk["text"])
+                expected += len(chunk["text"])
+                if chunk["next_offset"] is None:
+                    _recovery_require(expected == total, "string ended prematurely")
+                    return "".join(chunks)
+                _recovery_require(chunk["next_offset"] == expected, "string cursor mismatch")
+                result = yield from page(result["continuation"])
+        if "items" in result:
+            items = []
+            while True:
+                for entry in result["items"]:
+                    value = (yield from node(entry["continuation"])) if entry.get("deferred") else entry
+                    _recovery_require(not items or value["id"] > items[-1]["id"], "history repeated or unordered")
+                    items.append(value)
+                if not result["has_more"]:
+                    return items
+                result = yield from page(result["continuation"])
+        entries = {}
+        array = bool(result["entries"] and "index" in result["entries"][0])
+        total = result["total_entries"]
+        while True:
+            for entry in result["entries"]:
+                key = entry["index"] if array else entry["key"]
+                _recovery_require(key not in entries, "container entry repeated")
+                entries[key] = (yield from node(entry["continuation"])) if entry.get("deferred") else entry["value"]
+            if result["next_offset"] is None:
+                _recovery_require(len(entries) == total, "container ended prematurely")
+                return [entries[i] for i in range(total)] if array else entries
+            result = yield from page(result["continuation"])
+
+    value = yield from node(args)
+    state["evidence"].setdefault(task_id, {})[section] = (
+        {"sha256": sha256_bytes(json.dumps(value, sort_keys=True).encode())}
+        if section in {"task", "events", "comments"} else value
+    )
+    return value
+
+
+def _recovery_program(state: dict, graph: dict, role: str):
+    startup = yield ("kanban_worker_startup", {})
+    state["startup"] = startup["startup"]
+    own = graph[role]
+    summary = state["startup"]
+    _recovery_require(summary["task_id"] == own and summary["profile"] == role, "wrong startup identity")
+    _recovery_require(summary["spawn_receipt"] == "verified", "worker spawn receipt not verified")
+    execution = summary["execution"]
+    if role == "reviewer" and graph["variant"] == "no_grant":
+        _recovery_require(execution == {
+            "granted": False, "inspect": False, "recipes": [], "refusal": "workspace_not_granted",
+        }, f"wrong withheld capability: {execution}")
+        yield ("kanban_block", {"kind": "capability", "reason": "Fixture workspace_not_granted; no inspection authority."})
+        return
+    _recovery_require(execution["granted"] and execution["inspect"] and execution["refusal"] is None,
+                      f"missing inspection grant: {execution}")
+    _recovery_require(execution["recipes"] == ([] if graph["variant"] == "inspect_only" else ["offline"]),
+                      f"wrong recipes: {execution}")
+    if role != "implementer":
+        own_lifecycle = yield from _recovery_evidence(state, own, "lifecycle")
+        own_dependencies = yield from _recovery_evidence(state, own, "dependencies")
+        for task_id in dict.fromkeys([own, graph["implementer"], graph["reviewer"]]):
+            sections = ("task", "effective_goal", "lifecycle", "dependencies", "provenance")
+            if role == "tester" and task_id == graph["reviewer"]:
+                sections = ("lifecycle", "provenance", "runs")
+            for section in sections:
+                value = yield from _recovery_evidence(state, task_id, section)
+                if section == "provenance":
+                    _recovery_require(value["verdict"] == "verified", "candidate receipt not verified")
+                if section == "task" and task_id == graph["reviewer"]:
+                    _recovery_require(value["body"] == graph["body"], "mandatory restriction body not reconstructed")
+                    if graph["variant"] == "main":
+                        _recovery_require(len(value["body"]) >= 321724 and "\n" not in value["body"],
+                                          "mandatory single-line body is too small")
+                    state["mandatory_evidence"] = {"body_chars": len(value["body"]),
+                                                   "body_sha256": sha256_bytes(value["body"].encode())}
+        if role == "reviewer":
+            events = yield from _recovery_evidence(state, own, "events")
+            comments = yield from _recovery_evidence(state, own, "comments")
+            yield from _recovery_evidence(state, own, "runs")
+            if graph["variant"] == "main":
+                markers = [event["payload"]["marker"] for event in events if event["kind"] == "recovery_evidence"]
+                _recovery_require(markers == list(range(61)), "first/middle/late history was lost")
+                nested = next(event["payload"]["nested"]["text"] for event in events
+                              if event["kind"] == "recovery_evidence" and event["payload"]["marker"] == 30)
+                _recovery_require(nested == graph["nested"], "oversized nested event was lost")
+                _recovery_require(any(comment["body"] == graph["comment"] for comment in comments),
+                                  "oversized comment was lost")
+                _recovery_require(any(p["arguments"].get("offset", 0) > 0 for p in state["evidence_pages"]),
+                                  "no string continuation followed")
+                _recovery_require(any(p["arguments"].get("after", 0) > 0 for p in state["evidence_pages"]),
+                                  "no history continuation followed")
+                _recovery_require(any("item" in p["arguments"] for p in state["evidence_pages"]),
+                                  "no deferred history row followed")
+                state["mandatory_evidence"].update({
+                    "history_markers": markers, "nested_chars": len(nested),
+                    "comment_chars": len(graph["comment"]),
+                })
+        bookend = yield from _recovery_evidence(state, own, "lifecycle")
+        _recovery_require(bookend == own_lifecycle, "own lifecycle changed across graph reads")
+        candidate = state["evidence"][graph["implementer"]]["lifecycle"]
+        _recovery_require(candidate["acceptance"] == "pending", "eligibility was mistaken for acceptance")
+        _recovery_require(own_dependencies["satisfied"], "role dependencies not satisfied")
+        for field in ("candidate_task_id", "candidate_run_id", "head_sha", "goal_revision_ids"):
+            _recovery_require(own_lifecycle[field] == candidate[field], f"candidate mismatch: {field}")
+        if role == "tester":
+            review = state["evidence"][graph["reviewer"]]["lifecycle"]
+            _recovery_require(own_lifecycle["review_verdict"] is None, "tester local review is not null")
+            _recovery_require(review["review_verdict"] == candidate["review_verdict"] == "APPROVE",
+                              "fresh parent APPROVE missing")
+            for field in ("candidate_task_id", "candidate_run_id", "head_sha", "goal_revision_ids"):
+                _recovery_require(review[field] == candidate[field], f"review mismatch: {field}")
+    inspected = yield ("kanban_worker_inspect", {"operation": "summary"})
+    state["summary"] = inspected
+    _recovery_require(inspected["git"]["head"] == graph["head_sha"], "inspection used moving main")
+    if role == "implementer":
+        yield ("kanban_complete", {
+            "summary": "Precommitted harmless fixture B; execution: not_run; not an application claim.",
+            "metadata": {"base_sha": graph["base_sha"], "head_sha": graph["head_sha"],
+                         "workspace": summary["workspace_path"], "changed_files": ["app.py"], "execution": "not_run"},
+        })
+    elif role == "reviewer":
+        state["read"] = yield ("kanban_worker_inspect", {
+            "operation": "read", "path": "app.py", "line_count": 10,
+            "expected_source_digest": inspected["source_digest"],
+        })
+        state["diff"] = yield ("kanban_worker_inspect", {
+            "operation": "diff", "base": graph["base_sha"], "head": graph["head_sha"],
+        })
+        _recovery_require("return 2" in json.dumps(state["read"]), "typed read missed candidate source")
+        _recovery_require("return 1" in json.dumps(state["diff"]) and "return 2" in json.dumps(state["diff"]),
+                          "typed diff missed A..B")
+        _recovery_require(state["diff"]["source_digest"] == inspected["source_digest"], "source changed")
+        yield ("kanban_complete", {
+            "verdict": "APPROVE",
+            "summary": "Fixture source-only review of A..B; execution: not_run. Validation remains required.",
+            "metadata": {"reviewed_head_sha": graph["head_sha"], "execution": "not_run",
+                         "coverage_gap": "Offline recipe is the tester's required gate; no application gates covered."},
+        })
+    elif graph["variant"] == "inspect_only":
+        yield ("kanban_block", {"kind": "capability", "reason": "Fixture inspection available, recipes empty; required offline gate unavailable, never PASS."})
+    else:
+        verified = yield ("kanban_worker_verify", {"recipe": "offline", "source_digest": inspected["source_digest"]})
+        state["verification"] = verified
+        _recovery_require(verified.get("accepted") is True and verified.get("exit_code") == 0
+                          and verified.get("cleanup_ok") is True
+                          and "offline-verification-ok" in verified.get("stdout", "")
+                          and verified.get("source_digest") == inspected["source_digest"],
+                          f"offline verification not accepted: {verified}")
+        yield ("kanban_complete", {
+            "verdict": "PASS", "summary": "Only the offline fixture criteria passed; no application acceptance claim.",
+            "metadata": {"head_sha": graph["head_sha"], "execution": "offline",
+                         "source_digest": verified["source_digest"], "verification": verified},
+        })
+
+
+def _recovery_responder(state: dict, graph: dict, role: str):
+    from tests.fakes.fake_llm_provider import Text, ToolCall
+
+    program = _recovery_program(state, graph, role)
+    pending = None
+
+    def respond(record):
+        nonlocal pending
+        names = sorted(tool["function"]["name"] for tool in record["body"].get("tools", []))
+        state["catalogs"].append(names)
+        try:
+            if state.get("finished") or state.get("failure"):
+                return Text("Fixture worker finished.")
+            if pending is None:
+                action = next(program)
+            else:
+                last = next(message for message in reversed(record["body"]["messages"]) if message["role"] == "tool")
+                payload = json.loads(last["content"])
+                state["calls"].append({"tool": pending[0], "arguments": pending[1], "ok": payload.get("ok"),
+                                       "error": payload.get("error")})
+                _recovery_require(payload.get("ok") is True, f"{pending[0]} refused: {payload}")
+                if pending[0] in {"kanban_complete", "kanban_block"}:
+                    state["terminal"] = payload
+                action = program.send(payload)
+            name, arguments = action
+            _recovery_require(name in names, f"{name} missing from final catalog")
+            pending = action
+            return ToolCall(name, arguments)
+        except StopIteration:
+            state["finished"] = True
+            return Text("Fixture worker finished.")
+        except Exception as exc:
+            state["failure"] = str(exc)
+            return Text("Fixture proof refused: " + str(exc)[:600])
+
+    return respond
+
+
+def _run_recovery_case(root: Path, *, policy_root: Path, image_store: Path) -> dict:
+    """Three isolated graphs; all grants, receipts and verdicts use native dispatch."""
+    import yaml
+
+    root.mkdir(parents=True)
+    for name in ("home", "config", "cache", "data", "hermes", "kanban"):
+        (root / name).mkdir()
+    # Keep the inherited disk-backed TMPDIR. Only scratch homes are visible to workers.
+    for key in list(os.environ):
+        if key.startswith("HERMES_") or any(part in key for part in ("API_KEY", "TOKEN", "SECRET", "PASSWORD")):
+            del os.environ[key]
+    os.environ.update({
+        "HOME": str(root / "home"), "XDG_CONFIG_HOME": str(root / "config"),
+        "XDG_CACHE_HOME": str(root / "cache"), "XDG_DATA_HOME": str(root / "data"),
+        "HERMES_HOME": str(root / "hermes"), "HERMES_KANBAN_HOME": str(root / "kanban"),
+        "HERMES_KANBAN_DB": str(root / "kanban" / "kanban.db"), "PYTHONDONTWRITEBYTECODE": "1",
+    })
+    scripts_dir = Path(__file__).resolve().parent
+    sys.path[:] = [entry for entry in sys.path if Path(entry or os.getcwd()).resolve() != scripts_dir]
+    from tests.fakes.fake_llm_provider import FakeLLMServer, write_hermes_home
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_worker_runtime as runtime
+
+    connection = kbc.connect(root / "kanban" / "kanban.db")
+    kb._ensure_lifecycle_schema(connection)
+    kb._ensure_goal_revision_schema(connection)
+    receipt = {
+        "case": "recovery", "fixture_root": str(root),
+        "runtime_sha": _recovery_git(scripts_dir.parent, "rev-parse", "HEAD"),
+        "policy_sha": _recovery_git(policy_root, "rev-parse", "HEAD"),
+        "policy_source_digest": _tree_digest(policy_root),
+        "driver_sha256": sha256_file(Path(__file__)),
+        "image": {"reference": PYTHON_IMAGE, **json.loads((image_store / "inventory.json").read_text())["images"][PYTHON_IMAGE]},
+        "recipe": {"id": "offline", **OFFLINE_RECIPE}, "profiles": {}, "graphs": {},
+    }
+    graphs = []
+    workspaces = []
+    for variant in ("main", "inspect_only", "no_grant"):
+        repo = root / variant
+        base, head = _fixture_repo(repo)
+        implementation = kb.create_task(
+            connection, title=f"{variant} fixture implementation", assignee="implementer", initial_status="blocked",
+            workspace_kind="worktree", workspace_path=str(repo),
+            lifecycle_contract={"kind": "code", "review_mode": "separate_card", "reviewer": "reviewer", "validation_required": True},
+        )
+        checkout = repo / ".worktrees" / implementation
+        _recovery_git(repo, "worktree", "add", "-b", f"wt/{implementation}", str(checkout), head)
+        (repo / "app.py").write_text("def value():\n    return 3\n", encoding="utf-8")
+        _recovery_git(repo, "add", "app.py")
+        _recovery_git(repo, "commit", "-qm", "main advances independently")
+        main_head = _recovery_git(repo, "rev-parse", "HEAD")
+        review = kb.create_task(
+            connection, title=f"{variant} fixture review", assignee="reviewer",
+            workspace_kind="worktree", workspace_path=str(repo),
+            lifecycle_contract={"kind": "review", "candidate_task_id": implementation},
+        )
+        tester = kb.create_task(
+            connection, title=f"{variant} fixture validation", assignee="tester",
+            workspace_kind="worktree", workspace_path=str(repo),
+            lifecycle_contract={"kind": "validation", "candidate_task_id": implementation},
+        )
+        kb.link_tasks(connection, implementation, review, requirement="phase_finished")
+        kb.link_tasks(connection, review, tester, requirement="review_approved")
+        graph = {"variant": variant, "repo": str(repo), "implementer": implementation, "reviewer": review,
+                 "tester": tester, "base_sha": base, "head_sha": head, "main_sha": main_head,
+                 "implementation_checkout": str(checkout)}
+        graphs.append(graph)
+        workspaces.append({
+            "path": str(checkout if variant == "no_grant" else repo), "include_worktrees": True,
+            "inspect": True, "extra_source_paths": [],
+            "recipes": {} if variant == "inspect_only" else {"offline": OFFLINE_RECIPE},
+        })
+    policy = {"protocol": 1, "image_store": str(image_store), "workspaces": workspaces}
+    (root / "hermes" / "config.yaml").write_text(yaml.safe_dump({"toolsets": ["kanban"], "kanban": {"worker_execution": policy}}))
+    receipt["fixture_policy_digest"] = sha256_bytes(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode())
+    receipt["fixture_policy"] = policy
+    active = {}
+
+    def respond(record):
+        return active["responder"](record)
+
+    try:
+        with FakeLLMServer(respond) as server:
+            for role in ("implementer", "reviewer", "tester"):
+                home = root / "hermes" / "profiles" / role
+                write_hermes_home(home, server.base_url)
+                fake = yaml.safe_load((home / "config.yaml").read_text())
+                source = policy_root / "profiles" / role
+                config = yaml.safe_load((source / "config.yaml").read_text())
+                config["model"] = fake["model"]
+                config["memory"] = {"memory_enabled": False, "user_profile_enabled": False}
+                config.pop("remnic", None)
+                config["hooks"] = {}
+                config["plugins"]["enabled"] = ["cto-consequence-guard"]
+                config["telemetry"] = fake["telemetry"]
+                (home / "config.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
+                shutil.copyfile(source / "SOUL.md", home / "SOUL.md")
+                plugin = home / "plugins" / "cto-consequence-guard"
+                plugin.mkdir(parents=True)
+                for name in ("__init__.py", "plugin.yaml"):
+                    shutil.copyfile(policy_root / "plugins" / "consequence_guard" / name, plugin / name)
+                receipt["profiles"][role] = {
+                    "source_config_sha256": sha256_file(source / "config.yaml"),
+                    "staged_config_sha256": sha256_file(home / "config.yaml"),
+                    "soul_sha256": sha256_file(home / "SOUL.md"),
+                    "plugin_sha256": sha256_file(plugin / "__init__.py"), "toolsets": config["toolsets"],
+                    "coding_instructions": config["agent"]["coding_instructions"],
+                }
+            for graph in graphs:
+                result = {"identity": dict(graph), "workers": {}, "lifecycle": {}}
+                receipt["graphs"][graph["variant"]] = result
+                _recovery_require(kb.unblock_task(connection, graph["implementer"]), "implementation release refused")
+                roles = ("implementer", "reviewer") if graph["variant"] == "no_grant" else ("implementer", "reviewer", "tester")
+                for role in roles:
+                    state = {"catalogs": [], "calls": [], "snapshots": {}, "evidence_pages": [], "evidence": {}}
+                    result["workers"][role] = state
+                    active["responder"] = _recovery_responder(state, graph, role)
+                    dispatched = kbd.dispatch_once(
+                        connection, max_spawn=1, max_in_progress=4, max_in_progress_per_profile=4,
+                        reconcile_orphans=False,
+                    )
+                    _recovery_require(len(dispatched.spawned) == 1 and dispatched.spawned[0][0] == graph[role],
+                                      f"unexpected dispatch: {dispatched}; logs={_log_tail(root)}")
+                    task = kb.get_task(connection, graph[role])
+                    pid = int(task.worker_pid or 0)
+                    _LAST_WORKER["pid"] = pid
+                    state["pid"] = pid
+                    state["workspace"] = task.workspace_path
+                    state["checkout_sha"] = _recovery_git(Path(task.workspace_path), "rev-parse", "HEAD")
+                    _recovery_require(state["checkout_sha"] == graph["head_sha"]
+                                      and _recovery_git(Path(graph["repo"]), "rev-parse", "HEAD") == graph["main_sha"],
+                                      "candidate/main checkout isolation failed")
+                    if role != "implementer":
+                        _recovery_require(task.workspace_path == str(Path(graph["repo"]) / ".worktrees" / graph[role])
+                                          and task.workspace_path != graph["implementation_checkout"], "role shared implementation checkout")
+                    deadline = time.monotonic() + 14400
+                    while time.monotonic() < deadline:
+                        runtime.reap_worker_zombies()
+                        if state.get("failure") or not runtime._pid_alive(pid):
+                            break
+                        time.sleep(0.2)
+                    _recovery_require(state.get("finished") and not state.get("failure"),
+                                      f"{graph['variant']}/{role}: {state.get('failure')}; calls={state['calls'][-2:]}; logs={_log_tail(root)}")
+                    _recovery_require(not runtime._pid_alive(pid), "worker did not terminate")
+                    _LAST_WORKER["pid"] = None
+                    task = kb.get_task(connection, graph[role])
+                    state["status"] = task.status
+                    state["block_kind"] = task.block_kind
+                    state["runs"] = [dict(row) for row in connection.execute(
+                        "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (task.id,))]
+                    state["events"] = [dict(row) for row in connection.execute(
+                        "SELECT id, kind, payload FROM task_events WHERE task_id = ? AND kind IN ('claimed','spawned','blocked') ORDER BY id", (task.id,))]
+                    allowed = {"kanban_worker_startup", "kanban_worker_inspect", "kanban_show", "kanban_complete", "kanban_block"}
+                    if role == "tester" and graph["variant"] == "main":
+                        allowed.add("kanban_worker_verify")
+                    observed_calls = {}
+                    for request in server.main_requests():
+                        for message in request.get("messages", []):
+                            for call in message.get("tool_calls", []):
+                                observed_calls[call["id"]] = call["function"]
+                    _recovery_require(len(observed_calls) == len(state["calls"]), "provider/tool-result audit incomplete")
+                    _recovery_require(all(call["name"] in allowed and
+                                          (call["name"] != "kanban_show" or "section" in json.loads(call["arguments"]))
+                                          for call in observed_calls.values()), "forbidden fallback in provider records")
+                    execution = state["startup"]["execution"]
+                    _recovery_require(all(("kanban_worker_inspect" in catalog) == execution["inspect"]
+                                          and ("kanban_worker_verify" in catalog) == bool(execution["recipes"])
+                                          for catalog in state["catalogs"]), "catalog did not match retained capability")
+                    state["provider_audit"] = {"ok": True, "calls": len(state["calls"]), "forbidden_fallbacks": []}
+                    result["lifecycle"][role] = kb.get_lifecycle_state(connection, graph["implementer"])
+                    blocked = (role == "tester" and graph["variant"] == "inspect_only") or (role == "reviewer" and graph["variant"] == "no_grant")
+                    _recovery_require(task.status == ("blocked" if blocked else "done"), f"wrong terminal status: {task.status}")
+                    if blocked:
+                        _recovery_require(task.block_kind == "capability", "missing native capability block")
+                    if role == "implementer":
+                        graph["body"] = (
+                            ("inert fixture evidence. " * 14000 if graph["variant"] == "main" else "")
+                            + f" Operator authorizes source-only evidence review of {graph['base_sha']}..{graph['head_sha']}; execution: not_run. "
+                            + "RECOVERY_RESTRICTION: fixture only; never application acceptance."
+                        )
+                        review_task = kb.get_task(connection, graph["reviewer"])
+                        kb.update_task(connection, graph["reviewer"], expected_version=review_task.version,
+                                       reason="Seed inert mandatory recovery evidence", body=graph["body"], author="fixture-operator")
+                        if graph["variant"] == "main":
+                            graph["nested"] = "nested fixture evidence. " * 1600 + "NESTED_LATE_RESTRICTION"
+                            graph["comment"] = json.dumps({"nested": {"text": "comment fixture evidence. " * 1600 + "COMMENT_LATE_RESTRICTION"}})
+                            kb.add_comment(connection, graph["reviewer"], "fixture-operator", graph["comment"])
+                            with kb.write_txn(connection):
+                                for index in range(61):
+                                    payload = {"marker": index}
+                                    if index == 30:
+                                        payload["nested"] = {"text": graph["nested"]}
+                                    kb._append_event(connection, graph["reviewer"], "recovery_evidence", payload)
+                    server.requests.clear()
+                final = kb.get_lifecycle_state(connection, graph["implementer"])
+                _recovery_require(final["acceptance"] == ("accepted" if graph["variant"] == "main" else "pending"),
+                                  f"wrong candidate acceptance: {final}")
+                _recovery_require(final["validation_verdict"] == ("PASS" if graph["variant"] == "main" else None),
+                                  "capability absence became a verdict")
+                result["final_lifecycle"] = final
+            cleaned, records, epoch = _await_cleanup(_journal_roots(root), deadline=time.monotonic() + 120)
+            receipt["cleanup"] = {"ok": cleaned, "records": records, "observed_epoch": epoch}
+            _recovery_require(cleaned, "execution journals unreconciled")
+            receipt["ok"] = True
+            return receipt
+    finally:
+        connection.close()
+        # Retain observations even on a failed assertion, outside teardown's reach.
+        (root / "recovery-observations.json").write_text(json.dumps(receipt, indent=2, sort_keys=True))
+
+
 def _tree_digest(root: Path) -> str:
     entries: list[str] = []
     for path in sorted(root.rglob("*")):
@@ -1015,7 +1471,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--image-store", required=True, help="owner-only OCI archive store")
     parser.add_argument("--receipt", help="write the JSON receipt here")
     parser.add_argument("--prepare-images", action="store_true", help="supervised image preparation only")
-    parser.add_argument("--case", choices=["all", "main", "death"], default="all")
+    parser.add_argument("--case", choices=["all", "main", "death", "recovery"], default="all")
     args = parser.parse_args(argv)
     policy_root = Path(args.policy_root).resolve()
     image_store = Path(args.image_store).expanduser()
@@ -1034,16 +1490,28 @@ def main(argv: list[str] | None = None) -> int:
     directory = tempfile.mkdtemp(prefix="worker-execution-smoke-")
     root = Path(directory)
     cases = ["main", "death"] if args.case == "all" else [args.case]
+    # "all" deliberately preserves the historical main+death contract.
+    failed = False
     reconciled = True
     preserved: str | None = None
     try:
         for case in cases:
             try:
-                receipts[case] = _run_case(
-                    root / case, policy_root=policy_root, image_store=image_store,
-                    death=case == "death",
-                )
+                if case == "recovery":
+                    receipts[case] = _run_recovery_case(
+                        root / case, policy_root=policy_root, image_store=image_store,
+                    )
+                else:
+                    receipts[case] = _run_case(
+                        root / case, policy_root=policy_root, image_store=image_store,
+                        death=case == "death",
+                    )
             except BaseException:
+                failed = True
+                if case == "recovery":
+                    observations = root / case / "recovery-observations.json"
+                    if observations.is_file():
+                        receipts[case] = json.loads(observations.read_text())
                 _cancel_worker()
                 raise
             if args.receipt:
@@ -1069,6 +1537,9 @@ def main(argv: list[str] | None = None) -> int:
         if not reconciled:
             preserved = str(root)
             print(f"worker execution fixture preserved with its journals: {root}", flush=True)
+        elif failed and args.case == "recovery":
+            preserved = str(root)
+            print(f"worker execution fixture preserved with its evidence: {root}", flush=True)
         elif os.environ.get("HERMES_ISSUE76_KEEP") == "1":
             print(f"worker execution fixture kept: {root}", flush=True)
         else:

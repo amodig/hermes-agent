@@ -903,17 +903,70 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
                       f"Unlinked {args.parent_id} -> {args.child_id}")
 
 
+def _claim_preflight(conn, task) -> Optional[str]:
+    """Why this card cannot be claimed, without writing or materializing anything.
+
+    Mirrors the cheap half of ``claim_task``: status, an existing claim, and unmet
+    dependencies. A concurrent edit can still land after this check — the claim itself
+    is fenced to ``task`` — but the common refusals no longer create a workspace.
+    """
+    if task.status != "ready":
+        return f"status={task.status} lock={task.claim_lock or '(none)'}"
+    if task.claim_lock or task.current_run_id:
+        return f"already claimed (lock={task.claim_lock or '(none)'})"
+    blockers = kb.evaluate_dependencies(conn, task.id)["blockers"]
+    if blockers:
+        detail = ", ".join(
+            f"{item['parent_id']} ({item['code']})" for item in blockers[:3])
+        return f"unsatisfied dependencies: {detail}"
+    return None
+
+
 def _cmd_claim(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        # Derive the candidate AND materialize the workspace before claiming: either
+        # step can refuse (an unresolvable candidate, a dirty canonical worktree, a
+        # missing candidate commit, a checkout sitting on another commit), and a claim
+        # that already committed ready->running would strand the card running with no
+        # worker holding it. Resolution reads only fields the claim does not change.
+        pending = kb.get_task(conn, args.task_id)
+        try:
+            # Two non-mutating steps, then the one that creates a directory:
+            # 1. the candidate is resolved first, so an unresolvable role card fails
+            #    without materializing anything;
+            # 2. claimability is preflighted before materialization — a card that cannot
+            #    be claimed must not leave a checkout (and branch) behind, because a stale
+            #    detached role checkout can refuse the retry against a newer candidate.
+            candidate_head = (
+                kbw.candidate_head_for_task(conn, pending) if pending is not None else None)
+            blocked = _claim_preflight(conn, pending) if pending is not None else None
+            if blocked:
+                return _err(f"cannot claim {args.task_id}: {blocked}")
+            workspace = (
+                kbw.resolve_workspace(pending, candidate_head=candidate_head)
+                if pending is not None else None)
+        except ValueError as exc:
+            return _err(f"kanban: {exc}")
+        # Fence the claim to the row this workspace was derived from: an operator edit
+        # that lands during resolution must refuse here rather than let a worker run in
+        # a workspace computed from the previous lifecycle/workspace fields.
+        task = kb.claim_task(
+            conn, args.task_id, ttl_seconds=args.ttl, expected_task=pending)
         if task is None:
             existing = kb.get_task(conn, args.task_id)
             if existing is None:
                 return _err(f"no such task: {args.task_id}")
             return _err(f"cannot claim {args.task_id}: status={existing.status} "
-                        f"lock={existing.claim_lock or '(none)'}")
-        workspace = kbw.resolve_workspace(task)
-        kbw.set_workspace_path(conn, task.id, str(workspace))
+                        f"lock={existing.claim_lock or '(none)'} "
+                        f"(the task changed while its workspace was resolved)")
+        # A successful claim proves the row still existed, so resolution above ran.
+        # Persist the kind it was resolved as: a role card converted from the scratch
+        # default is a worktree now, and completion cleanup follows the recorded kind.
+        resolved_kind = kbw.effective_workspace_kind(pending)
+        kbw.set_workspace_path(
+            conn, task.id, str(workspace),
+            kind=resolved_kind if resolved_kind != (pending.workspace_kind or "scratch") else None,
+        )
     print(f"Claimed {task.id}\nWorkspace: {workspace}")
     return 0
 
@@ -1268,12 +1321,29 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     if rc:
         return rc
     reason = _stripped_or_none(getattr(args, "reason", None))
-    author = _profile_author() if reason else None
+    expected_version = getattr(args, "expected_version", None)
+    author = _profile_author() if (reason or expected_version is not None) else None
     suffix = f": {reason}" if reason else ""
+    if expected_version is not None and len(ids) != 1:
+        return _err("kanban unblock: --expected-version requires exactly one task id", 2)
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
+        def op(tid):
+            if expected_version is None:
+                return kb.unblock_task(conn, tid)
+            # Fenced recovery: the audit comment is written by the transition itself,
+            # so a stale refusal leaves no comment before the mutation it describes.
+            return kb.unblock_task(
+                conn, tid, expected_version=expected_version, reason=reason, author=author,
+            )
+
+        if expected_version is None:
+            op = _commented(conn, reason, author, "UNBLOCK", op)
+        failure = (
+            "cannot unblock {} (not blocked/scheduled?)" if expected_version is None
+            else "cannot unblock {}: stale version, changed state, or active claim"
+        )
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
-                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+                           lambda tid: failure.format(tid))
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:

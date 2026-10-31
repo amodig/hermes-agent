@@ -2877,10 +2877,17 @@ def _dispatch_lane_task(
         try:
             _check_not_stopping(should_stop, task_id)
             _require_autonomous_worker_capacity()
+            # A typed role card (review/validation) works from its candidate's
+            # commit, never from whatever HEAD the anchor repo happens to hold: the
+            # head is derived here, once, and both workspace resolution and the
+            # grant that follows see the same commit.
+            candidate_head = _kbw.candidate_head_for_task(conn, spawn_task)
             if spawn_task.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(spawn_task, board=board)
+                workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(
+                    spawn_task, board=board, candidate_head=candidate_head)
             else:
-                workspace = _kbw.resolve_workspace(spawn_task, board=board)
+                workspace = _kbw.resolve_workspace(
+                    spawn_task, board=board, candidate_head=candidate_head)
             launch = _default_spawn(
                 spawn_task, str(workspace), board=board, defer_grant=True,
                 should_stop=should_stop,
@@ -2953,10 +2960,16 @@ def _dispatch_lane_task(
             _note_claim_hold(conn, task_id, result, lane=lane, board=board)
             return False
         try:
-            if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
+            candidate_head = _kbw.candidate_head_for_task(conn, claimed)
+            # A typed role card resolves as a worktree even from the scratch default, so
+            # branch bookkeeping and cleanup must follow the effective kind, not the column.
+            role_kind = _kbw.effective_workspace_kind(claimed)
+            if role_kind == "worktree":
+                workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(
+                    claimed, board=board, candidate_head=candidate_head)
             else:
-                workspace = _kbw.resolve_workspace(claimed, board=board)
+                workspace = _kbw.resolve_workspace(
+                    claimed, board=board, candidate_head=candidate_head)
         except Exception as exc:
             if _record_task_failure(
                 conn, claimed.id, f"workspace: {exc}",
@@ -2968,13 +2981,24 @@ def _dispatch_lane_task(
     try:
         assert claimed is not None
         assert workspace is not None
-        _kbw.set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
+        # Persist the kind the workspace was resolved as: a role card converted from the
+        # scratch default is a worktree, and completion cleanup follows the recorded kind.
+        workspace_kind = _kbw.effective_workspace_kind(claimed)
+        _kbw.set_workspace_path(
+            conn, claimed.id, str(workspace),
+            kind=(workspace_kind
+                  if workspace_kind != (claimed.workspace_kind or "scratch") else None),
+        )
+        if workspace_kind == "worktree":
+            # A role worktree is normally detached at the candidate, and "" is the
+            # truth to persist there — the historical "or wt/<id>" fallback would
+            # record a branch that does not exist.
             _kbw.set_branch_name(
                 conn, claimed.id,
-                resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
+                resolved_branch_name if resolved_branch_name is not None
+                else (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
             )
-        _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        _kbw._maybe_emit_scratch_tip(conn, claimed.id, workspace_kind)
         if lane == "review":
             claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
         if launch is None:

@@ -285,3 +285,183 @@ def test_legacy_null_block_kind_reuses_historical_recurrence_cause(
     assert loop_events
     assert loop_events[-1].payload["cause"] == "capability"
     assert loop_events[-1].payload["recurrences"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Version-fenced unblock (operator recovery)
+# ---------------------------------------------------------------------------
+
+
+def _blocked_task(conn, title="fenced"):
+    tid = _running_task(conn, title=title)
+    assert kb.block_task(conn, tid, reason="needs a human")
+    return tid
+
+
+def _snapshot(conn, tid):
+    task = kb.get_task(conn, tid)
+    return (
+        task.status, task.version, task.consecutive_failures, task.last_failure_error,
+    ), [event.kind for event in kb.list_events(conn, tid)], [
+        (comment.author, comment.body) for comment in kb.list_comments(conn, tid)
+    ]
+
+
+def test_fenced_unblock_succeeds_once_and_increments_version_once(kanban_home: Path) -> None:
+    with kbc.connect_closing() as conn:
+        tid = _blocked_task(conn)
+        version = kb.get_task(conn, tid).version
+
+        assert kb.unblock_task(
+            conn, tid, expected_version=version, reason="policy installed", author="operator",
+        )
+        task = kb.get_task(conn, tid)
+        assert (task.status, task.version) == ("ready", version + 1)
+        assert kb.list_comments(conn, tid)[-1].body == "UNBLOCK: policy installed"
+        assert kb.list_comments(conn, tid)[-1].author == "operator"
+        assert [e for e in kb.list_events(conn, tid) if e.kind == "unblocked"]
+
+        # The same fence can never act twice.
+        assert _snapshot(conn, tid) == _snapshot(conn, tid)
+        before = _snapshot(conn, tid)
+        assert kb.unblock_task(
+            conn, tid, expected_version=version, reason="policy installed", author="operator",
+        ) is False
+        assert _snapshot(conn, tid) == before
+
+
+def test_fenced_unblock_refuses_a_stale_version_without_any_write(kanban_home: Path) -> None:
+    with kbc.connect_closing() as conn:
+        tid = _blocked_task(conn)
+        version = kb.get_task(conn, tid).version
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET version = version + 1, consecutive_failures = 3, "
+                "last_failure_error = 'prior failure' WHERE id = ?", (tid,),
+            )
+        before = _snapshot(conn, tid)
+
+        assert kb.unblock_task(
+            conn, tid, expected_version=version, reason="stale recovery", author="operator",
+        ) is False
+        assert _snapshot(conn, tid) == before
+
+
+def test_fenced_unblock_refuses_an_active_claim_before_reclaiming(kanban_home: Path) -> None:
+    with kbc.connect_closing() as conn:
+        tid = _blocked_task(conn)
+        with kb.write_txn(conn):
+            run_id = conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at) "
+                "VALUES (?, 'worker', 'blocked', 1)", (tid,),
+            ).lastrowid
+            conn.execute(
+                "UPDATE tasks SET claim_lock = 'lock-fixture', current_run_id = ?, "
+                "worker_pid = 424242 WHERE id = ?", (run_id, tid),
+            )
+        version = kb.get_task(conn, tid).version
+        before = _snapshot(conn, tid)
+
+        assert kb.unblock_task(
+            conn, tid, expected_version=version, reason="recover", author="operator",
+        ) is False
+        assert _snapshot(conn, tid) == before
+        # The dangling run is left exactly as found: no reclaim on an uncertain owner.
+        run = conn.execute("SELECT status, ended_at FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        assert (run["status"], run["ended_at"]) == ("blocked", None)
+
+
+def test_fenced_unblock_refuses_a_card_that_is_not_blocked(kanban_home: Path) -> None:
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="already ready", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        before = _snapshot(conn, tid)
+        assert kb.unblock_task(conn, tid, expected_version=kb.get_task(conn, tid).version) is False
+        assert _snapshot(conn, tid) == before
+
+
+def test_fenced_unblock_rejects_invalid_versions(kanban_home: Path) -> None:
+    with kbc.connect_closing() as conn:
+        tid = _blocked_task(conn)
+        before = _snapshot(conn, tid)
+        for value in (True, False, 0, -1, 1.5, "2", [1]):
+            with pytest.raises(ValueError):
+                kb.unblock_task(conn, tid, expected_version=value)
+        assert _snapshot(conn, tid) == before
+
+
+def test_fenced_unblock_preserves_resume_gating_and_phase(kanban_home: Path) -> None:
+    with kbc.connect_closing() as conn:
+        parent = kb.create_task(conn, title="open parent", assignee="alice")
+        # Linked while todo (a running child cannot be gated retroactively); the parent
+        # then stays open while the child runs, exactly as the dispatch-tick test forces it.
+        child = kb.create_task(conn, title="waiter", assignee="worker")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (child,))
+        # An untyped block parks it on the human bucket, so it really is unblockable…
+        assert kb.block_task(conn, child, reason="waiting on upstream")
+        parked = kb.get_task(conn, child)
+        assert parked.status == "blocked"
+
+        assert kb.unblock_task(
+            conn, child, expected_version=parked.version, reason="dependency restored",
+            author="operator",
+        )
+        resumed = kb.get_task(conn, child)
+        # …but the open parent still wins over the resume phase, and the version moved once.
+        assert (resumed.status, resumed.version) == ("todo", parked.version + 1)
+
+
+def test_unfenced_unblock_keeps_its_old_behaviour(kanban_home: Path) -> None:
+    with kbc.connect_closing() as conn:
+        tid = _blocked_task(conn)
+        version = kb.get_task(conn, tid).version
+        assert kb.unblock_task(conn, tid)
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        # No fence, no version bump and no comment: the existing contract is untouched.
+        assert task.version == version
+        assert not [c for c in kb.list_comments(conn, tid) if c.body.startswith("UNBLOCK:")]
+
+
+def test_cli_fenced_unblock_records_reason_only_on_success(
+    kanban_home: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    with kbc.connect_closing() as conn:
+        tid = _blocked_task(conn)
+        # Two versions, so the stale fence below is still a valid version number.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET version = version + 1 WHERE id = ?", (tid,))
+        version = kb.get_task(conn, tid).version
+
+        stale = argparse.Namespace(
+            task_ids=[tid], reason="operator recovery", expected_version=version - 1,
+        )
+        assert kanban_cli._cmd_unblock(stale) == 1
+        assert "stale version" in capsys.readouterr().err
+        assert not [c for c in kb.list_comments(conn, tid) if c.body.startswith("UNBLOCK:")]
+
+        fenced = argparse.Namespace(
+            task_ids=[tid], reason="operator recovery", expected_version=version,
+        )
+        assert kanban_cli._cmd_unblock(fenced) == 0
+        assert "Unblocked" in capsys.readouterr().out
+        assert kb.list_comments(conn, tid)[-1].body == "UNBLOCK: operator recovery"
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_cli_fenced_unblock_requires_a_single_task(
+    kanban_home: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    with kbc.connect_closing() as conn:
+        first = _blocked_task(conn, title="one")
+        second = _blocked_task(conn, title="two")
+        before = _snapshot(conn, first), _snapshot(conn, second)
+        args = argparse.Namespace(
+            task_ids=[first, second], reason="bulk", expected_version=kb.get_task(conn, first).version,
+        )
+        assert kanban_cli._cmd_unblock(args) == 2
+        assert "--expected-version requires exactly one task id" in capsys.readouterr().err
+        assert (_snapshot(conn, first), _snapshot(conn, second)) == before

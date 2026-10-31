@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -24,6 +25,12 @@ if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
 
 _REMOVABLE_KINDS = ("scratch", "worktree")
+
+# Typed role cards (review / validation) work from a candidate commit, never from the
+# repository's current HEAD, and land in their own task-owned worktree.
+_ROLE_KINDS = frozenset({"review", "validation"})
+_COMMIT_ID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_CANDIDATE_WORKSPACE_UNAVAILABLE = "candidate_workspace_unavailable"
 
 
 def _path_key(path: Path | str | None) -> str:
@@ -706,12 +713,280 @@ def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple
     return target, branch_name
 
 
-def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> tuple[Path, str]:
+def _role_contract(task: Task) -> Optional[dict]:
+    """The typed ``review``/``validation`` contract, or ``None`` for every other card."""
+    contract = getattr(task, "lifecycle_contract", None)
+    if isinstance(contract, dict) and contract.get("kind") in _ROLE_KINDS:
+        return contract
+    return None
+
+
+def candidate_head_for_task(conn: sqlite3.Connection, task: Task) -> Optional[str]:
+    """The immutable commit a typed review/validation card must work from.
+
+    ``None`` for a card that is not a typed role card. A role card returns the full
+    commit id its candidate's own handoff recorded — never HEAD, a branch name, or a
+    commit read out of prose — and raises ``ValueError`` naming
+    ``candidate_workspace_unavailable`` when the board cannot supply one
+    unambiguously. The candidate is the card its contract names, so a completed
+    sibling, a later parent, or a moving branch is never mistaken for the work being
+    reviewed.
+    """
+    contract = _role_contract(task)
+    if contract is None:
+        return None
+    candidate_id = str(contract.get("candidate_task_id") or "").strip()
+    if not candidate_id:
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {task.id} names no candidate card")
+    state = _kb.get_lifecycle_state(conn, task.id)
+    handoff = _kb.latest_handoff(conn, candidate_id)
+    head = str(state.get("head_sha") or "").strip()
+    documented = str(handoff.get("head_sha") or "").strip()
+    base = str(handoff.get("base_sha") or "").strip()
+    if not _COMMIT_ID.match(head):
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: candidate {candidate_id} of {task.id} "
+            "has no recorded head commit")
+    if documented.lower() != head.lower():
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: candidate {candidate_id} of {task.id} "
+            f"reports head {head} but its handoff records {documented or 'none'}")
+    if not _COMMIT_ID.match(base):
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: candidate {candidate_id} of {task.id} "
+            "records no base commit")
+    return head
+
+
+def _git_head(path: Path) -> Optional[str]:
+    """The full commit id at ``path``'s HEAD, or ``None`` when it cannot be read."""
+    out = _kb._git_out(path, "rev-parse", "HEAD")
+    if not out or not _COMMIT_ID.match(out):
+        return None
+    return out
+
+
+def _clean_tree(path: Path, label: str) -> None:
+    """Refuse to move a checkout that holds anything git would have to overwrite.
+
+    Untracked files count: a reviewer's scratch notes are still work, and only the
+    operator can decide they are disposable. A failing ``git status`` never reads as
+    clean.
+    """
+    result = _git(path, "status", "--porcelain", "--untracked-files=all", timeout=60)
+    if result.returncode != 0:
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: cannot verify {label} is clean: "
+            f"{(result.stderr or result.stdout or '').strip()[:200]}")
+    if (result.stdout or "").strip():
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {label} has local changes or untracked "
+            "files; nothing was moved and no file was removed")
+
+
+def _role_repo_root(task: Task, board: Optional[str]) -> Path:
+    """The main repository whose ``.worktrees/<task-id>`` this role card owns.
+
+    A card that names a repository root, or already names its own canonical
+    worktree, anchors that same repository. Every other explicit path is refused
+    instead of retargeted: a reviewer pointed at a sibling's checkout would review
+    work that is not its candidate.
+    """
+    if not task.workspace_path:
+        board_slug = board if board else _kb.get_current_board()
+        board_default = (_kb.read_board_metadata(board_slug).get("default_workdir") or "").strip()
+        if not board_default:
+            raise ValueError(
+                f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: role worktree for {task.id} needs a "
+                f"repository, and board {board_slug!r} has no default_workdir set")
+        anchor = Path(board_default).expanduser()
+        if not anchor.is_absolute():
+            raise ValueError(
+                f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: board {board_slug!r} default_workdir "
+                f"{board_default!r} is not absolute")
+        repo_root = _git_toplevel(anchor)
+        if repo_root is None:
+            raise ValueError(
+                f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: board {board_slug!r} default_workdir "
+                f"{board_default!r} is not inside a git repository")
+    else:
+        requested = Path(task.workspace_path).expanduser()
+        if not requested.is_absolute():
+            raise ValueError(
+                f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: role worktree path "
+                f"{task.workspace_path!r} is not absolute")
+        requested_resolved = requested.resolve(strict=False)
+        repo_root = None
+        if requested.exists() and _is_linked_worktree_checkout(requested):
+            # A dispatch persists this card's own canonical worktree, so a retry
+            # names that checkout instead of the repository root. Resolve it back to
+            # the main checkout it belongs to rather than pretending it is one.
+            common = _git_common_dir(requested)
+            if common is None or common.name != ".git":
+                raise ValueError(
+                    f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: role worktree path "
+                    f"{task.workspace_path!r} is a linked checkout whose main repository "
+                    "cannot be identified")
+            repo_root = common.parent.resolve(strict=False)
+        elif requested.exists():
+            toplevel = _git_toplevel(requested)
+            if toplevel is not None and _path_key(toplevel) == _path_key(requested_resolved):
+                repo_root = toplevel
+        if repo_root is None:
+            # Not a repository root: only this card's own canonical worktree anchors.
+            repo_root = _repo_root_for_worktree_target(requested.parent)
+            if repo_root is None:
+                raise ValueError(
+                    f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: role worktree path "
+                    f"{task.workspace_path!r} is not inside a git repository")
+        canonical = repo_root / ".worktrees" / task.id
+        if _path_key(requested_resolved) != _path_key(repo_root) and (
+            _path_key(requested_resolved) != _path_key(canonical.resolve(strict=False))
+        ):
+            raise ValueError(
+                f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: role worktree path "
+                f"{task.workspace_path!r} is neither the repository root nor this card's "
+                f"own {canonical}; a sibling's checkout is never reused")
+    if _is_linked_worktree_checkout(repo_root):
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: role worktrees anchor a main checkout, "
+            f"but {repo_root} is itself a linked worktree")
+    return repo_root
+
+
+def _is_ancestor(repo: Path, commit: str, head: str) -> bool:
+    if not commit:
+        return False
+    return _git(repo, "merge-base", "--is-ancestor", commit, head, timeout=60).returncode == 0
+
+
+def _commit_referenced(repo: Path, commit: str) -> bool:
+    """True when some ref still reaches ``commit``, so moving a checkout loses nothing."""
+    if not commit:
+        return False
+    result = _git(repo, "for-each-ref", "--count=1", "--contains", commit, timeout=60)
+    return result.returncode == 0 and bool((result.stdout or "").strip())
+
+
+def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Path, str]:
+    """Materialize this role card's own worktree at ``candidate_head``.
+
+    Returns ``(path, branch)`` with an empty branch for the detached checkout that a
+    role worktree normally is. An existing canonical worktree is reused only when it
+    is already ``candidate_head``; a clean named-branch checkout of another commit is
+    moved onto the candidate with a non-force detach (its branch ref is untouched),
+    and anything dirtier is refused with the files preserved.
+    """
+    if not _COMMIT_ID.match(candidate_head or ""):
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {task.id} has no full candidate commit")
+    resolved = _kb._git_out(repo_root, "rev-parse", "--verify", f"{candidate_head}^{{commit}}")
+    if not resolved or not _COMMIT_ID.match(resolved):
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: candidate commit {candidate_head} is not "
+            f"in {repo_root}")
+    head = resolved
+    target = repo_root / ".worktrees" / task.id
+    if target.is_symlink() or (target.exists() and not target.is_dir()):
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is not a real directory")
+    if not target.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        result = _git(repo_root, "worktree", "add", "--detach", str(target), head, timeout=120)
+        if result.returncode != 0:
+            raise ValueError(
+                f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: git worktree add failed for {target} at "
+                f"{head}: {(result.stderr or result.stdout or '').strip()[:300]}")
+        if _git_head(target) != head:
+            raise ValueError(
+                f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} did not land on {head}")
+        return target.resolve(strict=False), ""
+    # An existing canonical checkout: prove it belongs to this repository, then never
+    # discard what is in it.
+    repo_root = repo_root.resolve(strict=False)
+    if not _is_linked_worktree_checkout(target) or (
+        _path_key(_git_common_dir(target)) != _path_key(_git_common_dir(repo_root))
+    ):
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is not a linked worktree of "
+            f"{repo_root}")
+    _clean_tree(target, str(target))
+    current = _git_head(target)
+    branch = _git_current_branch(target) or ""
+    if current == head:
+        return target.resolve(strict=False), branch
+    if not branch:
+        # A detached checkout is the normal shape for a role worktree, and after a
+        # rework its old candidate is simply not the new one. Follow the new candidate
+        # when moving cannot strand anything — the old commit is contained in the new
+        # candidate, or some ref still reaches it — and refuse otherwise.
+        if not (_is_ancestor(target, current, head) or _commit_referenced(target, current)):
+            raise ValueError(
+                f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is detached at "
+                f"{current or 'an unknown commit'}, not the candidate {head}, and nothing "
+                "reaches that commit; moving it would strand work")
+        result = _git(target, "checkout", "--detach", head, timeout=120)
+        if result.returncode != 0:
+            raise ValueError(
+                f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: could not move {target} onto {head}: "
+                f"{(result.stderr or result.stdout or '').strip()[:300]}")
+        if _git_head(target) != head:
+            raise ValueError(
+                f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} did not land on {head}")
+        return target.resolve(strict=False), ""
+    # Detaching leaves the branch ref behind, and the completion cleanup deletes a
+    # ``wt/<id>`` branch once the *detached* HEAD is clean and pushed. So only move a
+    # branch whose tip the candidate already contains: anything else is unique work.
+    if _git(target, "merge-base", "--is-ancestor", current, head, timeout=60).returncode != 0:
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is checked out on {branch} at "
+            f"{current}, which the candidate {head} does not contain; detaching would "
+            "strand that work")
+    result = _git(target, "checkout", "--detach", head, timeout=120)
+    if result.returncode != 0:
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: could not move {target} onto {head}: "
+            f"{(result.stderr or result.stdout or '').strip()[:300]}")
+    if _git_head(target) != head:
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} did not land on {head}")
+    return target.resolve(strict=False), ""
+
+
+def _validate_role_directory(task: Task, path: Path, candidate_head: Optional[str]) -> None:
+    """Check an operator-supplied role workspace in place; never checkout or reset it."""
+    if not candidate_head:
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: role workspace for {task.id} needs the "
+            "candidate commit, never HEAD")
+    if not path.is_dir() or path.is_symlink():
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: role workspace {path} does not exist")
+    head = _git_head(path)
+    if head is None:
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: role workspace {path} is not a git checkout")
+    if head != candidate_head:
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: role workspace {path} is at {head}, not the "
+            f"candidate {candidate_head}; this directory is never moved for you")
+    _clean_tree(path, str(path))
+
+
+def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None,
+                                candidate_head: Optional[str] = None) -> tuple[Path, str]:
     """Resolve + materialize a linked git worktree for ``task``. With no
     ``task.workspace_path`` the anchor is the board's ``default_workdir`` so
     every worktree lands under a board-owned repo (``<repo>/.worktrees/<id>``)
     instead of the dispatcher's incidental CWD (whatever dir the gateway was
     launched from); with no anchor configured we fail loudly rather than guess."""
+    if _role_contract(task) is not None:
+        if candidate_head is None:
+            raise ValueError(
+                f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {task.id} is a typed role card; its "
+                "worktree is materialized at the candidate commit, never at HEAD")
+        return _role_worktree(_role_repo_root(task, board), task, candidate_head)
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if not task.workspace_path:
         board_slug = board if board else _kb.get_current_board()
@@ -778,7 +1053,8 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
     return requested, branch_name
 
 
-def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
+def resolve_workspace(task: Task, *, board: Optional[str] = None,
+                     candidate_head: Optional[str] = None) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
     ``scratch``: ``<board-root>/workspaces/<id>/`` — path-stable across the
@@ -787,11 +1063,20 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     dispatcher's CWD — confused-deputy traversal). ``worktree``: a linked git
     worktree; a repo-root ``workspace_path`` anchors ``<repo>/.worktrees/<id>``,
     a concrete path is created/reused, none -> the board's ``default_workdir``
-    (raises if unset rather than guessing). Persist via ``set_workspace_path``.
+    (raises if unset rather than guessing). A typed role card additionally needs
+    ``candidate_head``: its worktree is its own checkout of the candidate commit,
+    and an explicit ``dir`` workspace is verified in place against that commit.
+    Persist via ``set_workspace_path``.
     """
-    kind = task.workspace_kind or "scratch"
+    kind = effective_workspace_kind(task)
     if kind == "worktree":
-        return _resolve_worktree_workspace(task, board=board)[0]
+        # ``scratch`` is the create_task default, so a typed review/validation card can
+        # arrive here without a checkout. An empty scratch directory is not evidence:
+        # the role would either inspect nothing or — with a legacy explicit path — the
+        # repository's current tree instead of the candidate. A role card therefore
+        # always resolves a worktree at the candidate commit, or a named refusal.
+        return _resolve_worktree_workspace(
+            task, board=board, candidate_head=candidate_head)[0]
     if kind == "scratch" and not task.workspace_path:
         p = _kb.workspaces_root(board=board) / task.id
     elif kind == "scratch":
@@ -813,6 +1098,8 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                 f"{task.workspace_path!r}; use an absolute path "
                 f"(relative paths are ambiguous against the dispatcher's CWD)"
             )
+        if _role_contract(task) is not None:
+            _validate_role_directory(task, p, candidate_head)
     else:
         raise ValueError(f"unknown workspace_kind: {kind}")
     p.mkdir(parents=True, exist_ok=True)
@@ -824,8 +1111,33 @@ def _set_task_column(conn: sqlite3.Connection, task_id: str, column: str, value:
         conn.execute(f"UPDATE tasks SET {column} = ? WHERE id = ?", (value, task_id))
 
 
-def set_workspace_path(conn: sqlite3.Connection, task_id: str, path: Path | str) -> None:
-    _set_task_column(conn, task_id, "workspace_path", str(path))
+def effective_workspace_kind(task: Task) -> str:
+    """The kind a workspace resolves as, which is what must be persisted.
+
+    A typed role card is never ``scratch``: resolution gives it a linked worktree at the
+    candidate commit, so recording it as scratch would send completion through scratch
+    cleanup — an ``rmtree`` of a registered worktree instead of ``git worktree remove``.
+    """
+    kind = task.workspace_kind or "scratch"
+    if kind == "scratch" and _role_contract(task) is not None:
+        return "worktree"
+    return kind
+
+
+def set_workspace_path(
+    conn: sqlite3.Connection, task_id: str, path: Path | str, *, kind: Optional[str] = None,
+) -> None:
+    """Persist the resolved workspace. Path and kind go in one transaction: a crash
+    between two writes would leave a worktree path recorded as ``scratch``, which is
+    exactly the pair completion cleanup mis-branches on."""
+    if kind is None:
+        _set_task_column(conn, task_id, "workspace_path", str(path))
+        return
+    with _kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ?, workspace_kind = ? WHERE id = ?",
+            (str(path), kind, task_id),
+        )
 
 
 def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str) -> None:

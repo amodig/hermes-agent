@@ -14,6 +14,11 @@ from collections import deque
 from dataclasses import dataclass, field
 
 COORDINATION_ENDPOINT = ("z300.barracuda-trout.ts.net", 6697)
+# The same agents network, for a host that runs no Tailscale: the sanctioned SSH
+# tunnel (arttula-tunnel.service) forwards this loopback port to the agents Ergo's
+# plaintext listener, so the tunnel — not TLS — is what protects the transport.
+TUNNEL_COORDINATION_ENDPOINT = ("127.0.0.1", 16697)
+COORDINATION_ENDPOINTS = frozenset({COORDINATION_ENDPOINT, TUNNEL_COORDINATION_ENDPOINT})
 REQUIRED_CAPS = frozenset({"sasl", "message-tags", "account-tag", "server-time", "batch"})
 AGENT_ACCOUNTS = frozenset({"agent-hermes-cto", "agent-jeeves"} | {
     f"agent-omp-{host}-{slot:02d}" for host in ("loota", "z300") for slot in range(1, 5)})

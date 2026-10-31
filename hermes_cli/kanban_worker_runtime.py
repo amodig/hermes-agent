@@ -675,6 +675,27 @@ def _worker_scope_suffix(task: Task, *, preparation_id: Optional[str]) -> str:
     return f"kanban-{task.id}-run-{task.current_run_id}"
 
 
+def _execution_refusal_code(reason: Optional[str]) -> Optional[str]:
+    """The stable execution-refusal code a worker may report, or None for a grant.
+
+    ``resolve_execution_grant`` returns ``(None, None)`` when no execution policy is
+    configured at all and ``(None, "<code>: <detail>")`` for a refusal. Only the code
+    is descriptive forever; the detail routinely holds paths, argv and config values,
+    so it stays in this process's log and never crosses the grant pipe. Anything that
+    is not already a lowercase code becomes ``resolution_failed`` rather than being
+    forwarded.
+    """
+    if reason is None:
+        return "policy_not_configured"
+    code = str(reason).split(":", 1)[0].strip()
+    if (
+        not code or len(code) > 64 or not code.isascii() or not code.islower()
+        or not code[0].isalpha() or not code.replace("_", "").isalnum()
+    ):
+        return "resolution_failed"
+    return code
+
+
 def _raise_if_launch_refused(scope_unit: str, returncode: Optional[int]) -> None:
     """Raise infrastructure when the launcher died because its scope was refused.
 
@@ -1513,11 +1534,13 @@ def _default_spawn(
             env.get("HERMES_KANBAN_DB", ""),
         )
         execution_grant = None
+        execution_refusal = None
         if startup_context is not None:
             from hermes_cli.worker_execution_policy import resolve_execution_grant
 
+            reason: Optional[str] = None
             try:
-                execution_grant, execution_refusal = resolve_execution_grant(
+                execution_grant, reason = resolve_execution_grant(
                     profile_home=env.get("HERMES_HOME"),
                     workspace=workspace,
                     task_id=task.id,
@@ -1528,10 +1551,15 @@ def _default_spawn(
                     runtime_identity=actual,
                 )
             except Exception as exc:  # a broken policy grants nothing, never fails the launch
-                execution_grant, execution_refusal = None, f"resolution_failed: {exc}"
-            if execution_refusal:
+                execution_grant, reason = None, f"resolution_failed: {exc}"
+            if execution_grant is not None:
+                execution_refusal = None
+            else:
+                execution_refusal = _execution_refusal_code(reason)
+            if reason or execution_refusal:
                 _kb()._log.warning(
-                    "kanban worker execution: withheld for %s (%s)", task.id, execution_refusal,
+                    "kanban worker execution: withheld for %s (%s)",
+                    task.id, reason or execution_refusal,
                 )
         grant_payload = {
             "grant": True,
@@ -1559,6 +1587,10 @@ def _default_spawn(
             payload["claim_lock"] = claim_lock
             if execution_grant is not None:
                 payload["worker_execution"] = execution_grant.bind(run_id, claim_lock)
+            if startup_context is not None:
+                # Descriptive only: the code names why authority is absent, so the
+                # worker can report it instead of guessing. It never grants anything.
+                payload["worker_execution_refusal"] = execution_refusal
             frame = json.dumps(payload, sort_keys=True).encode("utf-8") + b"\n"
             _write_worker_grant(grant_fd, frame)
             # The buffered import handshake was already flushed. Only close an

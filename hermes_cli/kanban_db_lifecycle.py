@@ -699,11 +699,43 @@ def promote_task(
     return True, None
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_version: Optional[int] = None,
+    reason: Optional[str] = None,
+    author: Optional[str] = None,
+) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+    when that is where it left off), closing any leaked run first.
+
+    ``expected_version`` fences the transition for operator recovery: a stale
+    version, a non-blocked card, or any surviving claim/run/pid refuses before a
+    single write instead of reclaiming ownership this call cannot prove. Only a
+    fenced call records its audit ``UNBLOCK: <reason>`` comment, and only after the
+    version-fenced update has actually landed — a refusal leaves rows, events,
+    comments and counters exactly as they were.
+    """
+    if expected_version is not None:
+        if isinstance(expected_version, bool) or not isinstance(expected_version, int):
+            raise ValueError("expected_version must be an integer")
+        if expected_version < 1:
+            raise ValueError("expected_version must be >= 1")
     now = int(time.time())
     with _kb.write_txn(conn):
+        if expected_version is not None:
+            row = conn.execute(
+                "SELECT status, version, claim_lock, current_run_id, worker_pid "
+                "FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            if row is None or _kb._row_get(row, "status") not in ("blocked", "scheduled"):
+                return False
+            if int(_kb._row_get(row, "version") or 1) != expected_version:
+                return False
+            if any(_kb._row_get(row, field) for field in
+                   ("claim_lock", "current_run_id", "worker_pid")):
+                return False
         resume_status = (
             _kb._resume_status_from_events(conn, task_id)
             if _kb._task_status(conn, task_id) == "blocked"
@@ -725,11 +757,20 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # unbounded; only complete_task clears them. ``consecutive_failures``
         # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
         # is a fresh start for the retry budget.
-        cur = conn.execute(
+        statement = (
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
+            "consecutive_failures = 0, last_failure_error = NULL"
         )
+        params: list[Any] = [new_status]
+        if expected_version is not None:
+            # Incremented exactly once, and only for the version that was checked.
+            statement += ", version = version + 1"
+        statement += " WHERE id = ? AND status IN ('blocked', 'scheduled')"
+        params.append(task_id)
+        if expected_version is not None:
+            statement += " AND version = ?"
+            params.append(expected_version)
+        cur = conn.execute(statement, params)
         if cur.rowcount != 1:
             return False
         _kb._append_event(
@@ -740,6 +781,13 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 else None
             ),
         )
+        if expected_version is not None and (reason or "").strip():
+            # Nested transaction (allow_nested) so the comment lands with the
+            # transition it justifies, never before it.
+            _kb.add_comment(
+                conn, task_id, author or os.environ.get("HERMES_PROFILE") or "orchestrator",
+                f"UNBLOCK: {reason.strip()}",
+            )
         return True
 
 

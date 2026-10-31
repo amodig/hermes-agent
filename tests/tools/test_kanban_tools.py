@@ -9,6 +9,7 @@ Verifies:
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -80,6 +81,721 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert d["task"]["status"] == "running"
     assert "worker_context" in d
     assert "runs" in d
+
+
+def _page_whole_file(path: str) -> str:
+    """Page *path* with the real read_file tool, exactly as a worker is told to."""
+    from tools.file_tools import read_file_tool
+
+    pages: list[str] = []
+    offset = 1
+    for _ in range(50):
+        out = json.loads(read_file_tool(path, offset=offset, limit=2000))
+        assert not out.get("error"), out
+        pages.append(out.get("content") or "")
+        if out.get("next_offset"):
+            offset = int(out["next_offset"])
+        elif out.get("truncated"):
+            offset += 2000
+        else:
+            return "\n".join(pages)
+    raise AssertionError("did not reach the end of the spill within 50 pages")
+
+
+def test_show_spills_but_its_decision_inputs_and_receipt_stay_pageable(tmp_path, monkeypatch):
+    """A worker's kanban_show on a card carrying hundreds of KB of event history.
+
+    Compact single-line JSON used to make the whole answer one unreadable line once
+    the runtime spilled it, so a worker could not reach its own lifecycle, its
+    authorization, or the candidate's launch receipt. The spill is unchanged; what
+    changed is that the result is now indented, so read_file offset/limit paging
+    works — and the decision inputs lead the payload instead of trailing the history.
+    """
+    from pathlib import Path as _Path
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-validator")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    receipt = {"code_sha": "a" * 40, "generation": "b" * 64}
+    head = "e" * 40
+    authorization = "Do not widen the grant; report the exact host gate you ran.\n" * 100
+    late_marker = "LATE-EVENT-MARKER-9c1f"
+
+    conn = kbc.connect()
+    try:
+        implementation = kb.create_task(
+            conn, title="candidate", assignee="coder",
+            lifecycle_contract={
+                "kind": "code", "review_mode": "same_card", "reviewer": "reviewer",
+                "validation_required": True,
+            })
+        assert kb.claim_task(conn, implementation, claimer=kb._claimer_id()) is not None
+        kbd._set_worker_pid(conn, implementation, os.getpid())
+        impl_run = kb._current_run_id(conn, implementation)
+        kb._append_event(
+            conn, implementation, "spawned", {"runtime_identity": receipt}, run_id=impl_run)
+        conn.execute(
+            "UPDATE task_runs SET metadata = ?, status = 'review', "
+            "outcome = 'review_requested' WHERE id = ?",
+            (json.dumps({"head_sha": head}), impl_run))
+        conn.execute(
+            "UPDATE tasks SET candidate_run_id = ? WHERE id = ?", (impl_run, implementation))
+        validation = kb.create_task(
+            conn, title="validate the candidate", assignee="test-validator",
+            body=authorization,
+            lifecycle_contract={"kind": "validation", "candidate_task_id": implementation})
+        # ~360 KiB of nested history, the shape the real card carried.
+        for seq in range(4):
+            kb._append_event(conn, validation, "note",
+                             {"seq": seq, "detail": {"nested": ["x" * 300] * 300}})
+        kb._append_event(conn, validation, "note", {"marker": late_marker})
+        conn.commit()
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    from tools.tool_result_storage import PERSISTED_OUTPUT_TAG, maybe_persist_tool_result
+
+    raw = kt._handle_show({"task_id": validation})
+    assert len(raw) > 321 * 1024, len(raw)
+    original = json.loads(raw)
+    assert original["task"]["body"] == authorization
+    assert original["lifecycle"]["candidate_run_id"] == impl_run
+    assert original["provenance"]["verdict"] == "verified"
+    # Key order is the fix's point: decision inputs before the history arrays.
+    assert raw.index('"lifecycle"') < raw.index('"events"')
+    assert raw.index('"worker_context"') < raw.index('"events"')
+    assert raw.index('"provenance"') < raw.index('"events"')
+
+    spilled = maybe_persist_tool_result(raw, "kanban_show", "tc_show_spill", env=None)
+    assert PERSISTED_OUTPUT_TAG in spilled, spilled[:400]
+    path = spilled.split("Full output saved to: ", 1)[1].splitlines()[0].strip()
+
+    paged = _page_whole_file(path)
+    # The last event the card wrote is reachable, so history is not the casualty.
+    assert late_marker in paged
+    assert f'"candidate_task_id": "{implementation}"' in paged
+    assert f'"candidate_run_id": {impl_run}' in paged
+    assert receipt["generation"] in paged          # the launch receipt, not a synthetic OK
+    assert "candidate_missing" not in paged
+    assert authorization.splitlines()[0] in paged
+    assert '"worker_context"' in paged
+
+
+@pytest.fixture
+def evidence_board(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+
+    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID",
+                "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
+        monkeypatch.delenv(key, raising=False)
+    conn = kbc.connect()
+    try:
+        yield kb, conn, worker_env
+    finally:
+        conn.close()
+
+
+def _evidence(args, *, ok=True):
+    from tools import kanban_tools as kt
+    from tools.tool_result_storage import maybe_persist_tool_result
+
+    raw = kt._handle_show(args)
+    assert len(raw.encode("utf-8")) <= 32768
+    assert maybe_persist_tool_result(raw, "kanban_show", "bounded-evidence", env=None) == raw
+    page = json.loads(raw)
+    assert page.get("ok") is ok, page
+    assert "worker_context" not in page
+    if not ok:
+        assert set(page) == {"ok", "error", "code"}, page
+    return page
+
+
+def _continue_evidence(args):
+    assert {"task_id", "board", "section", "snapshot"} <= set(args)
+    assert "after" in args or {"pointer", "offset"} <= set(args)
+    return _evidence({**args, "chars": 8192, "limit": 200})
+
+
+def _reconstruct_evidence(page):
+    if "value" in page:
+        return page["value"]
+    if "chunk" in page:
+        pieces = []
+        start = page["chunk"]["offset"]
+        while True:
+            chunk = page["chunk"]
+            assert chunk["offset"] == start + sum(map(len, pieces))
+            pieces.append(chunk["text"])
+            if chunk["next_offset"] is None:
+                assert start + sum(map(len, pieces)) == chunk["total_chars"]
+                return "".join(pieces)
+            assert chunk["next_offset"] > chunk["offset"]
+            page = _continue_evidence(page["continuation"])
+    entries = []
+    total = page["total_entries"]
+    while True:
+        for entry in page["entries"]:
+            value = (_reconstruct_evidence(_continue_evidence(entry["continuation"]))
+                     if entry.get("deferred") else entry["value"])
+            entries.append((entry, value))
+        if page["next_offset"] is None:
+            break
+        page = _continue_evidence(page["continuation"])
+    assert len(entries) == total
+    if not entries or "key" in entries[0][0]:
+        keys = [entry["key"] for entry, _ in entries]
+        assert keys == sorted(set(keys))
+        return {entry["key"]: value for entry, value in entries}
+    assert [entry["index"] for entry, _ in entries] == list(range(total))
+    return [value for _, value in entries]
+
+
+def _reconstruct_history(args):
+    page = _evidence(args)
+    items = []
+    while True:
+        assert page["returned"] == len(page["items"])
+        for item in page["items"]:
+            value = (_reconstruct_evidence(_continue_evidence(item["continuation"]))
+                     if item.get("deferred") else item)
+            assert value["id"] == item["id"]
+            items.append(value)
+        if not page["has_more"]:
+            assert page["next_after"] is None
+            break
+        assert page["next_after"] == items[-1]["id"]
+        page = _continue_evidence(page["continuation"])
+    ids = [item["id"] for item in items]
+    assert ids == sorted(set(ids))
+    return items
+
+
+def test_bounded_show_reconstructs_large_evidence(evidence_board, monkeypatch, capsys):
+    """Single-line restrictions and every history row need structured continuations."""
+    kb, conn, tid = evidence_board
+    import sys
+
+    sizes = []
+    read_page = _evidence
+
+    def measured(args, **kwargs):
+        page = read_page(args, **kwargs)
+        sizes.append(len(json.dumps(page, ensure_ascii=False).encode("utf-8")))
+        return page
+
+    monkeypatch.setattr(sys.modules[__name__], "_evidence", measured)
+
+    body = 'é🦄"\\' * 81000 + " LATE-RESTRICTION: never authorize production writes."
+    assert len(body) > 321724
+    conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (body, tid))
+    comment = json.dumps({"nested": [body]})
+    kb.add_comment(conn, tid, author="operator", body=comment)
+    for seq in range(65):
+        kb._append_event(conn, tid, "note", {
+            "seq": seq, "detail": {"nested": [body if seq == 32 else f"marker-{seq}"]}})
+    conn.commit()
+    from tools.kanban_tools import _COMMENT_FIELDS, _EVENT_FIELDS, _RUN_FIELDS, _TASK_FIELDS, _fields
+
+    first = _evidence({"task_id": tid, "section": "lifecycle"})
+    token = first["snapshot"]
+    assert token.startswith("kb1:") and len(token.split(":")[1]) == 64
+    args = {"task_id": tid, "snapshot": token, "limit": 200, "chars": 8192}
+    task = _reconstruct_evidence(_evidence({**args, "section": "task"}))
+    assert task == kb.redact_review_value(_fields(kb.get_task(conn, tid), _TASK_FIELDS))
+    assert task["body"] == body
+    comments = _reconstruct_history({**args, "section": "comments"})
+    assert comments == kb.redact_review_value([
+        _fields(c, ("id",) + _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)])
+    assert comments[-1]["body"] == comment
+    events = _reconstruct_history({**args, "section": "events", "limit": 3})
+    assert events == kb.redact_review_value([
+        _fields(e, ("id",) + _EVENT_FIELDS) for e in kb.list_events(conn, tid)])
+    assert [e["payload"]["seq"] for e in events if e["kind"] == "note"] == list(range(65))
+    assert events[-33]["payload"]["detail"]["nested"] == [body]
+    assert _reconstruct_history({**args, "section": "runs"}) == [
+        _fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)]
+    # Explicit cross-section bookend: this exact token still covers the own lifecycle.
+    assert _evidence({**args, "section": "lifecycle"})["snapshot"] == token
+    assert max(sizes) <= 32768
+    with capsys.disabled():
+        print(f"\nbounded evidence: {len(body)} body codepoints; {len(events)} history events; "
+              f"{len(sizes)} pages; maximum envelope {max(sizes)} UTF-8 bytes")
+
+
+@pytest.mark.parametrize("extra,code", [
+    ({"limit": 2}, "invalid_evidence_request"),
+    ({"section": "nope"}, "invalid_evidence_request"),
+    ({"section": None}, "invalid_evidence_request"),
+    ({"section": "task", "after": 0}, "invalid_evidence_request"),
+    ({"section": "events", "after": True}, "invalid_evidence_request"),
+    ({"section": "events", "after": -1}, "invalid_evidence_request"),
+    ({"section": "events", "after": 2**63}, "invalid_evidence_request"),
+    ({"section": "events", "item": True}, "invalid_evidence_request"),
+    ({"section": "events", "item": 0}, "invalid_evidence_request"),
+    ({"section": "events", "item": 1, "after": 0}, "invalid_evidence_request"),
+    ({"section": "events", "item": None}, "invalid_evidence_request"),
+    ({"section": "task", "pointer": 0}, "invalid_pointer"),
+    ({"section": "task", "pointer": "body"}, "invalid_pointer"),
+    ({"section": "task", "pointer": "/~2"}, "invalid_pointer"),
+    ({"section": "task", "pointer": "/x" * 65}, "invalid_pointer"),
+    ({"section": "task", "offset": True}, "invalid_evidence_request"),
+    ({"section": "task", "offset": -1}, "invalid_evidence_request"),
+    ({"section": "task", "limit": False}, "invalid_evidence_request"),
+    ({"section": "task", "limit": 201}, "invalid_evidence_request"),
+    ({"section": "task", "limit": 0}, "invalid_evidence_request"),
+    ({"section": "task", "chars": True}, "invalid_evidence_request"),
+    ({"section": "task", "chars": 8193}, "invalid_evidence_request"),
+    ({"section": "task", "chars": 0}, "invalid_evidence_request"),
+    ({"section": "task", "chars": 1.5}, "invalid_evidence_request"),
+    ({"section": "task", "snapshot": None}, "invalid_evidence_request"),
+    ({"section": "task", "snapshot": "forged"}, "invalid_evidence_request"),
+    ({"section": "task", "pointer": "/body"}, "snapshot_required"),
+    ({"section": "task", "offset": 1}, "snapshot_required"),
+    ({"section": "events", "after": 1}, "snapshot_required"),
+    ({"section": "events", "item": 1}, "snapshot_required"),
+])
+def test_bounded_show_rejects_invalid_arguments(evidence_board, extra, code):
+    _, _, tid = evidence_board
+    assert _evidence({"task_id": tid, **extra}, ok=False)["code"] == code
+
+
+def test_bounded_show_pointer_boundaries_and_row_isolation(evidence_board):
+    kb, conn, tid = evidence_board
+    kb._append_event(conn, tid, "note", {"a/~": ["", "hello", None], "": "empty-key"})
+    event = conn.execute("SELECT MAX(id) FROM task_events").fetchone()[0]
+    other = kb.create_task(conn, title="other")
+    foreign = kb.add_comment(conn, other, author="operator", body="foreign")
+    conn.commit()
+    token = _evidence({"task_id": tid, "section": "task"})["snapshot"]
+    args = {"task_id": tid, "section": "events", "item": event, "snapshot": token}
+    assert _reconstruct_evidence(_evidence({**args, "pointer": "/payload/a~1~0/1"})) == "hello"
+    assert _reconstruct_evidence(_evidence({**args, "pointer": "/payload/"})) == "empty-key"
+    empty = _evidence({**args, "pointer": "/payload/a~1~0/0"})
+    assert empty["chunk"]["text"] == "" and empty["chunk"]["next_offset"] is None
+    end = _evidence({**args, "pointer": "/payload/a~1~0/1", "offset": 5})
+    assert end["chunk"]["text"] == "" and end["chunk"]["next_offset"] is None
+    for pointer in ("/payload/a~1~0/01", "/payload/a~1~0/-", "/payload/a~1~0/3", "/absent"):
+        assert _evidence({**args, "pointer": pointer}, ok=False)["code"] == "invalid_pointer"
+    assert _evidence({**args, "pointer": "/payload/a~1~0/1", "offset": 6},
+                     ok=False)["code"] == "invalid_evidence_request"
+    assert _evidence({**args, "section": "comments", "item": foreign},
+                     ok=False)["code"] == "invalid_evidence_request"
+    empty_history = _evidence({"task_id": tid, "section": "comments"})
+    assert empty_history["items"] == [] and empty_history["next_after"] is None
+    assert _evidence({"task_id": "missing", "section": "task"},
+                     ok=False)["code"] == "task_not_found"
+
+
+@pytest.fixture
+def evidence_graph(evidence_board):
+    kb, conn, tid = evidence_board
+    parent = kb.create_task(conn, title="parent goal", body="goal restrictions")
+    candidate = kb.create_task(conn, title="candidate", lifecycle_contract={
+        "kind": "code", "review_mode": "separate_card", "reviewer": "reviewer",
+        "validation_required": True})
+    review = kb.create_task(conn, title="review", assignee="reviewer", lifecycle_contract={
+        "kind": "review", "candidate_task_id": candidate})
+    # A reverse-only lifecycle reference must join the scope even without an edge.
+    reverse = kb.create_task(conn, title="other review", assignee="reviewer", lifecycle_contract={
+        "kind": "review", "candidate_task_id": candidate})
+    conn.execute("UPDATE tasks SET lifecycle_contract = ? WHERE id = ?",
+                 (json.dumps({"kind": "validation", "candidate_task_id": candidate}), tid))
+    for left, right in ((parent, candidate), (candidate, review), (review, tid)):
+        conn.execute("INSERT OR IGNORE INTO task_links(parent_id, child_id) VALUES (?, ?)", (left, right))
+    run = conn.execute(
+        "INSERT INTO task_runs(task_id, status, started_at, metadata) VALUES (?, 'done', 1, ?)",
+        (candidate, json.dumps({"head_sha": "a" * 40}))).lastrowid
+    conn.execute("UPDATE tasks SET candidate_run_id = ? WHERE id = ?", (run, candidate))
+    kb._append_event(conn, review, "note", {"lifecycle": {"verdict": "APPROVE"}})
+    event = conn.execute("SELECT MAX(id) FROM task_events").fetchone()[0]
+    comment = kb.add_comment(conn, parent, author="operator", body="authorization")
+    conn.commit()
+    return kb, conn, {"tid": tid, "parent": parent, "candidate": candidate,
+                      "review": review, "reverse": reverse, "run": run,
+                      "event": event, "comment": comment}
+
+
+@pytest.mark.parametrize("mutation", [
+    "own_body", "own_version", "parent_goal", "candidate_head", "candidate_run",
+    "review_verdict", "run_metadata", "new_link", "delete_link", "new_event",
+    "new_comment", "edit_event", "delete_event", "edit_comment", "delete_comment",
+    "reverse_reference", "claim_lock", "receipt",
+])
+def test_bounded_show_cross_section_snapshot_rejects_semantic_mutations(evidence_graph, mutation):
+    import sqlite3
+
+    kb, conn, ids = evidence_graph
+    tid = ids["tid"]
+    token = _evidence({"task_id": tid, "section": "lifecycle"})["snapshot"]
+    version = kb.get_task(conn, tid).version
+    writer = sqlite3.connect(kb.kanban_db_path())
+    try:
+        statements = {
+            "own_body": ("UPDATE tasks SET body = 'changed' WHERE id = ?", (tid,)),
+            "own_version": ("UPDATE tasks SET version = version + 1 WHERE id = ?", (tid,)),
+            "parent_goal": ("UPDATE task_goal_revisions SET body = 'changed restriction' WHERE task_id = ?", (ids["parent"],)),
+            "candidate_head": ("UPDATE task_runs SET metadata = ? WHERE id = ?", (json.dumps({"head_sha": "b" * 40}), ids["run"])),
+            "candidate_run": ("UPDATE tasks SET candidate_run_id = NULL WHERE id = ?", (ids["candidate"],)),
+            "review_verdict": ("UPDATE task_events SET payload = ? WHERE id = ?", (json.dumps({"lifecycle": {"verdict": "REQUEST_CHANGES"}}), ids["event"])),
+            "run_metadata": ("UPDATE task_runs SET metadata = ? WHERE task_id = ?", (json.dumps({"authorization": "new"}), tid)),
+            "new_link": ("INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)", (ids["parent"], tid)),
+            "delete_link": ("DELETE FROM task_links WHERE parent_id = ? AND child_id = ?", (ids["review"], tid)),
+            "new_event": ("INSERT INTO task_events(task_id, kind, payload, created_at) VALUES (?, 'note', '{}', 1)", (ids["parent"],)),
+            "new_comment": ("INSERT INTO task_comments(task_id, author, body, created_at) VALUES (?, 'operator', 'new authorization', 1)", (ids["parent"],)),
+            "edit_event": ("UPDATE task_events SET created_at = created_at + 1 WHERE id = ?", (ids["event"],)),
+            "delete_event": ("DELETE FROM task_events WHERE id = ?", (ids["event"],)),
+            "edit_comment": ("UPDATE task_comments SET body = 'revoked' WHERE id = ?", (ids["comment"],)),
+            "delete_comment": ("DELETE FROM task_comments WHERE id = ?", (ids["comment"],)),
+            "reverse_reference": ("UPDATE tasks SET body = 'reverse-only edit' WHERE id = ?", (ids["reverse"],)),
+            "claim_lock": ("UPDATE tasks SET claim_lock = 'new-owner' WHERE id = ?", (ids["candidate"],)),
+            "receipt": ("INSERT INTO task_events(task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'spawned', '{}', 1)", (ids["candidate"], ids["run"])),
+        }
+        writer.execute(*statements[mutation])
+        writer.commit()
+    finally:
+        writer.close()
+    if mutation != "own_version":
+        assert kb.get_task(conn, tid).version == version
+    for section in ("task", "comments", "events"):
+        assert _evidence({"task_id": tid, "section": section, "snapshot": token},
+                         ok=False)["code"] == "stale_snapshot"
+
+
+@pytest.mark.parametrize("edit", ["update", "delete"])
+def test_bounded_show_pins_heartbeat_history_without_starvation(evidence_board, edit):
+    kb, conn, tid = evidence_board
+    kb._append_event(conn, tid, "heartbeat", {"note": "old heartbeat note"})
+    pinned = conn.execute("SELECT MAX(id) FROM task_events").fetchone()[0]
+    conn.commit()
+    token = _evidence({"task_id": tid, "section": "events"})["snapshot"]
+    for table in ("tasks", "task_runs"):
+        key = "id" if table == "tasks" else "task_id"
+        conn.execute(f"UPDATE {table} SET last_heartbeat_at = 999, claim_expires = 999 WHERE {key} = ?", (tid,))
+    for kind in ("heartbeat", "claim_extended"):
+        kb._append_event(conn, tid, kind, {"note": "new lease note"})
+    conn.commit()
+    args = {"task_id": tid, "section": "events", "snapshot": token}
+    events = _reconstruct_history(args)
+    assert events[-1]["id"] == pinned and events[-1]["payload"]["note"] == "old heartbeat note"
+    assert _evidence({**args, "section": "task"})["snapshot"] == token
+    if edit == "update":
+        conn.execute("UPDATE task_events SET payload = ? WHERE id = ?",
+                     (json.dumps({"note": "silently edited"}), pinned))
+    else:
+        conn.execute("DELETE FROM task_events WHERE id = ?", (pinned,))
+    conn.commit()
+    assert _evidence(args, ok=False)["code"] == "stale_snapshot"
+
+
+def test_bounded_show_snapshot_binds_task_board_and_file(evidence_board, monkeypatch, tmp_path):
+    import sqlite3
+
+    kb, conn, tid = evidence_board
+    other = kb.create_task(conn, title="other task")
+    token = _evidence({"task_id": tid, "section": "task"})["snapshot"]
+    assert _evidence({"task_id": other, "section": "task", "snapshot": token},
+                     ok=False)["code"] == "stale_snapshot"
+    with monkeypatch.context() as patch, kb.pin_first_board_resolution():
+        patch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path()))
+        assert _evidence({"task_id": tid, "board": "other-board", "section": "task", "snapshot": token},
+                         ok=False)["code"] == "stale_snapshot"
+    replacement = tmp_path / "replacement.db"
+    target = sqlite3.connect(replacement)
+    conn.backup(target)
+    target.close()
+    # Same exact evidence bytes at another inode cannot reuse a token.
+    with monkeypatch.context() as patch:
+        patch.setenv("HERMES_KANBAN_DB", str(replacement))
+        assert _evidence({"task_id": tid, "section": "task", "snapshot": token},
+                         ok=False)["code"] == "stale_snapshot"
+    # A replacement at the SAME board path is equally fenced.
+    with monkeypatch.context() as patch:
+        patch.setenv("HERMES_KANBAN_DB", str(replacement))
+        copied_token = _evidence({"task_id": tid, "section": "task"})["snapshot"]
+        second = tmp_path / "second.db"
+        target = sqlite3.connect(second)
+        conn.backup(target)
+        target.close()
+        second.replace(replacement)
+        assert _evidence({"task_id": tid, "section": "task", "snapshot": copied_token},
+                         ok=False)["code"] == "stale_snapshot"
+
+
+def test_bounded_show_projection_and_fingerprint_share_one_transaction(evidence_board, monkeypatch):
+    kb, conn, tid = evidence_board
+    from hermes_cli import kanban_db_evidence as evidence
+
+    original = kb.get_task(conn, tid).body
+    fingerprint = evidence._fingerprint
+
+    def interleave(reader, *args):
+        token = fingerprint(reader, *args)
+        conn.execute("UPDATE tasks SET body = 'concurrent authorization' WHERE id = ?", (tid,))
+        conn.commit()
+        return token
+
+    with monkeypatch.context() as patch:
+        patch.setattr(evidence, "_fingerprint", interleave)
+        first = _evidence({"task_id": tid, "section": "task", "limit": 200})
+        assert first["value"]["body"] == original
+    assert _evidence({"task_id": tid, "section": "task", "snapshot": first["snapshot"]},
+                     ok=False)["code"] == "stale_snapshot"
+
+
+@pytest.mark.parametrize("column,value", [
+    ("payload", "{"), ("metadata", "{"), ("lifecycle_contract", "{"),
+    ("payload", '{"duplicate":1,"duplicate":2}'),
+    ("payload", "[" * 65 + "0" + "]" * 65),
+    ("payload", '{"bad":NaN}'),
+])
+def test_bounded_show_refuses_damaged_evidence(evidence_board, column, value):
+    kb, conn, tid = evidence_board
+    table = {"payload": "task_events", "metadata": "task_runs", "lifecycle_contract": "tasks"}[column]
+    key = "id" if table == "tasks" else "task_id"
+    conn.execute(f"UPDATE {table} SET {column} = ? WHERE {key} = ?", (value, tid))
+    conn.commit()
+    assert _evidence({"task_id": tid, "section": "task"},
+                     ok=False)["code"] == "evidence_unavailable"
+
+
+def test_bounded_show_redacts_complete_values_before_chunking(evidence_board):
+    kb, conn, tid = evidence_board
+    secret = "sk-" + "aB3x" * 12
+    prefix = ("public restriction " * 500)[:8179] + " api_key="
+    body = prefix + secret + " no production writes"
+    assert len(prefix) < 8192 < len(prefix + secret)
+    conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (body, tid))
+    conn.commit()
+    token = _evidence({"task_id": tid, "section": "task"})["snapshot"]
+    page = _evidence({"task_id": tid, "section": "task", "pointer": "/body",
+                      "snapshot": token, "chars": 8192})
+    result = _reconstruct_evidence(page)
+    assert result == kb.redact_review_value(body)
+    assert secret not in result and result.endswith(" no production writes")
+
+
+def test_bounded_show_escape_budget_and_nested_run_arrays(evidence_board, capsys):
+    kb, conn, tid = evidence_board
+    body = "\x00" * 20000 + "é🦄 restriction: no production writes"
+    conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (body, tid))
+    metadata = {"a/~": [{"index": index, "restriction": "no writes " * 50} for index in range(250)]}
+    conn.execute("UPDATE task_runs SET metadata = ? WHERE task_id = ?", (json.dumps(metadata), tid))
+    conn.commit()
+    token = _evidence({"task_id": tid, "section": "task"})["snapshot"]
+    args = {"task_id": tid, "section": "task", "snapshot": token, "pointer": "/body", "chars": 8192}
+    first = _evidence(args)
+    assert len(first["chunk"]["text"]) < 8192
+    assert _reconstruct_evidence(first) == body
+    size = len(json.dumps(first, ensure_ascii=False).encode("utf-8"))
+    assert 32760 <= size <= 32768
+    runs = _reconstruct_history({**args, "section": "runs", "pointer": ""})
+    assert runs[0]["metadata"] == metadata
+    end = _evidence({"task_id": tid, "section": "runs", "item": runs[0]["id"],
+                     "snapshot": token, "pointer": "/metadata/a~1~0", "offset": 250})
+    assert end["entries"] == [] and end["next_offset"] is None
+    with capsys.disabled():
+        print(f"\nbounded escaping: first near-ceiling envelope {size} UTF-8 bytes")
+
+
+def test_bounded_show_reuses_all_native_section_projections(evidence_graph):
+    kb, conn, ids = evidence_graph
+    from hermes_cli.kanban_db_receipts import candidate_identity
+
+    tid = ids["tid"]
+    lifecycle = kb.get_lifecycle_state(conn, tid)
+    expected = {
+        "lifecycle": lifecycle,
+        "effective_goal": kb.get_effective_goal(conn, tid),
+        "dependencies": kb.evaluate_dependencies(conn, tid),
+        "dispatch_guard": kb.get_dispatch_guard(conn, tid, board="default"),
+        "parents": kb.parent_ids(conn, tid),
+        "children": kb.child_ids(conn, tid),
+        "active_handoff": kb.latest_handoff(conn, tid),
+        "provenance": candidate_identity(conn, lifecycle["candidate_task_id"],
+                                         lifecycle["candidate_run_id"]),
+    }
+    token = _evidence({"task_id": tid, "section": "lifecycle"})["snapshot"]
+    for section, value in expected.items():
+        assert _reconstruct_evidence(_evidence({
+            "task_id": tid, "section": section, "snapshot": token,
+        })) == kb.redact_review_value(value)
+
+
+@pytest.mark.parametrize("schema", ["absent", "empty", "legacy", "missing_goal_column", "missing_primary_key"])
+def test_bounded_show_never_initializes_or_migrates(evidence_board, monkeypatch, tmp_path, schema):
+    import sqlite3
+    from hermes_cli import worker_startup
+
+    kb, _, tid = evidence_board
+    path = tmp_path / "incompatible.db"
+    if schema != "absent":
+        writer = sqlite3.connect(path)
+        if schema == "legacy":
+            writer.execute("CREATE TABLE tasks(id TEXT PRIMARY KEY)")
+        elif schema == "missing_goal_column":
+            writer.executescript(kb.SCHEMA_SQL)
+            writer.execute("ALTER TABLE task_goal_revisions DROP COLUMN reason")
+        elif schema == "missing_primary_key":
+            writer.executescript(kb.SCHEMA_SQL)
+            writer.executescript(
+                "CREATE TABLE malformed AS SELECT * FROM task_comments; "
+                "DROP TABLE task_comments; ALTER TABLE malformed RENAME TO task_comments;")
+        writer.close()
+    before = path.read_bytes() if path.exists() else None
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(path))
+    monkeypatch.setattr(kb, "_ensure_goal_revision_schema",
+                        lambda *_: pytest.fail("attempted migration"))
+    real_open = worker_startup._open_board
+    statements = []
+
+    def read_only(path):
+        reader = real_open(path)
+        reader.set_trace_callback(statements.append)
+        return reader
+
+    monkeypatch.setattr(worker_startup, "_open_board", read_only)
+    assert _evidence({"task_id": tid, "section": "effective_goal"},
+                     ok=False)["code"] == "board_unavailable"
+    assert (path.read_bytes() if path.exists() else None) == before
+    assert all(statement.startswith(("SELECT ", "PRAGMA table_info(", "ROLLBACK"))
+               for statement in statements)
+
+
+def test_bounded_show_read_only_authorizer_and_unrepresentable_descriptor(evidence_board, monkeypatch):
+    import sqlite3
+    from hermes_cli import worker_startup
+
+    kb, conn, tid = evidence_board
+    connect = sqlite3.connect
+    actions = []
+
+    def readonly_connect(*args, **kwargs):
+        reader = connect(*args, **kwargs)
+
+        def authorize(action, first, second, *_):
+            actions.append((action, first, second))
+            allowed = action in (sqlite3.SQLITE_READ, sqlite3.SQLITE_SELECT,
+                                 sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_TRANSACTION,
+                                 sqlite3.SQLITE_RECURSIVE)
+            allowed |= action == sqlite3.SQLITE_PRAGMA and (
+                first in ("table_info", "database_list")
+                or (first == "query_only" and second == "ON"))
+            return sqlite3.SQLITE_OK if allowed else sqlite3.SQLITE_DENY
+
+        reader.set_authorizer(authorize)
+        return reader
+
+    with monkeypatch.context() as patch:
+        patch.setattr(worker_startup.sqlite3, "connect", readonly_connect)
+        _evidence({"task_id": tid, "section": "effective_goal"})
+        _evidence({"task_id": tid, "section": "dispatch_guard"})
+    assert actions
+    kb._append_event(conn, tid, "note", {"x" * 40000: "value"})
+    conn.commit()
+    page = _evidence({"task_id": tid, "section": "events"})
+    row = page["items"][-1]
+    assert row["deferred"]
+    item = _continue_evidence(row["continuation"])
+    payload = next(entry for entry in item["entries"] if entry["key"] == "payload")
+    assert _evidence(payload["continuation"], ok=False)["code"] == "evidence_unavailable"
+
+
+@pytest.fixture
+def evidence_worker(evidence_board, monkeypatch, tmp_path):
+    from dataclasses import replace
+    from hermes_cli import kanban_runtime as runtime, worker_startup
+
+    kb, conn, tid = evidence_board
+    identity = replace(runtime.runtime_identity(), generation="fixture-generation",
+                       dependency_fingerprint="fixture-dependencies")
+    monkeypatch.setattr(runtime, "runtime_identity", lambda: identity)
+    monkeypatch.setattr(runtime, "assert_runtime_import_root", lambda **_: identity)
+    monkeypatch.setattr(worker_startup, "_GRANT", None)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    run = kb._current_run_id(conn, tid)
+    claim = kb.get_task(conn, tid).claim_lock
+    metadata = {"runtime_identity": identity.as_dict(), "worker_pid": identity.pid,
+                "worker_start_time": identity.start_time, "preparation_id": "preparation"}
+    conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = NULL, workspace_path = ? WHERE id = ?",
+                 (identity.pid, str(workspace), tid))
+    conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = NULL, metadata = ? WHERE id = ?",
+                 (identity.pid, json.dumps(metadata), run))
+    parent = kb.create_task(conn, title="same-board parent")
+    conn.execute("INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)", (parent, tid))
+    conn.commit()
+    path = str(kb.kanban_db_path())
+    for key, value in {
+        "HERMES_KANBAN_TASK": tid, "HERMES_KANBAN_RUN_ID": str(run),
+        "HERMES_KANBAN_BOARD": "default", "HERMES_KANBAN_DB": path,
+        "HERMES_PROFILE": "test-worker", "HERMES_KANBAN_WORKSPACE": str(workspace),
+        "HERMES_KANBAN_CLAIM_LOCK": claim, "HERMES_KANBAN_RUNTIME_GRANTED": "1",
+    }.items():
+        monkeypatch.setenv(key, value)
+    worker_startup._retain_worker_grant({
+        "grant": True, "runtime_identity": identity.as_dict(), "preparation_id": "preparation",
+        "run_id": run, "claim_lock": claim,
+        "worker_context": {"task_id": tid, "profile": "test-worker", "board": "default",
+                           "workspace": str(workspace), "db_path": path},
+    }, identity)
+    return kb, conn, tid, parent
+
+
+def test_bounded_show_authenticated_worker_can_read_same_board_parent(evidence_worker, monkeypatch):
+    from hermes_cli import worker_startup
+
+    kb, conn, tid, parent = evidence_worker
+    assert _evidence({"section": "task"})["task_id"] == tid
+    assert _evidence({"section": "task", "task_id": parent})["task_id"] == parent
+    assert _evidence({"section": "task", "board": "other"},
+                     ok=False)["code"] == "invalid_evidence_request"
+    conn.execute("UPDATE tasks SET claim_lock = 'successor' WHERE id = ?", (tid,))
+    conn.commit()
+    # Parent access must also recheck the worker's OWN claim in the same transaction.
+    assert _evidence({"section": "task", "task_id": parent},
+                     ok=False)["code"] == "invalid_evidence_request"
+
+
+@pytest.mark.parametrize("key", [
+    "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_BOARD", "HERMES_PROFILE", "HERMES_KANBAN_WORKSPACE",
+    "HERMES_KANBAN_CLAIM_LOCK", "HERMES_KANBAN_RUNTIME_GRANTED",
+    "HERMES_KANBAN_PREPARATION_ID",
+])
+def test_bounded_show_refuses_conflicting_inherited_worker_state(evidence_worker, monkeypatch, key):
+    _, _, tid, _ = evidence_worker
+    monkeypatch.setenv(key, "foreign")
+    assert _evidence({"section": "task", "task_id": tid},
+                     ok=False)["code"] == "invalid_evidence_request"
+
+
+def test_bounded_show_refuses_missing_grants_and_delegation(evidence_worker, monkeypatch):
+    from agent.delegation_context import delegated_child_context, non_dispatcher_owned_context
+    from hermes_cli import worker_startup
+
+    _, _, tid, parent = evidence_worker
+    for context in (delegated_child_context, non_dispatcher_owned_context):
+        with context():
+            assert _evidence({"section": "task", "task_id": parent},
+                             ok=False)["code"] == "invalid_evidence_request"
+    with monkeypatch.context() as patch:
+        patch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+        assert _evidence({"section": "task", "task_id": tid},
+                         ok=False)["code"] == "invalid_evidence_request"
+    monkeypatch.setattr(worker_startup, "_GRANT", None)
+    assert _evidence({"section": "task", "task_id": tid},
+                     ok=False)["code"] == "invalid_evidence_request"
 
 
 def test_show_bare_call_outside_worker_returns_orientation_not_error(monkeypatch, worker_env):
@@ -1877,3 +2593,160 @@ def test_effort_update_contract_through_registry(worker_env, monkeypatch):
     with kbc.connect_closing() as conn:
         task = kb.get_task(conn, tid)
     assert (task.reasoning_effort, task.version) == (None, version)
+
+
+def test_orchestrator_fenced_unblock_requires_the_current_version(monkeypatch, tmp_path):
+    """The version fence is a recovery CAS: stale or active-claim calls change nothing."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    from pathlib import Path
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="blocked recovery", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
+        assert kb.block_task(conn, tid, reason="needs an operator")
+        # Two versions, so the stale fence below is still a valid version number.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET version = version + 1 WHERE id = ?", (tid,))
+        version = kb.get_task(conn, tid).version
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+
+    stale = json.loads(kt._handle_unblock({"task_id": tid, "expected_version": version - 1}))
+    assert "stale version" in stale.get("error", ""), stale
+    again = kbc.connect()
+    try:
+        parked = kb.get_task(again, tid)
+        assert (parked.status, parked.version) == ("blocked", version)
+        assert not [c for c in kb.list_comments(again, tid) if c.body.startswith("UNBLOCK:")]
+    finally:
+        again.close()
+
+    fenced = json.loads(kt._handle_unblock({"task_id": tid, "expected_version": version}))
+    assert fenced.get("ok") is True and fenced.get("status") == "ready", fenced
+    final = kbc.connect()
+    try:
+        assert kb.get_task(final, tid).version == version + 1
+        # The ordinary unfenced call is untouched by the fence (fresh card, so the
+        # block-loop breaker cannot route it out of the blocked bucket).
+        other = kb.create_task(final, title="plain unblock", assignee="worker")
+        with kb.write_txn(final):
+            final.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (other,))
+        assert kb.block_task(final, other, reason="needs an operator")
+        plain_version = kb.get_task(final, other).version
+    finally:
+        final.close()
+    plain = json.loads(kt._handle_unblock({"task_id": other}))
+    assert plain.get("ok") is True, plain
+    check = kbc.connect()
+    try:
+        assert kb.get_task(check, other).version == plain_version
+    finally:
+        check.close()
+
+
+def test_orchestrator_fenced_unblock_records_the_reason_it_was_given(monkeypatch, tmp_path):
+    """The tool path must be able to say why recovery happened, with a real actor."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    from pathlib import Path
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="fenced recovery", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
+        assert kb.block_task(conn, tid, reason="needs an operator")
+        # Two versions, so the stale fence below is still a valid version number.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET version = version + 1 WHERE id = ?", (tid,))
+        version = kb.get_task(conn, tid).version
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+
+    # A reason without the fence is refused: the ordinary unblock writes no comment.
+    refused = json.loads(kt._handle_unblock({"task_id": tid, "reason": "no fence"}))
+    assert "requires expected_version" in refused.get("error", ""), refused
+
+    stale = json.loads(kt._handle_unblock(
+        {"task_id": tid, "expected_version": version - 1, "reason": "too early"}))
+    assert "stale version" in stale.get("error", ""), stale
+    check = kbc.connect()
+    try:
+        assert not [c for c in kb.list_comments(check, tid) if c.body.startswith("UNBLOCK:")]
+    finally:
+        check.close()
+
+    fenced = json.loads(kt._handle_unblock(
+        {"task_id": tid, "expected_version": version, "reason": "policy installed"}))
+    assert fenced.get("ok") is True, fenced
+    final = kbc.connect()
+    try:
+        comment = [c for c in kb.list_comments(final, tid) if c.body.startswith("UNBLOCK:")][-1]
+        assert comment.body == "UNBLOCK: policy installed"
+        assert comment.author and comment.author.strip()
+    finally:
+        final.close()
+
+
+def test_bounded_pages_always_say_whether_the_value_is_complete(evidence_board):
+    """An unfinished read must be visible in the result, never merely implied.
+
+    Pagination exists because the whole value cannot be delivered at all; every page
+    therefore states `complete`, so a caller cannot mistake a first page for the whole
+    section, the whole body, or the whole history.
+    """
+    kb, conn, tid = evidence_board
+    body = "restriction-free filler " * 1000 + "LATE-RESTRICTION: never authorize writes"
+    conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (body, tid))
+    for seq in range(3):
+        kb._append_event(conn, tid, "note", {"seq": seq})
+    conn.commit()
+
+    token = _evidence({"task_id": tid, "section": "lifecycle"})["snapshot"]
+    args = {"task_id": tid, "snapshot": token, "chars": 1024, "limit": 1}
+
+    # A section that fits in one page is complete.
+    whole = {"task_id": tid, "snapshot": token, "limit": 200, "chars": 8192}
+    assert _evidence({**whole, "section": "lifecycle"})["complete"] is True
+    # A chunked body is explicitly incomplete until its final chunk.
+    page = _evidence({**args, "section": "task", "pointer": "/body"})
+    assert page["complete"] is False
+    assert page["chunk"]["next_offset"] is not None
+    pages = 1
+    while page["chunk"]["next_offset"] is not None:
+        page = _evidence(page["continuation"])
+        pages += 1
+    assert pages > 1
+    assert page["complete"] is True
+    assert page["chunk"]["next_offset"] is None
+    # History is explicitly incomplete while rows remain, and complete at the end.
+    history = _evidence({**args, "section": "events", "limit": 1})
+    assert (history["complete"], history["has_more"]) == (False, True)
+    while history["has_more"]:
+        history = _evidence(history["continuation"])
+    assert (history["complete"], history["next_after"]) == (True, None)
