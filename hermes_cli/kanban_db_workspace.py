@@ -767,6 +767,28 @@ def _git_head(path: Path) -> Optional[str]:
     return out
 
 
+def _ignored_paths_target_tracks(repo: Path, worktree: Path, head: str) -> list[str]:
+    """Present ignored files whose path the target commit tracks.
+
+    ``git status --porcelain --untracked-files=all`` cannot see them: an ignored file is
+    invisible, so a checkout reports "clean" and then overwrites it in place. Git only
+    guards *untracked* files, so this is the only backstop for an operator's ignored
+    notes when the candidate starts tracking the same path.
+    """
+    ignored = _git(
+        worktree, "ls-files", "--others", "--ignored", "--exclude-standard", "-z", timeout=60)
+    if ignored.returncode != 0:
+        return []
+    present = [path for path in (ignored.stdout or "").split("\0") if path]
+    if not present:
+        return []
+    tracked = _git(repo, "ls-tree", "-r", "--name-only", "-z", head, timeout=120)
+    if tracked.returncode != 0:
+        return []
+    tracked_paths = {path for path in (tracked.stdout or "").split("\0") if path}
+    return [path for path in present if path in tracked_paths]
+
+
 def _clean_tree(path: Path, label: str) -> None:
     """Refuse to move a checkout that holds anything git would have to overwrite.
 
@@ -912,6 +934,14 @@ def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Pa
             f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is not a linked worktree of "
             f"{repo_root}")
     _clean_tree(target, str(target))
+    # …and ignored files are not "local changes" to git, so a candidate that starts
+    # tracking one of them would overwrite it without any warning.
+    clobbered = _ignored_paths_target_tracks(repo_root, target, head)
+    if clobbered:
+        shown = ", ".join(clobbered[:3])
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} holds ignored file(s) the "
+            f"candidate {head} tracks ({shown}); moving it would overwrite them")
     current = _git_head(target)
     branch = _git_current_branch(target) or ""
     if current == head:

@@ -2882,7 +2882,10 @@ def _dispatch_lane_task(
             # head is derived here, once, and both workspace resolution and the
             # grant that follows see the same commit.
             candidate_head = _kbw.candidate_head_for_task(conn, spawn_task)
-            if spawn_task.workspace_kind == "worktree":
+            # A role card resolves as a worktree even from the scratch default, so the
+            # detached-checkout branch must key on the effective kind or the empty
+            # branch it reports is never captured (and ``wt/<id>`` gets invented later).
+            if _kbw.effective_workspace_kind(spawn_task) == "worktree":
                 workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(
                     spawn_task, board=board, candidate_head=candidate_head)
             else:
@@ -2915,6 +2918,29 @@ def _dispatch_lane_task(
                 _note_claim_hold(
                     conn, task_id, result, lane=lane, board=board, expected_task=preflight,
                 )
+                return False
+            # The claim fence covers THIS card; the head came from another card's
+            # handoff. A candidate rebound while the worker was prepared would leave the
+            # worker holding a checkout of the previous candidate, so the binding is
+            # re-read at the claim boundary and a mismatch releases the claim.
+            try:
+                bound_head = _kbw.candidate_head_for_task(conn, claimed)
+            except Exception as exc:
+                bound_head = None
+                candidate_problem = f"candidate is no longer resolvable: {exc}"
+            else:
+                candidate_problem = (
+                    None if bound_head == candidate_head
+                    else f"candidate moved from {candidate_head} to {bound_head} "
+                         "while the worker was prepared")
+            if candidate_problem is not None:
+                if launch.cancel:
+                    launch.cancel()
+                if _record_task_failure(
+                    conn, claimed.id, candidate_problem, outcome="spawn_failed",
+                    failure_limit=failure_limit, release_claim=True, end_run=True,
+                ):
+                    result.auto_blocked.append(claimed.id)
                 return False
         except WorkerLaunchInterrupted as exc:
             if launch is not None and launch.cancel:

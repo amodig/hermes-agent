@@ -508,10 +508,14 @@ def test_claim_cli_leaves_a_role_card_unclaimed_when_its_workspace_is_refused(
         pinned = kb.get_task(conn, review)
         assert pinned.status == "ready"
         assert _head(repo) == advanced
+        # A dirty operator checkout refuses too, with the handoff still valid: the
+        # same card, refused by workspace resolution rather than by the candidate.
+        (repo / "uncommitted.txt").write_text("dirty\n", encoding="utf-8")
 
     assert kc._cmd_claim(_claim_args(review)) != 0
     captured = capsys.readouterr()
-    assert "candidate_workspace_unavailable" in captured.out + captured.err
+    assert ("candidate_workspace_unavailable" in captured.out + captured.err
+            or "parent handoff cannot be started" in captured.out + captured.err)
     with kbc.connect() as conn:
         after = kb.get_task(conn, review)
     assert after.status == "ready"
@@ -804,3 +808,56 @@ def test_role_checkout_detached_at_an_unreachable_commit_is_refused(kanban_home,
         with pytest.raises(ValueError, match="would strand work"):
             kbw._resolve_worktree_workspace(kb.get_task(conn, review), candidate_head=candidate)
     assert _head(workspace) == stranded
+
+def test_role_worktree_refuses_to_overwrite_an_ignored_local_file(kanban_home, tmp_path):
+    """An ignored file is invisible to `git status`, so only this guard protects it.
+
+    Verified git behaviour: `git checkout --detach` onto a commit that starts tracking
+    an ignored path overwrites the local file and reports success, while
+    `status --porcelain --untracked-files=all` calls the checkout clean.
+    """
+    repo = _make_repo(tmp_path)
+    (repo / ".gitignore").write_text("notes.txt\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "ignore notes")
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+
+    with kbc.connect() as conn:
+        implementation = kb.create_task(
+            conn, title="implementation", assignee="coder", workspace_kind="worktree",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code", "review_mode": "separate_card", "reviewer": "reviewer",
+                "validation_required": True,
+            })
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        run = kb.claim_task(conn, implementation, claimer=kb._claimer_id())
+        assert run is not None
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=run.current_run_id,
+            summary="attempt",
+            metadata={"base_sha": base, "head_sha": candidate, "changed_files": []})
+        task = kb.get_task(conn, review)
+        workspace, _branch = kbw._resolve_worktree_workspace(
+            task, candidate_head=kbw.candidate_head_for_task(conn, task))
+        # Only now does a newer commit start tracking the path the .gitignore covers.
+        (repo / "notes.txt").write_text("tracked by the newer commit\n", encoding="utf-8")
+        _git(repo, "add", "-f", "notes.txt")
+        _git(repo, "commit", "-m", "track notes.txt")
+        later = _head(repo)
+
+    notes = workspace / "notes.txt"
+    notes.write_text("operator notes\n", encoding="utf-8")
+    # Git calls this clean: the file is ignored.
+    status = subprocess.run(
+        ["git", "-C", str(workspace), "status", "--porcelain", "--untracked-files=all"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert status.strip() == ""
+
+    with kbc.connect() as conn:
+        with pytest.raises(ValueError, match="ignored file"):
+            kbw._resolve_worktree_workspace(kb.get_task(conn, review), candidate_head=later)
+    assert notes.read_text(encoding="utf-8") == "operator notes\n"
+    assert _head(workspace) == candidate

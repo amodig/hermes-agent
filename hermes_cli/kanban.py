@@ -906,19 +906,34 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 def _claim_preflight(conn, task) -> Optional[str]:
     """Why this card cannot be claimed, without writing or materializing anything.
 
-    Mirrors the cheap half of ``claim_task``: status, an existing claim, and unmet
-    dependencies. A concurrent edit can still land after this check — the claim itself
-    is fenced to ``task`` — but the common refusals no longer create a workspace.
+    This mirrors ``claim_task``'s own admission so it never refuses something the claim
+    would accept: a dangling ``current_run_id`` is reclaimed rather than refused, an
+    actively forced promotion may proceed, and the parent-handoff and pull-request
+    guards count as refusals. Only a live claim lock disqualifies ownership. A
+    concurrent edit can still land after this check — the claim itself is fenced to
+    ``task`` — but the common refusals no longer create a workspace.
     """
+    from hermes_cli.kanban_db_lifecycle_claims import (
+        _forceable_dependency_override,
+        _forced_promotion_active,
+    )
+
     if task.status != "ready":
         return f"status={task.status} lock={task.claim_lock or '(none)'}"
-    if task.claim_lock or task.current_run_id:
-        return f"already claimed (lock={task.claim_lock or '(none)'})"
-    blockers = kb.evaluate_dependencies(conn, task.id)["blockers"]
-    if blockers:
+    if task.claim_lock:
+        return f"already claimed (lock={task.claim_lock})"
+    if kb._parent_handoff_start_error(conn, task.id) is not None:
+        return "the parent handoff cannot be started"
+    dependencies = kb.evaluate_dependencies(conn, task.id)
+    if not dependencies["satisfied"] and not (
+        _forced_promotion_active(conn, task.id)
+        and _forceable_dependency_override(dependencies)
+    ):
         detail = ", ".join(
-            f"{item['parent_id']} ({item['code']})" for item in blockers[:3])
+            f"{item['parent_id']} ({item['code']})" for item in dependencies["blockers"][:3])
         return f"unsatisfied dependencies: {detail}"
+    if kb._active_pr_guard_reason(conn, task.id) is not None:
+        return "an active pull request needs acknowledgement"
     return None
 
 
