@@ -2998,7 +2998,7 @@ def _dispatch_lane_task(
                 resolved_branch_name if resolved_branch_name is not None
                 else (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
             )
-        _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        _kbw._maybe_emit_scratch_tip(conn, claimed.id, workspace_kind)
         if lane == "review":
             claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
         if launch is None:
