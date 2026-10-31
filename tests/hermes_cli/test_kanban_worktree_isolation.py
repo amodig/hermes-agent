@@ -1119,3 +1119,48 @@ def test_cleanup_preserves_a_branch_shadowed_by_a_same_named_tag(kanban_home, tm
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     assert survives, "the branch tip is not contained by any remote ref, so it must survive"
+
+def test_discard_refuses_after_another_claim_cycle(kanban_home, tmp_path):
+    """`version` alone cannot prove ownership: claim/release leaves it unchanged.
+
+    A claim opens a run with its own pid and start time, and a release or reclaim leaves
+    those behind — so any cycle moves the ownership snapshot even when the row reads
+    ready, unlocked and at the same version.
+    """
+    from hermes_cli import kanban as kc
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+
+    with kbc.connect() as conn:
+        implementation = kb.create_task(
+            conn, title="implementation", assignee="coder", workspace_kind="worktree",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code", "review_mode": "separate_card", "reviewer": "reviewer",
+                "validation_required": True,
+            })
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        run = kb.claim_task(conn, implementation, claimer=kb._claimer_id())
+        assert run is not None
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=run.current_run_id,
+            summary="attempt",
+            metadata={"base_sha": base, "head_sha": candidate, "changed_files": []})
+        task = kb.get_task(conn, review)
+        path, _branch = kbw._resolve_worktree_workspace(
+            task, candidate_head=kbw.candidate_head_for_task(conn, task))
+        # Another claimer ran this card and released it: same version, ready, unlocked,
+        # but the run's pid and start time are now recorded.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = 1234, worker_pid = 4242 WHERE id = ?", (review,))
+        current = kb.get_task(conn, review)
+        # Same version, same status, no lock — only the run's pid/start time differ.
+        assert current.version == task.version
+        assert current.status == task.status
+        assert current.claim_lock is None
+
+        assert kc._discard_if_still_ours(conn, task, path, candidate) is False
+    assert path.exists()

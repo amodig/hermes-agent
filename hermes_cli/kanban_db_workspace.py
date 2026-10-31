@@ -804,16 +804,31 @@ def _ignored_paths_target_tracks(repo: Path, worktree: Path, head: str) -> list[
     guards *untracked* files, so this is the only backstop for an operator's ignored
     notes when the candidate starts tracking the same path.
     """
-    # ``--directory`` also reports ignored directories, including empty ones, which a
-    # plain listing omits even though a checkout or removal deletes them.
-    ignored = _git(
+    # Two listings on purpose. Per-file first: ``--directory`` collapses a nonempty
+    # ignored directory to ``dir/``, losing which children exist, and a tracked sibling
+    # (``cache/new`` beside an ignored ``cache/local``) is not a conflict. The second
+    # listing adds directories that are *empty*, which the first cannot report at all
+    # even though a checkout or removal deletes them.
+    files = _git(
+        worktree, "ls-files", "--others", "--ignored", "--exclude-standard", "-z", timeout=60)
+    if files.returncode != 0:
+        return []
+    directories = _git(
         worktree, "ls-files", "--others", "--ignored", "--exclude-standard",
         "--directory", "-z", timeout=60,
     )
-    if ignored.returncode != 0:
+    if directories.returncode != 0:
         return []
-    present = [path for path in (ignored.stdout or "").split("\0") if path]
-    if not present:
+    present = [path for path in (files.stdout or "").split("\0") if path]
+    empty_dirs = []
+    known = set(present)
+    for entry in (directories.stdout or "").split("\0"):
+        if not entry or not entry.endswith("/"):
+            continue
+        bare = entry.rstrip("/")
+        if bare not in known:
+            empty_dirs.append(bare)
+    if not present and not empty_dirs:
         return []
     tracked = _git(repo, "ls-tree", "-r", "--name-only", "-z", head, timeout=120)
     if tracked.returncode != 0:
@@ -824,20 +839,31 @@ def _ignored_paths_target_tracks(repo: Path, worktree: Path, head: str) -> list[
     paths = sorted({path for path in (tracked.stdout or "").split("\0") if path})
     if not paths:
         return []
+    def ancestor_tracked(key):
+        parent = key
+        while "/" in parent:
+            parent = parent.rsplit("/", 1)[0]
+            index = bisect.bisect_left(paths, parent)
+            if index < len(paths) and paths[index] == parent:
+                return True
+        return False
+
+    def exact_or_tracked_child(key):
+        index = bisect.bisect_left(paths, key)
+        return (index < len(paths) and paths[index] == key) or (
+            index < len(paths) and paths[index].startswith(key + "/"))
+
     hits = []
     for entry in present:
-        key = entry.rstrip("/")
-        # A file/directory conflict overwrites too: ignored dir ``cache/local`` versus a
-        # tracked file ``cache``, or an ignored file ``cache`` versus ``cache/item``.
-        index = bisect.bisect_left(paths, key)
-        conflict = (index < len(paths) and paths[index] == key) or (
-            index < len(paths) and paths[index].startswith(key + "/"))
-        parent = key
-        while not conflict and "/" in parent:
-            parent = parent.rsplit("/", 1)[0]
-            ancestor = bisect.bisect_left(paths, parent)
-            conflict = ancestor < len(paths) and paths[ancestor] == parent
-        if conflict:
+        # A file can be replaced by a tracked file, a tracked child, or a tracked
+        # ancestor (its directory path became a file).
+        if exact_or_tracked_child(entry) or ancestor_tracked(entry):
+            hits.append(entry)
+    for entry in empty_dirs:
+        # An empty directory is only at risk when a tracked file takes its own path;
+        # tracked children would simply be added inside it.
+        index = bisect.bisect_left(paths, entry)
+        if index < len(paths) and paths[index] == entry:
             hits.append(entry)
     return hits
 

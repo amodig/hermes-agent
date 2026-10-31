@@ -920,14 +920,28 @@ def _discard_if_still_ours(conn, pending, workspace, prepared_head: str) -> bool
         if not acquired or not _claim_connection_is_current(conn):
             return False
         current = kb.get_task(conn, pending.id)
-        if (
-            current is None
-            or current.version != pending.version
-            or current.status == "running"
-            or current.claim_lock
-        ):
+        if current is None or _claim_ownership(current) != _claim_ownership(pending):
+            # Any claim cycle moves at least one of these — a run is opened with the
+            # claim's pid and start time, and releasing or reclaiming it leaves them
+            # behind. ``version`` alone does not change on claim/release, so it cannot
+            # prove the checkout is still ours.
+            return False
+        if current.status == "running" or current.claim_lock:
             return False
         return kbw.discard_prepared_worktree(pending, workspace, prepared_head)
+
+
+def _claim_ownership(task) -> tuple:
+    """The fields a claim cycle changes, used to prove nobody else has run this card."""
+    return (
+        task.version,
+        task.status,
+        task.claim_lock or "",
+        task.current_run_id or 0,
+        task.worker_pid or 0,
+        task.started_at or 0,
+        task.assignee or "",
+    )
 
 
 def _claim_preflight(conn, task) -> Optional[str]:
