@@ -730,3 +730,77 @@ def test_claim_refuses_an_unclaimable_card_before_materializing_anything(
         after = kb.get_task(conn, review)
     assert after.claim_lock == "someone-else"
     assert after.workspace_path == str(repo)
+
+def test_clean_role_checkout_follows_a_new_candidate_after_rework(kanban_home, tmp_path):
+    """REQUEST_CHANGES + rework leaves the review worktree on the rejected candidate.
+
+    Refusing to move a clean, detached checkout there would make the second review
+    undispatchable — every spawn failing on the relic of the first. The old candidate
+    is contained in the new one, so following it strands nothing.
+    """
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    first = _commit(repo, "candidate.txt", "candidate\n")
+
+    with kbc.connect() as conn:
+        implementation = kb.create_task(
+            conn, title="implementation", assignee="coder", workspace_kind="worktree",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code", "review_mode": "separate_card", "reviewer": "reviewer",
+                "validation_required": True,
+            })
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        run = kb.claim_task(conn, implementation, claimer=kb._claimer_id())
+        assert run is not None
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=run.current_run_id,
+            summary="first attempt",
+            metadata={"base_sha": base, "head_sha": first, "changed_files": []})
+        task = kb.get_task(conn, review)
+        workspace, _branch = kbw._resolve_worktree_workspace(
+            task, candidate_head=kbw.candidate_head_for_task(conn, task))
+    assert _head(workspace) == first
+
+    # The implementer answers REQUEST_CHANGES with a second candidate on top.
+    second = _commit(repo, "fix.txt", "fixed\n")
+    with kbc.connect() as conn:
+        resolved = kbw._resolve_worktree_workspace(
+            kb.get_task(conn, review), candidate_head=second)
+    assert resolved[0] == workspace
+    assert _head(workspace) == second
+
+
+def test_role_checkout_detached_at_an_unreachable_commit_is_refused(kanban_home, tmp_path):
+    """Moving a checkout whose commits nothing reaches would lose that work."""
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+
+    with kbc.connect() as conn:
+        implementation = kb.create_task(
+            conn, title="implementation", assignee="coder", workspace_kind="worktree",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code", "review_mode": "separate_card", "reviewer": "reviewer",
+                "validation_required": True,
+            })
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        run = kb.claim_task(conn, implementation, claimer=kb._claimer_id())
+        assert run is not None
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=run.current_run_id,
+            summary="attempt",
+            metadata={"base_sha": base, "head_sha": candidate, "changed_files": []})
+        task = kb.get_task(conn, review)
+        workspace, _branch = kbw._resolve_worktree_workspace(
+            task, candidate_head=kbw.candidate_head_for_task(conn, task))
+
+    # An empty detached commit inside the role checkout is reachable from no ref.
+    _git(workspace, "commit", "--allow-empty", "-m", "unreferenced work")
+    stranded = _head(workspace)
+    assert stranded != candidate
+    with kbc.connect() as conn:
+        with pytest.raises(ValueError, match="would strand work"):
+            kbw._resolve_worktree_workspace(kb.get_task(conn, review), candidate_head=candidate)
+    assert _head(workspace) == stranded

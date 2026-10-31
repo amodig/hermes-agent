@@ -855,6 +855,20 @@ def _role_repo_root(task: Task, board: Optional[str]) -> Path:
     return repo_root
 
 
+def _is_ancestor(repo: Path, commit: str, head: str) -> bool:
+    if not commit:
+        return False
+    return _git(repo, "merge-base", "--is-ancestor", commit, head, timeout=60).returncode == 0
+
+
+def _commit_referenced(repo: Path, commit: str) -> bool:
+    """True when some ref still reaches ``commit``, so moving a checkout loses nothing."""
+    if not commit:
+        return False
+    result = _git(repo, "for-each-ref", "--count=1", "--contains", commit, timeout=60)
+    return result.returncode == 0 and bool((result.stdout or "").strip())
+
+
 def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Path, str]:
     """Materialize this role card's own worktree at ``candidate_head``.
 
@@ -903,10 +917,24 @@ def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Pa
     if current == head:
         return target.resolve(strict=False), branch
     if not branch:
-        raise ValueError(
-            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is detached at "
-            f"{current or 'an unknown commit'}, not the candidate {head}; moving it would "
-            "strand work that is reachable from no branch")
+        # A detached checkout is the normal shape for a role worktree, and after a
+        # rework its old candidate is simply not the new one. Follow the new candidate
+        # when moving cannot strand anything — the old commit is contained in the new
+        # candidate, or some ref still reaches it — and refuse otherwise.
+        if not (_is_ancestor(target, current, head) or _commit_referenced(target, current)):
+            raise ValueError(
+                f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is detached at "
+                f"{current or 'an unknown commit'}, not the candidate {head}, and nothing "
+                "reaches that commit; moving it would strand work")
+        result = _git(target, "checkout", "--detach", head, timeout=120)
+        if result.returncode != 0:
+            raise ValueError(
+                f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: could not move {target} onto {head}: "
+                f"{(result.stderr or result.stdout or '').strip()[:300]}")
+        if _git_head(target) != head:
+            raise ValueError(
+                f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} did not land on {head}")
+        return target.resolve(strict=False), ""
     # Detaching leaves the branch ref behind, and the completion cleanup deletes a
     # ``wt/<id>`` branch once the *detached* HEAD is clean and pushed. So only move a
     # branch whose tip the candidate already contains: anything else is unique work.
