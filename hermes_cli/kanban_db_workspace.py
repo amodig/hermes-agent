@@ -1127,9 +1127,17 @@ def effective_workspace_kind(task: Task) -> str:
 def set_workspace_path(
     conn: sqlite3.Connection, task_id: str, path: Path | str, *, kind: Optional[str] = None,
 ) -> None:
-    _set_task_column(conn, task_id, "workspace_path", str(path))
-    if kind is not None:
-        _set_task_column(conn, task_id, "workspace_kind", kind)
+    """Persist the resolved workspace. Path and kind go in one transaction: a crash
+    between two writes would leave a worktree path recorded as ``scratch``, which is
+    exactly the pair completion cleanup mis-branches on."""
+    if kind is None:
+        _set_task_column(conn, task_id, "workspace_path", str(path))
+        return
+    with _kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ?, workspace_kind = ? WHERE id = ?",
+            (str(path), kind, task_id),
+        )
 
 
 def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str) -> None:
