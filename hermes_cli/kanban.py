@@ -903,13 +903,16 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
                       f"Unlinked {args.parent_id} -> {args.child_id}")
 
 
-def _discard_if_still_ours(conn, pending, workspace, prepared_head: str) -> bool:
+def _discard_if_still_ours(
+    conn, pending, workspace, prepared_head: str, prepared_run_head: int,
+) -> bool:
     """Remove the prepared checkout only while this attempt provably still owns the card.
 
-    The removal must be serialized against the claim itself, so it runs under the shared
-    dispatch-admission fence with a re-read: unchanged version, not running, no claim
-    lock. Anything else — a winner's worker, a released claim still finalizing, a moved
-    row — preserves the worktree.
+    The removal is serialized against the claim itself under the shared
+    dispatch-admission fence, with a re-read that must show an unchanged ownership tuple
+    AND an unchanged run ledger. The ledger is what makes it a proof: a claim/release
+    cycle rewinds every ``tasks`` column the tuple covers, so only ``task_runs``
+    remembers that an attempt happened. Anything else preserves the worktree.
     """
     from hermes_cli.kanban_db_lifecycle_claims import (
         _claim_connection_is_current,
@@ -927,6 +930,8 @@ def _discard_if_still_ours(conn, pending, workspace, prepared_head: str) -> bool
             # prove the checkout is still ours.
             return False
         if current.status == "running" or current.claim_lock:
+            return False
+        if kb._run_ledger_head(conn, pending.id) != prepared_run_head:
             return False
         return kbw.discard_prepared_worktree(pending, workspace, prepared_head)
 
@@ -995,6 +1000,8 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             #    detached role checkout can refuse the retry against a newer candidate.
             candidate_head = (
                 kbw.candidate_head_for_task(conn, pending) if pending is not None else None)
+            prepared_run_head = (
+                kb._run_ledger_head(conn, pending.id) if pending is not None else 0)
             blocked = _claim_preflight(conn, pending) if pending is not None else None
             if blocked:
                 return _err(f"cannot claim {args.task_id}: {blocked}")
@@ -1027,7 +1034,7 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             # remove only an unchanged row that nobody owns.
             if workspace is not None and pending is not None and resolved_kind == "worktree":
                 _discard_if_still_ours(
-                    conn, pending, workspace, candidate_head or "")
+                    conn, pending, workspace, candidate_head or "", prepared_run_head)
             if existing is None:
                 return _err(f"no such task: {args.task_id}")
             return _err(f"cannot claim {args.task_id}: status={existing.status} "

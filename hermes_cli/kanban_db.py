@@ -2358,6 +2358,21 @@ def _append_event(
     )
 
 
+def _run_ledger_head(conn: sqlite3.Connection, task_id: str) -> int:
+    """Highest run id this task has ever opened, 0 when never claimed.
+
+    Monotonic on purpose: a claim inserts a ``task_runs`` row (AUTOINCREMENT, ids are
+    never reused), while the ``tasks`` columns a cycle touches are rewound by the release
+    — ``claim_lock``, ``current_run_id`` and ``worker_pid`` return to NULL and
+    ``started_at`` only distinguishes "never claimed" (COALESCE). So this ledger is the
+    only cheap evidence that no attempt has happened since a snapshot was taken.
+    """
+    row = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM task_runs WHERE task_id = ?", (task_id,),
+    ).fetchone()
+    return int(row[0] or 0) if row is not None else 0
+
+
 def _end_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,

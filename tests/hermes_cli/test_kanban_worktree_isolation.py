@@ -1120,16 +1120,81 @@ def test_cleanup_preserves_a_branch_shadowed_by_a_same_named_tag(kanban_home, tm
     ).stdout.strip()
     assert survives, "the branch tip is not contained by any remote ref, so it must survive"
 
-def test_discard_refuses_after_another_claim_cycle(kanban_home, tmp_path):
-    """`version` alone cannot prove ownership: claim/release leaves it unchanged.
+def test_discard_refuses_after_a_real_claim_release_cycle(kanban_home, tmp_path):
+    """A claim/release rewinds every task column, so only the run ledger remembers it.
 
-    A claim opens a run with its own pid and start time, and a release or reclaim leaves
-    those behind — so any cycle moves the ownership snapshot even when the row reads
-    ready, unlocked and at the same version.
+    Produced here by a real cycle (claim, then the dispatcher's release path) rather than
+    an edited row: `claim_lock`, `current_run_id` and `worker_pid` all return to NULL and
+    `started_at` keeps the first claim's value, so the ownership tuple compares equal.
     """
     from hermes_cli import kanban as kc
+    from hermes_cli.kanban_db_dispatch import _record_task_failure
 
     repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+
+    with kbc.connect() as conn:
+        implementation = kb.create_task(
+            conn, title="implementation", assignee="coder", workspace_kind="worktree",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code", "review_mode": "separate_card", "reviewer": "reviewer",
+                "validation_required": True,
+            })
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        run = kb.claim_task(conn, implementation, claimer=kb._claimer_id())
+        assert run is not None
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=run.current_run_id,
+            summary="attempt",
+            metadata={"base_sha": base, "head_sha": candidate, "changed_files": []})
+        pending = kb.get_task(conn, review)
+        path, _branch = kbw._resolve_worktree_workspace(
+            pending, candidate_head=kbw.candidate_head_for_task(conn, pending))
+        prepared_head = kbw.candidate_head_for_task(conn, pending)
+        prepared_run_head = kb._run_ledger_head(conn, review)
+
+        # A real cycle: the row is taken exactly as a claim takes it (a running row plus a
+        # new run), then the dispatcher's release path ends it.
+        with kb.write_txn(conn):
+            run_id = conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at) "
+                "VALUES (?, 'rival', 'running', 1)", (review,),
+            ).lastrowid
+            conn.execute(
+                "UPDATE tasks SET status = 'running', claim_lock = 'rival-lock', "
+                "claim_expires = 1, current_run_id = ?, worker_pid = 999999, "
+                "worker_started_at = 1 WHERE id = ?", (run_id, review))
+        _record_task_failure(
+            conn, review, "spawn failed", outcome="spawn_failed",
+            release_claim=True, end_run=True,
+        )
+        # Restore only the status the retry path chose; the release itself nulled the
+        # lock/run/pid, which is the state a loser would read.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, current_run_id = NULL, "
+                "worker_pid = NULL, consecutive_failures = 0, last_failure_error = NULL "
+                "WHERE id = ?", (pending.status, review))
+        after = kb.get_task(conn, review)
+
+        assert kc._claim_ownership(after) == kc._claim_ownership(pending), (
+            "a released cycle must be invisible to the task columns")
+        assert kb._run_ledger_head(conn, review) > prepared_run_head
+
+        assert kc._discard_if_still_ours(conn, pending, path, prepared_head, prepared_run_head) is False
+    assert path.exists()
+
+
+def test_discard_preserves_a_worktree_holding_an_ignored_empty_directory(
+    kanban_home, tmp_path,
+):
+    """A plain `ls-files` listing omits ignored directories, and removal deletes them."""
+    repo = _make_repo(tmp_path)
+    (repo / ".gitignore").write_text("empty/\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "ignore empty dir")
     base = _head(repo)
     candidate = _commit(repo, "candidate.txt", "candidate\n")
 
@@ -1151,16 +1216,36 @@ def test_discard_refuses_after_another_claim_cycle(kanban_home, tmp_path):
         task = kb.get_task(conn, review)
         path, _branch = kbw._resolve_worktree_workspace(
             task, candidate_head=kbw.candidate_head_for_task(conn, task))
-        # Another claimer ran this card and released it: same version, ready, unlocked,
-        # but the run's pid and start time are now recorded.
-        with kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET started_at = 1234, worker_pid = 4242 WHERE id = ?", (review,))
-        current = kb.get_task(conn, review)
-        # Same version, same status, no lock — only the run's pid/start time differ.
-        assert current.version == task.version
-        assert current.status == task.status
-        assert current.claim_lock is None
+        (path / "empty").mkdir()
+        assert kbw.discard_prepared_worktree(task, path, candidate) is False
+    assert (path / "empty").is_dir()
 
-        assert kc._discard_if_still_ours(conn, task, path, candidate) is False
-    assert path.exists()
+
+def test_cleanup_preserves_a_branch_shadowed_by_a_same_named_tag(kanban_home, tmp_path):
+    """`rev-parse --verify <name>` picks the tag and warns; the branch tip is what matters."""
+    from hermes_cli import kanban_db_workspace as workspace_module
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+    _git(repo, "branch", "wt/shadowed", base)
+    _git(repo, "tag", "wt/shadowed", candidate)     # same short name, newer tip
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="worktree task", assignee="worker", workspace_kind="worktree",
+            workspace_path=str(repo))
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (tid,))
+    worktree = repo / ".worktrees" / tid
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    _git(repo, "worktree", "add", "-q", "--detach", str(worktree), candidate)
+
+    workspace_module._cleanup_worktree_workspace(tid, str(worktree), "wt/shadowed")
+
+    survives = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--list", "wt/shadowed"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert survives, "the branch tip is not contained by any remote ref, so it must survive"
+
