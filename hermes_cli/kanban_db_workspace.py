@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import time
 import unicodedata
+import bisect
 from pathlib import Path
 from typing import Optional
 from typing import TYPE_CHECKING
@@ -478,6 +479,10 @@ def _cleanup_worktree_workspace(
                 return
         # No --force: git's own dirty guard re-verifies at removal time, so if
         # the tree became dirty since our check (TOCTOU) removal fails safe.
+        # Which branch the checkout is really on, before it disappears: an empty recorded
+        # branch is only the legacy auto-generated ``wt/<id>`` when the worktree was
+        # actually sitting on it. A detached role checkout has no branch to delete.
+        current_branch = _git_current_branch(wp) or ""
         release_lsp_clients(str(worktree_path))
         result = _git(repo_root, "worktree", "remove", str(wp), timeout=60)
         if result.returncode != 0:
@@ -492,7 +497,13 @@ def _cleanup_worktree_workspace(
             )
             return
         _kb._log.debug("Removed worktree workspace: %s", wp)
-        branch = (branch_name or "").strip() or f"wt/{task_id}"
+        # Only a branch this task recorded — or the legacy auto-generated name its
+        # worktree was demonstrably checked out on — may be deleted. Inventing
+        # ``wt/<id>`` for a detached role checkout would force-delete a same-named
+        # branch the card never used.
+        branch = (branch_name or "").strip()
+        if not branch and current_branch == f"wt/{task_id}":
+            branch = current_branch
         if branch.startswith("wt/"):
             _git(repo_root, "branch", "-D", branch, timeout=30)
     except Exception:
@@ -785,8 +796,27 @@ def _ignored_paths_target_tracks(repo: Path, worktree: Path, head: str) -> list[
     tracked = _git(repo, "ls-tree", "-r", "--name-only", "-z", head, timeout=120)
     if tracked.returncode != 0:
         return []
-    tracked_paths = {path for path in (tracked.stdout or "").split("\0") if path}
-    return [path for path in present if path in tracked_paths]
+    paths = sorted({path.casefold() for path in (tracked.stdout or "").split("\0") if path})
+    if not paths:
+        return []
+    hits = []
+    for entry in present:
+        key = entry.casefold()
+        # A file/directory conflict overwrites too (ignored dir ``cache/local`` versus a
+        # tracked file ``cache``, or an ignored file ``cache`` versus ``cache/item``), and
+        # a case-insensitive filesystem makes ``Notes.txt`` and ``notes.txt`` the same
+        # path. Compare casefolded, both as an exact match and across that boundary.
+        index = bisect.bisect_left(paths, key)
+        conflict = (index < len(paths) and paths[index] == key) or (
+            index < len(paths) and paths[index].startswith(key + "/"))
+        parent = key
+        while not conflict and "/" in parent:
+            parent = parent.rsplit("/", 1)[0]
+            ancestor = bisect.bisect_left(paths, parent)
+            conflict = ancestor < len(paths) and paths[ancestor] == parent
+        if conflict:
+            hits.append(entry)
+    return hits
 
 
 def _clean_tree(path: Path, label: str) -> None:
@@ -956,7 +986,8 @@ def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Pa
                 f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is detached at "
                 f"{current or 'an unknown commit'}, not the candidate {head}, and nothing "
                 "reaches that commit; moving it would strand work")
-        result = _git(target, "checkout", "--detach", head, timeout=120)
+        result = _git(
+            target, "checkout", "--no-overwrite-ignore", "--detach", head, timeout=120)
         if result.returncode != 0:
             raise ValueError(
                 f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: could not move {target} onto {head}: "
@@ -973,7 +1004,8 @@ def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Pa
             f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is checked out on {branch} at "
             f"{current}, which the candidate {head} does not contain; detaching would "
             "strand that work")
-    result = _git(target, "checkout", "--detach", head, timeout=120)
+    result = _git(
+            target, "checkout", "--no-overwrite-ignore", "--detach", head, timeout=120)
     if result.returncode != 0:
         raise ValueError(
             f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: could not move {target} onto {head}: "
@@ -1139,6 +1171,35 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None,
 def _set_task_column(conn: sqlite3.Connection, task_id: str, column: str, value: str) -> None:
     with _kb.write_txn(conn):
         conn.execute(f"UPDATE tasks SET {column} = ? WHERE id = ?", (value, task_id))
+
+
+def discard_prepared_worktree(
+    task: Task, path: Path | str, prepared_head: str, *, board: Optional[str] = None,
+) -> bool:
+    """Remove a worktree prepared for a claim that was then refused.
+
+    Only when nothing can be lost: this card's canonical linked worktree, clean by git's
+    own check, sitting exactly at the head the attempt prepared, free of ignored files
+    that head tracks. Any doubt preserves it, and removal never deletes a branch. Without
+    this, a refused attempt leaves a checkout at a candidate a retry may be unable to move
+    away from, poisoning every later dispatch.
+    """
+    try:
+        repo_root = _role_repo_root(task, board)
+        target = repo_root / ".worktrees" / task.id
+        candidate = Path(path).expanduser()
+        if _path_key(candidate.resolve(strict=False)) != _path_key(target.resolve(strict=False)):
+            return False
+        if not target.is_dir() or not _is_linked_worktree_checkout(target):
+            return False
+        if _git_head(target) != prepared_head:
+            return False
+        _clean_tree(target, str(target))
+        if _ignored_paths_target_tracks(repo_root, target, prepared_head):
+            return False
+        return _git(repo_root, "worktree", "remove", str(target), timeout=60).returncode == 0
+    except Exception:
+        return False
 
 
 def effective_workspace_kind(task: Task) -> str:

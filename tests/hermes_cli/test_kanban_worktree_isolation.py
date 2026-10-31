@@ -861,3 +861,128 @@ def test_role_worktree_refuses_to_overwrite_an_ignored_local_file(kanban_home, t
             kbw._resolve_worktree_workspace(kb.get_task(conn, review), candidate_head=later)
     assert notes.read_text(encoding="utf-8") == "operator notes\n"
     assert _head(workspace) == candidate
+
+def test_ignored_directory_that_the_candidate_turns_into_a_file_is_refused(
+    kanban_home, tmp_path,
+):
+    """A file/directory conflict is overwritten too, and exact-path equality misses it."""
+    repo = _make_repo(tmp_path)
+    (repo / ".gitignore").write_text("cache\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "ignore cache")
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+
+    with kbc.connect() as conn:
+        implementation = kb.create_task(
+            conn, title="implementation", assignee="coder", workspace_kind="worktree",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code", "review_mode": "separate_card", "reviewer": "reviewer",
+                "validation_required": True,
+            })
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        run = kb.claim_task(conn, implementation, claimer=kb._claimer_id())
+        assert run is not None
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=run.current_run_id,
+            summary="attempt",
+            metadata={"base_sha": base, "head_sha": candidate, "changed_files": []})
+        task = kb.get_task(conn, review)
+        workspace, _branch = kbw._resolve_worktree_workspace(
+            task, candidate_head=kbw.candidate_head_for_task(conn, task))
+        # The candidate turns the ignored directory's path into a tracked file.
+        (repo / "cache").write_text("now a file\n", encoding="utf-8")
+        _git(repo, "add", "-f", "cache")
+        _git(repo, "commit", "-m", "cache is a file now")
+        later = _head(repo)
+
+    (workspace / "cache" / "local").mkdir(parents=True)
+    (workspace / "cache" / "local" / "payload.bin").write_bytes(b"operator data\n")
+
+    with kbc.connect() as conn:
+        with pytest.raises(ValueError, match="ignored file"):
+            kbw._resolve_worktree_workspace(kb.get_task(conn, review), candidate_head=later)
+    assert (workspace / "cache" / "local" / "payload.bin").read_bytes() == b"operator data\n"
+    assert _head(workspace) == candidate
+
+
+def test_cleanup_never_deletes_a_branch_the_role_never_recorded(kanban_home, tmp_path):
+    """An empty recorded branch is the truth for a detached checkout, not ``wt/<id>``."""
+    from hermes_cli import kanban_db_workspace as workspace_module
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+
+    with kbc.connect() as conn:
+        implementation = kb.create_task(
+            conn, title="implementation", assignee="coder", workspace_kind="worktree",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code", "review_mode": "separate_card", "reviewer": "reviewer",
+                "validation_required": True,
+            })
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        run = kb.claim_task(conn, implementation, claimer=kb._claimer_id())
+        assert run is not None
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=run.current_run_id,
+            summary="attempt",
+            metadata={"base_sha": base, "head_sha": candidate, "changed_files": []})
+        task = kb.get_task(conn, review)
+        path, branch = kbw._resolve_worktree_workspace(
+            task, candidate_head=kbw.candidate_head_for_task(conn, task))
+        assert branch == ""
+
+    # A same-named branch with unique work exists, and this card never used it.
+    _git(repo, "branch", f"wt/{review}", base)
+    with kbc.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (review,))
+        workspace_module._cleanup_worktree_workspace(review, str(path), branch)
+
+    survivors = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--list", f"wt/{review}"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert survivors, "a branch this card never recorded must survive cleanup"
+
+
+def test_discard_prepared_worktree_only_removes_a_clean_checkout(
+    kanban_home, tmp_path,
+):
+    """A refused claim discards what it created, never operator work."""
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+
+    with kbc.connect() as conn:
+        implementation = kb.create_task(
+            conn, title="implementation", assignee="coder", workspace_kind="worktree",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code", "review_mode": "separate_card", "reviewer": "reviewer",
+                "validation_required": True,
+            })
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        run = kb.claim_task(conn, implementation, claimer=kb._claimer_id())
+        assert run is not None
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=run.current_run_id,
+            summary="attempt",
+            metadata={"base_sha": base, "head_sha": candidate, "changed_files": []})
+        task = kb.get_task(conn, review)
+        path, _branch = kbw._resolve_worktree_workspace(
+            task, candidate_head=kbw.candidate_head_for_task(conn, task))
+
+        # A clean checkout at the prepared head is discarded…
+        assert kbw.discard_prepared_worktree(task, path, candidate) is True
+        assert not path.exists()
+
+        # …and anything else is preserved: here, a checkout with local edits.
+        path, _branch = kbw._resolve_worktree_workspace(
+            task, candidate_head=kbw.candidate_head_for_task(conn, task))
+        (path / "app.py").write_text("dirty\n", encoding="utf-8")
+        assert kbw.discard_prepared_worktree(task, path, candidate) is False
+        assert path.exists()

@@ -957,9 +957,19 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             blocked = _claim_preflight(conn, pending) if pending is not None else None
             if blocked:
                 return _err(f"cannot claim {args.task_id}: {blocked}")
-            workspace = (
-                kbw.resolve_workspace(pending, candidate_head=candidate_head)
-                if pending is not None else None)
+            resolved_kind = (
+                kbw.effective_workspace_kind(pending) if pending is not None else "scratch")
+            if pending is None:
+                workspace, resolved_branch = None, None
+            elif resolved_kind == "worktree":
+                # The branch is part of the truth: a detached role checkout reports "",
+                # and completion cleanup deletes only a branch the card recorded.
+                workspace, resolved_branch = kbw._resolve_worktree_workspace(
+                    pending, candidate_head=candidate_head)
+            else:
+                workspace = kbw.resolve_workspace(
+                    pending, candidate_head=candidate_head)
+                resolved_branch = None
         except ValueError as exc:
             return _err(f"kanban: {exc}")
         # Fence the claim to the row this workspace was derived from: an operator edit
@@ -969,6 +979,10 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             conn, args.task_id, ttl_seconds=args.ttl, expected_task=pending)
         if task is None:
             existing = kb.get_task(conn, args.task_id)
+            # A refusal after materialization must not leave the checkout behind: a clean
+            # prepared worktree is discarded so a retry is not blocked by its relic.
+            if workspace is not None and pending is not None and resolved_kind == "worktree":
+                kbw.discard_prepared_worktree(pending, workspace, candidate_head or "")
             if existing is None:
                 return _err(f"no such task: {args.task_id}")
             return _err(f"cannot claim {args.task_id}: status={existing.status} "
@@ -977,11 +991,12 @@ def _cmd_claim(args: argparse.Namespace) -> int:
         # A successful claim proves the row still existed, so resolution above ran.
         # Persist the kind it was resolved as: a role card converted from the scratch
         # default is a worktree now, and completion cleanup follows the recorded kind.
-        resolved_kind = kbw.effective_workspace_kind(pending)
         kbw.set_workspace_path(
             conn, task.id, str(workspace),
             kind=resolved_kind if resolved_kind != (pending.workspace_kind or "scratch") else None,
         )
+        if resolved_branch is not None:
+            kbw.set_branch_name(conn, task.id, resolved_branch)
     print(f"Claimed {task.id}\nWorkspace: {workspace}")
     return 0
 

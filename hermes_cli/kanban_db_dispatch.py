@@ -2936,6 +2936,12 @@ def _dispatch_lane_task(
             if candidate_problem is not None:
                 if launch.cancel:
                     launch.cancel()
+                # The prepared checkout is at the previous candidate; a retry may be
+                # unable to move away from it, so discard it when nothing can be lost.
+                if workspace is not None:
+                    _kbw.discard_prepared_worktree(
+                        claimed, workspace, candidate_head or "", board=board,
+                    )
                 if _record_task_failure(
                     conn, claimed.id, candidate_problem, outcome="spawn_failed",
                     failure_limit=failure_limit, release_claim=True, end_run=True,
