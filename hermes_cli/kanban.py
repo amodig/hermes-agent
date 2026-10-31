@@ -903,6 +903,33 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
                       f"Unlinked {args.parent_id} -> {args.child_id}")
 
 
+def _discard_if_still_ours(conn, pending, workspace, prepared_head: str) -> bool:
+    """Remove the prepared checkout only while this attempt provably still owns the card.
+
+    The removal must be serialized against the claim itself, so it runs under the shared
+    dispatch-admission fence with a re-read: unchanged version, not running, no claim
+    lock. Anything else — a winner's worker, a released claim still finalizing, a moved
+    row — preserves the worktree.
+    """
+    from hermes_cli.kanban_db_lifecycle_claims import (
+        _claim_connection_is_current,
+        _dispatch_admission_lock,
+    )
+
+    with _dispatch_admission_lock(allow_nested=True) as acquired:
+        if not acquired or not _claim_connection_is_current(conn):
+            return False
+        current = kb.get_task(conn, pending.id)
+        if (
+            current is None
+            or current.version != pending.version
+            or current.status == "running"
+            or current.claim_lock
+        ):
+            return False
+        return kbw.discard_prepared_worktree(pending, workspace, prepared_head)
+
+
 def _claim_preflight(conn, task) -> Optional[str]:
     """Why this card cannot be claimed, without writing or materializing anything.
 
@@ -980,14 +1007,13 @@ def _cmd_claim(args: argparse.Namespace) -> int:
         if task is None:
             existing = kb.get_task(conn, args.task_id)
             # A refusal after materialization must not leave the checkout behind — but only
-            # when this attempt still owns it. Another dispatcher can win the claim CAS
-            # here; its worker may already be running in that worktree.
-            if (
-                workspace is not None and pending is not None
-                and resolved_kind == "worktree"
-                and (existing is None or (existing.status != "running" and not existing.claim_lock))
-            ):
-                kbw.discard_prepared_worktree(pending, workspace, candidate_head or "")
+            # while this attempt still owns the card. Reading the row proves nothing: another
+            # dispatcher can claim it between that read and the removal, and its worker may
+            # already be starting there. So take the same admission fence the claim uses and
+            # remove only an unchanged row that nobody owns.
+            if workspace is not None and pending is not None and resolved_kind == "worktree":
+                _discard_if_still_ours(
+                    conn, pending, workspace, candidate_head or "")
             if existing is None:
                 return _err(f"no such task: {args.task_id}")
             return _err(f"cannot claim {args.task_id}: status={existing.status} "

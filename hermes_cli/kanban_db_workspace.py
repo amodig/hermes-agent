@@ -508,7 +508,11 @@ def _cleanup_worktree_workspace(
             # The HEAD check above covers the checkout; the branch ref can still hold
             # unique work (an adopted ``wt/*`` checkout that was later detached). Delete
             # only a branch whose tip some remote-tracking ref already contains.
-            tip = _git(repo_root, "rev-parse", "--verify", branch, timeout=30)
+            # ``refs/heads/<name>`` explicitly: a tag of the same short name shadows the
+            # branch under ``rev-parse --verify`` (warning only), which would verify the
+            # tag's tip and then delete a branch whose own tip has unique work.
+            tip = _git(
+                repo_root, "rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}", timeout=30)
             reachable = False
             if tip.returncode == 0 and (tip.stdout or "").strip():
                 contains = _git(
@@ -800,8 +804,12 @@ def _ignored_paths_target_tracks(repo: Path, worktree: Path, head: str) -> list[
     guards *untracked* files, so this is the only backstop for an operator's ignored
     notes when the candidate starts tracking the same path.
     """
+    # ``--directory`` also reports ignored directories, including empty ones, which a
+    # plain listing omits even though a checkout or removal deletes them.
     ignored = _git(
-        worktree, "ls-files", "--others", "--ignored", "--exclude-standard", "-z", timeout=60)
+        worktree, "ls-files", "--others", "--ignored", "--exclude-standard",
+        "--directory", "-z", timeout=60,
+    )
     if ignored.returncode != 0:
         return []
     present = [path for path in (ignored.stdout or "").split("\0") if path]
@@ -818,7 +826,7 @@ def _ignored_paths_target_tracks(repo: Path, worktree: Path, head: str) -> list[
         return []
     hits = []
     for entry in present:
-        key = entry
+        key = entry.rstrip("/")
         # A file/directory conflict overwrites too: ignored dir ``cache/local`` versus a
         # tracked file ``cache``, or an ignored file ``cache`` versus ``cache/item``.
         index = bisect.bisect_left(paths, key)
@@ -1213,7 +1221,9 @@ def discard_prepared_worktree(
         # ``git worktree remove`` deletes untracked and ignored files with the directory,
         # so ANY ignored entry means operator content: preserve, do not remove.
         ignored = _git(
-            target, "ls-files", "--others", "--ignored", "--exclude-standard", "-z", timeout=60)
+            target, "ls-files", "--others", "--ignored", "--exclude-standard",
+            "--directory", "-z", timeout=60,
+        )
         if ignored.returncode != 0:
             return False          # cannot enumerate → preserve
         if (ignored.stdout or "").strip("\0"):
