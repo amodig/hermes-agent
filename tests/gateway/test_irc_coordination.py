@@ -255,11 +255,31 @@ async def test_human_exact_mentions_and_dm_get_unique_sessions(adapter):
     adapter._message_handler = handler
     for text, destination in [("@" + OWN + " hello", "#agents"), (OWN + ": hi", "#agents"),
                               (OWN + ", hello", "#agents"), ("/reset", OWN)]:
+        before = len(adapter._writer.lines)
         await adapter._handle_line(frame(text, account="amodig", destination=destination))
         await asyncio.wait_for(adapter._coord_dispatch_task, 3)
+        assert events[-1].source.chat_id == "amodig"
+        assert all(line.startswith("PRIVMSG amodig :!res ") for line in adapter._writer.lines[before:])
     assert len({event.source.thread_id for event in events}) == 4
     assert all(uuid.UUID(event.message_id).version == 4 for event in events)
     assert adapter._writer.lines[-1].startswith("PRIVMSG amodig :!res ")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text,destination", [
+    ("@" + OWN + " hello", "#agents"), (OWN + ": hi", "#agents"),
+    (OWN + ", hello", "#agents"), ("hello", OWN),
+])
+async def test_human_busy_replies_use_sender_nick(adapter, text, destination):
+    from collections import deque
+    import time
+
+    adapter._coordination_state.accepted_at["amodig"] = deque([time.monotonic()] * 6)
+    await adapter._handle_line(frame(text, account="amodig", destination=destination))
+    assert adapter._coord_dispatch_task is None
+    assert len(adapter._writer.lines) == 1
+    assert adapter._writer.lines[0].startswith("PRIVMSG amodig :!res ")
+    assert adapter._writer.lines[0].endswith(" busy 1/1 busy")
 
 
 @pytest.mark.asyncio
@@ -1453,6 +1473,39 @@ async def test_hello_presence_channel_reply_rate_limit_and_dm(adapter, monkeypat
         await adapter._handle_line(raw)
     adapter.handle_message.assert_not_awaited()
     assert set(adapter._peers) == {PEER}
+
+
+@pytest.mark.asyncio
+async def test_local_reconnect_preserves_hello_reply_window(adapter, monkeypatch):
+    import time
+
+    clock, delays = [100.0], []
+    release = asyncio.Event()
+
+    async def sleep(delay):
+        delays.append(delay)
+        await release.wait()
+
+    monkeypatch.setattr(irc, "time", SimpleNamespace(time=time.time, monotonic=lambda: clock[0]))
+    monkeypatch.setattr(irc, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": sleep}))
+    await adapter._handle_line(hello())
+    assert len(adapter._writer.lines) == 1
+    await adapter.disconnect()
+    clock[0] += 1
+    adapter._writer = Writer()
+    adapter._registered = True
+    adapter._mark_connected()
+    adapter._session_id = str(uuid.uuid4())
+    adapter._address = f"{OWN}/{adapter._session_id}"
+    await adapter._handle_line(hello())
+    pending = adapter._hello_reply_tasks[PEER]
+    await asyncio.sleep(0)
+    assert not adapter._writer.lines and delays == [4.0]
+    clock[0] += 4
+    release.set()
+    await pending
+    assert adapter._writer.lines == [
+        f"PRIVMSG {PEER} :!hello 1 hermes loota {adapter._session_id}"]
 
 
 @pytest.mark.asyncio

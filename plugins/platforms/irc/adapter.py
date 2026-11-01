@@ -415,7 +415,7 @@ class IRCAdapter(BasePlatformAdapter):
         self._address = None
         self._peers.clear()
         self._inbox.clear()
-        self._hello_replies.clear()
+        # Keep the last-reply window across reconnects; only pending sends expire.
         for task in self._hello_reply_tasks.values():
             task.cancel()
         self._hello_reply_tasks.clear()
@@ -889,7 +889,7 @@ class IRCAdapter(BasePlatformAdapter):
         self._inbox.append({
             "kind": "req", "id": request_id, "account": account, "target": target,
             "serverTime": server_time, "text": question, "untrusted": True})
-        reply_destination = self.channel if destination == self.channel else account
+        reply_destination = account if account == HUMAN_ACCOUNT else self.channel
         now = time.monotonic()
         accepted_at = self._coordination_state.accepted_at.setdefault(account, deque())
         while accepted_at and accepted_at[0] <= now - 60:
