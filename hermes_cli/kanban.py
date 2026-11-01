@@ -905,23 +905,31 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 def _cmd_claim(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
-        # Derive the candidate before claiming: a role card whose candidate cannot
-        # be resolved must fail here, not after the claim leaves a running card with
-        # no worker holding it.
+        # Prepare the exact candidate workspace before committing a claim; a
+        # refusal must leave no running card or open run behind.
         pending = kb.get_task(conn, args.task_id)
         try:
             candidate_head = (
                 kbw.candidate_head_for_task(conn, pending) if pending is not None else None)
         except ValueError as exc:
             return _err(f"kanban: {exc}")
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        if pending is None:
+            return _err(f"no such task: {args.task_id}")
+        if pending.status != "ready" or pending.claim_lock is not None:
+            return _err(f"cannot claim {args.task_id}: status={pending.status} "
+                        f"lock={pending.claim_lock or '(none)'}")
+        try:
+            workspace = kbw.resolve_workspace(pending, candidate_head=candidate_head)
+        except ValueError as exc:
+            return _err(f"kanban: {exc}")
+        task = kb.claim_task(
+            conn, args.task_id, ttl_seconds=args.ttl, expected_task=pending)
         if task is None:
             existing = kb.get_task(conn, args.task_id)
             if existing is None:
                 return _err(f"no such task: {args.task_id}")
             return _err(f"cannot claim {args.task_id}: status={existing.status} "
                         f"lock={existing.claim_lock or '(none)'}")
-        workspace = kbw.resolve_workspace(task, candidate_head=candidate_head)
         kbw.set_workspace_path(conn, task.id, str(workspace))
     print(f"Claimed {task.id}\nWorkspace: {workspace}")
     return 0

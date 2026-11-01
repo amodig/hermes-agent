@@ -558,3 +558,54 @@ def test_claim_cli_leaves_a_role_card_unclaimed_when_its_candidate_is_missing(
     assert after.status == "review"
     assert after.claim_lock is None
     assert after.current_run_id is None
+
+
+def test_claim_cli_workspace_refusal_leaves_no_claim_or_open_run(kanban_home, tmp_path, capsys):
+    from hermes_cli import kanban as kc
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+    (repo / ".git" / "info" / "exclude").write_text(".worktrees/\n", encoding="utf-8")
+    with kbc.connect() as conn:
+        implementation = kb.create_task(
+            conn, title="implementation", assignee="coder", workspace_kind="worktree",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code", "review_mode": "separate_card", "reviewer": "reviewer",
+                "validation_required": True})
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        validation = _role_card(conn, "validation", implementation, repo, "tester")
+        kb.link_tasks(conn, implementation, review, requirement="phase_finished")
+        kb.link_tasks(conn, review, validation)
+        run = kb.claim_task(conn, implementation, claimer=kb._claimer_id())
+        assert run is not None
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=run.current_run_id,
+            summary="candidate handoff",
+            metadata={"base_sha": base, "head_sha": candidate, "changed_files": []})
+        review_run = kb.claim_review_task(conn, review, claimer="reviewer:test")
+        assert review_run is not None
+        assert kb.complete_task(
+            conn, review, expected_run_id=review_run.current_run_id, verdict="APPROVE",
+            summary="candidate approved", metadata={"reviewed_head_sha": candidate})
+        kb.recompute_ready(conn)
+        before = kb.get_task(conn, validation)
+        assert before.status == "ready" and before.claim_lock is None
+        head = kbw.candidate_head_for_task(conn, before)
+    workspace = kbw.resolve_workspace(before, candidate_head=head)
+    note = workspace / "local-notes.txt"
+    note.write_text("preserve this\n", encoding="utf-8")
+    result = kc._cmd_claim(_claim_args(validation))
+    captured = capsys.readouterr()
+    assert "candidate_workspace_unavailable" in captured.out + captured.err
+    assert result != 0
+    assert note.read_text(encoding="utf-8") == "preserve this\n"
+    assert _head(workspace) == candidate
+    with kbc.connect() as conn:
+        after = kb.get_task(conn, validation)
+        assert after.status == "ready" and after.claim_lock is None
+        assert after.current_run_id is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ? AND status = 'running'",
+            (validation,)).fetchone()[0] == 0

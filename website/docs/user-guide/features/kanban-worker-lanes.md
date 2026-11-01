@@ -90,6 +90,8 @@ registration and refuses checkout collisions with ignored local files.
 Materialized tracked content and executable modes must match the immutable
 candidate tree, independently of live-index optimization flags such as
 `assume-unchanged` and `skip-worktree`; mismatches refuse execution.
+Manual claims validate the workspace before committing a claim or opening a run;
+the claim's task-snapshot fence rejects intervening card changes.
 
 For code-changing tasks, pick the review model encoded by the task graph:
 
