@@ -1,0 +1,449 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "hello-omp-uuidv7",
+      "kind": "hello",
+      "wire": "!hello 1 omp loota 0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+      "valid": true,
+      "parsed": {
+        "kind": "hello",
+        "version": 1,
+        "runtime": "omp",
+        "host": "loota",
+        "sessionId": "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"
+      }
+    },
+    {
+      "name": "hello-hermes-uuidv4",
+      "kind": "hello",
+      "wire": "!hello 1 hermes loota 3f2a1b4c-5d6e-4f70-8a9b-1c2d3e4f5a6b",
+      "valid": true,
+      "parsed": {
+        "kind": "hello",
+        "version": 1,
+        "runtime": "hermes",
+        "host": "loota",
+        "sessionId": "3f2a1b4c-5d6e-4f70-8a9b-1c2d3e4f5a6b"
+      }
+    },
+    {
+      "name": "hello-omp-cirrus7-uuidv8",
+      "kind": "hello",
+      "wire": "!hello 1 omp cirrus7 0f5e4d3c-2b1a-8c9d-8e7f-6a5b4c3d2e1f",
+      "valid": true,
+      "parsed": {
+        "kind": "hello",
+        "version": 1,
+        "runtime": "omp",
+        "host": "cirrus7",
+        "sessionId": "0f5e4d3c-2b1a-8c9d-8e7f-6a5b4c3d2e1f"
+      }
+    },
+    {
+      "name": "hello-omp-z300-uuidv1",
+      "kind": "hello",
+      "wire": "!hello 1 omp z300 6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+      "valid": true,
+      "parsed": {
+        "kind": "hello",
+        "version": 1,
+        "runtime": "omp",
+        "host": "z300",
+        "sessionId": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+      }
+    },
+    {
+      "name": "hello-unsupported-version",
+      "kind": "hello",
+      "wire": "!hello 2 omp loota 0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "hello-missing-session-id",
+      "kind": "hello",
+      "wire": "!hello 1 omp loota",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "hello-unknown-runtime",
+      "kind": "hello",
+      "wire": "!hello 1 openai loota 0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "hello-unknown-host",
+      "kind": "hello",
+      "wire": "!hello 1 omp desktop 0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "hello-uppercase-session-id",
+      "kind": "hello",
+      "wire": "!hello 1 omp loota 0199A1B2-C3D4-7E5F-8A9B-0C1D2E3F4A5B",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "hello-session-bad-variant",
+      "kind": "hello",
+      "wire": "!hello 1 omp loota 0199a1b2-c3d4-7e5f-7a9b-0c1d2e3f4a5b",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "hello-trailing-space",
+      "kind": "hello",
+      "wire": "!hello 1 omp loota 0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b ",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "hello-control-injection",
+      "kind": "hello",
+      "wire": "!hello 1 omp loota 0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\u0000QUIT",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "req-qualified",
+      "kind": "req",
+      "wire": "!req 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d agent-hermes-cto/3f2a1b4c-5d6e-4f70-8a9b-1c2d3e4f5a6b What changed in the last deploy?",
+      "valid": true,
+      "parsed": {
+        "kind": "req",
+        "id": "0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d",
+        "target": "agent-hermes-cto/3f2a1b4c-5d6e-4f70-8a9b-1c2d3e4f5a6b",
+        "question": "What changed in the last deploy?"
+      }
+    },
+    {
+      "name": "req-unicode-question",
+      "kind": "req",
+      "wire": "!req 1c7e5d2f-9b3e-4a4c-8d6e-7f8a9b0c1d2e agent-omp-cirrus7-02/0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b 请总结  配置 与 🌐 状态",
+      "valid": true,
+      "parsed": {
+        "kind": "req",
+        "id": "1c7e5d2f-9b3e-4a4c-8d6e-7f8a9b0c1d2e",
+        "target": "agent-omp-cirrus7-02/0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "question": "请总结  配置 与 🌐 状态"
+      }
+    },
+    {
+      "name": "req-empty-question",
+      "kind": "req",
+      "wire": "!req 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d agent-hermes-cto/3f2a1b4c-5d6e-4f70-8a9b-1c2d3e4f5a6b ",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "req-missing-question",
+      "kind": "req",
+      "wire": "!req 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d agent-hermes-cto/3f2a1b4c-5d6e-4f70-8a9b-1c2d3e4f5a6b",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "req-oversized-question",
+      "kind": "req",
+      "wire": "!req 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d agent-hermes-cto/3f2a1b4c-5d6e-4f70-8a9b-1c2d3e4f5a6b qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+      "valid": true,
+      "parsed": {
+        "kind": "req",
+        "id": "0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d",
+        "target": "agent-hermes-cto/3f2a1b4c-5d6e-4f70-8a9b-1c2d3e4f5a6b",
+        "question": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+      }
+    },
+    {
+      "name": "req-legacy-account-only",
+      "kind": "req",
+      "wire": "!req 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d agent-hermes-cto ping",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "req-invalid-id-version",
+      "kind": "req",
+      "wire": "!req 0b6f4c1e-8a2d-5f3b-9c5d-6e7f8a9b0c1d agent-hermes-cto/3f2a1b4c-5d6e-4f70-8a9b-1c2d3e4f5a6b ping",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "req-uppercase-id",
+      "kind": "req",
+      "wire": "!req 0B6F4C1E-8A2D-4F3B-9C5D-6E7F8A9B0C1D agent-hermes-cto/3f2a1b4c-5d6e-4f70-8a9b-1c2d3e4f5a6b ping",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "req-uppercase-account",
+      "kind": "req",
+      "wire": "!req 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d Agent-Hermes-CTO/3f2a1b4c-5d6e-4f70-8a9b-1c2d3e4f5a6b ping",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "req-address-missing-session",
+      "kind": "req",
+      "wire": "!req 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d agent-hermes-cto/ ping",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "req-control-injection",
+      "kind": "req",
+      "wire": "!req 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d agent-hermes-cto/3f2a1b4c-5d6e-4f70-8a9b-1c2d3e4f5a6b version\u0001VERSION\u0001",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "req-newline-injection",
+      "kind": "req",
+      "wire": "!req 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d agent-hermes-cto/3f2a1b4c-5d6e-4f70-8a9b-1c2d3e4f5a6b first\nQUIT",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "req-malformed-missing-target",
+      "kind": "req",
+      "wire": "!req 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "res-single-part",
+      "kind": "res",
+      "wire": "!res 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d ok 1/1 All systems nominal.",
+      "valid": true,
+      "parsed": {
+        "kind": "res",
+        "id": "0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d",
+        "status": "ok",
+        "part": 1,
+        "total": 1,
+        "body": "All systems nominal."
+      }
+    },
+    {
+      "name": "res-multipart-middle",
+      "kind": "res",
+      "wire": "!res 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d ok 2/3 second slice",
+      "valid": true,
+      "parsed": {
+        "kind": "res",
+        "id": "0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d",
+        "status": "ok",
+        "part": 2,
+        "total": 3,
+        "body": "second slice"
+      }
+    },
+    {
+      "name": "res-unicode-part",
+      "kind": "res",
+      "wire": "!res 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d ok 1/2 部署 完成 🌐",
+      "valid": true,
+      "parsed": {
+        "kind": "res",
+        "id": "0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d",
+        "status": "ok",
+        "part": 1,
+        "total": 2,
+        "body": "部署 完成 🌐"
+      }
+    },
+    {
+      "name": "res-empty-ok-body",
+      "kind": "res",
+      "wire": "!res 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d ok 1/1 ",
+      "valid": true,
+      "parsed": {
+        "kind": "res",
+        "id": "0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d",
+        "status": "ok",
+        "part": 1,
+        "total": 1,
+        "body": ""
+      }
+    },
+    {
+      "name": "res-empty-err-body",
+      "kind": "res",
+      "wire": "!res 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d err 1/1 ",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "res-empty-busy-body",
+      "kind": "res",
+      "wire": "!res 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d busy 1/1 ",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "res-part-exceeds-total",
+      "kind": "res",
+      "wire": "!res 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d ok 3/2 body",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "res-part-zero",
+      "kind": "res",
+      "wire": "!res 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d ok 0/1 body",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "res-total-over-limit",
+      "kind": "res",
+      "wire": "!res 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d ok 1/7 body",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "res-unknown-status",
+      "kind": "res",
+      "wire": "!res 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d pending 1/1 body",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "res-missing-body-delimiter",
+      "kind": "res",
+      "wire": "!res 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d ok 1/1",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "res-oversized-body",
+      "kind": "res",
+      "wire": "!res 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d ok 1/1 yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+      "valid": true,
+      "parsed": {
+        "kind": "res",
+        "id": "0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d",
+        "status": "ok",
+        "part": 1,
+        "total": 1,
+        "body": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+      }
+    },
+    {
+      "name": "res-invalid-id-version",
+      "kind": "res",
+      "wire": "!res 0b6f4c1e-8a2d-7f3b-9c5d-6e7f8a9b0c1d ok 1/1 hi",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "res-control-injection",
+      "kind": "res",
+      "wire": "!res 0b6f4c1e-8a2d-4f3b-9c5d-6e7f8a9b0c1d ok 1/1 bad\u0001text",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "note-broadcast",
+      "kind": "note",
+      "wire": "!note 2d8f6a4b-1c3e-4f5a-8b7c-9d0e1f2a3b4c * heads up: deploy at 18:00 UTC",
+      "valid": true,
+      "parsed": {
+        "kind": "note",
+        "id": "2d8f6a4b-1c3e-4f5a-8b7c-9d0e1f2a3b4c",
+        "target": "*",
+        "text": "heads up: deploy at 18:00 UTC"
+      }
+    },
+    {
+      "name": "note-directed",
+      "kind": "note",
+      "wire": "!note 3e9a7b5c-2d4f-4a6b-9c8d-0e1f2a3b4c5d agent-omp-cirrus7-02/0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b check the queue before deploy",
+      "valid": true,
+      "parsed": {
+        "kind": "note",
+        "id": "3e9a7b5c-2d4f-4a6b-9c8d-0e1f2a3b4c5d",
+        "target": "agent-omp-cirrus7-02/0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "text": "check the queue before deploy"
+      }
+    },
+    {
+      "name": "note-unicode",
+      "kind": "note",
+      "wire": "!note 4f0b8c6d-3e5a-4b7c-8d9e-1f2a3b4c5d6e agent-hermes-cto/3f2a1b4c-5d6e-4f70-8a9b-1c2d3e4f5a6b 提醒：窗口 18:00 关闭 🚧",
+      "valid": true,
+      "parsed": {
+        "kind": "note",
+        "id": "4f0b8c6d-3e5a-4b7c-8d9e-1f2a3b4c5d6e",
+        "target": "agent-hermes-cto/3f2a1b4c-5d6e-4f70-8a9b-1c2d3e4f5a6b",
+        "text": "提醒：窗口 18:00 关闭 🚧"
+      }
+    },
+    {
+      "name": "note-legacy-account-only",
+      "kind": "note",
+      "wire": "!note agent-hermes-cto heads up",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "note-empty",
+      "kind": "note",
+      "wire": "!note 2d8f6a4b-1c3e-4f5a-8b7c-9d0e1f2a3b4c *",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "note-empty-with-space",
+      "kind": "note",
+      "wire": "!note 2d8f6a4b-1c3e-4f5a-8b7c-9d0e1f2a3b4c * ",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "note-oversized",
+      "kind": "note",
+      "wire": "!note 2d8f6a4b-1c3e-4f5a-8b7c-9d0e1f2a3b4c * xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "valid": true,
+      "parsed": {
+        "kind": "note",
+        "id": "2d8f6a4b-1c3e-4f5a-8b7c-9d0e1f2a3b4c",
+        "target": "*",
+        "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+    },
+    {
+      "name": "note-invalid-id-version",
+      "kind": "note",
+      "wire": "!note 0b6f4c1e-8a2d-7f3b-9c5d-6e7f8a9b0c1d * hi",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "note-control-injection",
+      "kind": "note",
+      "wire": "!note 2d8f6a4b-1c3e-4f5a-8b7c-9d0e1f2a3b4c * hi\u0001DCC\u0001",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "note-account-only-target",
+      "kind": "note",
+      "wire": "!note 2d8f6a4b-1c3e-4f5a-8b7c-9d0e1f2a3b4c agent-hermes-cto hi",
+      "valid": false,
+      "parsed": null
+    },
+    {
+      "name": "note-wildcard-with-session",
+      "kind": "note",
+      "wire": "!note 2d8f6a4b-1c3e-4f5a-8b7c-9d0e1f2a3b4c */3f2a1b4c-5d6e-4f70-8a9b-1c2d3e4f5a6b hi",
+      "valid": false,
+      "parsed": null
+    }
+  ]
+}

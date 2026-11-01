@@ -12,9 +12,11 @@ import datetime
 import contextlib
 import logging
 import re
+import socket
 import ssl
 import time
 import uuid
+from collections import deque
 from urllib.parse import urlsplit
 from typing import Any, Dict, List, Optional
 
@@ -27,9 +29,11 @@ from gateway.platforms.helpers import cancel_task
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.config import Platform
 from gateway.irc_coordination import (
-    AGENT_ACCOUNTS, ALLOWED_ACCOUNTS, COORDINATION_ENDPOINT, REQUIRED_CAPS, DEDUPE_SECONDS,
-    REQUEST_TIMEOUT, REPLY_TIMEOUT, ResponseAssembly, coordination_state, format_request, normalize_body,
-    parse_request, response_lines,
+    AGENT_ACCOUNTS, ALLOWED_ACCOUNTS, COORDINATION_ENDPOINT, DEDUPE_SECONDS, HELLO_REPLY_INTERVAL,
+    HOSTS, HUMAN_ACCOUNT, INBOX_LIMIT, INBOX_READ_LIMIT, REQUESTS_PER_MINUTE, REQUIRED_CAPS,
+    REQUEST_TIMEOUT, REPLY_TIMEOUT, ResponseAssembly, coordination_state, format_hello, format_note,
+    format_request, normalize_body, parse_address, parse_hello, parse_note, parse_request,
+    response_lines, settle_peer_result,
 )
 
 
@@ -81,6 +85,11 @@ def _extract_nick(prefix: str) -> str:
 
 def _ms_id() -> str:
     return str(int(time.time() * 1000))
+
+
+def _local_host() -> str:
+    """Coordination presence advertises the local short hostname, nothing else."""
+    return socket.gethostname().split(".", 1)[0].lower()
 
 
 def _env_or_extra(extra: dict, env: str, key: str, default: Any = "") -> Any:
@@ -284,6 +293,12 @@ class IRCAdapter(BasePlatformAdapter):
         self._outbound = None
         self._batches = set()
         self._timestamp_warning_at = {}
+        self._host = _local_host() if self.coordination else ""
+        self._session_id: Optional[str] = None
+        self._address: Optional[str] = None
+        self._peers: Dict[str, Dict[str, str]] = {}
+        self._inbox = deque(maxlen=INBOX_LIMIT)
+        self._hello_replies: Dict[str, float] = {}
 
     def toolsets_for_source(self, source):
         return ["no_tools"] if self.coordination else None
@@ -296,6 +311,8 @@ class IRCAdapter(BasePlatformAdapter):
                 or self.nickname != self.sasl_account or self.sasl_account not in AGENT_ACCOUNTS
                 or self.allowed_accounts != ALLOWED_ACCOUNTS or self.channel != "#agents"):
             return "invalid-coordination-config"
+        if self.coordination and self._host not in HOSTS:
+            return "unsupported-coordination-host"
         if self.require_sasl or self.sasl_account or self.sasl_password:
             if not self.use_tls or not self.sasl_account or not self.sasl_password:
                 return "sasl-requires-tls-and-credentials"
@@ -328,6 +345,7 @@ class IRCAdapter(BasePlatformAdapter):
         self._joined.clear()
         self._joined_channels.clear()
         self._batches.clear()
+        self._clear_coordination_session()
         self._connection_started = time.time()
         # Prevent two profiles from using the same IRC identity
         if not self._acquire_platform_lock("irc", f"{self.server}:{self.nickname}", f"IRC identity {self.nickname}@{self.server}"):
@@ -381,12 +399,131 @@ class IRCAdapter(BasePlatformAdapter):
             return self._fail("connection_lost", "IRC connection closed during setup", retryable=True)
         self._connecting = False
         self._mark_connected()
+        if self.coordination:
+            # One UUIDv4 per successful connection; it identifies this gateway/profile endpoint.
+            self._session_id = str(uuid.uuid4())
+            self._address = f"{self.sasl_account}/{self._session_id}"
+            await self._send_hello(self.channel)
         logger.info("IRC: connected to %s:%s as %s, joined %s", self.server, self.port, self._current_nick, self.channel)
         self._wire_plugin_handlers(None)
         return True
 
+    def _clear_coordination_session(self):
+        """Presence, inbox and the advertised address never outlive one connection."""
+        self._session_id = None
+        self._address = None
+        self._peers.clear()
+        self._inbox.clear()
+        self._hello_replies.clear()
+
+    async def _send_hello(self, destination):
+        if not self._session_id:
+            return
+        try:
+            line = format_hello("hermes", self._host, self._session_id, destination)
+        except ValueError:
+            return  # Startup validation already rejected an unsupported identity.
+        await self._send_raw(line)
+
+    async def _reply_hello(self, account):
+        """Answer a channel hello with one DM hello per sender per five seconds."""
+        now = time.monotonic()
+        last = self._hello_replies.get(account)
+        if last is not None and now - last < HELLO_REPLY_INTERVAL:
+            return
+        self._hello_replies[account] = now
+        await self._send_hello(account)
+
+    def _settle_outbound(self, reason, account=None):
+        if self._outbound is None:
+            return
+        assembly, future = self._outbound
+        if future.done() or (account is not None and assembly.account != account):
+            return
+        future.set_result({"requestId": assembly.request_id, "error": reason})
+
+    def _record_peer(self, account, hello):
+        address = f"{account}/{hello['sessionId']}"
+        prior = self._peers.get(account)
+        self._peers[account] = {
+            "account": account, "address": address, "runtime": hello["runtime"],
+            "host": hello["host"], "sessionId": hello["sessionId"]}
+        if prior is not None and prior["address"] != address:
+            self._settle_outbound("peer-changed", account)
+
+    def _drop_peer(self, account):
+        if not isinstance(account, str) or account not in self._peers:
+            return
+        del self._peers[account]
+        self._settle_outbound("peer-changed", account)
+
+    def _admit_note(self, account, note_id, msgid=None):
+        """Dedupe by (sender account, note UUID) and budget notes separately from questions."""
+        now = time.monotonic()
+        keys = [f"note:{account}:{note_id}"] + ([f"msg:{msgid}"] if msgid else [])
+        if any(self._request_dedupe.contains(key) for key in keys):
+            return False
+        admitted = self._coordination_state.note_accepted_at
+        recent = [at for at in admitted.get(account, ()) if now - at < 60]
+        if len(recent) >= REQUESTS_PER_MINUTE:
+            admitted[account] = recent
+            return False
+        recent.append(now)
+        admitted[account] = recent
+        for key in keys:
+            self._request_dedupe.is_duplicate(key)
+        return True
+
+    def status_payload(self) -> Dict[str, Any]:
+        return {
+            "connected": self.is_connected,
+            "account": self.sasl_account,
+            "address": self._address,
+            "sessionId": self._session_id,
+            "channel": self.channel,
+            "server": self.server,
+            "pendingRequestId": self._outbound[0].request_id if self._outbound is not None else None,
+            "inFlightRequest": self._coord_dispatch_task is not None,
+            "peers": sorted(self._peers.values(), key=lambda peer: (peer["account"], peer["address"])),
+        }
+
+    def read_inbox(self, limit: int = 10) -> Dict[str, Any]:
+        if not self.coordination or not self.is_connected:
+            return {"error": "not-connected"}
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= INBOX_READ_LIMIT:
+            return {"error": "invalid-limit"}
+        return {"untrusted": True, "entries": list(self._inbox)[-limit:]}
+
+    async def send_note(self, target, text, *, note_id=None) -> Dict[str, Any]:
+        """Queue one advisory note; it is never a model turn, tool call or task change."""
+        note_id = note_id or str(uuid.uuid4())
+        error = lambda reason: {"noteId": note_id, "error": reason}
+        if (not self.coordination or not self.is_connected
+                or self._writer is None or self._writer.is_closing()):
+            return error("not-connected")
+        if target != "*":
+            parsed = parse_address(target) if isinstance(target, str) else None
+            if (parsed is None or parsed[0] == self.sasl_account or parsed[0] == HUMAN_ACCOUNT
+                    or parsed[0] not in AGENT_ACCOUNTS):
+                return error("invalid-target")
+            peer = self._peers.get(parsed[0])
+            if peer is None:
+                return error("unknown-peer")
+            if peer["address"] != target:
+                return error("peer-changed")
+        try:
+            line = format_note(note_id, target, text, self.channel)
+        except ValueError as exc:
+            return error(str(exc))
+        try:
+            await self._send_raw(line)
+        except OSError:
+            return error("not-connected")
+        return {"noteId": note_id, "target": target, "status": "sent"}
+
     def _cancel_coordination(self):
         self._active_requests.clear()
+        self._clear_coordination_session()
         if self._outbound is not None:
             self._outbound[1].cancel()
         if self._coord_dispatch_task is not None:
@@ -579,6 +716,19 @@ class IRCAdapter(BasePlatformAdapter):
             elif command == "NICK" and _extract_nick(msg["prefix"]) == self._current_nick:
                 self._set_fatal_error("identity_changed", "IRC identity changed", retryable=False)
                 await self._notify_fatal_error()
+            elif command == "PART" and params and params[0] == self.channel:
+                self._drop_peer(_extract_nick(msg["prefix"]))
+            elif command == "QUIT":
+                self._drop_peer(_extract_nick(msg["prefix"]))
+            elif command == "KICK" and len(params) >= 2 and params[0] == self.channel:
+                if params[1] == self._current_nick:
+                    self._set_fatal_error("channel_kicked", "IRC coordination channel membership lost", retryable=False)
+                    await self.disconnect()
+                    await self._notify_fatal_error()
+                else:
+                    self._drop_peer(params[1])
+            elif command == "NICK":
+                self._drop_peer(_extract_nick(msg["prefix"]))
             elif command == "PRIVMSG" and len(params) == 2 and self.is_connected:
                 await self._handle_coordination(msg)
             return
@@ -632,20 +782,56 @@ class IRCAdapter(BasePlatformAdapter):
             return
         if sent < now - DEDUPE_SECONDS:
             return
+        server_time = tags["time"]
         if text.startswith("!res"):
             if self._outbound is not None:
                 assembly, future = self._outbound
-                if not future.done():
-                    try:
-                        result = assembly.add(account, destination, text)
-                    except ValueError as e:
-                        result = {"requestId": assembly.request_id, "error": str(e)}
-                    if result is not None:
-                        future.set_result(result)
+                if not future.done() and assembly.account == account and assembly.destination == destination:
+                    peer = self._peers.get(account)
+                    if peer is None or peer["address"] != assembly.address:
+                        future.set_result({"requestId": assembly.request_id, "error": "peer-changed"})
+                    else:
+                        try:
+                            result = assembly.add(account, destination, text)
+                        except ValueError as exc:
+                            result = {"requestId": assembly.request_id, "error": str(exc)}
+                        if result is not None:
+                            future.set_result(settle_peer_result(result))
             return  # even a malformed/unsolicited response is never work
+        if text.startswith("!hello"):
+            hello = parse_hello(text)
+            if hello is None or account == HUMAN_ACCOUNT:
+                return
+            if not re.fullmatch(r"[^!\s]+![^@\s]+@\S+", msg["prefix"]):
+                return
+            try:
+                format_hello(hello["runtime"], hello["host"], hello["sessionId"], destination)
+            except ValueError:
+                return
+            self._record_peer(account, hello)
+            if destination == self.channel:
+                await self._reply_hello(account)  # A DM hello is recorded but never answered.
+            return
+        if text.startswith("!note"):
+            note = parse_note(text)
+            if note is None or destination != self.channel or account not in self._peers:
+                return
+            if note["target"] != "*" and note["target"] != self._address:
+                return
+            try:
+                format_note(note["id"], note["target"], note["text"], destination)
+            except ValueError:
+                return
+            if not self._admit_note(account, note["id"], tags.get("msgid")):
+                return
+            self._inbox.append({
+                "kind": "note", "id": note["id"], "account": account, "target": note["target"],
+                "serverTime": server_time, "text": note["text"], "untrusted": True})
+            logger.info("IRC advisory from %s; use irc_read", account)
+            return
         request = parse_request(text)
         if request is None:
-            if account != "amodig" or text.startswith("!"):
+            if account != HUMAN_ACCOUNT or text.startswith("!"):
                 return
             question = text
             if destination == self.channel:
@@ -653,9 +839,11 @@ class IRCAdapter(BasePlatformAdapter):
                 if not mention:
                     return
                 question = mention[1]
-            request = (str(uuid.uuid4()), self.sasl_account, normalize_body(question))
+            request = (str(uuid.uuid4()), self._address or "", normalize_body(question))
+        elif destination != self.channel or account not in self._peers:
+            return  # Structured requests require agent presence; only human prose may use DMs.
         request_id, target, question = request
-        if target != self.sasl_account or not question:
+        if target != self._address or not question:
             return
         try:
             # Apply the same single-line budget on receipt; a relay cannot smuggle a split request.
@@ -669,13 +857,17 @@ class IRCAdapter(BasePlatformAdapter):
             return
         for key in ids:
             self._request_dedupe.is_duplicate(key)
+        # Dedupe ran before any frame or budget change; retained questions are readable too.
+        self._inbox.append({
+            "kind": "req", "id": request_id, "account": account, "target": target,
+            "serverTime": server_time, "text": question, "untrusted": True})
         reply_destination = self.channel if destination == self.channel else account
         accepted_at = self._coordination_state.accepted_at
         while accepted_at and accepted_at[0] <= time.monotonic() - 60:
             accepted_at.popleft()
         pending = self._coordination_state.dispatch
         busy = (self._coord_dispatch_task is not None
-                or (pending is not None and not pending.done()) or len(accepted_at) >= 6)
+                or (pending is not None and not pending.done()) or len(accepted_at) >= REQUESTS_PER_MINUTE)
         logger.info("IRC coordination request=%s account=%s outcome=%s",
                     request_id, account, "busy" if busy else "accepted")
         if busy:
@@ -786,18 +978,26 @@ class IRCAdapter(BasePlatformAdapter):
     async def request_peer(self, target, question, *, request_id=None):
         request_id = request_id or str(uuid.uuid4())
         error = lambda reason: {"requestId": request_id, "error": reason}
-        if not self.coordination or not self.is_connected:
+        if not self.coordination:
             return error("unavailable")
-        if (not isinstance(target, str) or target not in self.allowed_accounts
-                or target not in AGENT_ACCOUNTS or target == self.sasl_account):
+        if not self.is_connected:
+            return error("not-connected")
+        parsed = parse_address(target) if isinstance(target, str) else None
+        if (parsed is None or parsed[0] == self.sasl_account or parsed[0] == HUMAN_ACCOUNT
+                or parsed[0] not in AGENT_ACCOUNTS):
             return error("invalid-target")
+        peer = self._peers.get(parsed[0])
+        if peer is None:
+            return error("unknown-peer")
+        if peer["address"] != target:
+            return error("peer-changed")
         if self._outbound is not None:
             return error("busy")
         try:
             line = format_request(request_id, target, question, self.channel)
         except ValueError as e:
             return error(str(e))
-        assembly = ResponseAssembly(request_id, target, self.channel)
+        assembly = ResponseAssembly(request_id, parsed[0], self.channel, target)
         future = asyncio.get_running_loop().create_future()
         self._outbound = assembly, future
         try:
@@ -805,7 +1005,7 @@ class IRCAdapter(BasePlatformAdapter):
                 await self._send_raw(line)
                 return await future
         except asyncio.TimeoutError:
-            return error("partial-response" if assembly.parts else "timeout")
+            return error("timeout")
         except asyncio.CancelledError:
             if asyncio.current_task().cancelling():
                 raise

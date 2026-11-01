@@ -22,6 +22,12 @@ is_connected = _irc_mod.is_connected
 _env_enablement = _irc_mod._env_enablement
 
 
+@pytest.fixture(autouse=True)
+def _coordination_host(monkeypatch):
+    """Coordination startup validates the local short hostname; tests pin a supported one."""
+    monkeypatch.setattr(_irc_mod, "_local_host", lambda: "loota")
+
+
 class TestIRCProtocolHelpers:
 
     def test_parse_simple_command(self):
