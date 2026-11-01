@@ -733,6 +733,7 @@ def _handle_show(args: dict, **kw) -> str:
     # command cannot name different boards.
     board = _resolved_board(args.get("board"))
     from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+    from hermes_cli.kanban_db_receipts import candidate_identity
 
     db_path = kb.kanban_db_path(
         board=args.get("board") if os.environ.get("HERMES_KANBAN_DB", "").strip() else board,
@@ -741,10 +742,27 @@ def _handle_show(args: dict, **kw) -> str:
         task = _existing_task(kb, conn, tid)
         effective_goal = kb.get_effective_goal(conn, tid)
         dependencies = kb.evaluate_dependencies(conn, tid)
-        return json.dumps({
+        lifecycle = kb.get_lifecycle_state(conn, tid)
+        lifecycle_state = lifecycle if isinstance(lifecycle, dict) else {}
+        # The decision inputs and the launch receipt lead the payload: this result is
+        # routinely hundreds of KB of history, and the spillover preview only keeps the
+        # first 1.5 KB. A worker that has to page for its own authority is a worker that
+        # guesses. A review/validation card names the implementation card as its
+        # candidate, so reconcile against that id/run — never this card's own run, which
+        # would find no receipt. Same projection as ``hermes kanban show --json``.
+        front = {
             "task": _fields(task, _TASK_FIELDS),
+            "lifecycle": lifecycle,
             "effective_goal": effective_goal,
-            "lifecycle": kb.get_lifecycle_state(conn, tid),
+            # Same string build_worker_context hands the dispatcher at spawn time.
+            "worker_context": kb.build_worker_context(conn, tid),
+            "provenance": candidate_identity(
+                conn,
+                lifecycle_state.get("candidate_task_id") or tid,
+                lifecycle_state.get("candidate_run_id"),
+            ),
+        }
+        front.update({
             # Live dispatcher guard; ready/review cards can be held while queued.
             "dispatch_guard": kb.get_dispatch_guard(conn, tid, board=board),
             "parents": kb.parent_ids(conn, tid),
@@ -759,9 +777,11 @@ def _handle_show(args: dict, **kw) -> str:
             # Capped; full log via CLI.
             "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
             "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
-            "active_handoff": kb.latest_handoff(conn, tid),
-            # Same string build_worker_context hands the dispatcher at spawn time.
-            "worker_context": kb.build_worker_context(conn, tid)})
+            "active_handoff": kb.latest_handoff(conn, tid)})
+        # Indented, unescaped: this result spills to a file whenever it is large, and
+        # compact single-line JSON cannot be paged by read_file at all. Values and key
+        # set are unchanged — only the whitespace and the key order.
+        return json.dumps(front, indent=2, ensure_ascii=False)
 
 
 @_kanban_handler("kanban_list")

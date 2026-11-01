@@ -478,11 +478,11 @@ def _git_text(git: SyntheticGit, args: list[str]) -> str:
         _refuse("git_unsupported", "Git output is not valid UTF-8")
 
 
-def _git_tracked(git: SyntheticGit) -> dict[str, tuple[str, str]]:
-    """``path -> (mode, object id)`` from the index; no worktree access."""
-    raw = git.run(["ls-files", "--stage", "-z"])
+def _git_tracked(git: SyntheticGit, *, tree: Optional[str] = None) -> dict[str, tuple[str, str]]:
+    """``path -> (mode, object id)`` from the index or immutable tree; no worktree access."""
+    raw = git.run(["ls-tree", "-r", "-z", tree] if tree is not None else ["ls-files", "--stage", "-z"])
     if raw.returncode != 0:
-        _refuse("git_unavailable", "Git index could not be read")
+        _refuse("git_unavailable", "Git source inventory could not be read")
     tracked: dict[str, tuple[str, str]] = {}
     for item in raw.stdout.split(b"\x00"):
         if not item:
@@ -492,11 +492,11 @@ def _git_tracked(git: SyntheticGit) -> dict[str, tuple[str, str]]:
             fields = header.decode("ascii").split(" ")
             name = path.decode("utf-8", "strict")
         except UnicodeDecodeError:
-            _refuse("git_unsupported", "Git index contains a non-UTF-8 path")
+            _refuse("git_unsupported", "Git source inventory contains a non-UTF-8 path")
         if len(fields) != 3:
-            _refuse("git_unsupported", "Git index entry is malformed")
+            _refuse("git_unsupported", "Git source inventory entry is malformed")
         _validate_source_name(name)
-        tracked[name] = (fields[0], fields[1])
+        tracked[name] = (fields[0], fields[2] if tree is not None else fields[1])
     return tracked
 
 
@@ -514,7 +514,11 @@ def _scan_source(
     *,
     materialize: Optional[Path] = None,
 ) -> SourceSnapshot:
-    """Build one bounded inventory from tracked paths plus granted extra source files."""
+    """Inventory accepted source; review copies must match the immutable candidate.
+
+    Compare the bytes and modes actually copied, not Git's worktree cleanliness:
+    index flags, cached stat data and clean filters must not authorize different code.
+    """
     if authority.git is None:
         raise WorkerExecutionRefused("workspace_not_a_repository", "granted workspace is not a Git repository")
     git = SyntheticGit(authority.workspace_path, authority.git)
@@ -535,6 +539,32 @@ def _scan_source(
                 branch = symbolic.stdout.decode("utf-8", "strict").strip().removeprefix("refs/heads/")
             except UnicodeDecodeError:
                 raise WorkerExecutionRefused("git_unsupported", "Git branch is malformed")
+        candidate = None
+        if materialize is not None and str(getattr(authority, "role", "unknown")) == "review":
+            # Materializing means running the recipe against a COPY. For a review
+            # claim the copy must be the reviewed commit itself: same HEAD as the
+            # granted pair, and no tracked or staged modification on top of it.
+            if authority.review is None:
+                raise WorkerExecutionRefused(
+                    "source_changed", "no immutable candidate handoff is bound to this claim")
+            granted_head = str(_record_value(authority.review, "head", "")).lower()
+            if not granted_head or head.lower() != granted_head:
+                raise WorkerExecutionRefused(
+                    "source_changed", "the granted workspace HEAD is not the reviewed head")
+            dirty = git.run([
+                "diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv",
+                "--ignore-submodules=all", granted_head, "--",
+            ])
+            if dirty.returncode == 1:
+                raise WorkerExecutionRefused(
+                    "source_changed",
+                    "the reviewed candidate has tracked or staged modifications; a copy of it "
+                    "would not be the reviewed commit")
+            if dirty.returncode != 0:
+                # An unreadable comparison is not a clean tree.
+                raise WorkerExecutionRefused(
+                    "git_unsupported", "Git could not verify the candidate is unmodified")
+            candidate = _git_tracked(git, tree=granted_head)
         tracked = _git_tracked(git)
         extras = [list(_split_relative(item, "extra_source_paths")) for item in authority.extra_source_paths]
         reserved_tracked = [path for path in tracked if _reserved(path.split("/"))]
@@ -560,6 +590,8 @@ def _scan_source(
             accepted[name] = "file"
         entries: list[SourceEntry] = []
         link_targets: dict[str, tuple[str, str]] = {}
+        copied_tracked: dict[str, tuple[str, str]] = {}
+        object_hash = hashlib.sha1 if len(head) == 40 else hashlib.sha256
         total_bytes = 0
         if len(accepted) > MAX_INVENTORY_ENTRIES:
             raise WorkerExecutionRefused("source_too_large", "the granted source set exceeds the entry bound")
@@ -592,7 +624,12 @@ def _scan_source(
                         raise WorkerExecutionRefused("unsafe_symlink", "the granted source set contains a symlink cycle")
                     # The digest binds the exact link text that is copied; normalization
                     # is only for containment and graph validation.
-                    digest = "sha256:" + sha256_hex(target.encode("utf-8", "surrogateescape"))
+                    link_bytes = target.encode("utf-8", "surrogateescape")
+                    digest = "sha256:" + sha256_hex(link_bytes)
+                    if candidate is not None and name in tracked:
+                        blob = object_hash(f"blob {len(link_bytes)}\0".encode("ascii"), usedforsecurity=False)
+                        blob.update(link_bytes)
+                        copied_tracked[name] = ("120000", blob.hexdigest())
                     link_targets[name] = (target, normalized)
                     entries.append(SourceEntry(name, "link", False, len(target), digest))
                     if materialize is not None:
@@ -613,6 +650,10 @@ def _scan_source(
                     if not stat.S_ISREG(opened.st_mode) or int(opened.st_nlink) != 1:
                         raise WorkerExecutionRefused("hardlinked_source", "the granted source set changed during inspection")
                     digest = hashlib.sha256()
+                    blob = (
+                        object_hash(f"blob {opened.st_size}\0".encode("ascii"), usedforsecurity=False)
+                        if candidate is not None and name in tracked else None
+                    )
                     written = None
                     if materialize is not None:
                         target_path = materialize / name
@@ -627,6 +668,8 @@ def _scan_source(
                             if total_bytes > MAX_INVENTORY_BYTES:
                                 raise WorkerExecutionRefused("source_too_large", "the granted source set exceeds the byte bound")
                             digest.update(chunk)
+                            if blob is not None:
+                                blob.update(chunk)
                             if written is not None:
                                 written.write(chunk)
                     finally:
@@ -639,10 +682,14 @@ def _scan_source(
                     os.close(fd)
                 executable = bool(opened.st_mode & 0o111)
                 entries.append(SourceEntry(name, "file", executable, int(opened.st_size), "sha256:" + digest.hexdigest()))
+                if blob is not None:
+                    copied_tracked[name] = ("100755" if executable else "100644", blob.hexdigest())
                 if materialize is not None:
-                    with contextlib.suppress(OSError):
-                        os.chmod(materialize / name, 0o755 if executable else 0o644)
+                    os.chmod(materialize / name, 0o755 if executable else 0o644)
         _validate_link_graph(link_targets, accepted)
+        if candidate is not None and copied_tracked != candidate:
+            raise WorkerExecutionRefused(
+                "source_changed", "the copied tracked content or modes do not match the reviewed commit")
         digests = sorted(entry.digest_line() for entry in entries)
         source_digest = "sha256:" + sha256_hex(b"".join(digests) + b"HEAD\x00" + head.encode("ascii"))
         return SourceSnapshot(
