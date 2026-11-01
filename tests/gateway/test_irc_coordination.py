@@ -2,22 +2,38 @@
 import asyncio
 import datetime
 import json
+import logging
 import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
+from pathlib import Path
+
 from gateway.config import PlatformConfig
+
 from gateway.irc_coordination import (
-    ALLOWED_ACCOUNTS, REQUIRED_CAPS, ResponseAssembly, format_request, normalize_body, parse_request,
-    parse_response, response_lines, truncate_body,
+    ALLOWED_ACCOUNTS, REQUIRED_CAPS, ResponseAssembly, format_hello, format_note, format_request,
+    normalize_body, parse_address, parse_hello, parse_note, parse_request, parse_response, response_lines,
+    truncate_body,
 )
 from gateway.platforms.helpers import carry_inbound_dedup, inbound_dedup_caches
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 
 irc = load_plugin_adapter("irc")
 OWN, PEER = "agent-hermes-cto", "agent-jeeves"
+LOCAL_SESSION = "3f2a1b4c-5d6e-4f70-8a9b-1c2d3e4f5a6b"
+PEER_SESSION = "0f5e4d3c-2b1a-8c9d-8e7f-6a5b4c3d2e1f"
+OWN_ADDRESS = f"{OWN}/{LOCAL_SESSION}"
+PEER_ADDRESS = f"{PEER}/{PEER_SESSION}"
+
+
+def seed(instance, *, account=OWN, local_session=LOCAL_SESSION, peer=PEER, peer_session=PEER_SESSION):
+    """Offline fixtures: authenticate the test's own session and one discovered peer."""
+    instance._session_id, instance._address = local_session, f"{account}/{local_session}"
+    instance._record_peer(peer, {"runtime": "hermes", "host": "z300", "sessionId": peer_session})
+    return instance
 
 
 class Writer:
@@ -46,6 +62,7 @@ def isolate_coordination_process_state(monkeypatch):
     import gateway.irc_coordination as coordination
 
     monkeypatch.setattr(coordination, "_coordination_states", {})
+    monkeypatch.setattr(irc, "_local_host", lambda: "loota")
 
 
 @pytest.fixture
@@ -61,7 +78,7 @@ def adapter(monkeypatch):
     adapter._writer = Writer()
     adapter._registered = True
     adapter._mark_connected()
-    return adapter
+    return seed(adapter)
 
 
 def frame(body, *, account=PEER, nick=None, destination="#agents", tags="", stamp=None):
@@ -69,26 +86,34 @@ def frame(body, *, account=PEER, nick=None, destination="#agents", tags="", stam
     return f"@account={account};time={stamp}{tags} :{nick or account}!u@host PRIVMSG {destination} :{body}"
 
 
-def request(question="hello", *, target=OWN, request_id=None):
+def request(question="hello", *, target=OWN_ADDRESS, request_id=None):
     request_id = request_id or str(uuid.uuid4())
     return request_id, f"!req {request_id} {target} {question}"
 
 
+def hello(session=PEER_SESSION, *, account=PEER, runtime="hermes", host="z300", destination="#agents"):
+    return frame(f"!hello 1 {runtime} {host} {session}", account=account, destination=destination)
+
+
 def test_wire_roundtrip_budgets_and_conflicts():
     request_id = str(uuid.uuid4())
-    line = format_request(request_id, OWN, "hello\r\nQUIT\x00now", "#agents")
+    line = format_request(request_id, OWN_ADDRESS, "hello\r\nQUIT\x00now", "#agents")
     assert "\r" not in line and "\n" not in line and "\x00" not in line
-    assert parse_request(line.partition(" :")[2]) == (request_id, OWN, "hello QUIT now")
-    with pytest.raises(ValueError, match="request-too-large"):
-        format_request(request_id, OWN, "あ" * 300, "#agents")
+    assert parse_request(line.partition(" :")[2]) == (request_id, OWN_ADDRESS, "hello QUIT now")
+    with pytest.raises(ValueError, match="request-too-long"):
+        format_request(request_id, OWN_ADDRESS, "あ" * 300, "#agents")
     with pytest.raises(ValueError):
-        format_request(request_id, OWN, "hello", "#agents\r\nJOIN #other")
-    assert parse_request(f"!req {request_id} {OWN} a\x01b") is None
+        format_request(request_id, OWN_ADDRESS, "hello", "#agents\r\nJOIN #other")
+    with pytest.raises(ValueError, match="invalid-target"):
+        format_request(request_id, OWN, "hello", "#agents")
+    with pytest.raises(ValueError, match="empty-question"):
+        format_request(request_id, OWN_ADDRESS, "  ", "#agents")
+    assert parse_request(f"!req {request_id} {OWN_ADDRESS} a\x01b") is None
     body = "あ🙂 with spaces " * 200
     lines = response_lines(request_id, "ok", body, "#agents")
     assert 1 < len(lines) <= 6
     assert all(len(line.encode()) <= 400 for line in lines)
-    assembly = ResponseAssembly(request_id, PEER, "#agents")
+    assembly = ResponseAssembly(request_id, PEER, "#agents", PEER_ADDRESS)
     assert assembly.add(OWN, "#agents", lines[-1].partition(" :")[2]) is None
     assert assembly.add(PEER, OWN, lines[-1].partition(" :")[2]) is None
     for line in reversed(lines):
@@ -96,10 +121,49 @@ def test_wire_roundtrip_budgets_and_conflicts():
     assert result["text"] == truncate_body(body)
     assert result["text"].endswith(" [truncated]")
     assert len(result["text"].encode()) <= 1800
-    with pytest.raises(ValueError, match="invalid-response"):
+    with pytest.raises(ValueError, match="duplicate-part"):
         assembly.add(PEER, "#agents", lines[0].partition(" :")[2])
     assert normalize_body("\0a\r\nb\t\x1bc\x7f") == "a b c"
     assert parse_response(f"!res {request_id} err timeout 1/1 timeout") is None
+    hello_id = f"!hello 1 hermes loota {LOCAL_SESSION}"
+    assert parse_hello(hello_id)["sessionId"] == LOCAL_SESSION
+    assert format_hello("hermes", "loota", LOCAL_SESSION, PEER) == f"PRIVMSG {PEER} :{hello_id}"
+    note_id = str(uuid.uuid4())
+    note = format_note(note_id, "*", "heads up", "#agents")
+    assert parse_note(note.partition(" :")[2]) == {
+        "kind": "note", "id": note_id, "target": "*", "text": "heads up"}
+    with pytest.raises(ValueError, match="note-too-long"):
+        format_note(note_id, "*", "x" * 500, "#agents")
+    assert parse_address(OWN_ADDRESS) == (OWN, LOCAL_SESSION)
+    assert parse_address(OWN) is None
+
+
+def test_fixture_conformance_all_four_wire_families():
+    """The vendored fixture is the portable contract; Python must accept exactly its cases."""
+    fixture = json.loads(Path(__file__).resolve().parents[1].joinpath(
+        "fixtures", "agent-irc-v1.json").read_text(encoding="utf-8"))
+
+    def adapted(case):
+        kind, wire = case["kind"], case["wire"]
+        if kind == "hello":
+            return parse_hello(wire)
+        if kind == "note":
+            return parse_note(wire)
+        if kind == "req":
+            parsed = parse_request(wire)
+            if parsed is None:
+                return None
+            return {"kind": "req", "id": parsed[0], "target": parsed[1], "question": parsed[2]}
+        parsed = parse_response(wire)
+        if parsed is None:
+            return None
+        return {"kind": "res", "id": parsed[0], "status": parsed[1],
+                "part": parsed[2], "total": parsed[3], "body": parsed[4]}
+
+    assert fixture["version"] == 1 and {case["kind"] for case in fixture["cases"]} == {
+        "hello", "req", "res", "note"}
+    for case in fixture["cases"]:
+        assert adapted(case) == case["parsed"], case["name"]
 
 
 @pytest.mark.asyncio
@@ -162,6 +226,24 @@ async def test_ingress_gate_rejects_spoofs_history_and_nonrequests(adapter):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("account,destination,present", [
+    ("amodig", OWN, False), ("amodig", "#agents", False),
+    (PEER, OWN, True), (PEER, OWN, False), (PEER, "#agents", False),
+])
+async def test_structured_requests_require_channel_and_agent_presence(adapter, account, destination, present):
+    adapter.handle_message = AsyncMock()
+    if not present:
+        adapter._peers.clear()
+    request_id, body = request()
+    await adapter._handle_line(frame(body, account=account, destination=destination))
+    assert adapter._coord_dispatch_task is None and not adapter._active_requests
+    assert not adapter._inbox and not adapter._writer.lines
+    assert not adapter._request_dedupe.contains(f"req:{request_id}")
+    assert not adapter._coordination_state.accepted_at
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_human_exact_mentions_and_dm_get_unique_sessions(adapter):
     events = []
 
@@ -173,11 +255,31 @@ async def test_human_exact_mentions_and_dm_get_unique_sessions(adapter):
     adapter._message_handler = handler
     for text, destination in [("@" + OWN + " hello", "#agents"), (OWN + ": hi", "#agents"),
                               (OWN + ", hello", "#agents"), ("/reset", OWN)]:
+        before = len(adapter._writer.lines)
         await adapter._handle_line(frame(text, account="amodig", destination=destination))
         await asyncio.wait_for(adapter._coord_dispatch_task, 3)
+        assert events[-1].source.chat_id == "amodig"
+        assert all(line.startswith("PRIVMSG amodig :!res ") for line in adapter._writer.lines[before:])
     assert len({event.source.thread_id for event in events}) == 4
     assert all(uuid.UUID(event.message_id).version == 4 for event in events)
     assert adapter._writer.lines[-1].startswith("PRIVMSG amodig :!res ")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text,destination", [
+    ("@" + OWN + " hello", "#agents"), (OWN + ": hi", "#agents"),
+    (OWN + ", hello", "#agents"), ("hello", OWN),
+])
+async def test_human_busy_replies_use_sender_nick(adapter, text, destination):
+    from collections import deque
+    import time
+
+    adapter._coordination_state.accepted_at["amodig"] = deque([time.monotonic()] * 6)
+    await adapter._handle_line(frame(text, account="amodig", destination=destination))
+    assert adapter._coord_dispatch_task is None
+    assert len(adapter._writer.lines) == 1
+    assert adapter._writer.lines[0].startswith("PRIVMSG amodig :!res ")
+    assert adapter._writer.lines[0].endswith(" busy 1/1 busy")
 
 
 @pytest.mark.asyncio
@@ -264,6 +366,7 @@ async def test_watchdog_holds_admission_until_executor_worker_finishes(adapter, 
             receiver._writer = Writer()
             receiver._registered = True
             receiver._mark_connected()
+            seed(receiver)
             writers.append(receiver._writer)
         await adapter.send("#agents", "interim", metadata={"thread_id": request_id, "_interim_send": True})
         busy_id, busy_body = request()
@@ -309,7 +412,7 @@ async def test_rate_limit_errors_and_disconnect(adapter):
     assert adapter._writer.lines[-1] == f"PRIVMSG #agents :!res {request_id} busy 1/1 busy"
     assert sum(" err 1/1 unavailable" in line for line in adapter._writer.lines) == 6
     assert not any("private-provider-detail" in line for line in adapter._writer.lines)
-    pending = asyncio.create_task(adapter.request_peer(PEER, "hello"))
+    pending = asyncio.create_task(adapter.request_peer(PEER_ADDRESS, "hello"))
     await asyncio.sleep(0)
     await adapter.disconnect()
     assert (await pending)["error"] == "disconnected"
@@ -319,20 +422,21 @@ async def test_rate_limit_errors_and_disconnect(adapter):
 @pytest.mark.asyncio
 async def test_outbound_correlation_full_coverage_partial_and_duplicate(adapter, monkeypatch):
     monkeypatch.setattr(irc, "REQUEST_TIMEOUT", 0.04)
-    pending = asyncio.create_task(adapter.request_peer(PEER, "hello"))
+    pending = asyncio.create_task(adapter.request_peer(PEER_ADDRESS, "hello"))
     await asyncio.sleep(0)
     assembly = adapter._outbound[0]
     rid = assembly.request_id
-    assert (await adapter.request_peer(PEER, "second"))["error"] == "busy"
+    assert (await adapter.request_peer(PEER_ADDRESS, "second"))["error"] == "busy"
     await adapter._handle_line(frame(f"!res {rid} ok 2/2 world", account="agent-omp-loota-01"))
     await adapter._handle_line(frame(f"!res {rid} ok 2/2 world", destination=OWN))
     assert not assembly.parts
     await adapter._handle_line(frame(f"!res {rid} ok 2/2 world"))
     assert not pending.done()
     await adapter._handle_line(frame(f"!res {rid} ok 1/2 hello "))
-    assert await pending == {"requestId": rid, "account": PEER, "status": "ok", "text": "hello world"}
+    assert await pending == {"requestId": rid, "account": PEER, "status": "ok",
+                             "text": "hello world", "untrusted": True}
     for duplicate in (False, True):
-        pending = asyncio.create_task(adapter.request_peer(PEER, "hello"))
+        pending = asyncio.create_task(adapter.request_peer(PEER_ADDRESS, "hello"))
         await asyncio.sleep(0)
         rid = adapter._outbound[0].request_id
         raw = frame(f"!res {rid} ok 2/2 partial")
@@ -340,9 +444,9 @@ async def test_outbound_correlation_full_coverage_partial_and_duplicate(adapter,
         if duplicate:
             await adapter._handle_line(raw)
         result = await pending
-        assert result["error"] == ("invalid-response" if duplicate else "partial-response")
+        assert result["error"] == ("duplicate-part" if duplicate else "timeout")
         assert adapter._outbound is None
-    assert (await adapter.request_peer(PEER, "unanswered"))["error"] == "timeout"
+    assert (await adapter.request_peer(PEER_ADDRESS, "unanswered"))["error"] == "timeout"
 
 
 def test_tool_uses_runtime_profile_and_owner_socket_only(tmp_path, monkeypatch):
@@ -368,14 +472,14 @@ def test_tool_uses_runtime_profile_and_owner_socket_only(tmp_path, monkeypatch):
     for profile in ("alpha", "beta", "alpha"):
         token = set_hermes_home_override(str(tmp_path / "profiles" / profile))
         try:
-            assert json.loads(tools.irc_request({"target": PEER, "question": "hi", "profile": "other"}))["status"] == "ok"
+            assert json.loads(tools.irc_request({"target": PEER_ADDRESS, "question": "hi", "profile": "other"}))["status"] == "ok"
         finally:
             reset_hermes_home_override(token)
     assert [call[2]["profile"] for call in calls] == ["alpha", "beta", "alpha"]
     assert all(call[0] == owner_home and call[1] == "irc-request" and call[3] == 65 for call in calls)
     monkeypatch.setattr(control_socket, "resolve_client_socket_path", lambda home: None)
     monkeypatch.setattr(control_socket, "query_gateway_control", original_query)
-    assert json.loads(tools.irc_request({"target": PEER, "question": "hi"}))["error"] == "unavailable"
+    assert json.loads(tools.irc_request({"target": PEER_ADDRESS, "question": "hi"}))["error"] == "unavailable"
     assert len(calls) == 3
 
 
@@ -385,7 +489,7 @@ async def test_outbound_deadline_includes_blocked_transport_write(adapter, monke
     async def blocked():
         await asyncio.Event().wait()
     adapter._writer.drain = blocked
-    result = await asyncio.wait_for(adapter.request_peer(PEER, "hello"), 3)
+    result = await asyncio.wait_for(adapter.request_peer(PEER_ADDRESS, "hello"), 3)
     assert result["error"] == "timeout"
     assert adapter._outbound is None
 
@@ -400,7 +504,7 @@ async def test_required_capability_withdrawal_disconnects_and_stops_admission(ad
     await adapter._handle_line(f":server CAP {OWN} DEL :unrelated-cap")
     assert adapter.is_connected and not writer.closed
     future = asyncio.get_running_loop().create_future()
-    adapter._outbound = (ResponseAssembly(str(uuid.uuid4()), PEER, "#agents"), future)
+    adapter._outbound = (ResponseAssembly(str(uuid.uuid4()), PEER, "#agents", PEER_ADDRESS), future)
     dispatch = asyncio.create_task(asyncio.Event().wait())
     adapter._coord_dispatch_task = dispatch
     await adapter._handle_line(f":server CAP {OWN} DEL :unrelated-cap {capability}")
@@ -506,9 +610,9 @@ def test_tool_reaches_windows_pipe_without_unix_socket(tmp_path, monkeypatch):
 
     monkeypatch.setattr(control_socket, "resolve_client_socket_path", no_unix_socket)
     monkeypatch.setattr(control_socket, "_query_windows_pipe", pipe_query)
-    assert json.loads(tools.irc_request({"target": PEER, "question": "hello"}))["status"] == "ok"
+    assert json.loads(tools.irc_request({"target": PEER_ADDRESS, "question": "hello"}))["status"] == "ok"
     assert len(calls) == 1 and calls[0][0] == tmp_path and calls[0][2] == 65
-    assert calls[0][1]["params"] == {"profile": "default", "target": PEER, "question": "hello"}
+    assert calls[0][1]["params"] == {"profile": "default", "target": PEER_ADDRESS, "question": "hello"}
 
 
 @pytest.mark.asyncio
@@ -800,17 +904,17 @@ def test_request_boundary_reserves_relay_prefix_headroom():
     from gateway.irc_coordination import IRC_BYTES, PREFIX_HEADROOM
 
     request_id = str(uuid.uuid4())
-    envelope = f"PRIVMSG #agents :!req {request_id} {OWN} "
+    envelope = f"PRIVMSG #agents :!req {request_id} {OWN_ADDRESS} "
     room = IRC_BYTES - PREFIX_HEADROOM - len(envelope.encode())
     question = "é" * (room // 2) + "x" * (room % 2)
-    line = format_request(request_id, OWN, question, "#agents")
+    line = format_request(request_id, OWN_ADDRESS, question, "#agents")
     assert len(line.encode()) + PREFIX_HEADROOM == IRC_BYTES
     prefix = f":{OWN}!hermes@relay.example "
     assert len((prefix + line).encode()) <= IRC_BYTES
     received = irc._parse_irc_message(prefix + line)
-    assert parse_request(received["params"][1]) == (request_id, OWN, question)
-    with pytest.raises(ValueError, match="request-too-large"):
-        format_request(request_id, OWN, question + "x", "#agents")
+    assert parse_request(received["params"][1]) == (request_id, OWN_ADDRESS, question)
+    with pytest.raises(ValueError, match="request-too-long"):
+        format_request(request_id, OWN_ADDRESS, question + "x", "#agents")
 
 
 @pytest.mark.asyncio
@@ -931,7 +1035,8 @@ def test_tool_catalog_matches_normalized_gateway_config(adapter, monkeypatch, sh
     try:
         selected = set(catalog.get_tool_names_for_toolset(config["platform_toolsets"]["cli"][0]))
         definitions = catalog.get_definitions(selected)
-        assert {item["function"]["name"] for item in definitions} == ({"irc_request"} if expected else set())
+        assert {item["function"]["name"] for item in definitions} == (
+            {"irc_status", "irc_read", "irc_request", "irc_send"} if expected else set())
         assert tools._available() is expected
     finally:
         invalidate_check_fn_cache()
@@ -959,6 +1064,7 @@ async def test_admission_window_survives_adapter_replacement(adapter, monkeypatc
     replacement._writer = Writer()
     replacement._registered = True
     replacement._mark_connected()
+    seed(replacement)
     replacement._message_handler = handler
     await replacement._handle_line(frame(bodies[0]))  # Fresh timestamp, same old UUID: still deduplicated.
     assert not replacement._writer.lines
@@ -1173,12 +1279,13 @@ def reload_irc_adapter(monkeypatch, tmp_path):
         package = manager._load_directory_module(manifest, module_name=namespace)
         module = sys.modules[package.__name__ + ".adapter"]
         monkeypatch.setattr(module, "_get_scoped_secret", lambda *args: "")
+        monkeypatch.setattr(module, "_local_host", lambda: "loota")
         instance = module.IRCAdapter(config)
         instance.config.typing_indicator = False
         instance._writer = Writer()
         instance._registered = True
         instance._mark_connected()
-        return instance, module
+        return seed(instance), module
 
     try:
         yield load
@@ -1229,8 +1336,9 @@ async def test_plugin_reload_preserves_worker_lease_and_expired_response(adapter
         other._writer = Writer()
         other._registered = True
         other._mark_connected()
+        seed(other, account=other_account)
         other.set_message_handler(AsyncMock(return_value="independent answer"))
-        other_id, other_body = request(target=other_account)
+        other_id, other_body = request(target=f"{other_account}/{LOCAL_SESSION}")
         await other._handle_line(frame(other_body))
         await asyncio.wait_for(other._coord_dispatch_task, 3)
         assert other._writer.lines == [f"PRIVMSG #agents :!res {other_id} ok 1/1 independent answer"]
@@ -1252,8 +1360,15 @@ async def test_plugin_reload_preserves_worker_lease_and_expired_response(adapter
 
 
 @pytest.mark.asyncio
-async def test_plugin_reload_preserves_rate_window_and_replay_ids(adapter, reload_irc_adapter):
+@pytest.mark.parametrize("replace_adapter", [False, True])
+async def test_question_buckets_survive_reconnect_and_reload_per_sender(
+        adapter, reload_irc_adapter, monkeypatch, replace_adapter):
+    import time
+
+    clock = [1000.0]
+    fake_time = SimpleNamespace(time=time.time, monotonic=lambda: clock[0])
     first, first_module = reload_irc_adapter(adapter.config)
+    monkeypatch.setattr(first_module, "time", fake_time)
     first.set_message_handler(AsyncMock(return_value="accepted"))
     bodies = []
     for index in range(6):
@@ -1262,16 +1377,393 @@ async def test_plugin_reload_preserves_rate_window_and_replay_ids(adapter, reloa
         await first._handle_line(frame(body, tags=f";msgid=reload-{index}"))
         await asyncio.wait_for(first._coord_dispatch_task, 3)
     assert first._message_handler.await_count == 6
+    state = first._coordination_state
     await first.disconnect()
-    second, second_module = reload_irc_adapter(adapter.config)
-    assert first_module is not second_module
-    second.set_message_handler(AsyncMock(return_value="must not run"))
+    if replace_adapter:
+        second, second_module = reload_irc_adapter(adapter.config)
+        assert first_module is not second_module
+        monkeypatch.setattr(second_module, "time", fake_time)
+    else:
+        second = first
+        second._writer = Writer()
+        second._registered = True
+        second._mark_connected()
+        seed(second)
+    assert second._coordination_state is state
+    second.set_message_handler(AsyncMock(return_value="independent answer"))
     await second._handle_line(frame(bodies[0]))  # Same UUID, fresh server timestamp.
     await second._handle_line(frame(request()[1], tags=";msgid=reload-0"))  # New UUID, old msgid.
     assert second._writer.lines == []  # Replays are silent, not even busy/error responses.
+    clock[0] += 59
     seventh_id, seventh_body = request()
     await second._handle_line(frame(seventh_body))
     await second._handle_line(frame(seventh_body))
     assert second._writer.lines == [f"PRIVMSG #agents :!res {seventh_id} busy 1/1 busy"]
     second._message_handler.assert_not_awaited()
     assert second._coord_dispatch_task is None
+    other = "agent-omp-loota-01"
+    await second._handle_line(hello(account=other, destination=OWN))
+    other_id, other_body = request()
+    await second._handle_line(frame(other_body, account=other))
+    await asyncio.wait_for(second._coord_dispatch_task, 3)
+    assert second._writer.lines[-1] == f"PRIVMSG #agents :!res {other_id} ok 1/1 independent answer"
+    # Authenticated human prose gets its own bucket, not the agents' exhausted budget.
+    await second._handle_line(frame("human question", account="amodig", destination=OWN))
+    await asyncio.wait_for(second._coord_dispatch_task, 3)
+    assert second._writer.lines[-1].endswith(" ok 1/1 independent answer")
+    assert second._message_handler.await_count == 2
+    clock[0] += 1
+    await second._handle_line(frame(seventh_body))  # A busy UUID never becomes queued work.
+    fresh_id, fresh_body = request()
+    await second._handle_line(frame(fresh_body))
+    await asyncio.wait_for(second._coord_dispatch_task, 3)
+    assert second._message_handler.await_count == 3
+    assert second._writer.lines[-1] == f"PRIVMSG #agents :!res {fresh_id} ok 1/1 independent answer"
+
+
+@pytest.mark.asyncio
+async def test_hello_presence_channel_reply_rate_limit_and_dm(adapter, monkeypatch):
+    import time
+
+    clock = [100.0]
+    release = asyncio.Event()
+    delays = []
+
+    async def sleep(delay):
+        delays.append(delay)
+        await release.wait()
+
+    monkeypatch.setattr(irc, "time", SimpleNamespace(time=time.time, monotonic=lambda: clock[0]))
+    monkeypatch.setattr(irc, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": sleep}))
+    adapter._peers.clear()
+    await adapter._handle_line(hello())
+    assert adapter._peers[PEER] == {
+        "account": PEER, "address": PEER_ADDRESS, "runtime": "hermes", "host": "z300",
+        "sessionId": PEER_SESSION}
+    reply = f"PRIVMSG {PEER} :!hello 1 hermes loota {LOCAL_SESSION}"
+    assert adapter._writer.lines == [reply]
+    await adapter._handle_line(hello())
+    old_task = adapter._hello_reply_tasks[PEER]
+    await asyncio.sleep(0)
+    # Remove the old peer and reconnect before its five-second throttle expires.
+    await adapter._handle_line(f":{PEER}!u@host PART #agents")
+    clock[0] += 1
+    new_session = str(uuid.uuid4())
+    await adapter._handle_line(hello(new_session))
+    pending = adapter._hello_reply_tasks[PEER]
+    await asyncio.gather(old_task, return_exceptions=True)
+    assert old_task.cancelled() and pending is not old_task
+    for _ in range(10):
+        await adapter._handle_line(hello(new_session))
+    assert list(adapter._hello_reply_tasks.values()) == [pending]
+    assert adapter._writer.lines == [reply]
+    assert adapter._peers[PEER]["address"] == f"{PEER}/{new_session}"
+    clock[0] += 4
+    release.set()
+    await pending  # No further hello is needed to trigger backfill.
+    assert delays == [5.0, 4.0] and not adapter._hello_reply_tasks
+    assert adapter._writer.lines == [reply, reply]
+    adapter._drop_peer(PEER)
+    await adapter._handle_line(hello(destination=OWN))  # DM hello is recorded, never answered.
+    assert PEER in adapter._peers and adapter._writer.lines == [reply, reply]
+    assert not adapter._hello_reply_tasks
+    adapter.handle_message = AsyncMock()
+    for raw in (hello(runtime="openai"), frame("!hello 2 omp loota " + PEER_SESSION),
+                hello(account="amodig"), frame("!hello 1 omp loota " + PEER_SESSION, nick="other")):
+        await adapter._handle_line(raw)
+    adapter.handle_message.assert_not_awaited()
+    assert set(adapter._peers) == {PEER}
+
+
+@pytest.mark.asyncio
+async def test_local_reconnect_preserves_hello_reply_window(adapter, monkeypatch):
+    import time
+
+    clock, delays = [100.0], []
+    release = asyncio.Event()
+
+    async def sleep(delay):
+        delays.append(delay)
+        await release.wait()
+
+    monkeypatch.setattr(irc, "time", SimpleNamespace(time=time.time, monotonic=lambda: clock[0]))
+    monkeypatch.setattr(irc, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": sleep}))
+    await adapter._handle_line(hello())
+    assert len(adapter._writer.lines) == 1
+    await adapter.disconnect()
+    clock[0] += 1
+    adapter._writer = Writer()
+    adapter._registered = True
+    adapter._mark_connected()
+    adapter._session_id = str(uuid.uuid4())
+    adapter._address = f"{OWN}/{adapter._session_id}"
+    await adapter._handle_line(hello())
+    pending = adapter._hello_reply_tasks[PEER]
+    await asyncio.sleep(0)
+    assert not adapter._writer.lines and delays == [4.0]
+    clock[0] += 4
+    release.set()
+    await pending
+    assert adapter._writer.lines == [
+        f"PRIVMSG {PEER} :!hello 1 hermes loota {adapter._session_id}"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("local,event", [
+    (local, event) for local in (False, True) for event in ("PART", "QUIT", "NICK", "KICK")
+] + [(True, "disconnect")])
+async def test_deferred_hello_is_cancelled_on_peer_or_local_removal(adapter, monkeypatch, event, local):
+    async def sleep(delay):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(irc, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": sleep}))
+    adapter._notify_fatal_error = AsyncMock()
+    await adapter._handle_line(hello())
+    await adapter._handle_line(hello())
+    pending = adapter._hello_reply_tasks[PEER]
+    await asyncio.sleep(0)
+    writer = adapter._writer
+    sent = list(writer.lines)
+    account = OWN if local else PEER
+    if event == "disconnect":
+        await adapter.disconnect()
+    else:
+        line = {
+            "PART": f":{account}!u@host PART #agents",
+            "QUIT": f":{account}!u@host QUIT :gone",
+            "NICK": f":{account}!u@host NICK :new-nick",
+            "KICK": f":operator!u@host KICK #agents {account} :gone",
+        }[event]
+        await adapter._handle_line(line)
+    await asyncio.gather(pending, return_exceptions=True)
+    assert pending.cancelled() and not adapter._hello_reply_tasks
+    assert PEER not in adapter._peers and writer.lines == sent
+    if local or event == "disconnect":
+        assert not adapter.is_connected and adapter._address is None
+
+
+@pytest.mark.asyncio
+async def test_presence_invalidation_and_disconnect_clear_inbox(adapter):
+    adapter._inbox.append({"kind": "note", "id": "x", "account": PEER, "target": "*",
+                           "serverTime": "t", "text": "kept until disconnect", "untrusted": True})
+    for raw, account in ((":agent-jeeves!u@h PART #agents", PEER),
+                         (":agent-jeeves!u@h QUIT :bye", PEER),
+                         (":agent-jeeves!u@h NICK :agent-jeeves2", PEER),
+                         (":op!u@h KICK #agents agent-jeeves :bye", PEER)):
+        await adapter._handle_line(hello())
+        assert account in adapter._peers
+        await adapter._handle_line(raw)
+        assert account not in adapter._peers
+    await adapter._handle_line(hello())
+    assert adapter.read_inbox()["entries"][0]["text"] == "kept until disconnect"
+    await adapter.disconnect()
+    assert not adapter._peers and not adapter._inbox
+    assert adapter._address is None and adapter._session_id is None
+    assert adapter.read_inbox()["error"] == "not-connected"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("victim", [OWN, PEER])
+async def test_kick_ends_local_coordination_but_only_removes_remote_peer(adapter, victim):
+    other = "agent-omp-loota-01"
+    await adapter._handle_line(hello(account=other))
+    await adapter._handle_line(frame(f"!note {uuid.uuid4()} * retained until local kick"))
+    writer = adapter._writer
+    notified = AsyncMock()
+    adapter.set_fatal_error_handler(notified)
+    dispatch = asyncio.create_task(asyncio.Event().wait())
+    adapter._coord_dispatch_task = adapter._coordination_state.dispatch = dispatch
+    dispatch.add_done_callback(adapter._coordination_finished)
+    adapter._active_requests["inbound"] = {}
+    pending = asyncio.create_task(adapter.request_peer(PEER_ADDRESS, "pending"))
+    try:
+        await asyncio.sleep(0)
+        assert adapter._outbound is not None
+        await adapter._handle_line(f":op!u@h KICK #elsewhere {victim} :unrelated")
+        assert adapter.is_connected and not pending.done()
+        await adapter._handle_line(f":op!u@h KICK #agents {victim} :removed")
+        result = await asyncio.wait_for(pending, 3)
+        status = adapter.status_payload()
+        if victim == OWN:
+            assert result["error"] == "disconnected"
+            assert not status["connected"] and status["address"] is None and status["sessionId"] is None
+            assert not status["peers"] and not adapter._inbox and not adapter._active_requests
+            assert writer.closed and dispatch.cancelled()
+            assert adapter._coordination_state.dispatch is None
+            assert adapter.fatal_error_code == "channel_kicked" and not adapter.fatal_error_retryable
+            notified.assert_awaited_once_with(adapter)
+            assert adapter.read_inbox()["error"] == "not-connected"
+            assert (await adapter.send_note("*", "cannot send"))["error"] == "not-connected"
+            assert (await adapter.request_peer(PEER_ADDRESS, "cannot ask"))["error"] == "not-connected"
+        else:
+            assert result["error"] == "peer-changed"
+            assert status["connected"] and status["address"] == OWN_ADDRESS
+            assert set(adapter._peers) == {other}
+            assert adapter.read_inbox()["entries"][0]["text"] == "retained until local kick"
+            assert not writer.closed and not dispatch.done() and adapter._active_requests
+            notified.assert_not_awaited()
+    finally:
+        dispatch.cancel()
+        pending.cancel()
+        await asyncio.gather(dispatch, pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_exact_session_targeting_rejects_stale_and_account_only(adapter, monkeypatch):
+    monkeypatch.setattr(irc, "REQUEST_TIMEOUT", 0.02)
+    adapter.handle_message = AsyncMock()
+    stale, account_only = OWN_ADDRESS.replace("3f2a", "9f2a"), OWN
+    for target in (stale, account_only, f"agent-omp-loota-01/{LOCAL_SESSION}"):
+        await adapter._handle_line(frame(request(target=target)[1]))
+    await adapter._handle_line(frame(request(target=OWN_ADDRESS)[1], destination=OWN))
+    assert not adapter.handle_message.called and not adapter._writer.lines
+    # Reuse of the account slot by a new session settles the old address once.
+    pending = asyncio.create_task(adapter.request_peer(PEER_ADDRESS, "hello"))
+    await asyncio.sleep(0)
+    request_id = adapter._outbound[0].request_id
+    new_session = "6ba7b810-9dad-41d1-80b4-00c04fd430c8"
+    await adapter._handle_line(hello(new_session))
+    assert await pending == {"requestId": request_id, "error": "peer-changed"}
+    assert adapter._peers[PEER]["address"] == f"{PEER}/{new_session}"
+    assert (await adapter.request_peer(PEER_ADDRESS, "old"))["error"] == "peer-changed"
+    assert (await adapter.request_peer(f"{PEER}/{new_session}", "new"))["error"] == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_notes_are_inbox_only_deduped_rated_and_bounded(adapter, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=irc.logger.name)  # the advisory is a plain INFO record
+    monkeypatch.setattr(irc, "REQUESTS_PER_MINUTE", 1000)
+    adapter.handle_message = AsyncMock()
+    note_id = str(uuid.uuid4())
+    directed = frame(f"!note {note_id} {OWN_ADDRESS} check  the queue")
+    await adapter._handle_line(directed)
+    await adapter._handle_line(directed)  # duplicate (sender, note UUID)
+    broadcast_id = str(uuid.uuid4())
+    await adapter._handle_line(frame(f"!note {broadcast_id} * heads up"))
+    await adapter._handle_line(frame(f"!note {uuid.uuid4()} agent-omp-loota-01/{LOCAL_SESSION} miss"))
+    await adapter._handle_line(frame(f"!note {uuid.uuid4()} * off-channel note", destination=OWN))
+    await adapter._handle_line(frame(f"!note {uuid.uuid4()} * no presence", account="agent-omp-loota-01"))
+    entries = adapter.read_inbox()["entries"]
+    assert [(e["id"], e["target"], e["text"]) for e in entries] == [
+        (note_id, OWN_ADDRESS, "check  the queue"), (broadcast_id, "*", "heads up")]
+    assert all(e["untrusted"] and e["account"] == PEER and e["kind"] == "note" for e in entries)
+    assert caplog.text.count(f"IRC advisory from {PEER}") == 2
+    adapter.handle_message.assert_not_awaited()
+    assert not adapter._writer.lines
+    for index in range(120):
+        raw = frame(f"!note {uuid.uuid4()} * n{index}")
+        await adapter._handle_line(raw)
+    assert len(adapter.read_inbox(20)["entries"]) == 20
+    assert len(adapter._inbox) == 100 and adapter._inbox[-1]["text"] == "n119"
+    assert adapter._inbox[0]["text"] != "check  the queue"
+    assert adapter.read_inbox(0)["error"] == "invalid-limit"
+    assert adapter.read_inbox("5")["error"] == "invalid-limit"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replace_adapter", [False, True])
+async def test_note_budget_survives_reconnect_and_plugin_reload(adapter, reload_irc_adapter, monkeypatch, replace_adapter):
+    import time
+
+    clock = [1000.0]
+    fake_time = SimpleNamespace(time=time.time, monotonic=lambda: clock[0])
+    monkeypatch.setattr(irc, "time", fake_time)
+    note_ids = [str(uuid.uuid4()) for _ in range(6)]
+    for note_id in note_ids:
+        await adapter._handle_line(frame(f"!note {note_id} * accepted"))
+    assert len(adapter.read_inbox()["entries"]) == 6
+    state = adapter._coordination_state
+    await adapter.disconnect()
+    assert not adapter._peers and not adapter._inbox and adapter._address is None
+    if replace_adapter:
+        adapter, module = reload_irc_adapter(adapter.config)
+        monkeypatch.setattr(module, "time", fake_time)
+        adapter._clear_coordination_session()
+    else:
+        adapter._writer = Writer()
+        adapter._registered = True
+        adapter._mark_connected()
+    assert adapter._coordination_state is state
+    assert not adapter._peers and not adapter._inbox
+    adapter._session_id = str(uuid.uuid4())
+    adapter._address = f"{OWN}/{adapter._session_id}"
+    adapter.handle_message = AsyncMock()
+    # A reconnect needs a fresh hello even though the admission budget survived.
+    await adapter._handle_line(frame(f"!note {uuid.uuid4()} * undiscovered"))
+    assert not adapter._inbox
+    await adapter._handle_line(hello())
+    adapter._writer.lines.clear()
+    clock[0] += 59
+    await adapter._handle_line(frame(f"!note {uuid.uuid4()} * still throttled"))
+    assert not adapter._inbox
+    # Budgets are per sender, not shared with another authenticated agent.
+    other = "agent-omp-loota-01"
+    await adapter._handle_line(hello(account=other, destination=OWN))
+    await adapter._handle_line(frame(f"!note {uuid.uuid4()} * other sender", account=other))
+    clock[0] += 1
+    await adapter._handle_line(frame(f"!note {note_ids[0]} * replay"))  # TTL still applies after rate expiry.
+    await adapter._handle_line(frame(f"!note {uuid.uuid4()} * fresh window"))
+    assert [entry["text"] for entry in adapter.read_inbox()["entries"]] == ["other sender", "fresh window"]
+    assert not adapter._writer.lines and not adapter._coord_dispatch_task
+    assert not state.accepted_at  # Notes never spend the model-question budget.
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_note_target_validation_and_status(adapter):
+    adapter._writer.lines.clear()
+    sent = await adapter.send_note(PEER_ADDRESS, "advice")
+    assert sent["status"] == "sent" and sent["target"] == PEER_ADDRESS
+    assert adapter._writer.lines == [
+        f"PRIVMSG #agents :!note {sent['noteId']} {PEER_ADDRESS} advice"]
+    for target, error in ((f"agent-omp-loota-01/{LOCAL_SESSION}", "unknown-peer"),
+                          (OWN_ADDRESS, "invalid-target"), (PEER, "invalid-target"),
+                          (f"amodig/{LOCAL_SESSION}", "invalid-target")):
+        assert (await adapter.send_note(target, "x"))["error"] == error
+    assert (await adapter.send_note("*", "  "))["error"] == "empty-text"
+    assert (await adapter.send_note("*", "x" * 500))["error"] == "note-too-long"
+    assert (await adapter.send_note("*", "broadcast"))["status"] == "sent"
+    status = adapter.status_payload()
+    assert status["address"] == OWN_ADDRESS and status["sessionId"] == LOCAL_SESSION
+    assert status["peers"] == [{"account": PEER, "address": PEER_ADDRESS, "runtime": "hermes",
+                                "host": "z300", "sessionId": PEER_SESSION}]
+    adapter._peers[PEER] = {**adapter._peers[PEER], "address": f"{PEER}/{LOCAL_SESSION}"}
+    assert (await adapter.send_note(PEER_ADDRESS, "x"))["error"] == "peer-changed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,error", [("err", "peer-error"), ("busy", "busy")])
+async def test_peer_failure_body_is_untrusted_data_not_local_error(adapter, status, error):
+    pending = asyncio.create_task(adapter.request_peer(PEER_ADDRESS, "hello"))
+    await asyncio.sleep(0)
+    rid = adapter._outbound[0].request_id
+    body = "peer-controlled λ text  "
+    await adapter._handle_line(frame(f"!res {rid} {status} 1/1 {body}"))
+    result = await pending
+    assert result == {"requestId": rid, "account": PEER, "status": status, "untrusted": True,
+                      "text": body, "error": error}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command_bytes", [399, 400, 401])
+@pytest.mark.parametrize("prefix", ["ASCII", "λ🙂"])
+async def test_received_response_command_budget_preserves_verbatim_body(adapter, command_bytes, prefix):
+    pending = asyncio.create_task(adapter.request_peer(PEER_ADDRESS, "hello"))
+    await asyncio.sleep(0)
+    assembly = adapter._outbound[0]
+    rid = assembly.request_id
+    header = f"PRIVMSG #agents :!res {rid} ok 1/1 "
+    body = prefix + "x" * (command_bytes - len((header + prefix + "  ").encode("utf-8"))) + "  "
+    assert len((header + body).encode("utf-8")) == command_bytes
+    # Framing is admission context, not pure envelope syntax.
+    assert parse_response(f"!res {rid} ok 1/1 {body}")[-1] == body
+    await adapter._handle_line(frame(f"!res {uuid.uuid4()} ok 1/1 {'x' * 400}"))
+    assert not pending.done() and not assembly.parts
+    await adapter._handle_line(frame(f"!res {rid} ok 1/1 {body}"))
+    result = await pending
+    if command_bytes > 400:
+        assert result == {"requestId": rid, "error": "response-too-long"}
+        assert assembly.total is None and assembly.size == 0
+    else:
+        assert result == {"requestId": rid, "account": PEER, "status": "ok",
+                          "text": body, "untrusted": True}

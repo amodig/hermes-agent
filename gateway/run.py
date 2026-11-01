@@ -5632,7 +5632,9 @@ async def _start_gateway_start_control_socket(runner):
             unserve_profile_verb, serve_profile_verb,
         )
         from gateway.run_plugin_rewire import reload_plugins_verb
-        from gateway.irc_coordination import irc_request_verb
+        from gateway.irc_coordination import (
+            irc_read_verb, irc_request_verb, irc_send_verb, irc_status_verb,
+        )
         # pause-for-update: the updater asks us to drain + exit (freeing venv handles) vs. a tree-kill
         # (same path as SIGUSR1). Handler runs on the socket executor thread, so marshal onto the loop.
         # pause-for-update (#92091 step 2): the updater asks this gateway to drain in-flight turns and exit
@@ -5682,6 +5684,9 @@ async def _start_gateway_start_control_socket(runner):
             verb_handlers={"pause-for-update": _pause_for_update_handler,
                            "rescan-profiles": _rescan_profiles_handler,
                            "irc-request": irc_request_verb(runner, _main_loop),
+                           "irc-status": irc_status_verb(runner, _main_loop),
+                           "irc-read": irc_read_verb(runner, _main_loop),
+                           "irc-send": irc_send_verb(runner, _main_loop),
                            "unserve-profile": unserve_profile_verb(runner),
                            "serve-profile": serve_profile_verb(runner),
                            "migrate-profile-identity": migrate_profile_identity_verb(runner),

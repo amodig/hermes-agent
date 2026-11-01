@@ -255,13 +255,14 @@ class GatewayControlServer:
         return encoded + b"\n"
 
     async def _run_request_line(self, raw: bytes, *, cancelled: threading.Event) -> bytes:
-        """Keep IRC's long blocking wait out of the executor needed by profile initialization."""
+        """Keep IRC waits out of the default executor needed by profile initialization."""
         loop = asyncio.get_running_loop()
         try:
             request = json.loads(raw)
         except (ValueError, UnicodeDecodeError):
             request = None
-        if not isinstance(request, dict) or request.get("verb") != "irc-request":
+        if not isinstance(request, dict) or request.get("verb") not in (
+                "irc-request", "irc-status", "irc-read", "irc-send"):
             return await loop.run_in_executor(None, lambda: self.handle_request_line(raw, cancelled=cancelled))
 
         from gateway.irc_coordination import CONTROL_TIMEOUT
