@@ -293,6 +293,10 @@ class IRCAdapter(BasePlatformAdapter):
     def _endpoint(self) -> tuple[str, int]:
         return (self.server, int(self.port))
 
+    def _network_scope(self) -> str:
+        """Sanctioned transports share one Ergo network and identity lock."""
+        return "agents-ergo" if self._endpoint in COORDINATION_ENDPOINTS else self.server
+
     def _transport_is_sanctioned(self) -> bool:
         """TLS, or the one documented loopback tunnel to the same agents network.
 
@@ -352,8 +356,12 @@ class IRCAdapter(BasePlatformAdapter):
         self._joined_channels.clear()
         self._batches.clear()
         self._connection_started = time.time()
-        # Prevent two profiles from using the same IRC identity
-        if not self._acquire_platform_lock("irc", f"{self.server}:{self.nickname}", f"IRC identity {self.nickname}@{self.server}"):
+        # Lock the account on its network, not the transport used to reach it.
+        scope = self._network_scope()
+        identity = self.sasl_account or self.nickname
+        if not self._acquire_platform_lock(
+                "irc", f"{scope}:{identity}",
+                f"IRC identity {identity}@{scope} via {self.server}:{self.port}"):
             return False
         self._connecting = True
         try:

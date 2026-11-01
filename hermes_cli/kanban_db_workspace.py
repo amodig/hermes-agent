@@ -1306,9 +1306,10 @@ def discard_prepared_worktree(
     """Remove a worktree prepared for a claim that was then refused.
 
     Only when nothing can be lost: this card's canonical linked worktree, clean by git's
-    own check, sitting exactly at the head the attempt prepared, free of ignored files
-    that head tracks. Any doubt preserves it, and removal never deletes a branch. Without
-    this, a refused attempt leaves a checkout at a candidate a retry may be unable to move
+    own check, sitting exactly at the head the attempt prepared, with that head still
+    reachable from a ref and no ignored files. Any doubt preserves it, and removal never
+    deletes a branch. Without this, a refused attempt leaves a checkout at a candidate
+    a retry may be unable to move
     away from, poisoning every later dispatch.
     """
     # A reused detached checkout's commit can be its last anchor, so an attempt
@@ -1327,6 +1328,11 @@ def discard_prepared_worktree(
             return False
         _clean_tree(target, str(target))
         if _worktree_removal_blockers(target):
+            return False
+        if not _commit_referenced(repo_root, prepared_head):
+            _kb._log.info(
+                "preserving prepared workspace at %s: no ref reaches prepared head %s",
+                target, prepared_head)
             return False
         result = _git(repo_root, "worktree", "remove", str(target), timeout=60)
         if result.returncode != 0:

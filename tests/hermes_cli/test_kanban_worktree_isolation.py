@@ -991,6 +991,30 @@ def test_discard_prepared_worktree_only_removes_a_clean_checkout(
         assert kbw.discard_prepared_worktree(task, path, candidate) is False
         assert path.exists()
 
+
+@pytest.mark.parametrize("referenced", [False, True])
+def test_discard_preserves_the_last_candidate_reference(kanban_home, tmp_path, referenced):
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    _git(repo, "checkout", "-b", "candidate")
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+    _git(repo, "checkout", "main")
+    with kbc.connect() as conn:
+        implementation = _candidate_card(conn, repo, base=base, head=candidate)
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        task = kb.get_task(conn, review)
+        path, _branch = kbw._resolve_worktree_workspace(task, candidate_head=candidate)
+        if not referenced:
+            _git(repo, "update-ref", "-d", "refs/heads/candidate")
+
+        assert kbw.discard_prepared_worktree(task, path, candidate) is referenced
+        assert path.is_dir() is not referenced
+        if not referenced:
+            assert _head(path) == candidate
+            assert (path / "candidate.txt").read_text() == "candidate\n"
+    assert _head(repo) == base
+
+
 def test_discard_preserves_a_worktree_holding_ignored_content(kanban_home, tmp_path):
     """`git worktree remove` deletes ignored files too, so any ignored entry preserves it."""
     repo = _make_repo(tmp_path)

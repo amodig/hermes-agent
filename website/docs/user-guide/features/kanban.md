@@ -614,7 +614,9 @@ Existing checkouts with `assume-unchanged` or `skip-worktree` index flags refuse
 with `candidate_workspace_unavailable`, even when `git status` looks clean: clear
 those flags and preserve or commit any local edits before retrying. A refused
 claim or deferred launch may remove only a checkout that attempt created, never
-one with index flags or ignored entries; reused detached checkouts remain anchored.
+one with index flags or ignored entries. Its prepared commit must still be reachable
+from a Git ref: even a newly created detached checkout survives if it is the last
+reference to that commit. Reused detached checkouts always remain anchored.
 CLI candidate-mismatch rollback leaves a successor run's claim and checkout intact.
 Ordinary worktree cards retain custom target paths; an inherited sibling checkout
 resolves to the card's own worktree rather than sharing the sibling's branch.

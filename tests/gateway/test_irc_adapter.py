@@ -619,6 +619,29 @@ def _tunnel_config(**overrides):
     return PlatformConfig(enabled=True, extra=extra)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coordination", [True, False])
+async def test_sanctioned_transports_lock_the_same_network_account(monkeypatch, coordination):
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    locks = []
+    for nickname, config in zip(("first-nick", "second-nick"),
+                                (_coordination_config(), _tunnel_config())):
+        config.extra["coordination"] = coordination
+        if not coordination:
+            config.extra["nickname"] = nickname
+        adapter = IRCAdapter(config)
+
+        def refuse_lock(platform, identity, message):
+            locks.append((platform, identity))
+            assert "synthetic-only" not in message
+            assert adapter.server in message
+            return False
+
+        monkeypatch.setattr(adapter, "_acquire_platform_lock", refuse_lock)
+        assert await adapter.connect() is False
+    assert locks[0] == locks[1] == ("irc", "agents-ergo:agent-hermes-cto")
+
+
 def test_public_endpoint_must_keep_tls():
     """The pinned Serve endpoint carries SASL only inside TLS."""
     config = _coordination_config()
