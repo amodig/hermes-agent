@@ -2956,6 +2956,15 @@ def _dispatch_lane_task(
         except Exception as exc:
             if launch is not None and launch.cancel:
                 launch.cancel()
+            # Preparation materializes a detached role worktree before the spawn. If the
+            # launch fails, that checkout is a relic of an attempt in which no worker ran,
+            # and a later candidate that does not contain its commit would make every retry
+            # refuse. Discard it while nothing can be lost.
+            if workspace is not None and spawn_task is not None:
+                _kbw.discard_prepared_worktree(
+                    spawn_task, workspace,
+                    candidate_head or (_kbw._git_head(workspace) or ""), board=board,
+                )
             from tools.autonomous_resources import AutonomousResourceUnavailable
             from tools.process_registry import RestartSafeScopeUnavailable
 

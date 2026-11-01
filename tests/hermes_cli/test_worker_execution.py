@@ -1121,3 +1121,30 @@ def test_materialized_review_source_must_be_the_reviewed_commit(fixture, monkeyp
     with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
         wes._materialize_source(authority, moved_root)
     assert excinfo.value.code == "source_changed"
+
+
+def test_materialized_review_source_refuses_index_flags_that_hide_changes(
+    fixture, monkeypatch,
+):
+    """`assume-unchanged`/`skip-worktree` make a modified file report clean.
+
+    Without this guard the copy would carry working-tree bytes that are not in the
+    reviewed commit, while `git diff --quiet HEAD` said the tree matched.
+    """
+    monkeypatch.setattr(
+        wep, "resolve_review_context",
+        lambda *_a, **_k: ("review", {"base": fixture.base, "head": fixture.head}))
+    authority = _authority(fixture)
+
+    for index, flag in enumerate(("--assume-unchanged", "--skip-worktree")):
+        run_root = fixture.root / f"flagged-run-{index}"
+        run_root.mkdir()
+        _git(fixture.repo, "update-index", flag, "app.py")
+        (fixture.repo / "app.py").write_text("print('swapped')\n", encoding="utf-8")
+        with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+            wes._materialize_source(authority, run_root)
+        assert excinfo.value.code == "source_changed", flag
+        assert "index flags" in str(excinfo.value), flag
+
+        _git(fixture.repo, "update-index", flag.replace("--", "--no-"), "app.py")
+        _git(fixture.repo, "checkout", "--", "app.py")

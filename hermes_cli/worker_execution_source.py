@@ -478,6 +478,36 @@ def _git_text(git: SyntheticGit, args: list[str]) -> str:
         _refuse("git_unsupported", "Git output is not valid UTF-8")
 
 
+def _reject_index_flags(git: SyntheticGit) -> None:
+    """Refuse paths whose index entry can hide changed content.
+
+    ``assume-unchanged`` and ``skip-worktree`` make Git report a modified file as
+    clean, and the digest then hashes the modified working-tree bytes — a copy of the
+    reviewed commit that is not the reviewed commit. ``ls-files -v`` marks such entries
+    with anything other than ``H``.
+    """
+    listing = git.run(["ls-files", "-v", "-z"])
+    if listing.returncode != 0:
+        _refuse("git_unavailable", "Git index flags could not be read")
+    flagged = []
+    for item in listing.stdout.split(b"\x00"):
+        if not item:
+            continue
+        tag, _, path = item.partition(b" ")
+        if tag != b"H":
+            try:
+                flagged.append(path.decode("utf-8", "strict"))
+            except UnicodeDecodeError:
+                flagged.append("<non-utf8 path>")
+    if flagged:
+        _refuse(
+            "source_changed",
+            f"{len(flagged)} tracked path(s) hide modifications behind index flags "
+            f"(assume-unchanged/skip-worktree); verification cannot prove the copy is the "
+            f"reviewed commit: {', '.join(sorted(flagged)[:3])}",
+        )
+
+
 def _git_tracked(git: SyntheticGit) -> dict[str, tuple[str, str]]:
     """``path -> (mode, object id)`` from the index; no worktree access."""
     raw = git.run(["ls-files", "--stage", "-z"])
@@ -546,6 +576,11 @@ def _scan_source(
             if not granted_head or head.lower() != granted_head:
                 raise WorkerExecutionRefused(
                     "source_changed", "the granted workspace HEAD is not the reviewed head")
+            # The diff guard alone is not proof: ``assume-unchanged`` and
+            # ``skip-worktree`` make a modified file report clean, and the copy would then
+            # carry bytes that are not in the reviewed commit. Sparse checkouts are refused
+            # for the same reason — a copy missing tracked paths is not the commit either.
+            _reject_index_flags(git)
             dirty = git.run([
                 "diff", "--quiet", "--no-ext-diff", "--no-textconv",
                 "--ignore-submodules=all", "HEAD", "--",

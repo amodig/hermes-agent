@@ -1002,11 +1002,6 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                 kbw.candidate_head_for_task(conn, pending) if pending is not None else None)
             prepared_run_head = (
                 kb._run_ledger_head(conn, pending.id) if pending is not None else 0)
-            # A non-role worktree card has no candidate commit, so the head this attempt
-            # prepared is the checkout it just resolved. Without it the discard guard
-            # compares against "" and can never reclaim an ordinary prepared worktree.
-            prepared_head = candidate_head or (
-                kbw._git_head(workspace) if workspace is not None else None) or ""
             blocked = _claim_preflight(conn, pending) if pending is not None else None
             if blocked:
                 return _err(f"cannot claim {args.task_id}: {blocked}")
@@ -1023,6 +1018,11 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                 workspace = kbw.resolve_workspace(
                     pending, candidate_head=candidate_head)
                 resolved_branch = None
+            # A non-role card has no candidate commit, so the head this attempt prepared is
+            # the checkout it just resolved. Without it the discard guard compares against
+            # "" and can never reclaim an ordinary prepared worktree.
+            prepared_head = candidate_head or (
+                kbw._git_head(workspace) if workspace is not None else None) or ""
         except ValueError as exc:
             return _err(f"kanban: {exc}")
         # Fence the claim to the row this workspace was derived from: an operator edit

@@ -465,3 +465,47 @@ def test_cli_fenced_unblock_requires_a_single_task(
         assert kanban_cli._cmd_unblock(args) == 2
         assert "--expected-version requires exactly one task id" in capsys.readouterr().err
         assert (_snapshot(conn, first), _snapshot(conn, second)) == before
+
+
+def test_failed_launch_preparation_discards_its_prepared_worktree(
+    kanban_home: Path, tmp_path: Path,
+) -> None:
+    """No worker ran, so the checkout it prepared must not poison later retries.
+
+    A later candidate that does not contain this checkout's commit makes
+    `_role_worktree` refuse it, which would block every retry after the launch
+    infrastructure is repaired.
+    """
+    import subprocess
+
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    for args in (("config", "user.email", "t@example.invalid"), ("config", "user.name", "t")):
+        subprocess.run(["git", "-C", str(repo), *args], check=True)
+    (repo / "app.py").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(
+            conn, title="ordinary worktree card", assignee="worker",
+            workspace_kind="worktree", workspace_path=str(repo))
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        target = repo / ".worktrees" / tid
+
+        def exploding_spawn(*_args, **_kwargs):
+            raise RuntimeError("launcher refused")
+
+        result = kbd.dispatch_once(
+            conn, max_spawn=1, max_in_progress=4, max_in_progress_per_profile=4,
+            spawn_fn=exploding_spawn, reconcile_orphans=False,
+        )
+        assert not result.spawned
+        after = kb.get_task(conn, tid)
+        assert after.status != "running"
+        # The checkout prepared for the failed launch is gone, not left to block a retry.
+        assert not target.exists(), sorted(p.name for p in target.parent.glob("*"))

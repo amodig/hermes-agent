@@ -1273,3 +1273,27 @@ def test_discard_reclaims_an_ordinary_prepared_worktree(kanban_home, tmp_path):
         assert kbw.discard_prepared_worktree(task, path, prepared_head) is True
     assert not path.exists()
     assert _head(repo) == base
+
+
+def test_claim_cli_claims_an_ordinary_card(kanban_home, tmp_path, capsys):
+    """Every non-role card takes this path: no candidate, so nothing to short-circuit.
+
+    The prepared-head computation once read the resolved workspace before it existed,
+    raising UnboundLocalError for every ordinary claim.
+    """
+    from hermes_cli import kanban as kc
+
+    repo = _make_repo(tmp_path)
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="ordinary worktree card", assignee="worker",
+            workspace_kind="worktree", workspace_path=str(repo))
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+
+    assert kc._cmd_claim(_claim_args(tid)) == 0, capsys.readouterr().err
+    with kbc.connect() as conn:
+        claimed = kb.get_task(conn, tid)
+    assert claimed.status == "running"
+    assert claimed.workspace_path and claimed.workspace_path != str(repo)
+    assert _head(Path(claimed.workspace_path)) == _head(repo)
