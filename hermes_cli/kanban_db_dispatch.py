@@ -2863,6 +2863,7 @@ def _dispatch_lane_task(
     claimed = None
     workspace = None
     resolved_branch_name = None
+    prepared_new = False
 
     if use_default_spawn:
         preflight = _kb.get_task(conn, task_id)
@@ -2886,6 +2887,8 @@ def _dispatch_lane_task(
             # detached-checkout branch must key on the effective kind or the empty
             # branch it reports is never captured (and ``wt/<id>`` gets invented later).
             if _kbw.effective_workspace_kind(spawn_task) == "worktree":
+                prepared_new = not (
+                    _kbw._role_repo_root(spawn_task, board) / ".worktrees" / spawn_task.id).exists()
                 workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(
                     spawn_task, board=board, candidate_head=candidate_head)
             else:
@@ -2915,6 +2918,11 @@ def _dispatch_lane_task(
             if claimed is None:
                 if launch.cancel:
                     launch.cancel()
+                _kbw.discard_prepared_worktree(
+                    spawn_task, workspace,
+                    candidate_head or (_kbw._git_head(workspace) or ""), board=board,
+                    prepared_new=prepared_new,
+                )
                 _note_claim_hold(
                     conn, task_id, result, lane=lane, board=board, expected_task=preflight,
                 )
@@ -2941,6 +2949,7 @@ def _dispatch_lane_task(
                 if workspace is not None:
                     _kbw.discard_prepared_worktree(
                         claimed, workspace, candidate_head or "", board=board,
+                        prepared_new=prepared_new,
                     )
                 if _record_task_failure(
                     conn, claimed.id, candidate_problem, outcome="spawn_failed",
@@ -2957,6 +2966,7 @@ def _dispatch_lane_task(
                 _kbw.discard_prepared_worktree(
                     spawn_task, workspace,
                     candidate_head or (_kbw._git_head(workspace) or ""), board=board,
+                    prepared_new=prepared_new,
                 )
             _note_launch_cancelled(task_id, str(exc), result)
             return False
@@ -2971,6 +2981,7 @@ def _dispatch_lane_task(
                 _kbw.discard_prepared_worktree(
                     spawn_task, workspace,
                     candidate_head or (_kbw._git_head(workspace) or ""), board=board,
+                    prepared_new=prepared_new,
                 )
             from tools.autonomous_resources import AutonomousResourceUnavailable
             from tools.process_registry import RestartSafeScopeUnavailable

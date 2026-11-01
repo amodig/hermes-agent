@@ -976,6 +976,10 @@ def test_discard_prepared_worktree_only_removes_a_clean_checkout(
         path, _branch = kbw._resolve_worktree_workspace(
             task, candidate_head=kbw.candidate_head_for_task(conn, task))
 
+        assert kbw.discard_prepared_worktree(
+            task, path, candidate, prepared_new=False) is False
+        assert path.is_dir()
+
         # A clean checkout at the prepared head is discarded…
         assert kbw.discard_prepared_worktree(task, path, candidate) is True
         assert not path.exists()
@@ -1183,7 +1187,8 @@ def test_discard_refuses_after_a_real_claim_release_cycle(kanban_home, tmp_path)
             "a released cycle must be invisible to the task columns")
         assert kb._run_ledger_head(conn, review) > prepared_run_head
 
-        assert kc._discard_if_still_ours(conn, pending, path, prepared_head, prepared_run_head) is False
+        assert kc._discard_if_still_ours(
+            conn, pending, path, prepared_head, prepared_run_head, prepared_new=True) is False
     assert path.exists()
 
 
@@ -1347,3 +1352,173 @@ def test_role_candidate_head_follows_the_bound_run_not_the_newest(kanban_home, t
 
     assert bound == first
     assert newest == second          # the newest handoff is the rejected candidate
+
+
+@pytest.mark.parametrize("flag", ["skip-worktree", "assume-unchanged"])
+def test_role_checkout_refuses_index_hidden_changes(kanban_home, tmp_path, flag):
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "app.py", "candidate\n")
+    with kbc.connect() as conn:
+        implementation = _candidate_card(conn, repo, base=base, head=candidate)
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        task = kb.get_task(conn, review)
+    path = kbw.resolve_workspace(task, candidate_head=candidate)
+    _git(path, "update-index", f"--{flag}", "app.py")
+    (path / "app.py").write_text("hidden local changes\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="candidate_workspace_unavailable.*index flags.*app.py"):
+        kbw.resolve_workspace(task, candidate_head=candidate)
+    assert (path / "app.py").read_text() == "hidden local changes\n"
+    _git(path, "update-index", f"--no-{flag}", "app.py")
+    (path / "app.py").write_text("candidate\n", encoding="utf-8")
+    assert kbw.resolve_workspace(task, candidate_head=candidate) == path
+    assert _head(path) == candidate
+
+
+def _ready_review_card(conn, repo: Path, base: str, candidate: str) -> str:
+    implementation = kb.create_task(
+        conn, title="implementation", assignee="coder", workspace_kind="worktree",
+        workspace_path=str(repo),
+        lifecycle_contract={
+            "kind": "code", "review_mode": "separate_card", "reviewer": "reviewer",
+            "validation_required": True,
+        },
+    )
+    review = _role_card(conn, "review", implementation, repo, "reviewer")
+    kb.link_tasks(conn, implementation, review, requirement="phase_finished")
+    run = kb.claim_task(conn, implementation, claimer=kb._claimer_id())
+    assert run is not None
+    assert kb.complete_task(
+        conn, implementation, expected_run_id=run.current_run_id, summary="candidate",
+        metadata={"base_sha": base, "head_sha": candidate, "changed_files": []},
+    )
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (review,))
+    assert kb.evaluate_dependencies(conn, review)["satisfied"]
+    return review
+
+
+@pytest.mark.parametrize("refusal", ["claim", "candidate"])
+@pytest.mark.parametrize("reused", [False, True])
+def test_cli_refusal_discards_only_new_worktrees(
+    kanban_home, tmp_path, monkeypatch, capsys, refusal, reused,
+):
+    from hermes_cli import kanban as kc
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "app.py", "candidate\n")
+    with kbc.connect() as conn:
+        review = _ready_review_card(conn, repo, base, candidate)
+        if reused:
+            kbw.resolve_workspace(kb.get_task(conn, review), candidate_head=candidate)
+    if refusal == "claim":
+        monkeypatch.setattr(kb, "claim_task", lambda *a, **kw: None)
+    else:
+        heads = iter((candidate, base))
+        monkeypatch.setattr(kbw, "candidate_head_for_task", lambda *a: next(heads))
+    assert kc._cmd_claim(_claim_args(review)) != 0
+    assert ("the task changed" if refusal == "claim" else "candidate moved") in capsys.readouterr().err
+    assert (repo / ".worktrees" / review).exists() is reused
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, review).current_run_id is None
+
+
+def test_cli_candidate_rollback_preserves_a_successor_claim(kanban_home, tmp_path, monkeypatch):
+    from hermes_cli import kanban as kc
+    from hermes_cli.kanban_db_dispatch import _record_task_failure
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "app.py", "candidate\n")
+    with kbc.connect() as conn:
+        review = _ready_review_card(conn, repo, base, candidate)
+    claim = kb.claim_task
+    successors = []
+
+    def replace_claim(conn, task_id, **kwargs):
+        original = claim(conn, task_id, **kwargs)
+        assert original is not None
+        _record_task_failure(
+            conn, task_id, "first attempt ended", outcome="spawn_failed",
+            release_claim=True, end_run=True,
+        )
+        successor = claim(conn, task_id, claimer="successor")
+        assert successor is not None
+        successors.append(successor)
+        return original
+
+    monkeypatch.setattr(kb, "claim_task", replace_claim)
+    heads = iter((candidate, base))
+    monkeypatch.setattr(kbw, "candidate_head_for_task", lambda *a: next(heads))
+    assert kc._cmd_claim(_claim_args(review)) != 0
+    with kbc.connect() as conn:
+        current = kb.get_task(conn, review)
+        assert current.status == "running"
+        assert current.current_run_id == successors[0].current_run_id
+        assert current.claim_lock == successors[0].claim_lock
+        assert current.consecutive_failures == successors[0].consecutive_failures
+
+
+@pytest.mark.parametrize("refusal", ["claim", "candidate", "error", "interrupted"])
+@pytest.mark.parametrize("reused", [False, True])
+def test_deferred_dispatch_discards_only_new_worktrees(
+    kanban_home, tmp_path, monkeypatch, refusal, reused,
+):
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli.kanban_runtime import runtime_identity
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "app.py", "candidate\n")
+    identity = runtime_identity(Path(__file__).resolve().parents[2])
+    cancelled = []
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
+    monkeypatch.setattr(kbd, "_require_autonomous_worker_capacity", lambda: None)
+    with kbc.connect() as conn:
+        review = _ready_review_card(conn, repo, base, candidate)
+        if reused:
+            kbw.resolve_workspace(kb.get_task(conn, review), candidate_head=candidate)
+        path = repo / ".worktrees" / review
+
+        def prepare(task, workspace, **kwargs):
+            assert kwargs["defer_grant"]
+            assert Path(workspace) == path
+            assert _head(path) == candidate
+            if refusal == "error":
+                raise RuntimeError("preparation failed")
+            if refusal == "interrupted":
+                raise kbd.WorkerLaunchInterrupted("drain during preparation")
+            if refusal == "claim":
+                kb.add_comment(
+                    conn, review, author="worker",
+                    body="Published https://github.com/example/repo/pull/7",
+                )
+            return kbd.WorkerLaunch(
+                identity.pid, identity.as_dict(), "worktree-refusal",
+                cancel=lambda: cancelled.append(True),
+            )
+
+        monkeypatch.setattr(kbd, "_default_spawn", prepare)
+        if refusal == "candidate":
+            heads = iter((candidate, base))
+            monkeypatch.setattr(kbw, "candidate_head_for_task", lambda *a: next(heads))
+        result = kbd.DispatchResult()
+        assert not kbd._dispatch_lane_task(
+            conn, {"id": review}, "reviewer", result, lane="ready", dry_run=False,
+            ttl_seconds=None, board=None, failure_limit=3, spawn_fn=None,
+            per_profile_cap=None, per_profile_running={},
+        )
+        assert path.exists() is reused
+        assert not result.spawned
+        assert kb.get_task(conn, review).current_run_id is None
+        if refusal in {"claim", "candidate"}:
+            assert cancelled == [True]
+        if refusal == "claim":
+            assert result.respawn_guarded == [(review, "active_pr")]
+        elif refusal == "candidate":
+            assert kb.get_task(conn, review).last_failure_error.startswith("candidate moved")
+        elif refusal == "interrupted":
+            assert result.cancelled == [review]
+        else:
+            assert kb.get_task(conn, review).last_failure_error == "preparation failed"

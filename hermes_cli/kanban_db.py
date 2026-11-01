@@ -3070,6 +3070,23 @@ def handoff_for_run(conn: sqlite3.Connection, task_id: str, run_id: int) -> dict
     return merged
 
 
+def bound_handoff(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+    """The handoff of the run ``task_id`` is BOUND to, falling back to its newest.
+
+    ``rebind-candidate --replace`` restores an earlier attested run, so after that
+    recovery the newest handoff belongs to the rejected candidate. Every consumer that
+    follows a candidate binding — workspace resolution, the execution grant and claim
+    admission — must read the bound run, or it contradicts the ones that do.
+    """
+    row = conn.execute(
+        "SELECT candidate_run_id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    bound = row["candidate_run_id"] if row is not None else None
+    if isinstance(bound, int) and not isinstance(bound, bool):
+        return handoff_for_run(conn, task_id, bound)
+    return latest_handoff(conn, task_id)
+
+
 def latest_handoff(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
     """Newest durable completion or review handoff, including recovery provenance."""
     merged: dict[str, Any] = {}

@@ -905,6 +905,7 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 def _discard_if_still_ours(
     conn, pending, workspace, prepared_head: str, prepared_run_head: int,
+    *, prepared_new: bool,
 ) -> bool:
     """Remove the prepared checkout only while this attempt provably still owns the card.
 
@@ -933,7 +934,8 @@ def _discard_if_still_ours(
             return False
         if kb._run_ledger_head(conn, pending.id) != prepared_run_head:
             return False
-        return kbw.discard_prepared_worktree(pending, workspace, prepared_head)
+        return kbw.discard_prepared_worktree(
+            pending, workspace, prepared_head, prepared_new=prepared_new)
 
 
 def _claim_ownership(task) -> tuple:
@@ -1007,9 +1009,12 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                 return _err(f"cannot claim {args.task_id}: {blocked}")
             resolved_kind = (
                 kbw.effective_workspace_kind(pending) if pending is not None else "scratch")
+            prepared_new = False
             if pending is None:
                 workspace, resolved_branch = None, None
             elif resolved_kind == "worktree":
+                prepared_new = not (
+                    kbw._role_repo_root(pending, None) / ".worktrees" / pending.id).exists()
                 # The branch is part of the truth: a detached role checkout reports "",
                 # and completion cleanup deletes only a branch the card recorded.
                 workspace, resolved_branch = kbw._resolve_worktree_workspace(
@@ -1039,7 +1044,8 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             # remove only an unchanged row that nobody owns.
             if workspace is not None and pending is not None and resolved_kind == "worktree":
                 _discard_if_still_ours(
-                    conn, pending, workspace, prepared_head, prepared_run_head)
+                    conn, pending, workspace, prepared_head, prepared_run_head,
+                    prepared_new=prepared_new)
             if existing is None:
                 return _err(f"no such task: {args.task_id}")
             return _err(f"cannot claim {args.task_id}: status={existing.status} "
@@ -1058,14 +1064,19 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             except ValueError:
                 confirmed = None
             if confirmed != candidate_head:
-                kbw.discard_prepared_worktree(pending, workspace, prepared_head)
+                kbw.discard_prepared_worktree(
+                    pending, workspace, prepared_head, prepared_new=prepared_new)
                 from hermes_cli.kanban_db_dispatch import _record_task_failure
 
-                _record_task_failure(
-                    conn, task.id,
-                    f"candidate moved from {candidate_head} to {confirmed} during the claim",
-                    outcome="spawn_failed", release_claim=True, end_run=True,
-                )
+                current = kb.get_task(conn, task.id)
+                if (current is not None
+                        and current.current_run_id == task.current_run_id
+                        and current.claim_lock == task.claim_lock):
+                    _record_task_failure(
+                        conn, task.id,
+                        f"candidate moved from {candidate_head} to {confirmed} during the claim",
+                        outcome="spawn_failed", release_claim=True, end_run=True,
+                    )
                 return _err(
                     f"kanban: candidate moved from {candidate_head} to {confirmed} while "
                     f"{args.task_id} was claimed; the claim was released")

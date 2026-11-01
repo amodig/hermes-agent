@@ -779,14 +779,8 @@ def candidate_head_for_task(conn: sqlite3.Connection, task: Task) -> Optional[st
             f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {task.id} names no candidate card")
     state = _kb.get_lifecycle_state(conn, task.id)
     # The lifecycle projection already names the BOUND candidate run, so the documented
-    # head must come from that same run: after a rebind to an earlier attested candidate
-    # the newest handoff belongs to the rejected one.
-    bound_run = state.get("candidate_run_id")
-    handoff = (
-        _kb.handoff_for_run(conn, candidate_id, int(bound_run))
-        if isinstance(bound_run, int) and not isinstance(bound_run, bool)
-        else _kb.latest_handoff(conn, candidate_id)
-    )
+    # head must come from that same run.
+    handoff = _kb.bound_handoff(conn, candidate_id)
     head = str(state.get("head_sha") or "").strip()
     documented = str(handoff.get("head_sha") or "").strip()
     base = str(handoff.get("base_sha") or "").strip()
@@ -885,6 +879,16 @@ def _ignored_paths_target_tracks(repo: Path, worktree: Path, head: str) -> list[
     return hits
 
 
+def _index_flagged_paths(worktree: Path) -> list[str]:
+    flags = _git(worktree, "ls-files", "-v", "-z", timeout=60)
+    if flags.returncode != 0:
+        return ["<unreadable index>"]
+    return [
+        item.split(" ", 1)[1] for item in (flags.stdout or "").split("\0")
+        if item and not item.startswith("H ")
+    ]
+
+
 def _clean_tree(path: Path, label: str) -> None:
     """Refuse to move a checkout that holds anything git would have to overwrite.
 
@@ -901,6 +905,11 @@ def _clean_tree(path: Path, label: str) -> None:
         raise ValueError(
             f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {label} has local changes or untracked "
             "files; nothing was moved and no file was removed")
+    flagged = _index_flagged_paths(path)
+    if flagged:
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {label} has index flags hiding "
+            f"local changes ({', '.join(flagged[:3])}); clear the index flags first")
 
 
 def _role_repo_root(task: Task, board: Optional[str]) -> Path:
@@ -1248,16 +1257,9 @@ def _worktree_removal_blockers(worktree: Path) -> list[str]:
     against Git: non-force ``worktree remove`` exits 0 and deletes all of them.
     """
     reasons: list[str] = []
-    flags = _git(worktree, "ls-files", "-v", "-z", timeout=60)
-    if flags.returncode != 0:
-        reasons.append("index flags could not be read")
-    else:
-        flagged = [
-            item.split(" ", 1)[1] for item in (flags.stdout or "").split("\x00")
-            if item and not item.startswith("H ")
-        ]
-        if flagged:
-            reasons.append(f"{len(flagged)} path(s) marked assume-unchanged/skip-worktree")
+    flagged = _index_flagged_paths(worktree)
+    if flagged:
+        reasons.append(f"index flags prevent verification: {', '.join(flagged[:3])}")
     ignored = _git(
         worktree, "ls-files", "--others", "--ignored", "--exclude-standard",
         "--directory", "-z", timeout=60,
@@ -1271,6 +1273,7 @@ def _worktree_removal_blockers(worktree: Path) -> list[str]:
 
 def discard_prepared_worktree(
     task: Task, path: Path | str, prepared_head: str, *, board: Optional[str] = None,
+    prepared_new: bool = True,
 ) -> bool:
     """Remove a worktree prepared for a claim that was then refused.
 
@@ -1280,6 +1283,10 @@ def discard_prepared_worktree(
     this, a refused attempt leaves a checkout at a candidate a retry may be unable to move
     away from, poisoning every later dispatch.
     """
+    # A reused detached checkout's commit can be its last anchor, so an attempt
+    # that did not create the directory must not remove it.
+    if not prepared_new:
+        return False
     try:
         repo_root = _role_repo_root(task, board)
         target = repo_root / ".worktrees" / task.id

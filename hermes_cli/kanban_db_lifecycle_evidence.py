@@ -354,7 +354,7 @@ def _parent_handoff_context(
         parent = _kb.get_task(conn, parent_id)
         if parent is None or parent.status not in {"done", "archived"}:
             continue
-        handoff = _kb.latest_handoff(conn, parent_id)
+        handoff = _kb.bound_handoff(conn, parent_id)
         if handoff:
             handoff.setdefault("branch_name", parent.branch_name)
             handoff.setdefault("workspace_path", parent.workspace_path)
@@ -628,7 +628,7 @@ def _parent_handoff_start_error(
             not same_card_review and parent.status not in {"done", "archived"}
         ):
             continue
-        handoff = _kb.latest_handoff(conn, parent_id)
+        handoff = _kb.bound_handoff(conn, parent_id)
         expected = handoff.get("head_sha")
         if not expected and (
             parent.lifecycle_contract

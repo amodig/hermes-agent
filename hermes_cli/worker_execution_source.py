@@ -543,6 +543,7 @@ def _scan_source(
     authority: ExecutionAuthority,
     *,
     materialize: Optional[Path] = None,
+    from_commit: bool = False,
 ) -> SourceSnapshot:
     """Build one bounded inventory from tracked paths plus granted extra source files."""
     if authority.git is None:
@@ -663,6 +664,34 @@ def _scan_source(
                     raise WorkerExecutionRefused("unsupported_source_type", "the granted source set contains a non-regular entry")
                 if int(info.st_nlink) != 1:
                     raise WorkerExecutionRefused("hardlinked_source", "the granted source set contains a hard-linked file")
+                if from_commit and name in tracked:
+                    # The copy IS the reviewed commit: read the blob the index names
+                    # rather than the working tree, so no interleaving between the
+                    # cleanliness proof and this copy can substitute other bytes.
+                    # A granted extra file is not in the commit — it falls through to the
+                    # working-tree branch, where its digest binds the bytes copied.
+                    oid = tracked.get(name, ("", ""))[1]
+                    blob = git.run(["cat-file", "blob", oid])
+                    if blob.returncode != 0:
+                        raise WorkerExecutionRefused(
+                            "git_unavailable", "a reviewed blob could not be read")
+                    data = blob.stdout
+                    if len(data) > MAX_INVENTORY_BYTES - total_bytes:
+                        raise WorkerExecutionRefused(
+                            "source_too_large", "the granted source set exceeds the byte bound")
+                    total_bytes += len(data)
+                    if materialize is not None:
+                        target_path = materialize / name
+                        target_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                        with open(target_path, "xb") as written_commit:
+                            written_commit.write(data)
+                        with contextlib.suppress(OSError):
+                            os.chmod(target_path, 0o755 if mode == "100755" else 0o644)
+                    entries.append(SourceEntry(
+                        name, "file", mode == "100755", len(data),
+                        "sha256:" + sha256_hex(data),
+                    ))
+                    continue
                 try:
                     fd = root.open_file(parts)
                 except OSError as exc:
@@ -1238,7 +1267,7 @@ def _check_expected(args: Mapping[str, Any], key: str, actual: str) -> None:
 def _materialize_source(authority: ExecutionAuthority, run_root: Path) -> tuple[SourceSnapshot, Path]:
     source_dir = run_root / "source"
     source_dir.mkdir(mode=0o700)
-    snapshot = _scan_source(authority, materialize=source_dir)
+    snapshot = _scan_source(authority, materialize=source_dir, from_commit=True)
     return snapshot, source_dir
 
 

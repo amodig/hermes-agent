@@ -607,6 +607,14 @@ worktree, and optional patch hash. The original completion, runs, comments,
 and edges remain; dependents stay gated until the same parent is recommitted
 and completed with an immutable head.
 
+Typed reviewer/tester workspaces resolve at the bound candidate commit. Existing
+checkouts with `assume-unchanged` or `skip-worktree` index flags refuse with
+`candidate_workspace_unavailable`, even when `git status` looks clean: clear
+those flags and preserve or commit any local edits before retrying. A refused
+claim or deferred launch may remove only a checkout that attempt created;
+reused detached checkouts remain anchored. Candidate-mismatch rollback cannot
+release a successor run's claim.
+
 ### Unstartable review quarantine
 
 A `REVIEW` card whose recorded immutable head no longer matches its branch or
