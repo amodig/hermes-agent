@@ -257,6 +257,102 @@ def test_role_worktree_refuses_a_dirty_checkout_and_preserves_it(kanban_home, tm
     assert _head(reviewer_path) == candidate
 
 
+def test_role_worktree_preserves_ignored_files_on_checkout_collision(kanban_home, tmp_path):
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+    with kbc.connect() as conn:
+        implementation = _candidate_card(conn, repo, base=base, head=candidate)
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        task = kb.get_task(conn, review)
+        head = kbw.candidate_head_for_task(conn, task)
+
+    target = repo / ".worktrees" / review
+    _git(repo, "worktree", "add", str(target), "-b", f"wt/{review}", base)
+    (repo / ".git" / "info" / "exclude").write_text(
+        "candidate.txt\ncache.txt\n", encoding="utf-8")
+    note = target / "candidate.txt"
+    note.write_text("irreplaceable reviewer notes\n", encoding="utf-8")
+    cache = target / "cache.txt"
+    cache.write_text("unrelated ignored file\n", encoding="utf-8")
+    status = subprocess.run(
+        ["git", "-C", str(target), "status", "--porcelain", "--untracked-files=all"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert status == ""
+    git_dir = kbw._git_abs_path(target, "--git-dir")
+    assert git_dir is not None
+    original_head = (git_dir / "HEAD").read_bytes()
+    original_index = (git_dir / "index").read_bytes()
+
+    with pytest.raises(ValueError, match="candidate_workspace_unavailable"):
+        kbw.resolve_workspace(task, candidate_head=head)
+    assert _head(target) == base
+    assert (git_dir / "HEAD").read_bytes() == original_head
+    assert (git_dir / "index").read_bytes() == original_index
+    assert note.read_text(encoding="utf-8") == "irreplaceable reviewer notes\n"
+    assert cache.read_text(encoding="utf-8") == "unrelated ignored file\n"
+    assert (target / "README.md").read_text(encoding="utf-8") == "base\n"
+    assert _head(repo) == candidate
+
+    # Only a collision blocks checkout, not every ignored file in the worktree.
+    note.unlink()
+    assert kbw.resolve_workspace(task, candidate_head=head) == target.resolve()
+    assert _head(target) == candidate
+    assert note.read_text(encoding="utf-8") == "candidate\n"
+    assert cache.read_text(encoding="utf-8") == "unrelated ignored file\n"
+
+
+@pytest.mark.parametrize("persisted_path", [False, True])
+def test_role_worktree_refuses_retargeted_registration_before_mutation(
+    kanban_home, tmp_path, persisted_path,
+):
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+    with kbc.connect() as conn:
+        implementation = _candidate_card(conn, repo, base=base, head=candidate)
+        validation = _role_card(conn, "validation", implementation, repo, "tester")
+        target = repo / ".worktrees" / validation
+        if persisted_path:
+            kbw.set_workspace_path(conn, validation, target)
+        task = kb.get_task(conn, validation)
+        head = kbw.candidate_head_for_task(conn, task)
+
+    sibling = repo / ".worktrees" / "sibling"
+    _git(repo, "worktree", "add", str(target), "-b", f"wt/{validation}", base)
+    _git(repo, "worktree", "add", str(sibling), "-b", "wt/sibling", base)
+    before = {}
+    for checkout in (target, sibling):
+        git_dir = kbw._git_abs_path(checkout, "--git-dir")
+        assert git_dir is not None
+        assert (git_dir / "gitdir").read_text(encoding="utf-8").strip() == str(checkout / ".git")
+        before[checkout] = (
+            git_dir, (git_dir / "HEAD").read_bytes(), (git_dir / "index").read_bytes(),
+            (checkout / "README.md").read_bytes(),
+        )
+
+    # The old registration still backlinks target, but target now names the
+    # sibling's git directory. Sharing a common directory does not prove ownership.
+    retargeted = (sibling / ".git").read_bytes()
+    (target / ".git").write_bytes(retargeted)
+    assert kbw._git_common_dir(target) == kbw._git_common_dir(repo)
+    assert kbw._git_abs_path(target, "--git-dir") == before[sibling][0]
+    with pytest.raises(ValueError, match="candidate_workspace_unavailable"):
+        kbw.resolve_workspace(task, candidate_head=head)
+
+    for checkout, (git_dir, original_head, original_index, readme) in before.items():
+        assert (git_dir / "HEAD").read_bytes() == original_head
+        assert (git_dir / "index").read_bytes() == original_index
+        assert (checkout / "README.md").read_bytes() == readme
+        assert not (checkout / "candidate.txt").exists()
+    assert (target / ".git").read_bytes() == retargeted
+    assert (sibling / ".git").read_bytes() == retargeted
+    assert _head(target) == base
+    assert _head(sibling) == base
+    assert _head(repo) == candidate
+
+
 def test_role_worktree_refuses_a_siblings_checkout(kanban_home, tmp_path):
     repo = _make_repo(tmp_path)
     base = _head(repo)
