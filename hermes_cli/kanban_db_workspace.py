@@ -768,11 +768,12 @@ def _git_head(path: Path) -> Optional[str]:
 
 
 def _clean_tree(path: Path, label: str) -> None:
-    """Refuse to move a checkout that holds anything git would have to overwrite.
+    """Refuse local tracked changes or untracked files before reusing a checkout.
 
-    Untracked files count: a reviewer's scratch notes are still work, and only the
-    operator can decide they are disposable. A failing ``git status`` never reads as
-    clean.
+    A reviewer's scratch notes are still work, and only the operator can decide
+    they are disposable. A failing ``git status`` never reads as clean. Ignored
+    files are invisible here; checkout must use ``--no-overwrite-ignore`` so a
+    candidate's tracked file cannot silently replace them.
     """
     result = _git(path, "status", "--porcelain", "--untracked-files=all", timeout=60)
     if result.returncode != 0:
@@ -859,11 +860,15 @@ def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Pa
     """Materialize this role card's own worktree at ``candidate_head``.
 
     Returns ``(path, branch)`` with an empty branch for the detached checkout that a
-    role worktree normally is. An existing canonical worktree is reused only when it
-    is already ``candidate_head``; a clean named-branch checkout of another commit is
-    moved onto the candidate with a non-force detach (its branch ref is untouched),
-    and anything dirtier is refused with the files preserved.
+    role worktree normally is. An existing canonical worktree must have its own
+    exact registration backlink before any status or checkout can touch its index.
+    It is reused only when already at ``candidate_head``; a clean named-branch
+    checkout of another commit is moved onto the candidate with a non-force detach
+    (its branch ref is untouched). Local files, including ignored collisions, are
+    preserved on refusal.
     """
+    from hermes_cli.worker_execution_policy import _worktree_registration_backlinks
+
     if not _COMMIT_ID.match(candidate_head or ""):
         raise ValueError(
             f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {task.id} has no full candidate commit")
@@ -891,12 +896,20 @@ def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Pa
     # An existing canonical checkout: prove it belongs to this repository, then never
     # discard what is in it.
     repo_root = repo_root.resolve(strict=False)
+    repo_common = _git_common_dir(repo_root)
     if not _is_linked_worktree_checkout(target) or (
-        _path_key(_git_common_dir(target)) != _path_key(_git_common_dir(repo_root))
+        _path_key(_git_common_dir(target)) != _path_key(repo_common)
     ):
         raise ValueError(
             f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is not a linked worktree of "
             f"{repo_root}")
+    git_dir = _git_abs_path(target, "--git-dir")
+    if repo_common is None or git_dir is None or not _worktree_registration_backlinks(
+        str(repo_common), str(git_dir), str(target.resolve(strict=False))
+    ):
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target}'s git directory registration "
+            "does not backlink this checkout; nothing was moved")
     _clean_tree(target, str(target))
     current = _git_head(target)
     branch = _git_current_branch(target) or ""
@@ -915,7 +928,7 @@ def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Pa
             f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is checked out on {branch} at "
             f"{current}, which the candidate {head} does not contain; detaching would "
             "strand that work")
-    result = _git(target, "checkout", "--detach", head, timeout=120)
+    result = _git(target, "checkout", "--detach", "--no-overwrite-ignore", head, timeout=120)
     if result.returncode != 0:
         raise ValueError(
             f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: could not move {target} onto {head}: "

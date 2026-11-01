@@ -1121,3 +1121,90 @@ def test_materialized_review_source_must_be_the_reviewed_commit(fixture, monkeyp
     with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
         wes._materialize_source(authority, moved_root)
     assert excinfo.value.code == "source_changed"
+
+
+@pytest.mark.parametrize(
+    ("flag", "change"),
+    [
+        ("--assume-unchanged", "bytes"),
+        ("--skip-worktree", "bytes"),
+        ("--assume-unchanged", "link"),
+        (None, "mode"),
+    ],
+)
+def test_materialized_review_checks_copied_bytes_and_modes(fixture, monkeypatch, flag, change):
+    _git(fixture.repo, "reset", "-q")
+    _git(fixture.repo, "checkout", "--", "app.py")
+    (fixture.repo / "notes.txt").unlink()
+    os.symlink("app.py", fixture.repo / "alias")
+    _git(fixture.repo, "add", "alias")
+    _git(fixture.repo, "commit", "-qm", "candidate link")
+    fixture.head = _git(fixture.repo, "rev-parse", "HEAD")
+    monkeypatch.setattr(
+        wep, "resolve_review_context",
+        lambda *_a, **_k: ("review", {"base": fixture.base, "head": fixture.head}))
+    authority = _authority(fixture)
+    if flag is not None:
+        _git(fixture.repo, "update-index", flag, "alias" if change == "link" else "app.py")
+    if change == "bytes":
+        (fixture.repo / "app.py").write_bytes(b"print('altered')\n")
+    elif change == "link":
+        (fixture.repo / "alias").unlink()
+        os.symlink("./app.py", fixture.repo / "alias")
+    else:
+        # Git tests the owner execute bit; materialization copies ANY execute bit
+        # as 0755, so this apparently clean source would execute a different mode.
+        (fixture.repo / "app.py").chmod(0o654)
+    _git(fixture.repo, "diff", "--quiet", "HEAD", "--")
+    index_before = (fixture.repo / ".git" / "index").read_bytes()
+    bytes_before = (fixture.repo / "app.py").read_bytes()
+    mode_before = (fixture.repo / "app.py").stat().st_mode
+    link_before = os.readlink(fixture.repo / "alias")
+    run_root = fixture.root / "run"
+    run_root.mkdir()
+    with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+        wes._materialize_source(authority, run_root)
+    assert excinfo.value.code == "source_changed"
+    assert (fixture.repo / ".git" / "index").read_bytes() == index_before
+    assert (fixture.repo / "app.py").read_bytes() == bytes_before
+    assert (fixture.repo / "app.py").stat().st_mode == mode_before
+    assert os.readlink(fixture.repo / "alias") == link_before
+
+
+@pytest.mark.parametrize("object_format", ["sha1", "sha256"])
+def test_materialized_review_accepts_exact_candidate_with_index_flags(fixture, monkeypatch, object_format):
+    repo = fixture.root / "candidate"
+    repo.mkdir()
+    _git(repo, "init", "-q", f"--object-format={object_format}")
+    (repo / "plain.txt").write_bytes(b"candidate\n")
+    (repo / "run.sh").write_bytes(b"#!/bin/sh\nexit 0\n")
+    (repo / "run.sh").chmod(0o755)
+    os.symlink("./plain.txt", repo / "alias")
+    _git(repo, "add", ".")
+    _git(repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+         "commit", "-qm", "candidate")
+    fixture.repo = repo
+    fixture.head = _git(repo, "rev-parse", "HEAD")
+    fixture.base = fixture.head
+    monkeypatch.setattr(
+        wep, "resolve_review_context",
+        lambda *_a, **_k: ("review", {"base": fixture.base, "head": fixture.head}))
+    (repo / "extra.txt").write_bytes(b"granted extra\n")
+    authority = _authority(fixture, extras=["extra.txt"])
+    _git(repo, "update-index", "--assume-unchanged", "run.sh", "alias")
+    _git(repo, "update-index", "--skip-worktree", "plain.txt")
+    index_before = (repo / ".git" / "index").read_bytes()
+    inspected = wes._scan_source(authority)
+    run_root = fixture.root / "run"
+    run_root.mkdir()
+    snapshot, source_dir = wes._materialize_source(authority, run_root)
+    assert snapshot.head == fixture.head
+    assert snapshot.source_digest == inspected.source_digest
+    assert (source_dir / "plain.txt").read_bytes() == (repo / "plain.txt").read_bytes()
+    assert (source_dir / "plain.txt").stat().st_mode & 0o777 == 0o644
+    assert (source_dir / "run.sh").read_bytes() == (repo / "run.sh").read_bytes()
+    assert (source_dir / "run.sh").stat().st_mode & 0o777 == 0o755
+    assert (source_dir / "alias").is_symlink()
+    assert os.readlink(source_dir / "alias") == "./plain.txt"
+    assert (source_dir / "extra.txt").read_bytes() == b"granted extra\n"
+    assert (repo / ".git" / "index").read_bytes() == index_before

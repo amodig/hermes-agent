@@ -84,6 +84,13 @@ The kanban kernel enforces that exactly one of these terminates each run. A work
 
 ## Outputs and the review handoff
 
+Review and validation workspaces are pinned to the candidate commit. Before
+changing an existing role checkout, the dispatcher verifies its exact worktree
+registration and refuses checkout collisions with ignored local files.
+Materialized tracked content and executable modes must match the immutable
+candidate tree, independently of live-index optimization flags such as
+`assume-unchanged` and `skip-worktree`; mismatches refuse execution.
+
 For code-changing tasks, pick the review model encoded by the task graph:
 
 - **Same-card review:** call `kanban_request_review(summary=..., metadata=..., reviewer=...)`. The task enters `review` without touching block recurrence accounting. The dispatcher claims it with the bundled `sdlc-review` skill by default. The reviewer approves with `kanban_complete`, calls `kanban_request_changes(reason=...)` to close the review run and route the task back to its original implementer, or blocks only for a genuine external escalation.
