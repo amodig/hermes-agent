@@ -1048,6 +1048,27 @@ def _cmd_claim(args: argparse.Namespace) -> int:
         # A successful claim proves the row still existed, so resolution above ran.
         # Persist the kind it was resolved as: a role card converted from the scratch
         # default is a worktree now, and completion cleanup follows the recorded kind.
+        # Another operator can rebind the candidate card between resolution and this
+        # claim; that changes neither this row nor its version, so the fence above cannot
+        # see it. Re-read the binding before reporting a workspace, and undo the claim
+        # rather than leaving a worker pinned to a candidate the board no longer names.
+        if candidate_head is not None:
+            try:
+                confirmed = kbw.candidate_head_for_task(conn, task)
+            except ValueError:
+                confirmed = None
+            if confirmed != candidate_head:
+                kbw.discard_prepared_worktree(pending, workspace, prepared_head)
+                from hermes_cli.kanban_db_dispatch import _record_task_failure
+
+                _record_task_failure(
+                    conn, task.id,
+                    f"candidate moved from {candidate_head} to {confirmed} during the claim",
+                    outcome="spawn_failed", release_claim=True, end_run=True,
+                )
+                return _err(
+                    f"kanban: candidate moved from {candidate_head} to {confirmed} while "
+                    f"{args.task_id} was claimed; the claim was released")
         kbw.set_workspace_path(
             conn, task.id, str(workspace),
             kind=resolved_kind if resolved_kind != (pending.workspace_kind or "scratch") else None,

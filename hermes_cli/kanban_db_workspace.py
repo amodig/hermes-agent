@@ -769,7 +769,15 @@ def candidate_head_for_task(conn: sqlite3.Connection, task: Task) -> Optional[st
         raise ValueError(
             f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {task.id} names no candidate card")
     state = _kb.get_lifecycle_state(conn, task.id)
-    handoff = _kb.latest_handoff(conn, candidate_id)
+    # The lifecycle projection already names the BOUND candidate run, so the documented
+    # head must come from that same run: after a rebind to an earlier attested candidate
+    # the newest handoff belongs to the rejected one.
+    bound_run = state.get("candidate_run_id")
+    handoff = (
+        _kb.handoff_for_run(conn, candidate_id, int(bound_run))
+        if isinstance(bound_run, int) and not isinstance(bound_run, bool)
+        else _kb.latest_handoff(conn, candidate_id)
+    )
     head = str(state.get("head_sha") or "").strip()
     documented = str(handoff.get("head_sha") or "").strip()
     base = str(handoff.get("base_sha") or "").strip()

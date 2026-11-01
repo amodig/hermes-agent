@@ -3047,6 +3047,29 @@ def _handoff_fields(metadata: Any) -> dict[str, Any]:
         handoff["changed_files"] = [str(item) for item in changed if str(item).strip()]
     return handoff
 
+def handoff_for_run(conn: sqlite3.Connection, task_id: str, run_id: int) -> dict[str, Any]:
+    """The handoff recorded by ONE specific run of ``task_id``.
+
+    ``latest_handoff`` answers "newest", which stops being the candidate's own handoff as
+    soon as a card is rebound to an earlier attested run — the supported recovery for a
+    superseded candidate. Consumers that follow such a binding must read that run.
+    """
+    merged: dict[str, Any] = {}
+    run = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ? AND task_id = ?", (int(run_id), task_id),
+    ).fetchone()
+    if run:
+        merged.update(_handoff_fields(_json_dict(run["metadata"])))
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind IN ('completed', 'review_requested') ORDER BY id DESC LIMIT 1",
+        (task_id, int(run_id)),
+    ).fetchone()
+    if event:
+        merged.update(_handoff_fields(_json_dict(event["payload"])))
+    return merged
+
+
 def latest_handoff(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
     """Newest durable completion or review handoff, including recovery provenance."""
     merged: dict[str, Any] = {}

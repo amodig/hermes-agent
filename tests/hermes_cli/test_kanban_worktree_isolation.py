@@ -1297,3 +1297,53 @@ def test_claim_cli_claims_an_ordinary_card(kanban_home, tmp_path, capsys):
     assert claimed.status == "running"
     assert claimed.workspace_path and claimed.workspace_path != str(repo)
     assert _head(Path(claimed.workspace_path)) == _head(repo)
+
+
+def test_role_candidate_head_follows_the_bound_run_not_the_newest(kanban_home, tmp_path):
+    """After rebinding to an earlier attested run, the candidate is that run's head.
+
+    `latest_handoff` answers "newest", so a rebind to run A while run B is newer used to
+    raise candidate_workspace_unavailable for every review attempt.
+    """
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    first = _commit(repo, "candidate.txt", "candidate\n")
+
+    with kbc.connect() as conn:
+        implementation = kb.create_task(
+            conn, title="implementation", assignee="coder", workspace_kind="worktree",
+            workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code", "review_mode": "separate_card", "reviewer": "reviewer",
+                "validation_required": True,
+            })
+        run_a = kb.claim_task(conn, implementation, claimer=kb._claimer_id())
+        assert run_a is not None
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=run_a.current_run_id,
+            summary="first attempt",
+            metadata={"base_sha": base, "head_sha": first, "changed_files": []})
+        run_a_id = run_a.current_run_id
+        # A second, newer attested run on a different head.
+        second = _commit(repo, "second.txt", "second\n")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (implementation,))
+        run_b = kb.claim_task(conn, implementation, claimer=kb._claimer_id())
+        assert run_b is not None
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=run_b.current_run_id,
+            summary="second attempt",
+            metadata={"base_sha": base, "head_sha": second, "changed_files": []})
+        # Recovery binds the candidate back to the *earlier* run.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET candidate_run_id = ? WHERE id = ?", (run_a_id, implementation))
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        task = kb.get_task(conn, review)
+        state = kb.get_lifecycle_state(conn, review)
+        assert state["candidate_run_id"] == run_a_id
+        bound = kbw.candidate_head_for_task(conn, task)
+        newest = kb.latest_handoff(conn, implementation)["head_sha"]
+
+    assert bound == first
+    assert newest == second          # the newest handoff is the rejected candidate
