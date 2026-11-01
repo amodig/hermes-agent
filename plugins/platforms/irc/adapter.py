@@ -299,6 +299,7 @@ class IRCAdapter(BasePlatformAdapter):
         self._peers: Dict[str, Dict[str, str]] = {}
         self._inbox = deque(maxlen=INBOX_LIMIT)
         self._hello_replies: Dict[str, float] = {}
+        self._hello_reply_tasks: Dict[str, asyncio.Task] = {}
 
     def toolsets_for_source(self, source):
         return ["no_tools"] if self.coordination else None
@@ -415,6 +416,9 @@ class IRCAdapter(BasePlatformAdapter):
         self._peers.clear()
         self._inbox.clear()
         self._hello_replies.clear()
+        for task in self._hello_reply_tasks.values():
+            task.cancel()
+        self._hello_reply_tasks.clear()
 
     async def _send_hello(self, destination):
         if not self._session_id:
@@ -426,13 +430,29 @@ class IRCAdapter(BasePlatformAdapter):
         await self._send_raw(line)
 
     async def _reply_hello(self, account):
-        """Answer a channel hello with one DM hello per sender per five seconds."""
+        """Coalesce throttled channel hellos so a quick reconnect still gets discovery."""
+        if account in self._hello_reply_tasks:
+            return
         now = time.monotonic()
         last = self._hello_replies.get(account)
         if last is not None and now - last < HELLO_REPLY_INTERVAL:
+            self._hello_reply_tasks[account] = asyncio.create_task(
+                self._delayed_hello_reply(account, HELLO_REPLY_INTERVAL - (now - last)))
             return
         self._hello_replies[account] = now
         await self._send_hello(account)
+
+    async def _delayed_hello_reply(self, account, delay):
+        try:
+            await asyncio.sleep(delay)
+            if self.is_connected and account in self._peers:
+                self._hello_replies[account] = time.monotonic()
+                await self._send_hello(account)
+        except OSError:
+            logger.warning("IRC: hello reply failed account=%s", account)
+        finally:
+            if self._hello_reply_tasks.get(account) is asyncio.current_task():
+                del self._hello_reply_tasks[account]
 
     def _settle_outbound(self, reason, account=None):
         if self._outbound is None:
@@ -455,6 +475,9 @@ class IRCAdapter(BasePlatformAdapter):
         if not isinstance(account, str) or account not in self._peers:
             return
         del self._peers[account]
+        task = self._hello_reply_tasks.pop(account, None)
+        if task is not None:
+            task.cancel()
         self._settle_outbound("peer-changed", account)
 
     def _admit_note(self, account, note_id, msgid=None):
@@ -715,11 +738,16 @@ class IRCAdapter(BasePlatformAdapter):
                     self._batches.discard(params[0][1:])
             elif command == "NICK" and _extract_nick(msg["prefix"]) == self._current_nick:
                 self._set_fatal_error("identity_changed", "IRC identity changed", retryable=False)
+                await self.disconnect()
                 await self._notify_fatal_error()
-            elif command == "PART" and params and params[0] == self.channel:
-                self._drop_peer(_extract_nick(msg["prefix"]))
-            elif command == "QUIT":
-                self._drop_peer(_extract_nick(msg["prefix"]))
+            elif ((command == "PART" and params and params[0] == self.channel) or command == "QUIT"):
+                account = _extract_nick(msg["prefix"])
+                if account == self._current_nick:
+                    self._set_fatal_error("channel_left", "IRC coordination channel membership lost", retryable=False)
+                    await self.disconnect()
+                    await self._notify_fatal_error()
+                else:
+                    self._drop_peer(account)
             elif command == "KICK" and len(params) >= 2 and params[0] == self.channel:
                 if params[1] == self._current_nick:
                     self._set_fatal_error("channel_kicked", "IRC coordination channel membership lost", retryable=False)
@@ -862,8 +890,9 @@ class IRCAdapter(BasePlatformAdapter):
             "kind": "req", "id": request_id, "account": account, "target": target,
             "serverTime": server_time, "text": question, "untrusted": True})
         reply_destination = self.channel if destination == self.channel else account
-        accepted_at = self._coordination_state.accepted_at
-        while accepted_at and accepted_at[0] <= time.monotonic() - 60:
+        now = time.monotonic()
+        accepted_at = self._coordination_state.accepted_at.setdefault(account, deque())
+        while accepted_at and accepted_at[0] <= now - 60:
             accepted_at.popleft()
         pending = self._coordination_state.dispatch
         busy = (self._coord_dispatch_task is not None
@@ -873,7 +902,7 @@ class IRCAdapter(BasePlatformAdapter):
         if busy:
             await self._send_response(request_id, reply_destination, "busy", "busy")
             return
-        accepted_at.append(time.monotonic())
+        accepted_at.append(now)
         self._active_requests[request_id] = {
             "account": account, "destination": reply_destination, "expires": time.monotonic() + REQUEST_TIMEOUT}
         self._coord_dispatch_task = asyncio.create_task(

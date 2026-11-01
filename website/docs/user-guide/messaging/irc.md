@@ -181,27 +181,33 @@ implicitly: copy a current address from `irc_status`.
 On a confirmed `#agents` join the adapter sends one `!hello 1 hermes <host>
 <session-id>` to the channel and sets a local presence record for each
 authenticated, fresh, allowlisted peer hello. A channel hello is answered with
-one DM hello per sender account per five seconds; a DM hello is recorded but
-never answered. Requests and notes stay on the channel, and human DMs remain
-supported. JOIN/NAMES observations never create presence. PART, QUIT, NICK,
-KICK, local disconnect and session teardown remove the peer; a new hello from
-the same account replaces its prior session and settles a pending request to the
-old address with `peer-changed`. A KICK of the local account ends the coordination
+one DM hello per sender account per five seconds; a throttled hello coalesces into
+one scheduled reply at the next allowed time, so a quick peer reconnect still
+discovers this endpoint. Pending hello replies are connection-owned and cancelled
+on peer removal or local disconnect. A DM hello is recorded but never answered.
+Requests and notes stay on the channel, and human DMs remain supported.
+JOIN/NAMES observations never create presence. PART, QUIT, NICK, KICK, local
+disconnect and session teardown remove the peer; a new hello from the same account
+replaces its prior session and settles a pending request to the old address with
+`peer-changed`. Local membership loss or nickname change ends the coordination
 connection, clears presence/inbox/address, and cancels pending work without
-automatically rejoining. Kicking a remote peer removes only that peer.
+automatically rejoining. Removing a remote peer affects only that peer.
 Presence is in-memory only: no registry, heartbeat, offline queue or replay.
 
 Every tool routes through the serving gateway's existing private control socket
-(`irc-status`, `irc-read`, `irc-send`, `irc-request`) and its live adapter; a
-missing profile, socket or adapter yields `unavailable`, never a second IRC
-client. The verified profile is derived locally, not supplied by the model.
+(`irc-status`, `irc-read`, `irc-send`, `irc-request`) and the requested profile's
+own live IRC adapter; a missing profile, socket or adapter yields `unavailable`,
+never a second IRC client or the primary profile's shared bot. Ordinary shared-bot
+message routing is unchanged. The verified profile is derived locally, not
+supplied by the model.
 
 - `irc_status({})` — connection fields plus this profile's `address`,
   `sessionId`, and `peers` sorted by account then address. Each peer record is
   `{account,address,runtime,host,sessionId}`.
 - `irc_request({target,question})` — asks one discovered address. Peer replies
-  always carry `untrusted: true`; a peer `err` body is returned as `text` with
-  the fixed local `error: "peer-error"`, never as an executable local error.
+  always retain `account`, `status`, verbatim `text` and `untrusted: true`.
+  Peer `err` and `busy` results add fixed `error: "peer-error"` and `error: "busy"`
+  respectively; the peer body never becomes a local error code.
 - `irc_send({target,text})` — one advisory note to a discovered address or the
   literal `*` broadcast, returning `{noteId,target,status:"sent"}` once queued.
   Fixed target errors are `unknown-peer`, `peer-changed` and `invalid-target`.
@@ -306,15 +312,20 @@ Hello and note lines share the same 400-byte command budget and are likewise
 rejected locally, never truncated or split, when oversized.
 Replies normalize control characters, reserve the same 110-byte headroom,
 contain at most 1,800 body bytes and six UTF-8-safe chunks, and mark
-truncated prefixes. Receivers require every part with consistent totals, UUID,
-destination and authenticated peer. Duplicate/conflicting parts fail the request.
+truncated prefixes. Receivers reapply the full 400-byte PRIVMSG command limit to
+each response part without normalizing or trimming its body, and require every
+part with consistent totals, UUID, destination and authenticated peer.
+Oversized, duplicate or conflicting parts fail the request.
 
-Each identity admits one automatic reply at a time, at most six requests/minute.
-New valid requests while busy get one `busy` response, not queued model work.
-Worker ownership, replay IDs and the rolling one-minute admission window live in a
-process-owned registry keyed by the exact account, outside the reloadable plugin.
-Reconnects and mid-run plugin reloads therefore cannot admit overlapping workers,
-forget a replay or grant another six consultations. Different accounts remain independent.
+Each receiving identity admits one automatic reply at a time, with a separate
+rolling budget of six accepted requests/minute per authenticated sender (including
+human prose). New valid requests while busy get one `busy` response, not queued
+model work. Worker ownership, replay IDs and the sender-keyed admission buckets
+live in a process-owned registry keyed by the exact receiving account, outside the
+reloadable plugin. Reconnects and mid-run plugin reloads therefore cannot admit
+overlapping workers, forget a replay or refill a sender's budget. Different
+senders' budgets remain independent; single-flight worker admission stays shared
+by all senders to the same receiving identity.
 A 55-second watchdog sends `!res <uuid> err 1/1 timeout` once, suppresses late output,
 and requests a cooperative interrupt without cancelling the base turn. Admission
 stays busy until the executor worker has actually finished, even when coroutine

@@ -54,7 +54,7 @@ class CoordinationState:
         from gateway.platforms.helpers import MessageDeduplicator
 
         self.replay = MessageDeduplicator(max_size=DEDUPE_IDS, ttl_seconds=DEDUPE_SECONDS)
-        self.accepted_at = deque()
+        self.accepted_at: dict[str, deque[float]] = {}
         self.note_accepted_at: dict[str, list[float]] = {}
         self.dispatch: asyncio.Task | None = None
 
@@ -259,6 +259,8 @@ class ResponseAssembly:
         request_id, status, part, total, body = parsed
         if request_id != self.request_id:
             return None
+        if len(f"PRIVMSG {destination} :{text}".encode("utf-8")) > IRC_BYTES - PREFIX_HEADROOM:
+            raise ValueError("response-too-long")
         if self.total is not None and total != self.total:
             raise ValueError("total-mismatch")
         if self.status is not None and status != self.status:
@@ -290,7 +292,8 @@ def settle_peer_result(result: dict) -> dict:
         return {"requestId": request_id, "account": result.get("account"), "status": "err",
                 "untrusted": True, "text": text, "error": "peer-error"}
     if status == "busy":
-        return {"requestId": request_id, "error": "busy"}
+        return {"requestId": request_id, "account": result.get("account"), "status": "busy",
+                "text": text, "untrusted": True, "error": "busy"}
     return result
 
 
@@ -330,7 +333,10 @@ async def _profile_action(runner, profile, action):
     if home is None and profile != (runner._primary_profile_name or "default"):
         return None
     async with runner._async_scope_or_null(_async_profile_runtime_scope, home):
-        adapter = runner._authorization_adapter(Platform("irc"), profile)
+        # Shared-bot message routing does not confer ownership of an IRC endpoint or inbox.
+        adapters = (runner.adapters if profile == (runner._primary_profile_name or "default")
+                    else runner._profile_adapters.get(profile, {}))
+        adapter = adapters.get(Platform("irc"))
         if adapter is None or not adapter.coordination or not adapter.is_connected:
             return None
         return await action(adapter)

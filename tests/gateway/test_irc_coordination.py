@@ -1340,8 +1340,15 @@ async def test_plugin_reload_preserves_worker_lease_and_expired_response(adapter
 
 
 @pytest.mark.asyncio
-async def test_plugin_reload_preserves_rate_window_and_replay_ids(adapter, reload_irc_adapter):
+@pytest.mark.parametrize("replace_adapter", [False, True])
+async def test_question_buckets_survive_reconnect_and_reload_per_sender(
+        adapter, reload_irc_adapter, monkeypatch, replace_adapter):
+    import time
+
+    clock = [1000.0]
+    fake_time = SimpleNamespace(time=time.time, monotonic=lambda: clock[0])
     first, first_module = reload_irc_adapter(adapter.config)
+    monkeypatch.setattr(first_module, "time", fake_time)
     first.set_message_handler(AsyncMock(return_value="accepted"))
     bodies = []
     for index in range(6):
@@ -1350,47 +1357,136 @@ async def test_plugin_reload_preserves_rate_window_and_replay_ids(adapter, reloa
         await first._handle_line(frame(body, tags=f";msgid=reload-{index}"))
         await asyncio.wait_for(first._coord_dispatch_task, 3)
     assert first._message_handler.await_count == 6
+    state = first._coordination_state
     await first.disconnect()
-    second, second_module = reload_irc_adapter(adapter.config)
-    assert first_module is not second_module
-    second.set_message_handler(AsyncMock(return_value="must not run"))
+    if replace_adapter:
+        second, second_module = reload_irc_adapter(adapter.config)
+        assert first_module is not second_module
+        monkeypatch.setattr(second_module, "time", fake_time)
+    else:
+        second = first
+        second._writer = Writer()
+        second._registered = True
+        second._mark_connected()
+        seed(second)
+    assert second._coordination_state is state
+    second.set_message_handler(AsyncMock(return_value="independent answer"))
     await second._handle_line(frame(bodies[0]))  # Same UUID, fresh server timestamp.
     await second._handle_line(frame(request()[1], tags=";msgid=reload-0"))  # New UUID, old msgid.
     assert second._writer.lines == []  # Replays are silent, not even busy/error responses.
+    clock[0] += 59
     seventh_id, seventh_body = request()
     await second._handle_line(frame(seventh_body))
     await second._handle_line(frame(seventh_body))
     assert second._writer.lines == [f"PRIVMSG #agents :!res {seventh_id} busy 1/1 busy"]
     second._message_handler.assert_not_awaited()
     assert second._coord_dispatch_task is None
+    other = "agent-omp-loota-01"
+    await second._handle_line(hello(account=other, destination=OWN))
+    other_id, other_body = request()
+    await second._handle_line(frame(other_body, account=other))
+    await asyncio.wait_for(second._coord_dispatch_task, 3)
+    assert second._writer.lines[-1] == f"PRIVMSG #agents :!res {other_id} ok 1/1 independent answer"
+    # Authenticated human prose gets its own bucket, not the agents' exhausted budget.
+    await second._handle_line(frame("human question", account="amodig", destination=OWN))
+    await asyncio.wait_for(second._coord_dispatch_task, 3)
+    assert second._writer.lines[-1].endswith(" ok 1/1 independent answer")
+    assert second._message_handler.await_count == 2
+    clock[0] += 1
+    await second._handle_line(frame(seventh_body))  # A busy UUID never becomes queued work.
+    fresh_id, fresh_body = request()
+    await second._handle_line(frame(fresh_body))
+    await asyncio.wait_for(second._coord_dispatch_task, 3)
+    assert second._message_handler.await_count == 3
+    assert second._writer.lines[-1] == f"PRIVMSG #agents :!res {fresh_id} ok 1/1 independent answer"
 
 
 @pytest.mark.asyncio
 async def test_hello_presence_channel_reply_rate_limit_and_dm(adapter, monkeypatch):
+    import time
+
     clock = [100.0]
-    monkeypatch.setattr(irc.time, "monotonic", lambda: clock[0])
+    release = asyncio.Event()
+    delays = []
+
+    async def sleep(delay):
+        delays.append(delay)
+        await release.wait()
+
+    monkeypatch.setattr(irc, "time", SimpleNamespace(time=time.time, monotonic=lambda: clock[0]))
+    monkeypatch.setattr(irc, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": sleep}))
     adapter._peers.clear()
-    adapter._hello_replies.clear()
     await adapter._handle_line(hello())
     assert adapter._peers[PEER] == {
         "account": PEER, "address": PEER_ADDRESS, "runtime": "hermes", "host": "z300",
         "sessionId": PEER_SESSION}
-    assert adapter._writer.lines[-1] == f"PRIVMSG {PEER} :!hello 1 hermes loota {LOCAL_SESSION}"
-    replies = len(adapter._writer.lines)
+    reply = f"PRIVMSG {PEER} :!hello 1 hermes loota {LOCAL_SESSION}"
+    assert adapter._writer.lines == [reply]
     await adapter._handle_line(hello())
-    assert len(adapter._writer.lines) == replies  # one DM hello per sender per five seconds
-    clock[0] += 5
-    await adapter._handle_line(hello())
-    assert len(adapter._writer.lines) == replies + 1
-    adapter._peers.clear()
-    await adapter._handle_line(hello(destination=OWN))  # DM hello is recorded, never answered
-    assert PEER in adapter._peers and len(adapter._writer.lines) == replies + 1
+    old_task = adapter._hello_reply_tasks[PEER]
+    await asyncio.sleep(0)
+    # Remove the old peer and reconnect before its five-second throttle expires.
+    await adapter._handle_line(f":{PEER}!u@host PART #agents")
+    clock[0] += 1
+    new_session = str(uuid.uuid4())
+    await adapter._handle_line(hello(new_session))
+    pending = adapter._hello_reply_tasks[PEER]
+    await asyncio.gather(old_task, return_exceptions=True)
+    assert old_task.cancelled() and pending is not old_task
+    for _ in range(10):
+        await adapter._handle_line(hello(new_session))
+    assert list(adapter._hello_reply_tasks.values()) == [pending]
+    assert adapter._writer.lines == [reply]
+    assert adapter._peers[PEER]["address"] == f"{PEER}/{new_session}"
+    clock[0] += 4
+    release.set()
+    await pending  # No further hello is needed to trigger backfill.
+    assert delays == [5.0, 4.0] and not adapter._hello_reply_tasks
+    assert adapter._writer.lines == [reply, reply]
+    adapter._drop_peer(PEER)
+    await adapter._handle_line(hello(destination=OWN))  # DM hello is recorded, never answered.
+    assert PEER in adapter._peers and adapter._writer.lines == [reply, reply]
+    assert not adapter._hello_reply_tasks
     adapter.handle_message = AsyncMock()
     for raw in (hello(runtime="openai"), frame("!hello 2 omp loota " + PEER_SESSION),
                 hello(account="amodig"), frame("!hello 1 omp loota " + PEER_SESSION, nick="other")):
         await adapter._handle_line(raw)
     adapter.handle_message.assert_not_awaited()
     assert set(adapter._peers) == {PEER}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("local,event", [
+    (local, event) for local in (False, True) for event in ("PART", "QUIT", "NICK", "KICK")
+] + [(True, "disconnect")])
+async def test_deferred_hello_is_cancelled_on_peer_or_local_removal(adapter, monkeypatch, event, local):
+    async def sleep(delay):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(irc, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": sleep}))
+    adapter._notify_fatal_error = AsyncMock()
+    await adapter._handle_line(hello())
+    await adapter._handle_line(hello())
+    pending = adapter._hello_reply_tasks[PEER]
+    await asyncio.sleep(0)
+    writer = adapter._writer
+    sent = list(writer.lines)
+    account = OWN if local else PEER
+    if event == "disconnect":
+        await adapter.disconnect()
+    else:
+        line = {
+            "PART": f":{account}!u@host PART #agents",
+            "QUIT": f":{account}!u@host QUIT :gone",
+            "NICK": f":{account}!u@host NICK :new-nick",
+            "KICK": f":operator!u@host KICK #agents {account} :gone",
+        }[event]
+        await adapter._handle_line(line)
+    await asyncio.gather(pending, return_exceptions=True)
+    assert pending.cancelled() and not adapter._hello_reply_tasks
+    assert PEER not in adapter._peers and writer.lines == sent
+    if local or event == "disconnect":
+        assert not adapter.is_connected and adapter._address is None
 
 
 @pytest.mark.asyncio
@@ -1583,12 +1679,38 @@ async def test_send_note_target_validation_and_status(adapter):
 
 
 @pytest.mark.asyncio
-async def test_peer_err_body_is_untrusted_data_not_local_error(adapter, monkeypatch):
-    monkeypatch.setattr(irc, "REQUEST_TIMEOUT", 1.0)
+@pytest.mark.parametrize("status,error", [("err", "peer-error"), ("busy", "busy")])
+async def test_peer_failure_body_is_untrusted_data_not_local_error(adapter, status, error):
     pending = asyncio.create_task(adapter.request_peer(PEER_ADDRESS, "hello"))
     await asyncio.sleep(0)
     rid = adapter._outbound[0].request_id
-    await adapter._handle_line(frame(f"!res {rid} err 1/1 peer-controlled text"))
+    body = "peer-controlled λ text  "
+    await adapter._handle_line(frame(f"!res {rid} {status} 1/1 {body}"))
     result = await pending
-    assert result == {"requestId": rid, "account": PEER, "status": "err", "untrusted": True,
-                      "text": "peer-controlled text", "error": "peer-error"}
+    assert result == {"requestId": rid, "account": PEER, "status": status, "untrusted": True,
+                      "text": body, "error": error}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command_bytes", [399, 400, 401])
+@pytest.mark.parametrize("prefix", ["ASCII", "λ🙂"])
+async def test_received_response_command_budget_preserves_verbatim_body(adapter, command_bytes, prefix):
+    pending = asyncio.create_task(adapter.request_peer(PEER_ADDRESS, "hello"))
+    await asyncio.sleep(0)
+    assembly = adapter._outbound[0]
+    rid = assembly.request_id
+    header = f"PRIVMSG #agents :!res {rid} ok 1/1 "
+    body = prefix + "x" * (command_bytes - len((header + prefix + "  ").encode("utf-8"))) + "  "
+    assert len((header + body).encode("utf-8")) == command_bytes
+    # Framing is admission context, not pure envelope syntax.
+    assert parse_response(f"!res {rid} ok 1/1 {body}")[-1] == body
+    await adapter._handle_line(frame(f"!res {uuid.uuid4()} ok 1/1 {'x' * 400}"))
+    assert not pending.done() and not assembly.parts
+    await adapter._handle_line(frame(f"!res {rid} ok 1/1 {body}"))
+    result = await pending
+    if command_bytes > 400:
+        assert result == {"requestId": rid, "error": "response-too-long"}
+        assert assembly.total is None and assembly.size == 0
+    else:
+        assert result == {"requestId": rid, "account": PEER, "status": "ok",
+                          "text": body, "untrusted": True}
