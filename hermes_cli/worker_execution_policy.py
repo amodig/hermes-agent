@@ -653,7 +653,18 @@ def resolve_review_context(db_path: str, task_id: str) -> tuple[str, Optional[di
             return "implementation", None
         if not isinstance(candidate_id, str) or not candidate_id:
             return role, None
-        handoff = kanban_db.latest_handoff(connection, candidate_id)
+        # The candidate card's BOUND run, not its newest one: after a rebind to an
+        # earlier attested candidate the newest handoff belongs to the rejected work,
+        # and the grant would then refuse a workspace that is correctly at the bound head.
+        bound = connection.execute(
+            "SELECT candidate_run_id FROM tasks WHERE id = ?", (candidate_id,),
+        ).fetchone()
+        bound_run = bound["candidate_run_id"] if bound is not None else None
+        handoff = (
+            kanban_db.handoff_for_run(connection, candidate_id, int(bound_run))
+            if isinstance(bound_run, int) and not isinstance(bound_run, bool)
+            else kanban_db.latest_handoff(connection, candidate_id)
+        )
         base = str(handoff.get("base_sha") or "").strip()
         head = str(handoff.get("head_sha") or "").strip()
         if not _OBJECT_ID_RE.match(base) or not _OBJECT_ID_RE.match(head):

@@ -456,6 +456,15 @@ def _cleanup_worktree_workspace(
                 task_id, wp,
             )
             return
+        blockers = _worktree_removal_blockers(wp)
+        if blockers:
+            # ``worktree remove`` deletes these with the directory even though `status`
+            # called the tree clean; operator content outranks a tidy workspace.
+            _kb._log.info(
+                "Preserving worktree for task %s: %s at %s",
+                task_id, "; ".join(blockers), wp,
+            )
+            return
         # Windows cannot delete a directory while this process has its current
         # directory inside it. Completed workers normally run from their own
         # linked worktree, so move this process back to the main checkout
@@ -1230,6 +1239,36 @@ def _set_task_column(conn: sqlite3.Connection, task_id: str, column: str, value:
         conn.execute(f"UPDATE tasks SET {column} = ? WHERE id = ?", (value, task_id))
 
 
+def _worktree_removal_blockers(worktree: Path) -> list[str]:
+    """Content ``git worktree remove`` would delete although ``status`` calls it clean.
+
+    Two classes are invisible to a plain status check, and both are operator work:
+    files under ``assume-unchanged``/``skip-worktree`` (reported clean while modified) and
+    ignored entries (never reported at all, and removed with the directory). Verified
+    against Git: non-force ``worktree remove`` exits 0 and deletes all of them.
+    """
+    reasons: list[str] = []
+    flags = _git(worktree, "ls-files", "-v", "-z", timeout=60)
+    if flags.returncode != 0:
+        reasons.append("index flags could not be read")
+    else:
+        flagged = [
+            item.split(" ", 1)[1] for item in (flags.stdout or "").split("\x00")
+            if item and not item.startswith("H ")
+        ]
+        if flagged:
+            reasons.append(f"{len(flagged)} path(s) marked assume-unchanged/skip-worktree")
+    ignored = _git(
+        worktree, "ls-files", "--others", "--ignored", "--exclude-standard",
+        "--directory", "-z", timeout=60,
+    )
+    if ignored.returncode != 0:
+        reasons.append("ignored entries could not be read")
+    elif (ignored.stdout or "").strip("\0"):
+        reasons.append("ignored entries are present")
+    return reasons
+
+
 def discard_prepared_worktree(
     task: Task, path: Path | str, prepared_head: str, *, board: Optional[str] = None,
 ) -> bool:
@@ -1252,15 +1291,7 @@ def discard_prepared_worktree(
         if _git_head(target) != prepared_head:
             return False
         _clean_tree(target, str(target))
-        # ``git worktree remove`` deletes untracked and ignored files with the directory,
-        # so ANY ignored entry means operator content: preserve, do not remove.
-        ignored = _git(
-            target, "ls-files", "--others", "--ignored", "--exclude-standard",
-            "--directory", "-z", timeout=60,
-        )
-        if ignored.returncode != 0:
-            return False          # cannot enumerate → preserve
-        if (ignored.stdout or "").strip("\0"):
+        if _worktree_removal_blockers(target):
             return False
         result = _git(repo_root, "worktree", "remove", str(target), timeout=60)
         if result.returncode != 0:

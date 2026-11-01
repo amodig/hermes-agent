@@ -2951,6 +2951,13 @@ def _dispatch_lane_task(
         except WorkerLaunchInterrupted as exc:
             if launch is not None and launch.cancel:
                 launch.cancel()
+            # Preparation already materialized the checkout; nothing ran in it, and the
+            # workspace was never persisted, so database-driven cleanup has no path to it.
+            if workspace is not None and spawn_task is not None:
+                _kbw.discard_prepared_worktree(
+                    spawn_task, workspace,
+                    candidate_head or (_kbw._git_head(workspace) or ""), board=board,
+                )
             _note_launch_cancelled(task_id, str(exc), result)
             return False
         except Exception as exc:
