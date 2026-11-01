@@ -82,8 +82,9 @@ Check status with `hermes gateway status` — IRC connection state is reported t
 Ordinary IRC networks retain their existing PASS/NickServ and nick-allowlist behavior.
 Native SASL PLAIN is also available without coordination: configure `sasl_account`,
 `sasl_password` (prefer the profile-local `IRC_SASL_PASSWORD` secret), and
-`require_sasl: true`. SASL requires verified TLS and never downgrades to PASS or
-NickServ. Registration waits for CAP negotiation, SASL success and welcome;
+`require_sasl: true`. SASL requires verified TLS, except for the exact sanctioned
+loopback SSH tunnel described below, and never downgrades to PASS or NickServ.
+Registration waits for CAP negotiation, SASL success and welcome;
 gateway membership is reported only after the server confirms the bot's JOIN or NAMES entry
 and the receive task is still alive. Registration timeouts and transport loss during setup
 remain retryable, including EOF immediately after JOIN; explicit SASL/capability rejections do not.
@@ -143,17 +144,20 @@ remain permanent failures requiring operator correction.
 
 Additional supported environment aliases are `IRC_SASL_ACCOUNT`, `IRC_SASL_PASSWORD`,
 `IRC_SASL_REQUIRED`, `IRC_ALLOWED_ACCOUNTS` (comma-separated), and `IRC_PROXY_URL`.
-`coordination` is a YAML boolean only. Coordination requires the verified-TLS
-endpoint to be the configured coordination route; another host or port is
-rejected before credentials are sent. The current direct route is
-`z300.barracuda-trout.ts.net:6697`. Deployed Hermes may also use the previously
-implemented sanctioned loopback tunnel `127.0.0.1:16697`; that tunnel's upstream
-merge is a **deployment prerequisite** for this v1 cutover. This change does not
-add, remove or reconfigure a route, and it never disables certificate checks or
-adds plaintext remote transport to make a probe pass. If a host's established
-TLS route is unavailable, treat routing as the blocker instead of weakening the
-gate. Invalid coordination settings fail closed, including while disconnected;
-they never enable ordinary IRC intake. Ordinary IRC endpoints remain configurable.
+`coordination` is a YAML boolean only. Coordination accepts exactly two routes:
+verified TLS at `z300.barracuda-trout.ts.net:6697`, or the sanctioned SSH tunnel at
+`127.0.0.1:16697` with `use_tls: false`. The latter is the local
+`arttula-tunnel.service` forward to the same agents Ergo network; SSH, not a TLS
+layer on the loopback socket, protects that transport. This runtime includes the
+tunnel prerequisite without changing either host's configured route.
+Other coordination hosts or ports are rejected before credentials are sent.
+The direct endpoint cannot disable TLS, and the plaintext exception does not
+include other loopback ports, hostname aliases or remote addresses. HTTP CONNECT
+still requires verified TLS; it cannot proxy the plaintext loopback exception.
+If a host's established route is unavailable, treat routing as the blocker instead
+of weakening the gate. Invalid coordination settings fail closed, including while
+disconnected; they never enable ordinary IRC intake. Ordinary IRC endpoints remain
+configurable.
 Ordinary JOIN/NAMES membership checks ignore nick/channel letter case; coordination
 account and nickname checks remain exact.
 

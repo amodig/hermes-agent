@@ -535,6 +535,30 @@ def _scan_source(
                 branch = symbolic.stdout.decode("utf-8", "strict").strip().removeprefix("refs/heads/")
             except UnicodeDecodeError:
                 raise WorkerExecutionRefused("git_unsupported", "Git branch is malformed")
+        if materialize is not None and str(getattr(authority, "role", "unknown")) == "review":
+            # Materializing means running the recipe against a COPY. For a review
+            # claim the copy must be the reviewed commit itself: same HEAD as the
+            # granted pair, and no tracked or staged modification on top of it.
+            if authority.review is None:
+                raise WorkerExecutionRefused(
+                    "source_changed", "no immutable candidate handoff is bound to this claim")
+            granted_head = str(_record_value(authority.review, "head", "")).lower()
+            if not granted_head or head.lower() != granted_head:
+                raise WorkerExecutionRefused(
+                    "source_changed", "the granted workspace HEAD is not the reviewed head")
+            dirty = git.run([
+                "diff", "--quiet", "--no-ext-diff", "--no-textconv",
+                "--ignore-submodules=all", "HEAD", "--",
+            ])
+            if dirty.returncode == 1:
+                raise WorkerExecutionRefused(
+                    "source_changed",
+                    "the reviewed candidate has tracked or staged modifications; a copy of it "
+                    "would not be the reviewed commit")
+            if dirty.returncode != 0:
+                # An unreadable comparison is not a clean tree.
+                raise WorkerExecutionRefused(
+                    "git_unsupported", "Git could not verify the candidate is unmodified")
         tracked = _git_tracked(git)
         extras = [list(_split_relative(item, "extra_source_paths")) for item in authority.extra_source_paths]
         reserved_tracked = [path for path in tracked if _reserved(path.split("/"))]

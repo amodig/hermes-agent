@@ -69,7 +69,11 @@ from hermes_cli.worker_execution_common import (
 # ---------------------------------------------------------------------------
 
 _POLICY_KEYS = frozenset({"protocol", "image_store", "workspaces"})
-_WORKSPACE_KEYS = frozenset({"path", "inspect", "extra_source_paths", "recipes"})
+_WORKSPACE_REQUIRED_KEYS = frozenset({"path", "inspect", "extra_source_paths", "recipes"})
+# The only optional workspace key: an explicit opt-in for the native task worktrees
+# of the named repository. Absent means exact-path authority, exactly as before.
+_WORKSPACE_OPTIONAL_KEYS = frozenset({"include_worktrees"})
+_WORKSPACE_KEYS = _WORKSPACE_REQUIRED_KEYS | _WORKSPACE_OPTIONAL_KEYS
 _RECIPE_KEYS = frozenset({"image", "argv", "timeout_seconds", "services"})
 _SERVICE_KEYS = frozenset({"id", "image", "argv", "ready_argv", "port"})
 
@@ -111,6 +115,8 @@ class WorkspacePolicy:
     inspect: bool
     extra_source_paths: tuple[str, ...]
     recipes: tuple[RecipePolicy, ...]
+    # Opt-in: also cover this repository's own ``.worktrees/<task-id>`` checkouts.
+    include_worktrees: bool = False
 
 
 @dataclass(frozen=True)
@@ -123,11 +129,12 @@ class WorkerExecutionPolicy:
         return {recipe.id: recipe for workspace in self.workspaces for recipe in workspace.recipes}
 
 
-def _strict_keys(value: Mapping[str, Any], expected: frozenset, label: str) -> None:
+def _strict_keys(value: Mapping[str, Any], expected: frozenset, label: str,
+                 *, required: Optional[frozenset] = None) -> None:
     if not isinstance(value, Mapping):
         _refuse("policy_malformed", f"{label} must be a mapping")
     extra = set(value) - expected
-    missing = expected - set(value)
+    missing = (required if required is not None else expected) - set(value)
     if extra:
         _refuse("policy_malformed", f"{label} has unknown keys: {sorted(extra)}")
     if missing:
@@ -188,7 +195,10 @@ def parse_policy(section: Any) -> WorkerExecutionPolicy:
     workspaces: list[WorkspacePolicy] = []
     for index, entry in enumerate(workspaces_raw):
         label = f"workspaces[{index}]"
-        _strict_keys(entry, _WORKSPACE_KEYS, label)
+        _strict_keys(entry, _WORKSPACE_KEYS, label, required=_WORKSPACE_REQUIRED_KEYS)
+        include_worktrees = entry.get("include_worktrees", False)
+        if not isinstance(include_worktrees, bool):
+            _refuse("policy_malformed", f"{label}.include_worktrees must be a boolean")
         raw_path = entry["path"]
         if not isinstance(raw_path, str) or not os.path.isabs(raw_path):
             _refuse("policy_malformed", f"{label}.path must be an absolute path")
@@ -256,7 +266,8 @@ def parse_policy(section: Any) -> WorkerExecutionPolicy:
             seen_recipe_ids.add(recipe_id)
         if len(seen_recipe_ids) > MAX_RECIPES:
             _refuse("policy_malformed", "too many recipes")
-        workspaces.append(WorkspacePolicy(path, inspect, extras, tuple(recipes)))
+        workspaces.append(
+            WorkspacePolicy(path, inspect, extras, tuple(recipes), include_worktrees))
     if image_store is None and any(workspace.recipes for workspace in workspaces):
         _refuse("policy_malformed", "image_store is required when recipes are configured")
     digest = digest_of(section)
@@ -385,18 +396,109 @@ def _minimal_git_env(object_dir: Optional[str]) -> dict[str, str]:
     return env
 
 
-def _resolve_workspace(policy_entry: WorkspacePolicy) -> Optional[dict[str, Any]]:
-    """Exact canonical path plus held directory identity, never a prefix or label."""
+def _held_directory(path: str) -> Optional[dict[str, Any]]:
+    """Canonical path plus held directory identity; ``None`` on any doubt."""
     try:
-        resolved = Path(policy_entry.path).resolve(strict=True)
+        resolved = Path(path).resolve(strict=True)
         info = os.lstat(resolved)
     except OSError:
         return None
-    if not stat.S_ISDIR(info.st_mode) or Path(policy_entry.path).is_symlink():
+    if not stat.S_ISDIR(info.st_mode) or Path(path).is_symlink():
         return None
-    if str(resolved) != policy_entry.path:
+    if str(resolved) != path:
         return None
     return {"path": str(resolved), "device": int(info.st_dev), "inode": int(info.st_ino)}
+
+
+def _resolve_workspace(policy_entry: WorkspacePolicy) -> Optional[dict[str, Any]]:
+    """Exact canonical path plus held directory identity, never a prefix or label."""
+    return _held_directory(policy_entry.path)
+
+
+def _worktree_registration_backlinks(common_dir: str, git_dir: str, workspace: str) -> bool:
+    """True when Git's registry entry FOR THIS git directory backlinks this checkout.
+
+    The registration is addressed by the captured git directory itself
+    (``<common>/worktrees/<name>``), never by scanning for a pointer that happens to
+    name this path: a stale registration left behind for the same path would
+    otherwise vouch for a checkout whose ``.git`` was retargeted at a sibling
+    worktree, and the grant would bind this directory to another worktree's index
+    and HEAD. Regular bounded files only, no symlinks.
+    """
+    registry = Path(common_dir) / "worktrees"
+    captured = Path(git_dir)
+    try:
+        if registry.is_symlink() or not registry.is_dir():
+            return False
+        if captured.is_symlink() or not captured.is_dir():
+            return False
+        if os.path.normpath(str(captured.parent)) != os.path.normpath(str(registry)):
+            return False
+        pointer = captured / "gitdir"
+        info = os.lstat(pointer)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+            return False
+        recorded = pointer.read_bytes().decode("utf-8", "strict").strip()
+    except (OSError, UnicodeDecodeError):
+        return False
+    wanted = os.path.normpath(os.path.join(workspace, ".git"))
+    return bool(recorded) and os.path.normpath(recorded) == wanted
+
+
+def _resolve_worktree_opt_in(
+    policy: WorkerExecutionPolicy, workspace: str, task_id: str,
+) -> tuple[Optional[WorkspacePolicy], Optional[dict[str, Any]], Optional[dict[str, Any]],
+           Optional[str]]:
+    """``(entry, workspace_identity, git_identity, reason)`` for an opted-in worktree.
+
+    Only an entry with ``include_worktrees`` covers a native task worktree, and only
+    when the actual workspace is exactly ``<entry>/.worktrees/<task-id>`` — not a
+    descendant of it, not a label, not a checkout living somewhere else — and Git's
+    own registry backlinks that checkout from the entry's common directory under the
+    same held inode.
+    """
+    candidates: list[tuple[WorkspacePolicy, dict[str, Any], dict[str, Any]]] = []
+    for entry in policy.workspaces:
+        if not entry.include_worktrees:
+            continue
+        expected = os.path.join(entry.path, ".worktrees", task_id)
+        if workspace != expected:
+            continue
+        anchor = _resolve_workspace(entry)
+        if anchor is None:
+            return None, None, None, "workspace_not_granted: opted-in anchor is not a canonical directory"
+        anchor_git = capture_git_identity(anchor["path"])
+        if anchor_git is None:
+            return None, None, None, "workspace_not_granted: opted-in anchor is not a Git checkout"
+        if anchor_git["git_dir"] != anchor_git["common_dir"]:
+            return None, None, None, "workspace_not_granted: opted-in anchor is not a main checkout"
+        actual = _held_directory(workspace)
+        if actual is None:
+            continue
+        actual_git = capture_git_identity(actual["path"])
+        if actual_git is None:
+            continue
+        if actual_git["common_dir"] != anchor_git["common_dir"]:
+            continue
+        if (actual_git["common_device"], actual_git["common_inode"]) != (
+            anchor_git["common_device"], anchor_git["common_inode"]
+        ):
+            continue
+        # Each worktree keeps its own git directory; a common directory equal to the
+        # git directory means this is not a linked checkout at all.
+        if actual_git["git_dir"] == actual_git["common_dir"]:
+            continue
+        if not _worktree_registration_backlinks(
+            anchor_git["common_dir"], actual_git["git_dir"], actual["path"]
+        ):
+            continue
+        candidates.append((entry, actual, actual_git))
+    if not candidates:
+        return None, None, None, "workspace_not_granted"
+    if len(candidates) > 1:
+        return None, None, None, "workspace_ambiguous"
+    entry, actual, actual_git = candidates[0]
+    return entry, actual, actual_git, None
 
 
 def _resolve_image_store(policy: WorkerExecutionPolicy) -> Optional[dict[str, Any]]:
@@ -541,7 +643,10 @@ def resolve_review_context(db_path: str, task_id: str) -> tuple[str, Optional[di
                 return "implementation", None
             role = "review"
             candidate_id = task_id
-        elif status == "review":
+        elif status == "review" or kanban_db._resume_status_from_events(connection, task_id) == "review":
+            # A claimed review reads ``running``; the recorded resume status is the
+            # only evidence of the lane it came from. Missing it would hand a
+            # legacy reviewer implementation authority with no candidate pair.
             role = "review"
             candidate_id = task_id
         else:
@@ -589,16 +694,36 @@ def resolve_execution_grant(
         if resolved is None:
             continue
         matches.append((entry, resolved))
-    if not matches:
-        return None, "workspace_not_granted"
+    # An exact configuration match is the authority that was written down, including
+    # `inspect: false`; a repository-level opt-in never overrides or widens it.
     if len(matches) > 1:
         return None, "workspace_ambiguous"
-    entry, resolved_workspace = matches[0]
+    if matches:
+        entry, resolved_workspace = matches[0]
+        held = None
+    else:
+        entry, resolved_workspace, git, reason = _resolve_worktree_opt_in(
+            policy, canonical_workspace, task_id)
+        if entry is None:
+            return None, reason
+        held = git
     try:
         image_store = _resolve_image_store(policy)
         git = capture_git_identity(resolved_workspace["path"])
     except WorkerExecutionError as exc:
         return None, f"{exc.code}: {exc.message}"
+    if held is not None:
+        # Recheck the identities the match was made on before anything is granted: a
+        # checkout swapped between the decision and the grant is not that checkout.
+        again = _held_directory(resolved_workspace["path"])
+        if again is None or (
+            again["device"], again["inode"]
+        ) != (resolved_workspace["device"], resolved_workspace["inode"]):
+            return None, "workspace_not_granted: opted-in worktree moved during resolution"
+        if git is None or git["git_dir"] != held["git_dir"] or (
+            git["common_dir"], git["common_device"], git["common_inode"]
+        ) != (held["common_dir"], held["common_device"], held["common_inode"]):
+            return None, "workspace_not_granted: opted-in worktree Git identity changed during resolution"
     # The image store must live outside the workspace, profile and live state roots.
     if image_store is not None:
         store = Path(image_store["path"])
@@ -613,11 +738,16 @@ def resolve_execution_grant(
     if plugin is None:
         return None, "policy_plugin_unavailable"
     role, review = resolve_review_context(db_path, task_id)
-    if review is not None and git is not None:
-        head = _workspace_head_from_identity(git)
-        if head is not None and head.lower() != review["head"].lower():
-            # The reviewer is entitled to metadata but not to a stale commit-diff pair.
-            review = None
+    if role == "review":
+        # A reviewer or tester executes against an immutable candidate commit. If the
+        # board cannot name that pair, or the workspace is not sitting on it, there is
+        # no authority to execute against: metadata-only startup stays usable, but no
+        # recipe may run at whatever HEAD the workspace happens to hold.
+        if review is None:
+            return None, "candidate_workspace_unavailable"
+        head = _workspace_head_from_identity(git) if git is not None else None
+        if head is None or head.lower() != review["head"].lower():
+            return None, "candidate_workspace_unavailable"
     from hermes_constants import get_process_hermes_home
 
     parent = Path(tempfile.gettempdir()) / "hermes-worker-execution"

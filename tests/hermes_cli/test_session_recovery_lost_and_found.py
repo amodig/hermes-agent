@@ -213,29 +213,27 @@ def test_probe_populated_edge_caps_synthetic_domain(tmp_path: Path) -> None:
 # ── lost_and_found lane: unreadable table schemas ───────────────────────────
 
 
-def test_unreadable_schema_without_cli_names_the_sqlite3_requirement(
+def test_unavailable_salvage_refuses_without_changing_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Without a sqlite3 CLI the refusal must say exactly what to install."""
     source = tmp_path / "schemaless.db"
     output = tmp_path / "schemaless-recovered.db"
     _make_schema_unreadable_source(source)
+    before = source.read_bytes()
 
     import hermes_cli.session_lost_and_found as laf
 
     monkeypatch.setattr(laf, "find_sqlite3_cli", lambda: None)
-    with pytest.raises(SessionRecoverySourceError) as excinfo:
+    monkeypatch.setattr(laf, "find_sqlite3_cli_refusal", lambda: {"reason": "missing"})
+    with pytest.raises(SessionRecoverySourceError):
         recover_session_database(
             source,
             output,
             work_dir=tmp_path,
             allow_partial=True,
         )
-    message = str(excinfo.value)
-    assert "sessions" in message and "messages" in message
-    assert "sqlite3" in message
-    assert ".recover" in message
+    assert source.read_bytes() == before
     assert not output.exists()
 
 

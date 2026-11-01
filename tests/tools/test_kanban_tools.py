@@ -9,6 +9,7 @@ Verifies:
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -80,6 +81,115 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert d["task"]["status"] == "running"
     assert "worker_context" in d
     assert "runs" in d
+
+
+def _page_whole_file(path: str) -> str:
+    """Page *path* with the real read_file tool, exactly as a worker is told to."""
+    from tools.file_tools import read_file_tool
+
+    pages: list[str] = []
+    offset = 1
+    for _ in range(50):
+        out = json.loads(read_file_tool(path, offset=offset, limit=2000))
+        assert not out.get("error"), out
+        pages.append(out.get("content") or "")
+        if out.get("next_offset"):
+            offset = int(out["next_offset"])
+        elif out.get("truncated"):
+            offset += 2000
+        else:
+            return "\n".join(pages)
+    raise AssertionError("did not reach the end of the spill within 50 pages")
+
+
+def test_show_spills_but_its_decision_inputs_and_receipt_stay_pageable(tmp_path, monkeypatch):
+    """A worker's kanban_show on a card carrying hundreds of KB of event history.
+
+    Compact single-line JSON used to make the whole answer one unreadable line once
+    the runtime spilled it, so a worker could not reach its own lifecycle, its
+    authorization, or the candidate's launch receipt. The spill is unchanged; what
+    changed is that the result is now indented, so read_file offset/limit paging
+    works — and the decision inputs lead the payload instead of trailing the history.
+    """
+    from pathlib import Path as _Path
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-validator")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    receipt = {"code_sha": "a" * 40, "generation": "b" * 64}
+    head = "e" * 40
+    authorization = "Do not widen the grant; report the exact host gate you ran.\n" * 100
+    late_marker = "LATE-EVENT-MARKER-9c1f"
+
+    conn = kbc.connect()
+    try:
+        implementation = kb.create_task(
+            conn, title="candidate", assignee="coder",
+            lifecycle_contract={
+                "kind": "code", "review_mode": "same_card", "reviewer": "reviewer",
+                "validation_required": True,
+            })
+        assert kb.claim_task(conn, implementation, claimer=kb._claimer_id()) is not None
+        kbd._set_worker_pid(conn, implementation, os.getpid())
+        impl_run = kb._current_run_id(conn, implementation)
+        kb._append_event(
+            conn, implementation, "spawned", {"runtime_identity": receipt}, run_id=impl_run)
+        conn.execute(
+            "UPDATE task_runs SET metadata = ?, status = 'review', "
+            "outcome = 'review_requested' WHERE id = ?",
+            (json.dumps({"head_sha": head}), impl_run))
+        conn.execute(
+            "UPDATE tasks SET candidate_run_id = ? WHERE id = ?", (impl_run, implementation))
+        validation = kb.create_task(
+            conn, title="validate the candidate", assignee="test-validator",
+            body=authorization,
+            lifecycle_contract={"kind": "validation", "candidate_task_id": implementation})
+        # ~360 KiB of nested history, the shape the real card carried.
+        for seq in range(4):
+            kb._append_event(conn, validation, "note",
+                             {"seq": seq, "detail": {"nested": ["x" * 300] * 300}})
+        kb._append_event(conn, validation, "note", {"marker": late_marker})
+        conn.commit()
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    from tools.tool_result_storage import PERSISTED_OUTPUT_TAG, maybe_persist_tool_result
+
+    raw = kt._handle_show({"task_id": validation})
+    assert len(raw) > 321 * 1024, len(raw)
+    original = json.loads(raw)
+    assert original["task"]["body"] == authorization
+    assert original["lifecycle"]["candidate_run_id"] == impl_run
+    assert original["provenance"]["verdict"] == "verified"
+    # Key order is the fix's point: decision inputs before the history arrays.
+    assert raw.index('"lifecycle"') < raw.index('"events"')
+    assert raw.index('"worker_context"') < raw.index('"events"')
+    assert raw.index('"provenance"') < raw.index('"events"')
+
+    spilled = maybe_persist_tool_result(raw, "kanban_show", "tc_show_spill", env=None)
+    assert PERSISTED_OUTPUT_TAG in spilled, spilled[:400]
+    path = spilled.split("Full output saved to: ", 1)[1].splitlines()[0].strip()
+
+    paged = _page_whole_file(path)
+    # The last event the card wrote is reachable, so history is not the casualty.
+    assert late_marker in paged
+    assert f'"candidate_task_id": "{implementation}"' in paged
+    assert f'"candidate_run_id": {impl_run}' in paged
+    assert receipt["generation"] in paged          # the launch receipt, not a synthetic OK
+    assert "candidate_missing" not in paged
+    assert authorization.splitlines()[0] in paged
+    assert '"worker_context"' in paged
 
 
 def test_show_bare_call_outside_worker_returns_orientation_not_error(monkeypatch, worker_env):

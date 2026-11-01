@@ -29,11 +29,11 @@ from gateway.platforms.helpers import cancel_task
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.config import Platform
 from gateway.irc_coordination import (
-    AGENT_ACCOUNTS, ALLOWED_ACCOUNTS, COORDINATION_ENDPOINT, DEDUPE_SECONDS, HELLO_REPLY_INTERVAL,
+    AGENT_ACCOUNTS, ALLOWED_ACCOUNTS, COORDINATION_ENDPOINTS, DEDUPE_SECONDS, HELLO_REPLY_INTERVAL,
     HOSTS, HUMAN_ACCOUNT, INBOX_LIMIT, INBOX_READ_LIMIT, REQUESTS_PER_MINUTE, REQUIRED_CAPS,
-    REQUEST_TIMEOUT, REPLY_TIMEOUT, ResponseAssembly, coordination_state, format_hello, format_note,
-    format_request, normalize_body, parse_address, parse_hello, parse_note, parse_request,
-    response_lines, settle_peer_result,
+    REQUEST_TIMEOUT, REPLY_TIMEOUT, TUNNEL_COORDINATION_ENDPOINT, ResponseAssembly,
+    coordination_state, format_hello, format_note, format_request, normalize_body,
+    parse_address, parse_hello, parse_note, parse_request, response_lines, settle_peer_result,
 )
 
 
@@ -304,10 +304,25 @@ class IRCAdapter(BasePlatformAdapter):
     def toolsets_for_source(self, source):
         return ["no_tools"] if self.coordination else None
 
+    @property
+    def _endpoint(self) -> tuple[str, int]:
+        return (self.server, int(self.port))
+
+    def _transport_is_sanctioned(self) -> bool:
+        """TLS, or the one documented loopback tunnel to the same agents network.
+
+        SASL PLAIN carries the account password, so it stays encrypted on every
+        network transport. The loopback endpoint is the SSH tunnel an agent host
+        without Tailscale uses instead: the credential crosses a loopback socket
+        inside that tunnel, and nothing else is accepted here.
+        """
+        return bool(self.use_tls) or self._endpoint == TUNNEL_COORDINATION_ENDPOINT
+
     def _config_error(self):
         if self.coordination and (
-                self.config.extra.get("coordination") is not True or self.use_tls is not True
-                or (self.server, self.port) != COORDINATION_ENDPOINT
+                self.config.extra.get("coordination") is not True
+                or not self._transport_is_sanctioned()
+                or self._endpoint not in COORDINATION_ENDPOINTS
                 or not isinstance(self.sasl_account, str)
                 or self.nickname != self.sasl_account or self.sasl_account not in AGENT_ACCOUNTS
                 or self.allowed_accounts != ALLOWED_ACCOUNTS or self.channel != "#agents"):
@@ -315,7 +330,7 @@ class IRCAdapter(BasePlatformAdapter):
         if self.coordination and self._host not in HOSTS:
             return "unsupported-coordination-host"
         if self.require_sasl or self.sasl_account or self.sasl_password:
-            if not self.use_tls or not self.sasl_account or not self.sasl_password:
+            if not self._transport_is_sanctioned() or not self.sasl_account or not self.sasl_password:
                 return "sasl-requires-tls-and-credentials"
             if (not isinstance(self.sasl_account, str) or not isinstance(self.sasl_password, str)
                     or any(c in self.sasl_account for c in "\0\r\n ") or "\0" in self.sasl_password):

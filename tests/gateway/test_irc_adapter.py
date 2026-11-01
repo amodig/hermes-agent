@@ -611,6 +611,120 @@ def _coordination_config():
     })
 
 
+def _tunnel_config(**overrides):
+    """The same agents network over the sanctioned loopback SSH tunnel."""
+    from gateway.irc_coordination import TUNNEL_COORDINATION_ENDPOINT
+    config = _coordination_config()
+    config.extra.update(
+        server=TUNNEL_COORDINATION_ENDPOINT[0], port=TUNNEL_COORDINATION_ENDPOINT[1], use_tls=False)
+    config.extra.update(overrides)
+    return config
+
+
+def test_public_endpoint_must_keep_tls(monkeypatch):
+    """The pinned Serve endpoint carries SASL only inside TLS."""
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    config = _coordination_config()
+    config.extra["use_tls"] = False
+    assert IRCAdapter(config)._config_error() == "invalid-coordination-config"
+
+
+def test_tunnel_endpoint_is_the_only_plaintext_transport(monkeypatch):
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    adapter = IRCAdapter(_tunnel_config())
+    assert adapter._config_error() is None
+
+    # A loopback host on any other port, or a remote host on the tunnel port, is
+    # not the documented tunnel and keeps the TLS requirement.
+    for extra in (
+        {"port": 6697},
+        {"server": "irc.example.org"},
+        {"server": "localhost"},
+        {"server": "::1"},
+        {"server": "127.0.0.2"},
+        {"server": "127.0.0.1", "port": 6667},
+    ):
+        config = _tunnel_config(**extra)
+        config.extra["coordination"] = False
+        config.extra["nickname"] = "probe"
+        assert IRCAdapter(config)._config_error() == "sasl-requires-tls-and-credentials", extra
+
+
+@pytest.mark.parametrize("config_factory", [_coordination_config, _tunnel_config])
+def test_coordination_transports_keep_v1_pins(monkeypatch, config_factory):
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    roster = {"amodig", "agent-hermes-cto", "agent-jeeves"} | {
+        f"agent-omp-{host}-{slot:02d}"
+        for host in ("loota", "z300", "cirrus7") for slot in range(1, 5)}
+    config = config_factory()
+    config.extra["allowed_accounts"] = sorted(roster)
+    assert IRCAdapter(config)._config_error() is None
+    for overrides in (
+        {"coordination": "true"},
+        {"nickname": "hermes-bot"},
+        {"nickname": "amodig", "sasl_account": "amodig"},
+        {"channel": "#chat"},
+        {"server": "127.0.0.1", "port": 6697},
+        {"server": "irc.example.org"},
+        {"allowed_accounts": sorted(roster - {"agent-omp-cirrus7-04"})},
+        {"allowed_accounts": sorted(roster | {"agent-omp-other-01"})},
+    ):
+        invalid = config_factory()
+        invalid.extra.update(overrides)
+        assert IRCAdapter(invalid)._config_error() == "invalid-coordination-config", overrides
+    monkeypatch.setattr(_irc_mod, "_local_host", lambda: "unsupported")
+    assert IRCAdapter(config)._config_error() == "unsupported-coordination-host"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("config_factory", [_coordination_config, _tunnel_config])
+@pytest.mark.parametrize("host", ["loota", "z300", "cirrus7"])
+async def test_coordination_transports_authenticate_before_v1_presence(monkeypatch, config_factory, host):
+    from uuid import UUID
+
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    monkeypatch.setattr(_irc_mod, "_local_host", lambda: host)
+    conn = _NegotiatingIRCConnection()
+    opened = []
+
+    async def open_connection(*args, **kwargs):
+        opened.append((args, kwargs))
+        return conn.reader, conn
+
+    monkeypatch.setattr(_irc_mod.asyncio, "open_connection", open_connection)
+    config = config_factory()
+    adapter = IRCAdapter(config)
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *args: True)
+    connecting = asyncio.create_task(adapter.connect())
+    await asyncio.wait_for(conn.join_requested.wait(), 3)
+    assert not adapter.is_connected and not connecting.done()
+    assert not any(b" :!hello " in line for line in conn.writes)
+    conn.feed(":server 353 agent-hermes-cto = #agents :@agent-hermes-cto agent-jeeves")
+    assert await asyncio.wait_for(connecting, 3)
+    assert opened[0][0] == (config.extra["server"], config.extra["port"])
+    # Direct TLS stays verified; only the sanctioned SSH tunnel omits that layer.
+    tls = opened[0][1]["ssl"]
+    if config.extra["use_tls"]:
+        import ssl
+        assert tls.check_hostname and tls.verify_mode == ssl.CERT_REQUIRED
+    else:
+        assert tls is None
+    status = adapter.status_payload()
+    assert UUID(status["sessionId"]).version == 4
+    assert status["address"] == f"agent-hermes-cto/{status['sessionId']}"
+    assert status["peers"] == []  # NAMES is membership, not authenticated presence.
+    lines = [line.decode().strip() for line in conn.writes]
+    hello = f"PRIVMSG #agents :!hello 1 hermes {host} {status['sessionId']}"
+    assert lines.count(hello) == 1
+    assert lines.index("AUTHENTICATE PLAIN") < lines.index("CAP END") < lines.index("JOIN #agents") < lines.index(hello)
+    assert not any(line.startswith("PASS ") for line in lines)
+    assert "synthetic-only" not in repr(conn.writes)
+    await adapter.disconnect()
+    assert adapter.status_payload()["address"] is None
+    assert adapter.status_payload()["sessionId"] is None
+    assert adapter.read_inbox() == {"error": "not-connected"}
+
+
 @pytest.mark.asyncio
 async def test_sasl_cap_multiline_ping_split_frames_and_confirmed_join(monkeypatch, caplog):
     monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
