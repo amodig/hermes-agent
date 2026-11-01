@@ -1304,12 +1304,19 @@ def test_claim_cli_claims_an_ordinary_card(kanban_home, tmp_path, capsys):
     assert _head(Path(claimed.workspace_path)) == _head(repo)
 
 
-def test_role_candidate_head_follows_the_bound_run_not_the_newest(kanban_home, tmp_path):
+@pytest.mark.parametrize("nested_metadata", [True, False])
+def test_role_candidate_head_follows_the_bound_run_not_the_newest(
+    kanban_home, tmp_path, nested_metadata,
+):
     """After rebinding to an earlier attested run, the candidate is that run's head.
 
     `latest_handoff` answers "newest", so a rebind to run A while run B is newer used to
     raise candidate_workspace_unavailable for every review attempt.
     """
+    from hermes_cli.kanban_db_receipts import rebind_candidate
+    from hermes_cli.kanban_runtime import runtime_identity
+
+    receipt = runtime_identity(Path(__file__).resolve().parents[2]).as_dict()
     repo = _make_repo(tmp_path)
     base = _head(repo)
     first = _commit(repo, "candidate.txt", "candidate\n")
@@ -1339,14 +1346,28 @@ def test_role_candidate_head_follows_the_bound_run_not_the_newest(kanban_home, t
             conn, implementation, expected_run_id=run_b.current_run_id,
             summary="second attempt",
             metadata={"base_sha": base, "head_sha": second, "changed_files": []})
-        # Recovery binds the candidate back to the *earlier* run.
+        # Both handoffs have launch attestations. Older records may lack the nested
+        # lifecycle envelope, but their top-level head is still authoritative.
         with kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET candidate_run_id = ? WHERE id = ?", (run_a_id, implementation))
+            for run in (run_a, run_b):
+                kb._append_event(
+                    conn, implementation, "spawned", {"runtime_identity": receipt},
+                    run_id=run.current_run_id)
+            if not nested_metadata:
+                metadata = json.loads(conn.execute(
+                    "SELECT metadata FROM task_runs WHERE id = ?", (run_a_id,)).fetchone()[0])
+                metadata.pop("lifecycle", None)
+                conn.execute(
+                    "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                    (json.dumps(metadata), run_a_id))
+        rebind_candidate(
+            conn, implementation, run_id=run_a_id, head_sha=first,
+            reason="restore earlier candidate", replace=True, replaced_run=run_b.current_run_id)
         review = _role_card(conn, "review", implementation, repo, "reviewer")
         task = kb.get_task(conn, review)
         state = kb.get_lifecycle_state(conn, review)
         assert state["candidate_run_id"] == run_a_id
+        assert state["head_sha"] == first
         bound = kbw.candidate_head_for_task(conn, task)
         newest = kb.latest_handoff(conn, implementation)["head_sha"]
 
@@ -1424,7 +1445,10 @@ def test_cli_refusal_discards_only_new_worktrees(
         assert kb.get_task(conn, review).current_run_id is None
 
 
-def test_cli_candidate_rollback_preserves_a_successor_claim(kanban_home, tmp_path, monkeypatch):
+@pytest.mark.parametrize("takeover", ["claim", "row"])
+def test_cli_candidate_rollback_preserves_a_successor_claim(
+    kanban_home, tmp_path, monkeypatch, takeover,
+):
     from hermes_cli import kanban as kc
     from hermes_cli.kanban_db_dispatch import _record_task_failure
 
@@ -1439,12 +1463,19 @@ def test_cli_candidate_rollback_preserves_a_successor_claim(kanban_home, tmp_pat
     def replace_claim(conn, task_id, **kwargs):
         original = claim(conn, task_id, **kwargs)
         assert original is not None
-        _record_task_failure(
-            conn, task_id, "first attempt ended", outcome="spawn_failed",
-            release_claim=True, end_run=True,
-        )
-        successor = claim(conn, task_id, claimer="successor")
-        assert successor is not None
+        if takeover == "row":
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET current_run_id = ?, claim_lock = 'successor' WHERE id = ?",
+                    (original.current_run_id + 1000, task_id))
+            successor = kb.get_task(conn, task_id)
+        else:
+            _record_task_failure(
+                conn, task_id, "first attempt ended", outcome="spawn_failed",
+                release_claim=True, end_run=True,
+            )
+            successor = claim(conn, task_id, claimer="successor")
+            assert successor is not None
         successors.append(successor)
         return original
 
@@ -1452,6 +1483,9 @@ def test_cli_candidate_rollback_preserves_a_successor_claim(kanban_home, tmp_pat
     heads = iter((candidate, base))
     monkeypatch.setattr(kbw, "candidate_head_for_task", lambda *a: next(heads))
     assert kc._cmd_claim(_claim_args(review)) != 0
+    path = repo / ".worktrees" / review
+    assert path.is_dir()
+    assert _head(path) == candidate
     with kbc.connect() as conn:
         current = kb.get_task(conn, review)
         assert current.status == "running"
@@ -1522,3 +1556,135 @@ def test_deferred_dispatch_discards_only_new_worktrees(
             assert result.cancelled == [review]
         else:
             assert kb.get_task(conn, review).last_failure_error == "preparation failed"
+
+
+def test_deferred_dispatch_fences_a_rebound_base_with_the_same_head(
+    kanban_home, tmp_path, monkeypatch,
+):
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli.kanban_runtime import runtime_identity
+    from hermes_cli.worker_execution_policy import resolve_review_context
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    other_base = _commit(repo, "middle.txt", "middle\n")
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+    identity = runtime_identity(Path(__file__).resolve().parents[2])
+    cancelled, granted = [], []
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
+    monkeypatch.setattr(kbd, "_require_autonomous_worker_capacity", lambda: None)
+    with kbc.connect() as conn:
+        review = _ready_review_card(conn, repo, base, candidate)
+        implementation = kb.get_task(conn, review).lifecycle_contract["candidate_task_id"]
+        first_run = kb.get_task(conn, implementation).candidate_run_id
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (implementation,))
+        second_run = kb.claim_task(conn, implementation)
+        assert second_run is not None
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=second_run.current_run_id,
+            summary="same head, different review base",
+            metadata={"base_sha": other_base, "head_sha": candidate, "changed_files": []})
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET candidate_run_id = ? WHERE id = ?", (first_run, implementation))
+
+        def prepare(task, workspace, **kwargs):
+            assert kwargs["defer_grant"]
+            role, pair = resolve_review_context(str(kb.kanban_db_path()), review)
+            assert role == "review" and pair == {"base": base, "head": candidate}
+            return kbd.WorkerLaunch(
+                identity.pid, identity.as_dict(), "base-rebind",
+                cancel=lambda: cancelled.append(True),
+                grant=lambda *args: granted.append(args),
+            )
+
+        claim = kb.claim_task
+
+        def rebind_after_claim(connection, task_id, **kwargs):
+            claimed = claim(connection, task_id, **kwargs)
+            assert claimed is not None
+            with kb.write_txn(connection):
+                connection.execute(
+                    "UPDATE tasks SET candidate_run_id = ? WHERE id = ?",
+                    (second_run.current_run_id, implementation))
+            return claimed
+
+        monkeypatch.setattr(kbd, "_default_spawn", prepare)
+        monkeypatch.setattr(kb, "claim_task", rebind_after_claim)
+        result = kbd.DispatchResult()
+        assert not kbd._dispatch_lane_task(
+            conn, {"id": review}, "reviewer", result, lane="ready", dry_run=False,
+            ttl_seconds=None, board=None, failure_limit=3, spawn_fn=None,
+            per_profile_cap=None, per_profile_running={},
+        )
+        current = kb.get_task(conn, review)
+        assert current.current_run_id is None and current.claim_lock is None
+        assert current.last_failure_error.startswith("candidate moved")
+        assert base in current.last_failure_error and other_base in current.last_failure_error
+        assert cancelled == [True] and granted == [] and not result.spawned
+        assert not (repo / ".worktrees" / review).exists()
+
+
+@pytest.mark.parametrize("surface", ["cli", "deferred"])
+@pytest.mark.parametrize("target_kind", ["custom", "inherited"])
+@pytest.mark.parametrize("reused", [False, True])
+def test_ordinary_claim_tracks_creation_at_the_resolved_target(
+    kanban_home, tmp_path, monkeypatch, capsys, surface, target_kind, reused,
+):
+    from hermes_cli import kanban as kc
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli.kanban_runtime import runtime_identity
+
+    repo = _make_repo(tmp_path)
+    requested = repo / "custom-checkout"
+    if target_kind == "inherited":
+        requested = _add_worktree(repo, repo / ".worktrees" / "sibling", "wt/sibling")
+    with kbc.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="ordinary custom worktree", assignee="worker",
+            workspace_kind="worktree", workspace_path=str(requested))
+        task = kb.get_task(conn, task_id)
+        target = requested if target_kind == "custom" else repo / ".worktrees" / task_id
+        if reused:
+            _add_worktree(repo, target, f"wt/{task_id}")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+    resolved = []
+    resolve = kbw.resolve_workspace_created
+
+    def track_creation(task, **kwargs):
+        result = resolve(task, **kwargs)
+        resolved.append(result)
+        return result
+
+    monkeypatch.setattr(kbw, "resolve_workspace_created", track_creation)
+    if surface == "cli":
+        assert kc._cmd_claim(_claim_args(task_id)) == 0, capsys.readouterr().err
+    else:
+        identity = runtime_identity(Path(__file__).resolve().parents[2])
+        monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
+        monkeypatch.setattr(kbd, "_require_autonomous_worker_capacity", lambda: None)
+        monkeypatch.setattr(
+            kbd, "_default_spawn",
+            lambda *args, **kwargs: kbd.WorkerLaunch(
+                identity.pid, identity.as_dict(), "ordinary-target"))
+        with kbc.connect() as conn:
+            result = kbd.DispatchResult()
+            assert kbd._dispatch_lane_task(
+                conn, {"id": task_id}, "worker", result, lane="ready", dry_run=False,
+                ttl_seconds=None, board=None, failure_limit=3, spawn_fn=None,
+                per_profile_cap=None, per_profile_running={},
+            )
+            assert result.spawned == [(task_id, "worker", str(target))]
+    assert resolved == [(target, f"wt/{task_id}", not reused)]
+    with kbc.connect() as conn:
+        claimed = kb.get_task(conn, task_id)
+        assert claimed.status == "running"
+        assert claimed.workspace_path == str(target)
+        assert claimed.branch_name == f"wt/{task_id}"
+    assert _head(target) == _head(repo)
+    assert resolve(task) == (target, f"wt/{task_id}", False)
+    if target_kind == "inherited":
+        assert (requested / "README.md").read_text() == "base\n"
+        assert kbw._git_current_branch(requested) == "wt/sibling"

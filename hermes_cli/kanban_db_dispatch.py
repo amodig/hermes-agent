@@ -2878,22 +2878,19 @@ def _dispatch_lane_task(
         try:
             _check_not_stopping(should_stop, task_id)
             _require_autonomous_worker_capacity()
-            # A typed role card (review/validation) works from its candidate's
-            # commit, never from whatever HEAD the anchor repo happens to hold: the
-            # head is derived here, once, and both workspace resolution and the
-            # grant that follows see the same commit.
+            # Workspace resolution and the grant must name the same bound review pair,
+            # including a same-card review whose candidate is the card itself.
             candidate_head = _kbw.candidate_head_for_task(conn, spawn_task)
-            # A role card resolves as a worktree even from the scratch default, so the
-            # detached-checkout branch must key on the effective kind or the empty
-            # branch it reports is never captured (and ``wt/<id>`` gets invented later).
-            if _kbw.effective_workspace_kind(spawn_task) == "worktree":
-                prepared_new = not (
-                    _kbw._role_repo_root(spawn_task, board) / ".worktrees" / spawn_task.id).exists()
-                workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(
-                    spawn_task, board=board, candidate_head=candidate_head)
-            else:
-                workspace = _kbw.resolve_workspace(
-                    spawn_task, board=board, candidate_head=candidate_head)
+            contract = _kbw._role_contract(spawn_task)
+            candidate_id = (
+                contract["candidate_task_id"] if contract else task_id if lane == "review" else None)
+            handoff = _kb.bound_handoff(conn, candidate_id) if candidate_id else {}
+            candidate_pair = (
+                str(handoff.get("base_sha") or "").strip(),
+                candidate_head or str(handoff.get("head_sha") or "").strip(),
+            )
+            workspace, resolved_branch_name, prepared_new = _kbw.resolve_workspace_created(
+                spawn_task, board=board, candidate_head=candidate_head)
             launch = _default_spawn(
                 spawn_task, str(workspace), board=board, defer_grant=True,
                 should_stop=should_stop,
@@ -2927,19 +2924,21 @@ def _dispatch_lane_task(
                     conn, task_id, result, lane=lane, board=board, expected_task=preflight,
                 )
                 return False
-            # The claim fence covers THIS card; the head came from another card's
-            # handoff. A candidate rebound while the worker was prepared would leave the
-            # worker holding a checkout of the previous candidate, so the binding is
-            # re-read at the claim boundary and a mismatch releases the claim.
+            # This card's claim fence cannot detect a rebind on the candidate card.
+            # Either half changing invalidates the prepared worker's diff permission.
             try:
                 bound_head = _kbw.candidate_head_for_task(conn, claimed)
+                handoff = _kb.bound_handoff(conn, candidate_id) if candidate_id else {}
+                bound_pair = (
+                    str(handoff.get("base_sha") or "").strip(),
+                    bound_head or str(handoff.get("head_sha") or "").strip(),
+                )
             except Exception as exc:
-                bound_head = None
                 candidate_problem = f"candidate is no longer resolvable: {exc}"
             else:
                 candidate_problem = (
-                    None if bound_head == candidate_head
-                    else f"candidate moved from {candidate_head} to {bound_head} "
+                    None if bound_pair == candidate_pair
+                    else f"candidate moved from {candidate_pair} to {bound_pair} "
                          "while the worker was prepared")
             if candidate_problem is not None:
                 if launch.cancel:

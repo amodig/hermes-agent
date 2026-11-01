@@ -1012,17 +1012,10 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             prepared_new = False
             if pending is None:
                 workspace, resolved_branch = None, None
-            elif resolved_kind == "worktree":
-                prepared_new = not (
-                    kbw._role_repo_root(pending, None) / ".worktrees" / pending.id).exists()
-                # The branch is part of the truth: a detached role checkout reports "",
-                # and completion cleanup deletes only a branch the card recorded.
-                workspace, resolved_branch = kbw._resolve_worktree_workspace(
-                    pending, candidate_head=candidate_head)
             else:
-                workspace = kbw.resolve_workspace(
+                # Detached role checkouts report "", never an invented branch.
+                workspace, resolved_branch, prepared_new = kbw.resolve_workspace_created(
                     pending, candidate_head=candidate_head)
-                resolved_branch = None
             # A non-role card has no candidate commit, so the head this attempt prepared is
             # the checkout it just resolved. Without it the discard guard compares against
             # "" and can never reclaim an ordinary prepared worktree.
@@ -1064,14 +1057,14 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             except ValueError:
                 confirmed = None
             if confirmed != candidate_head:
-                kbw.discard_prepared_worktree(
-                    pending, workspace, prepared_head, prepared_new=prepared_new)
                 from hermes_cli.kanban_db_dispatch import _record_task_failure
 
                 current = kb.get_task(conn, task.id)
                 if (current is not None
                         and current.current_run_id == task.current_run_id
                         and current.claim_lock == task.claim_lock):
+                    kbw.discard_prepared_worktree(
+                        pending, workspace, prepared_head, prepared_new=prepared_new)
                     _record_task_failure(
                         conn, task.id,
                         f"candidate moved from {candidate_head} to {confirmed} during the claim",

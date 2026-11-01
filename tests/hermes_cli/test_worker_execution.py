@@ -1148,3 +1148,74 @@ def test_materialized_review_source_refuses_index_flags_that_hide_changes(
 
         _git(fixture.repo, "update-index", flag.replace("--", "--no-"), "app.py")
         _git(fixture.repo, "checkout", "--", "app.py")
+
+
+def test_review_materialization_preserves_each_committed_file_mode(fixture, monkeypatch):
+    script = fixture.repo / "a.sh"
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    script.chmod(0o755)
+    (fixture.repo / "z.txt").write_text("plain\n", encoding="utf-8")
+    _git(fixture.repo, "add", "-A")
+    _git(fixture.repo, "commit", "-qm", "mixed executable modes")
+    head = _git(fixture.repo, "rev-parse", "HEAD")
+    monkeypatch.setattr(
+        wep, "resolve_review_context",
+        lambda *_a, **_k: ("review", {"base": fixture.base, "head": head}))
+    authority = _authority(fixture)
+    inspected = wes._scan_source(authority)
+    run_root = fixture.root / "mixed-mode-run"
+    run_root.mkdir()
+    snapshot, source = wes._materialize_source(authority, run_root)
+
+    assert snapshot.source_digest == inspected.source_digest
+    assert snapshot.entry("a.sh").executable is True
+    assert snapshot.entry("z.txt").executable is False
+    assert (source / "a.sh").stat().st_mode & 0o777 == 0o755
+    assert (source / "z.txt").stat().st_mode & 0o777 == 0o644
+    assert (source / "a.sh").read_bytes() == script.read_bytes()
+
+
+def test_implementation_materialization_preserves_working_tree_edits(fixture):
+    authority = _authority(fixture)
+    assert authority.role == "implementation"
+    inspected = wes._scan_source(authority)
+    run_root = fixture.root / "implementation-run"
+    run_root.mkdir()
+    snapshot, source = wes._materialize_source(authority, run_root)
+
+    assert (source / "app.py").read_bytes() == b"print('dirty')\n"
+    assert (source / "notes.txt").read_bytes() == b"staged\n"
+    assert snapshot.source_digest == inspected.source_digest
+    assert snapshot.entry("app.py").digest == inspected.entry("app.py").digest
+
+
+def test_review_blob_bound_is_checked_before_buffering(fixture, monkeypatch):
+    _git(fixture.repo, "add", "-A")
+    _git(fixture.repo, "commit", "-qm", "clean candidate")
+    head = _git(fixture.repo, "rev-parse", "HEAD")
+    monkeypatch.setattr(
+        wep, "resolve_review_context",
+        lambda *_a, **_k: ("review", {"base": fixture.base, "head": head}))
+    authority = _authority(fixture)
+    first_oid = _git(fixture.repo, "rev-parse", "HEAD:app.py")
+    oversized_oid = _git(fixture.repo, "rev-parse", "HEAD:docs/readme.md")
+    monkeypatch.setattr(wes, "MAX_INVENTORY_BYTES", (fixture.repo / "app.py").stat().st_size)
+    calls = []
+    run = wes.SyntheticGit.run
+
+    def record(self, args, **kwargs):
+        if args[0] == "cat-file":
+            calls.append(args)
+        return run(self, args, **kwargs)
+
+    monkeypatch.setattr(wes.SyntheticGit, "run", record)
+    run_root = fixture.root / "bounded-run"
+    run_root.mkdir()
+    with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+        wes._materialize_source(authority, run_root)
+    assert excinfo.value.code == "source_too_large"
+    assert calls == [
+        ["cat-file", "-s", first_oid],
+        ["cat-file", "blob", first_oid],
+        ["cat-file", "-s", oversized_oid],
+    ]

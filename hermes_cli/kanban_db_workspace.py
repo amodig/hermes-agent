@@ -744,11 +744,12 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         )
 
 
-def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple[Path, str]:
-    """Materialize the canonical ``<repo>/.worktrees/<task-id>`` worktree."""
+def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple[Path, str, bool]:
+    """Materialize the canonical worktree, reporting whether this call created it."""
     target = repo_root / ".worktrees" / task_id
+    created = not target.exists()
     _ensure_git_worktree(repo_root, target, branch_name)
-    return target, branch_name
+    return target, branch_name, created
 
 
 def _role_contract(task: Task) -> Optional[dict]:
@@ -1113,6 +1114,15 @@ def _validate_role_directory(task: Task, path: Path, candidate_head: Optional[st
 
 def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None,
                                 candidate_head: Optional[str] = None) -> tuple[Path, str]:
+    """Resolve a worktree, retaining the historical (path, branch) API."""
+    path, branch, _created = _resolve_worktree_workspace_created(
+        task, board=board, candidate_head=candidate_head)
+    return path, branch
+
+
+def _resolve_worktree_workspace_created(
+    task: Task, *, board: Optional[str] = None, candidate_head: Optional[str] = None,
+) -> tuple[Path, str, bool]:
     """Resolve + materialize a linked git worktree for ``task``. With no
     ``task.workspace_path`` the anchor is the board's ``default_workdir`` so
     every worktree lands under a board-owned repo (``<repo>/.worktrees/<id>``)
@@ -1123,7 +1133,10 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None,
             raise ValueError(
                 f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {task.id} is a typed role card; its "
                 "worktree is materialized at the candidate commit, never at HEAD")
-        return _role_worktree(_role_repo_root(task, board), task, candidate_head)
+        repo_root = _role_repo_root(task, board)
+        created = not (repo_root / ".worktrees" / task.id).exists()
+        path, branch = _role_worktree(repo_root, task, candidate_head)
+        return path, branch, created
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if not task.workspace_path:
         board_slug = board if board else _kb.get_current_board()
@@ -1160,7 +1173,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None,
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
-            return requested_resolved, actual_branch
+            return requested_resolved, actual_branch, False
         # The requested path is an existing checkout of a DIFFERENT task's
         # branch (decompose children inherit the root's workspace_path
         # verbatim, so siblings all point here). Reusing it would run this task
@@ -1170,11 +1183,12 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None,
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if _path_key(fallback.resolve(strict=False)) != _path_key(requested_resolved):
+                created = not fallback.exists()
                 _ensure_git_worktree(fallback_root, fallback, branch_name)
-                return fallback.resolve(strict=False), branch_name
+                return fallback.resolve(strict=False), branch_name, created
         # No repo to anchor a fallback on (or the occupied path IS this task's
         # own canonical worktree): keep the legacy reuse rather than fail dispatch.
-        return requested_resolved, actual_branch or branch_name
+        return requested_resolved, actual_branch or branch_name, False
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and _path_key(requested_resolved) == _path_key(repo_root):
@@ -1186,8 +1200,9 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None,
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
+    created = not requested.exists()
     _ensure_git_worktree(repo_root, requested, branch_name)
-    return requested, branch_name
+    return requested, branch_name, created
 
 
 def resolve_workspace(task: Task, *, board: Optional[str] = None,
@@ -1205,6 +1220,19 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None,
     and an explicit ``dir`` workspace is verified in place against that commit.
     Persist via ``set_workspace_path``.
     """
+    return resolve_workspace_created(
+        task, board=board, candidate_head=candidate_head)[0]
+
+
+def resolve_workspace_created(
+    task: Task, *, board: Optional[str] = None, candidate_head: Optional[str] = None,
+) -> tuple[Path, Optional[str], bool]:
+    """(path, branch, created) — created is True only when this call made the checkout.
+
+    Ordinary cards retain custom targets and inherited-sibling repair; role cards
+    retain their candidate-pinned canonical checkout. Non-worktree directories
+    have no branch and never authorize worktree discard.
+    """
     kind = effective_workspace_kind(task)
     if kind == "worktree":
         # ``scratch`` is the create_task default, so a typed review/validation card can
@@ -1212,8 +1240,8 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None,
         # the role would either inspect nothing or — with a legacy explicit path — the
         # repository's current tree instead of the candidate. A role card therefore
         # always resolves a worktree at the candidate commit, or a named refusal.
-        return _resolve_worktree_workspace(
-            task, board=board, candidate_head=candidate_head)[0]
+        return _resolve_worktree_workspace_created(
+            task, board=board, candidate_head=candidate_head)
     if kind == "scratch" and not task.workspace_path:
         p = _kb.workspaces_root(board=board) / task.id
     elif kind == "scratch":
@@ -1240,7 +1268,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None,
     else:
         raise ValueError(f"unknown workspace_kind: {kind}")
     p.mkdir(parents=True, exist_ok=True)
-    return p
+    return p, None, False
 
 
 def _set_task_column(conn: sqlite3.Connection, task_id: str, column: str, value: str) -> None:

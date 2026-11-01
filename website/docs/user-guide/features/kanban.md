@@ -607,13 +607,22 @@ worktree, and optional patch hash. The original completion, runs, comments,
 and edges remain; dependents stay gated until the same parent is recommitted
 and completed with an immutable head.
 
-Typed reviewer/tester workspaces resolve at the bound candidate commit. Existing
-checkouts with `assume-unchanged` or `skip-worktree` index flags refuse with
-`candidate_workspace_unavailable`, even when `git status` looks clean: clear
+Typed reviewer/tester workspaces resolve at the bound candidate commit, including
+when recovery selects an older run with only top-level handoff metadata. Deferred
+launches refuse if either the bound base or head changes during preparation.
+Existing checkouts with `assume-unchanged` or `skip-worktree` index flags refuse
+with `candidate_workspace_unavailable`, even when `git status` looks clean: clear
 those flags and preserve or commit any local edits before retrying. A refused
-claim or deferred launch may remove only a checkout that attempt created;
-reused detached checkouts remain anchored. Candidate-mismatch rollback cannot
-release a successor run's claim.
+claim or deferred launch may remove only a checkout that attempt created, never
+one with index flags or ignored entries; reused detached checkouts remain anchored.
+CLI candidate-mismatch rollback leaves a successor run's claim and checkout intact.
+Ordinary worktree cards retain custom target paths; an inherited sibling checkout
+resolves to the card's own worktree rather than sharing the sibling's branch.
+
+Verification materializes committed bytes and per-file executable modes for review
+claims, checking each blob against the remaining inventory bound before reading it.
+Implementation claims instead copy the granted working-tree source, including
+tracked edits, so the verified digest describes the worker's actual changes.
 
 ### Unstartable review quarantine
 

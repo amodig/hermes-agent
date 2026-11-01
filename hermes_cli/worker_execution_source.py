@@ -670,7 +670,22 @@ def _scan_source(
                     # cleanliness proof and this copy can substitute other bytes.
                     # A granted extra file is not in the commit — it falls through to the
                     # working-tree branch, where its digest binds the bytes copied.
-                    oid = tracked.get(name, ("", ""))[1]
+                    entry_mode, oid = tracked[name]
+                    size_result = git.run(["cat-file", "-s", oid])
+                    if size_result.returncode != 0:
+                        raise WorkerExecutionRefused(
+                            "git_unavailable", "a reviewed blob size could not be read")
+                    try:
+                        size = int(size_result.stdout)
+                    except ValueError:
+                        raise WorkerExecutionRefused(
+                            "git_unsupported", "a reviewed blob size is malformed")
+                    if size < 0:
+                        raise WorkerExecutionRefused(
+                            "git_unsupported", "a reviewed blob size is malformed")
+                    if size > MAX_INVENTORY_BYTES - total_bytes:
+                        raise WorkerExecutionRefused(
+                            "source_too_large", "the granted source set exceeds the byte bound")
                     blob = git.run(["cat-file", "blob", oid])
                     if blob.returncode != 0:
                         raise WorkerExecutionRefused(
@@ -686,9 +701,9 @@ def _scan_source(
                         with open(target_path, "xb") as written_commit:
                             written_commit.write(data)
                         with contextlib.suppress(OSError):
-                            os.chmod(target_path, 0o755 if mode == "100755" else 0o644)
+                            os.chmod(target_path, 0o755 if entry_mode == "100755" else 0o644)
                     entries.append(SourceEntry(
-                        name, "file", mode == "100755", len(data),
+                        name, "file", entry_mode == "100755", len(data),
                         "sha256:" + sha256_hex(data),
                     ))
                     continue
@@ -1265,9 +1280,13 @@ def _check_expected(args: Mapping[str, Any], key: str, actual: str) -> None:
 
 
 def _materialize_source(authority: ExecutionAuthority, run_root: Path) -> tuple[SourceSnapshot, Path]:
+    """Copy reviewed commit bytes for review; retain working edits for implementation."""
     source_dir = run_root / "source"
     source_dir.mkdir(mode=0o700)
-    snapshot = _scan_source(authority, materialize=source_dir, from_commit=True)
+    snapshot = _scan_source(
+        authority, materialize=source_dir,
+        from_commit=str(getattr(authority, "role", "")) == "review",
+    )
     return snapshot, source_dir
 
 
