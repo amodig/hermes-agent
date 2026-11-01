@@ -2750,3 +2750,37 @@ def test_bounded_pages_always_say_whether_the_value_is_complete(evidence_board):
     while history["has_more"]:
         history = _evidence(history["continuation"])
     assert (history["complete"], history["next_after"]) == (True, None)
+
+
+def test_a_deferred_history_row_never_reports_the_page_complete(evidence_board):
+    """Cursor exhaustion is not completeness: a deferred row is undelivered evidence."""
+    kb, conn, tid = evidence_board
+    body = "a" * 40000
+    kb.add_comment(conn, tid, author="operator", body=body)
+    conn.commit()
+
+    token = _evidence({"task_id": tid, "section": "lifecycle"})["snapshot"]
+    page = _evidence({"task_id": tid, "snapshot": token, "section": "comments", "limit": 200})
+    deferred = [item for item in page["items"] if item.get("deferred")]
+    assert deferred, page["items"][:1]
+    assert page["complete"] is False, page["complete"]
+
+    delivered = _reconstruct_evidence(_continue_evidence(deferred[-1]["continuation"]))
+    assert delivered["body"] == kb.redact_review_value(body)
+
+
+def test_a_deferred_entry_never_reports_the_section_complete(evidence_board):
+    """Same rule for container pages: an oversized child is not a delivered value."""
+    kb, conn, tid = evidence_board
+    body = "b" * 40000
+    conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (body, tid))
+    conn.commit()
+
+    token = _evidence({"task_id": tid, "section": "lifecycle"})["snapshot"]
+    page = _evidence({"task_id": tid, "snapshot": token, "section": "task", "limit": 200})
+    entries = {entry.get("key"): entry for entry in page["entries"]}
+    assert entries["body"].get("deferred") is True, entries.get("body")
+    assert page["complete"] is False, page["complete"]
+
+    delivered = _reconstruct_evidence(_continue_evidence(entries["body"]["continuation"]))
+    assert delivered == body

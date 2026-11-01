@@ -248,13 +248,16 @@ def _node(base, value, *, item, pointer, parts, offset, limit, chars):
         _require(_fits(result), "evidence_unavailable")
         return result
     _require(offset <= len(value))
-    if offset == 0 and len(value) <= limit and _fits({**base, "value": value}):
+    if offset == 0 and len(value) <= limit and _fits({**base, "complete": True, "value": value}):
         return {**base, "complete": True, "value": value}
     keys = sorted(value) if isinstance(value, dict) else range(len(value))
     entries = []
 
     def page(end):
-        result = {**base, "complete": end >= len(value), "entries": entries,
+        # A deferred child is evidence this page did not deliver, so the page is never
+        # "complete" merely because the entry cursor reached the end.
+        complete = end >= len(value) and not any(entry.get("deferred") for entry in entries)
+        result = {**base, "complete": complete, "entries": entries,
                   "total_entries": len(value),
                   "next_offset": end if end < len(value) else None}
         if end < len(value):
@@ -307,7 +310,8 @@ def _history(conn, base, *, after, item, pointer, parts, offset, limit, chars, w
     last = after
 
     def page(more):
-        result = {**base, "complete": not more, "items": items, "returned": len(items),
+        complete = not more and not any(item.get("deferred") for item in items)
+        result = {**base, "complete": complete, "items": items, "returned": len(items),
                   "has_more": more, "next_after": last if more else None}
         if more:
             result["continuation"] = _continuation(base, after=last)

@@ -1249,3 +1249,27 @@ def test_cleanup_preserves_a_branch_shadowed_by_a_same_named_tag(kanban_home, tm
     ).stdout.strip()
     assert survives, "the branch tip is not contained by any remote ref, so it must survive"
 
+
+
+def test_discard_reclaims_an_ordinary_prepared_worktree(kanban_home, tmp_path):
+    """A non-role card has no candidate head, so the prepared checkout supplies it.
+
+    Without that, the guard compared against "" and could never reclaim an ordinary
+    prepared worktree, leaving it behind for a cleanup pass that follows the recorded
+    repository root instead.
+    """
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="ordinary worktree work", assignee="worker",
+            workspace_kind="worktree", workspace_path=str(repo))
+        task = kb.get_task(conn, tid)
+        assert kbw.candidate_head_for_task(conn, task) is None
+        path = kbw.resolve_workspace(task, candidate_head=None)
+        prepared_head = kbw._git_head(path)
+        assert prepared_head
+        assert kbw.discard_prepared_worktree(task, path, prepared_head) is True
+    assert not path.exists()
+    assert _head(repo) == base
