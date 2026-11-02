@@ -2945,6 +2945,17 @@ def _dispatch_lane_task(
                     None if bound_pair == candidate_pair
                     else f"candidate moved from {candidate_pair} to {bound_pair} "
                          "while the worker was prepared")
+            # Candidate-bound grants must authorize the accepted base..head even
+            # after an A→B→A rebind. Ordinary implementation grants are deliberately
+            # unbound working-tree authority and have no candidate pair to compare.
+            if candidate_id and launch.execution_grant is not None:
+                review = launch.execution_grant.review or {}
+                granted_pair = (review.get("base", ""), review.get("head", ""))
+                if not all(granted_pair) or granted_pair != candidate_pair:
+                    candidate_problem = (
+                        f"run {claimed.current_run_id} execution grant range "
+                        f"{granted_pair[0] or '<missing>'}..{granted_pair[1] or '<missing>'} "
+                        f"differs from accepted candidate {candidate_pair[0]}..{candidate_pair[1]}")
             if candidate_problem is not None:
                 if launch.cancel:
                     launch.cancel()

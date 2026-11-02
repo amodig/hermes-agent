@@ -26,6 +26,7 @@ from tools.autonomous_resources import CGROUP_ROOT, WORKER_SCOPE_PREFIX, WORKER_
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
+    from hermes_cli.worker_execution_common import ExecutionGrant
 
 
 def _dispatcher():
@@ -170,7 +171,7 @@ def _write_worker_grant(fd: int, frame: bytes) -> None:
 
 @dataclass(frozen=True)
 class WorkerLaunch:
-    """Child process identity verified before its Kanban grant."""
+    """Verified child identity; execution_grant is retained check context, not spawn authority."""
 
     pid: int
     runtime_identity: dict[str, Any]
@@ -178,6 +179,7 @@ class WorkerLaunch:
     grant: Optional[Callable[[int, Optional[str]], None]] = None
     cancel: Optional[Callable[[], None]] = None
     launcher_pid: Optional[int] = None
+    execution_grant: Optional[ExecutionGrant] = None
 
 
 class WorkerLaunchInterrupted(RuntimeError):
@@ -1601,11 +1603,12 @@ def _default_spawn(
         if defer_grant:
             return WorkerLaunch(
                 actual.pid, actual.as_dict(), preparation_id, grant=_grant, cancel=_cancel,
-                launcher_pid=proc.pid,
+                launcher_pid=proc.pid, execution_grant=execution_grant,
             )
         _grant(int(task.current_run_id or 0), task.claim_lock)
         return WorkerLaunch(
             actual.pid, actual.as_dict(), preparation_id, launcher_pid=proc.pid,
+            execution_grant=execution_grant,
         )
     except FileNotFoundError:
         _cancel()

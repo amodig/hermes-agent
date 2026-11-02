@@ -1812,9 +1812,14 @@ def test_deferred_dispatch_discards_only_new_worktrees(
             assert kb.get_task(conn, review).last_failure_error == "preparation failed"
 
 
+@pytest.mark.parametrize(
+    "interleaving", ["after-claim", "grant-mismatch", "grant-missing", "implementation-grant",
+                     "grant-match", "no-grant"],
+)
 def test_deferred_dispatch_fences_a_rebound_base_with_the_same_head(
-    kanban_home, tmp_path, monkeypatch,
+    kanban_home, tmp_path, monkeypatch, interleaving,
 ):
+    from types import SimpleNamespace
     from hermes_cli import kanban_db_dispatch as kbd
     from hermes_cli.kanban_runtime import runtime_identity
     from hermes_cli.worker_execution_policy import resolve_review_context
@@ -1845,12 +1850,30 @@ def test_deferred_dispatch_fences_a_rebound_base_with_the_same_head(
 
         def prepare(task, workspace, **kwargs):
             assert kwargs["defer_grant"]
+            if interleaving == "grant-mismatch":
+                with kb.write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET candidate_run_id = ? WHERE id = ?",
+                        (second_run.current_run_id, implementation))
             role, pair = resolve_review_context(str(kb.kanban_db_path()), review)
-            assert role == "review" and pair == {"base": base, "head": candidate}
+            captured_base = other_base if interleaving == "grant-mismatch" else base
+            assert role == "review" and pair == {"base": captured_base, "head": candidate}
+            # Restore A before the claim: both board reads see A, but the grant
+            # retained B. Only the grant comparison can detect this interleaving.
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET candidate_run_id = ? WHERE id = ?", (first_run, implementation))
+            execution = None
+            if interleaving not in {"no-grant", "after-claim"}:
+                execution = SimpleNamespace(
+                    role="implementation" if interleaving == "implementation-grant" else role,
+                    review=None if interleaving in {"grant-missing", "implementation-grant"} else pair,
+                )
             return kbd.WorkerLaunch(
                 identity.pid, identity.as_dict(), "base-rebind",
                 cancel=lambda: cancelled.append(True),
                 grant=lambda *args: granted.append(args),
+                execution_grant=execution,
             )
 
         claim = kb.claim_task
@@ -1865,17 +1888,33 @@ def test_deferred_dispatch_fences_a_rebound_base_with_the_same_head(
             return claimed
 
         monkeypatch.setattr(kbd, "_default_spawn", prepare)
-        monkeypatch.setattr(kb, "claim_task", rebind_after_claim)
+        if interleaving == "after-claim":
+            monkeypatch.setattr(kb, "claim_task", rebind_after_claim)
         result = kbd.DispatchResult()
-        assert not kbd._dispatch_lane_task(
+        accepted = kbd._dispatch_lane_task(
             conn, {"id": review}, "reviewer", result, lane="ready", dry_run=False,
             ttl_seconds=None, board=None, failure_limit=3, spawn_fn=None,
             per_profile_cap=None, per_profile_running={},
         )
         current = kb.get_task(conn, review)
+        if interleaving in {"grant-match", "no-grant"}:
+            assert accepted and result.spawned and granted and not cancelled
+            assert current.current_run_id == granted[0][0] and current.claim_lock
+            return
+        assert not accepted
         assert current.current_run_id is None and current.claim_lock is None
-        assert current.last_failure_error.startswith("candidate moved")
-        assert base in current.last_failure_error and other_base in current.last_failure_error
+        if interleaving == "after-claim":
+            assert current.last_failure_error.startswith("candidate moved")
+            assert base in current.last_failure_error and other_base in current.last_failure_error
+        else:
+            run = conn.execute(
+                "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (review,),
+            ).fetchone()[0]
+            captured = f"{other_base}..{candidate}" if interleaving == "grant-mismatch" else "<missing>..<missing>"
+            assert current.last_failure_error == (
+                f"run {run} execution grant range {captured} "
+                f"differs from accepted candidate {base}..{candidate}")
+            assert kb.get_task(conn, implementation).candidate_run_id == first_run
         assert cancelled == [True] and granted == [] and not result.spawned
         assert not (repo / ".worktrees" / review).exists()
 

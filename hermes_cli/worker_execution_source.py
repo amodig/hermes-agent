@@ -675,6 +675,16 @@ def _scan_source(
         total_bytes = 0
         if len(accepted) > MAX_INVENTORY_ENTRIES:
             raise WorkerExecutionRefused("source_too_large", "the granted source set exceeds the entry bound")
+        if from_commit:
+            # The worktree can match HEAD while the frozen index contains staged
+            # bytes (MM). Prove the batch's object ids belong to this commit first.
+            indexed = git.run(["diff-index", "--cached", "--exit-code", head, "--"])
+            if indexed.returncode == 1:
+                raise WorkerExecutionRefused(
+                    "source_changed", f"the frozen index diverges from bound commit {head}")
+            if indexed.returncode != 0:
+                raise WorkerExecutionRefused(
+                    "git_unsupported", "Git could not verify the frozen index matches the bound commit")
         committed_blobs = _committed_blobs(
             git, [tracked[name][1] for name in sorted(tracked)] if from_commit else [],
         )

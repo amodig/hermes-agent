@@ -1146,6 +1146,38 @@ def test_materialized_review_source_must_be_the_reviewed_commit(fixture, monkeyp
     assert excinfo.value.code == "source_changed"
 
 
+def test_review_inspection_refuses_staged_bytes_restored_in_worktree(fixture, monkeypatch):
+    _git(fixture.repo, "add", "-A")
+    _git(fixture.repo, "commit", "-qm", "clean reviewed candidate")
+    head = _git(fixture.repo, "rev-parse", "HEAD")
+    monkeypatch.setattr(
+        wep, "resolve_review_context",
+        lambda *_a, **_k: ("review", {"base": fixture.base, "head": head}))
+    authority = _authority(fixture)
+    grant = SimpleNamespace(task_id="review", run_id=7, profile="reviewer", preparation_id="probe")
+    expected = wes._inspect_summary(grant, authority)
+    path = fixture.repo / "app.py"
+    committed = path.read_bytes()
+    assert wes._scan_source(authority).entry("app.py").digest == "sha256:" + wec.sha256_hex(committed)
+
+    path.write_bytes(b"staged bytes are not the reviewed commit\n")
+    _git(fixture.repo, "add", "app.py")
+    path.write_bytes(committed)
+    assert _git(fixture.repo, "status", "--porcelain", "--", "app.py") == "MM app.py"
+    for inspect in (
+        lambda: wes._inspect_summary(grant, authority),
+        lambda: wes._scan_source(authority, from_commit=True),
+    ):
+        with pytest.raises(wec.WorkerExecutionRefused) as refused:
+            inspect()
+        assert refused.value.code == "source_changed"
+        assert f"frozen index diverges from bound commit {head}" in str(refused.value)
+
+    _git(fixture.repo, "add", "app.py")
+    clean = wes._inspect_summary(grant, authority)
+    assert clean["git"]["head"] == head and clean["source_digest"] == expected["source_digest"]
+
+
 def test_materialized_review_source_refuses_index_flags_that_hide_changes(
     fixture, monkeypatch,
 ):
@@ -1350,7 +1382,7 @@ def test_review_many_files_use_bounded_git_batches(fixture, monkeypatch):
     cat_file_calls = [args for args in calls if args[0] == "cat-file"]
     print(f"frozen scan: files={len(expected)}, run={len(calls)}, cat-file={len(cat_file_calls)}")
     assert len(cat_file_calls) <= 2
-    assert len(calls) <= 7
+    assert len(calls) <= 8  # Includes the frozen-index/commit equality precondition.
 
 
 def test_review_blob_bound_is_checked_before_buffering(fixture, monkeypatch):
