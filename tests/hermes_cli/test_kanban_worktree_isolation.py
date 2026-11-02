@@ -1566,6 +1566,66 @@ def _ready_review_card(conn, repo: Path, base: str, candidate: str) -> str:
     return review
 
 
+@pytest.mark.parametrize("managed", [True, False])
+def test_retained_scratch_role_dispatch_uses_only_managed_path_as_no_anchor(
+    kanban_home, tmp_path, monkeypatch, managed,
+):
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli.kanban_runtime import runtime_identity
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+    kb.write_board_metadata(None, default_workdir=str(repo))
+    identity = runtime_identity(Path(__file__).resolve().parents[2])
+    granted = []
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
+    monkeypatch.setattr(kbd, "_require_autonomous_worker_capacity", lambda: None)
+    monkeypatch.setattr(
+        kbd, "_default_spawn",
+        lambda *args, **kwargs: kbd.WorkerLaunch(
+            identity.pid, identity.as_dict(), "retained-scratch",
+            grant=lambda *args: granted.append(args)),
+    )
+    with kbc.connect() as conn:
+        review = _ready_review_card(conn, repo, base, candidate)
+        retained = (kb.workspaces_root() if managed else tmp_path / "explicit") / review
+        retained.mkdir(parents=True)
+        marker = retained / "retained.txt"
+        marker.write_text("keep previous attempt\n")
+        kbw.set_workspace_path(conn, review, retained, kind="scratch")
+        task = kb.get_task(conn, review)
+        target = repo / ".worktrees" / review
+        if managed:
+            assert kbw.resolve_workspace(task, candidate_head=candidate) == target
+            assert _head(target) == candidate
+        else:
+            with pytest.raises(ValueError, match="candidate_workspace_unavailable"):
+                kbw.resolve_workspace(task, candidate_head=candidate)
+        # Resolution is not a migration: only the successful claim persists the kind.
+        assert kb.get_task(conn, review) == task
+        assert task.workspace_kind == "scratch" and task.workspace_path == str(retained)
+        result = kbd.DispatchResult()
+        accepted = kbd._dispatch_lane_task(
+            conn, {"id": review}, "reviewer", result, lane="ready", dry_run=False,
+            ttl_seconds=None, board=None, failure_limit=3, spawn_fn=None,
+            per_profile_cap=None, per_profile_running={},
+        )
+        current = kb.get_task(conn, review)
+        assert accepted is managed
+        assert bool(granted) is managed
+        if managed:
+            assert result.spawned == [(review, "reviewer", str(target))]
+            assert current.workspace_kind == "worktree"
+            assert current.workspace_path == str(target)
+            assert current.status == "running" and current.current_run_id
+        else:
+            assert not result.spawned and not target.exists()
+            assert current.current_run_id is None and current.claim_lock is None
+            assert current.workspace_path == str(retained)
+        assert marker.read_text() == "keep previous attempt\n"
+
+
 @pytest.mark.parametrize("refusal", ["claim", "candidate"])
 @pytest.mark.parametrize("reused", [False, True])
 def test_cli_refusal_discards_only_new_worktrees(

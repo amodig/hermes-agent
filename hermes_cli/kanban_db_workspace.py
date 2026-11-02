@@ -955,7 +955,14 @@ def _role_repo_root(task: Task, board: Optional[str]) -> Path:
     instead of retargeted: a reviewer pointed at a sibling's checkout would review
     work that is not its candidate.
     """
-    if not task.workspace_path:
+    # A retained managed scratch directory is storage, not a repository anchor.
+    # Ignore it only during scratch-to-role conversion; reads never rewrite the row.
+    managed_scratch = (
+        (task.workspace_kind or "scratch") == "scratch"
+        and task.workspace_path
+        and _managed_scratch_path_info(Path(task.workspace_path).expanduser())[0]
+    )
+    if not task.workspace_path or managed_scratch:
         board_slug = board if board else _kb.get_current_board()
         board_default = (_kb.read_board_metadata(board_slug).get("default_workdir") or "").strip()
         if not board_default:
