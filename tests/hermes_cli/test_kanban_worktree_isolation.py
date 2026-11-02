@@ -1808,6 +1808,61 @@ def test_deferred_dispatch_discards_only_new_worktrees(
             assert kb.get_task(conn, review).last_failure_error == "preparation failed"
 
 
+@pytest.mark.parametrize("lane", ["ready", "review"])
+def test_deferred_candidate_rollback_preserves_operator_reclaim(
+    kanban_home, tmp_path, monkeypatch, lane,
+):
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli.kanban_runtime import runtime_identity
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "app.py", "candidate\n")
+    identity = runtime_identity(Path(__file__).resolve().parents[2])
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
+    monkeypatch.setattr(kbd, "_require_autonomous_worker_capacity", lambda: None)
+    with kbc.connect() as conn:
+        review = _ready_review_card(conn, repo, base, candidate)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (lane, review))
+        path = repo / ".worktrees" / review
+        reclaimed = {}
+
+        def cancel_and_reclaim():
+            # Reclaim does not need dispatch admission, and closes exactly this run.
+            with kbc.connect_closing() as other:
+                assert kb.reclaim_task(other, review, reason="operator recovery", signal_fn=lambda *a: None)
+                reclaimed["task"] = kb.get_task(other, review)
+                reclaimed["runs"] = kb.list_runs(other, review)
+                reclaimed["events"] = kb.list_events(other, review)
+
+        def prepare(task, workspace, **kwargs):
+            assert Path(workspace) == path and path.is_dir()
+            return kbd.WorkerLaunch(
+                identity.pid, identity.as_dict(), "reclaimed-candidate",
+                cancel=cancel_and_reclaim,
+            )
+
+        monkeypatch.setattr(kbd, "_default_spawn", prepare)
+        heads = iter((candidate, base))
+        monkeypatch.setattr(kbw, "candidate_head_for_task", lambda *a: next(heads))
+        result = kbd.DispatchResult()
+        assert not kbd._dispatch_lane_task(
+            conn, {"id": review}, "reviewer", result, lane=lane, dry_run=False,
+            ttl_seconds=None, board=None, failure_limit=1, spawn_fn=None,
+            per_profile_cap=None, per_profile_running={},
+        )
+        assert not path.exists()
+        assert not result.spawned and not result.auto_blocked
+        current = kb.get_task(conn, review)
+        assert current == reclaimed["task"]
+        assert current.status == lane and current.current_run_id is None
+        assert current.consecutive_failures == 0 and current.last_failure_error is None
+        assert kb.list_runs(conn, review) == reclaimed["runs"]
+        assert kb.list_events(conn, review) == reclaimed["events"]
+        assert not any(event.kind in {"gave_up", "blocked"} for event in reclaimed["events"])
+
+
 @pytest.mark.parametrize(
     "interleaving", ["after-claim", "grant-mismatch", "grant-missing", "implementation-grant",
                      "grant-match", "no-grant"],

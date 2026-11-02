@@ -1120,6 +1120,24 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE task_events SET kind = ? WHERE kind = ?", (new, old))
 
     _rebuild_drifted_tables(conn)
+    _ensure_gate_transition_version(conn)
+
+
+def _ensure_gate_transition_version(conn: sqlite3.Connection) -> None:
+    # Every entry to or exit from blocked/scheduled advances the card version:
+    # the state transition owns the fence, not whichever writer happens to run.
+    # Install on existing boards through the normal additive migration; a writer
+    # that already advanced version must not pay a second increment.
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS tasks_gate_transition_version
+        AFTER UPDATE OF status ON tasks
+        WHEN OLD.status != NEW.status
+          AND (OLD.status IN ('blocked', 'scheduled') OR NEW.status IN ('blocked', 'scheduled'))
+          AND NEW.version = OLD.version
+        BEGIN
+            UPDATE tasks SET version = OLD.version + 1 WHERE id = NEW.id;
+        END
+    """)
 
 
 def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:

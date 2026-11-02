@@ -330,6 +330,67 @@ def test_fenced_unblock_succeeds_once_and_increments_version_once(kanban_home: P
         assert _snapshot(conn, tid) == before
 
 
+def test_fenced_unblock_refuses_a_new_spawn_failure_gate(kanban_home: Path) -> None:
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(
+            conn, title="one attempt", assignee="worker", initial_status="blocked", max_retries=1,
+        )
+        version = kb.get_task(conn, tid).version
+        assert kb.promote_task(conn, tid, actor="operator") == (True, None)
+        assert kb.get_task(conn, tid).version == version + 1
+        claimed = kb.claim_task(conn, tid, claimer="worker")
+        assert claimed is not None
+        assert claimed.version == version + 1
+        assert kbd._record_task_failure(
+            conn, tid, "spawn refused", outcome="spawn_failed", release_claim=True,
+            end_run=True, expected_run_id=claimed.current_run_id,
+        )
+        failed = kb.get_task(conn, tid)
+        assert (failed.status, failed.version, failed.consecutive_failures) == (
+            "blocked", version + 2, 1,
+        )
+        assert failed.current_run_id is None and failed.claim_lock is None
+        assert kb.latest_run(conn, tid).outcome == "gave_up"
+        before = _snapshot(conn, tid)
+        assert not kb.unblock_task(conn, tid, expected_version=version, reason="stale recovery")
+        assert _snapshot(conn, tid) == before
+        assert kb.get_task(conn, tid).last_failure_error == "spawn refused"
+        assert kb.unblock_task(conn, tid, expected_version=failed.version, reason="spawn repaired")
+        recovered = kb.get_task(conn, tid)
+        assert (recovered.status, recovered.version, recovered.consecutive_failures) == (
+            "ready", failed.version + 1, 0,
+        )
+
+
+def test_existing_board_migrates_gate_versions_once(tmp_path: Path) -> None:
+    import sqlite3
+
+    tid = "t_legacy"
+    path = tmp_path / "pre-trigger.db"
+    with sqlite3.connect(path) as legacy:
+        legacy.executescript(kb.SCHEMA_SQL)
+        legacy.execute(
+            "INSERT INTO tasks (id, title, status, created_at) VALUES (?, 'old gate', 'blocked', 1)",
+            (tid,),
+        )
+    with kbc.connect_closing(path) as conn:
+        version = kb.get_task(conn, tid).version
+        assert kb.schedule_task(conn, tid)
+        assert kb.get_task(conn, tid).version == version + 1
+        assert kb.unblock_task(conn, tid, expected_version=version + 1)
+        assert kb.get_task(conn, tid).version == version + 2
+    kb.init_db(path)  # Re-running migration must not install a second increment.
+    with kbc.connect_closing(path) as conn:
+        assert kb.block_task(conn, tid)
+        assert kb.get_task(conn, tid).version == version + 3
+        assert kb.archive_task(conn, tid)
+        assert kb.get_task(conn, tid).version == version + 4
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+            conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
+        assert kb.get_task(conn, tid).version == version + 4
+
+
 def test_fenced_unblock_refuses_a_stale_version_without_any_write(kanban_home: Path) -> None:
     with kbc.connect_closing() as conn:
         tid = _blocked_task(conn)

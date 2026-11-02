@@ -1000,14 +1000,15 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     return text
 
 
-def redaction_safe_bounds(text: str, start: int, end: int) -> tuple[int, int]:
-    """Expand a raw slice across whole secrets before forced default redaction.
+def redaction_safe_bounds(text: str, start: int, end: int) -> tuple[int, int, str]:
+    """Return raw bounds and a forced-redacted slice using full match context.
 
-    Matchers retain their original objects and redaction order. This does not
-    redact or change existing callers; it keeps their full match context in an
-    opt-in slice, including unbounded/multiline values and plugin prefixes.
+    Scalar secrets remain indivisible. Containers protect only their changed
+    region, so public fields can page without losing the context that masks a
+    later password. Offsets always refer to the original text.
     """
     spans = []
+    container = None
     with _VAULT_REDACTION_LOCK:
         values = tuple(_VAULT_REDACTION_VALUES.get(_vault_scope(), ()))
     for value in values:
@@ -1019,10 +1020,31 @@ def redaction_safe_bounds(text: str, start: int, end: int) -> tuple[int, int]:
         if gate is not None and not gate(text):
             continue
         for match in pattern.finditer(text):
-            # Assignment matchers also recognize public fields. Keep only
-            # candidates the canonical redactor actually changes.
-            if redact_sensitive_text(match[0], force=True) != match[0]:
-                spans.append(match.span())
+            raw = match[0]
+            redacted = redact_sensitive_text(raw, force=True)
+            # Assignment matchers also recognize public fields.
+            if redacted == raw:
+                continue
+            left, right = match.span()
+            if pattern is _FORM_BODY_RE:
+                prefix = 0
+                while prefix < min(len(raw), len(redacted)) and raw[prefix] == redacted[prefix]:
+                    prefix += 1
+                suffix = 0
+                while (
+                    suffix < min(len(raw), len(redacted)) - prefix
+                    and raw[len(raw) - suffix - 1] == redacted[len(redacted) - suffix - 1]
+                ):
+                    suffix += 1
+                left += prefix
+                right -= suffix
+                # This matcher owns the whole form. Preserve its original input
+                # context even when a page starts midway through a public value.
+                container = (
+                    right, len(redacted) - len(raw),
+                    text[:match.start()] + redacted + text[match.end():],
+                )
+            spans.append((left, right))
     if _has_known_prefix_substring(text):
         stripped = _CONTROL_CHARS_RE.sub("", text)
         if stripped != text:
@@ -1041,7 +1063,12 @@ def redaction_safe_bounds(text: str, start: int, end: int) -> tuple[int, int]:
             start = left
         if left < end < right:
             end = right
-    return start, end
+    if container is not None:
+        right, delta, redacted = container
+        rendered_start = start + (delta if start >= right else 0)
+        rendered_end = end + (delta if end >= right else 0)
+        return start, end, redacted[rendered_start:rendered_end]
+    return start, end, redact_sensitive_text(text[start:end], force=True)
 
 
 # Commands whose stdout is an env-var dump: terminal redaction runs the

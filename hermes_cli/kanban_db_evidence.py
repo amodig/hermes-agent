@@ -222,12 +222,12 @@ def _node(base, value, *, item, pointer, parts, offset, limit, chars):
         _require(offset <= len(value))
 
         def chunk(length):
-            start, end = redaction_safe_bounds(value, offset, offset + length)
+            start, end, redacted = redaction_safe_bounds(value, offset, offset + length)
             # ``complete`` says in the result whether this value is fully delivered:
             # an unfinished read must never look finished to the caller.
             result = {**base, "complete": end >= len(value),
                       "chunk": {"pointer": pointer, "offset": start,
-                      "text": kb.redact_review_value(value[start:end]), "total_chars": len(value),
+                      "text": redacted, "total_chars": len(value),
                       "next_offset": end if end < len(value) else None}}
             if end < len(value):
                 result["continuation"] = _continuation(base, item=item, pointer=pointer, offset=end)

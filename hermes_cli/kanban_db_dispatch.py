@@ -2969,6 +2969,7 @@ def _dispatch_lane_task(
                 if _record_task_failure(
                     conn, claimed.id, candidate_problem, outcome="spawn_failed",
                     failure_limit=failure_limit, release_claim=True, end_run=True,
+                    expected_run_id=claimed.current_run_id,
                 ):
                     result.auto_blocked.append(claimed.id)
                 return False

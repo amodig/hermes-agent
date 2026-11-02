@@ -373,6 +373,45 @@ def test_bounded_show_uses_raw_offsets_across_vault_registration(evidence_board,
         clear_vault_redaction_values()
 
 
+@pytest.mark.parametrize("chars", [4096, 8192])
+def test_bounded_show_pages_public_form_bulk_without_exposing_password(evidence_board, chars):
+    kb, conn, _ = evidence_board
+    body = "message=" + "A" * 40000 + "&password=opaque"
+    tid = kb.create_task(conn, title="large public form", body=body)
+    token = _evidence({"task_id": tid, "section": "task"})["snapshot"]
+    page = _evidence({
+        "task_id": tid, "section": "task", "pointer": "/body", "chars": chars,
+        "snapshot": token,
+    })
+    pieces = []
+    cursor = 0
+    while True:
+        chunk = page["chunk"]
+        assert chunk["offset"] == cursor
+        assert len(chunk["text"]) <= chars
+        assert "opaque" not in chunk["text"]
+        assert len(json.dumps(page, ensure_ascii=False).encode()) <= 32768
+        pieces.append(chunk["text"])
+        if page["complete"]:
+            assert "&password=***" in chunk["text"]
+            break
+        assert chunk["next_offset"] == cursor + chars
+        cursor = chunk["next_offset"]
+        page = _evidence({**page["continuation"], "chars": chars})
+    assert len(pieces) > 1
+    assert "".join(pieces) == "message=" + "A" * 40000 + "&password=***"
+
+    # A caller may start within the public run and end inside the password.
+    page = _evidence({
+        "task_id": tid, "section": "task", "pointer": "/body",
+        "offset": 40000, "chars": 20,
+        "snapshot": token,
+    })
+    assert page["chunk"]["offset"] == 40000
+    assert page["chunk"]["text"] == "A" * 8 + "&password=***"
+    assert page["chunk"]["next_offset"] is None and page["complete"]
+
+
 @pytest.mark.parametrize("kind", ["pem", "json"])
 def test_bounded_show_expands_unbounded_multiline_redaction(evidence_board, kind):
     kb, conn, _ = evidence_board
