@@ -145,7 +145,12 @@ def _stamp_lifecycle_metadata(
         or updated.get("reviewed_head_sha")
         or _kb._handoff_fields(updated).get("head_sha")
     )
-    current_head = _latest_head(conn, candidate_task_id)
+    candidate = _kb.get_task(conn, candidate_task_id)
+    current_head = (
+        _kb.bound_handoff(conn, candidate_task_id).get("head_sha")
+        if candidate is not None and candidate.candidate_run_id is not None
+        else _latest_head(conn, candidate_task_id)
+    )
     if phase == "implementation":
         prior_rework = conn.execute(
             "SELECT kind, payload FROM task_events WHERE task_id = ? "
@@ -185,7 +190,7 @@ def _stamp_lifecycle_metadata(
             updated.pop("candidate_supersession", None)
     if phase != "implementation" and current_head and supplied_head and supplied_head != current_head:
         raise LifecycleEvidenceError("lifecycle evidence head_sha does not match the candidate head")
-    head_sha = supplied_head or current_head or _kb.latest_handoff(conn, candidate_task_id).get("head_sha")
+    head_sha = supplied_head or current_head
     envelope = lifecycle_metadata(
         conn,
         task_id,

@@ -1059,17 +1059,19 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             if confirmed != candidate_head:
                 from hermes_cli.kanban_db_dispatch import _record_task_failure
 
-                current = kb.get_task(conn, task.id)
-                if (current is not None
-                        and current.current_run_id == task.current_run_id
-                        and current.claim_lock == task.claim_lock):
-                    kbw.discard_prepared_worktree(
-                        pending, workspace, prepared_head, prepared_new=prepared_new)
-                    _record_task_failure(
-                        conn, task.id,
-                        f"candidate moved from {candidate_head} to {confirmed} during the claim",
-                        outcome="spawn_failed", release_claim=True, end_run=True,
-                    )
+                with kbc._dispatch_admission_lock(allow_nested=True) as admitted:
+                    current = kb.get_task(conn, task.id) if admitted else None
+                    if (current is not None
+                            and current.current_run_id == task.current_run_id
+                            and current.claim_lock == task.claim_lock):
+                        kbw.discard_prepared_worktree(
+                            pending, workspace, prepared_head, prepared_new=prepared_new)
+                        _record_task_failure(
+                            conn, task.id,
+                            f"candidate moved from {candidate_head} to {confirmed} during the claim",
+                            outcome="spawn_failed", release_claim=True, end_run=True,
+                            expected_run_id=task.current_run_id,
+                        )
                 return _err(
                     f"kanban: candidate moved from {candidate_head} to {confirmed} while "
                     f"{args.task_id} was claimed; the claim was released")

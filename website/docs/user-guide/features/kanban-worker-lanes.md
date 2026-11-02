@@ -92,6 +92,18 @@ For code-changing tasks, pick the review model encoded by the task graph:
 
 Both review models carry their structured handoff on the lifecycle transition itself. Do not place secrets, tokens, or raw PII in `summary` or `metadata`; run rows are durable.
 
+Review completion follows the **bound candidate run**, including an earlier attested
+run restored with `rebind-candidate --replace`; a newer rejected run does not change
+the head stamped into the verdict.
+
+When granted, `kanban_worker_inspect` reports and pages the reviewed commit's bytes,
+not the checkout's line-ending normalization. Its source digest is the one
+`kanban_worker_verify` requires for the copied recipe source. Review inspection,
+materialization, and the final verification comparison refuse a checkout with
+tracked or staged changes (`source_changed`). Implementation inspection continues
+to include working-tree edits. Explicitly granted extra source files are read from
+the checkout in both roles.
+
 The injected `KANBAN_GUIDANCE` covers both graph shapes, `kanban_complete`, the same-card review loop, and `kanban_block` for genuine blockers.
 
 ## Logs and audit trail
@@ -131,6 +143,11 @@ So lane authors don't have to reimplement these:
 - **Stale claim TTL** — a worker that claims and then never heartbeats / completes / blocks gets reclaimed after `DEFAULT_CLAIM_TTL_SECONDS` (15 min default) — but only if the worker process has actually died. A live worker (slow model spending 20+ min in one tool-free LLM call) gets the claim *extended* instead of killed; only a dead PID is reclaimed.
 - **Crashed worker** — a worker whose host-local PID has vanished is detected by `detect_crashed_workers` and reaped; the task increments `consecutive_failures` and may auto-block when the breaker trips.
 - **Run-level retry** — when a task is retried (post-block, post-crash, post-reclaim), the worker can use the `expected_run_id` parameter on terminating tools to fail fast if its own run was already superseded.
+- **Candidate-mismatch rollback** — direct claims hold admission through ownership
+  recheck, prepared-worktree discard, and run-fenced failure recording. A successor
+  run receives no failure counter, claim release, or event from the losing attempt.
+  Worktree reuse is recorded where the resolver decides to reuse it: an existing
+  operator-created checkout is never marked as attempt-created for rollback removal.
 - **Per-task max runtime** — `task.max_runtime_seconds` hard-caps wall-clock time per run, regardless of PID liveness. Catches genuinely-deadlocked workers that the live-PID extension would otherwise keep running.
 - **Stranded-task detection** — a ready task whose assignee never produces a claim within `kanban.stranded_threshold_seconds` (default 30 min) shows up in `hermes kanban diagnostics` as a `stranded_in_ready` warning. Severity escalates to error at 2x the threshold and critical at 6x. Catches typo'd assignees, deleted profiles, and down external worker pools in one signal — identity-agnostic, no per-board allowlist to curate.
 - **Running with open parents** — a `running` card whose direct parent is not `done`/`archived` (the parent reopened mid-run, or the link predates the running-child refusal) shows a `running_with_open_parents` warning: the dependency gate is not serialising the two runs and `kanban_complete` will be refused until the parent finishes. Read-only; suggests `hermes kanban unlink`.

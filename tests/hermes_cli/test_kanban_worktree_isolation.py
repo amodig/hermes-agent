@@ -1400,6 +1400,26 @@ def test_role_candidate_head_follows_the_bound_run_not_the_newest(
         assert "first attempt" in context
         assert second not in context
         assert "second attempt" not in context
+        if nested_metadata:
+            # Restore the implementation checkout too; claim admission correctly
+            # refuses a bound handoff whose recorded workspace still points at B.
+            _git(repo, "checkout", "--detach", first)
+            workspace = kbw.resolve_workspace(task, candidate_head=bound)
+            kbw.set_workspace_path(conn, review, str(workspace))
+            kb.recompute_ready(conn)
+            review_run = kb.claim_review_task(conn, review, claimer=kb._claimer_id())
+            assert review_run is not None
+            assert kb.complete_task(
+                conn, review, expected_run_id=review_run.current_run_id,
+                summary="approve restored candidate", verdict="APPROVE",
+                metadata={"head_sha": first},
+            )
+            evidence = json.loads(conn.execute(
+                "SELECT metadata FROM task_runs WHERE id = ?",
+                (review_run.current_run_id,)).fetchone()[0])["lifecycle"]
+            assert evidence["candidate_run_id"] == run_a_id
+            assert evidence["head_sha"] == first
+            assert kb.get_lifecycle_state(conn, implementation)["review_verdict"] == "APPROVE"
 
     assert bound == first
     assert newest == second          # the newest handoff is the rejected candidate
@@ -1718,3 +1738,106 @@ def test_ordinary_claim_tracks_creation_at_the_resolved_target(
     if target_kind == "inherited":
         assert (requested / "README.md").read_text() == "base\n"
         assert kbw._git_current_branch(requested) == "wt/sibling"
+
+
+def test_candidate_rollback_fences_failure_after_takeover_inside_admission(
+    kanban_home, tmp_path, monkeypatch,
+):
+    from hermes_cli import kanban as kc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "app.py", "candidate\n")
+    with kbc.connect() as conn:
+        review = _ready_review_card(conn, repo, base, candidate)
+    discard = kbw.discard_prepared_worktree
+    record_failure = kbd._record_task_failure
+    successor = {}
+    results = []
+
+    def discard_then_take_over(*args, **kwargs):
+        with kbc._dispatch_admission_lock() as admitted:
+            assert not admitted  # The rollback holds admission across the discard.
+        discard(*args, **kwargs)
+        with kbc.connect() as other:
+            original = kb.get_task(other, review)
+            with kb.write_txn(other):
+                run_id = other.execute(
+                    "INSERT INTO task_runs (task_id, status, claim_lock, started_at) "
+                    "VALUES (?, 'running', 'successor', 1)", (review,)).lastrowid
+                other.execute(
+                    "UPDATE tasks SET current_run_id = ?, claim_lock = 'successor' WHERE id = ?",
+                    (run_id, review))
+            successor["original_run"] = original.current_run_id
+            successor["task"] = kb.get_task(other, review)
+            successor["runs"] = [tuple(row) for row in other.execute(
+                "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (review,))]
+            successor["events"] = [tuple(row) for row in other.execute(
+                "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (review,))]
+
+    def record_fenced_failure(*args, **kwargs):
+        assert kwargs["expected_run_id"] == successor["original_run"]
+        with kbc._dispatch_admission_lock() as admitted:
+            assert not admitted
+        result = record_failure(*args, **kwargs)
+        results.append(result)
+        return result
+
+    monkeypatch.setattr(kbw, "discard_prepared_worktree", discard_then_take_over)
+    monkeypatch.setattr(kbd, "_record_task_failure", record_fenced_failure)
+    heads = iter((candidate, base))
+    monkeypatch.setattr(kbw, "candidate_head_for_task", lambda *args: next(heads))
+    assert kc._cmd_claim(_claim_args(review)) != 0
+    assert results == [False]
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, review) == successor["task"]
+        assert [tuple(row) for row in conn.execute(
+            "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (review,))] == successor["runs"]
+        assert [tuple(row) for row in conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (review,))] == successor["events"]
+
+
+@pytest.mark.parametrize("target_kind", ["role", "anchor", "custom", "inherited"])
+def test_worktree_creation_is_reported_at_the_reuse_decision(
+    kanban_home, tmp_path, monkeypatch, target_kind,
+):
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "app.py", "candidate\n")
+    with kbc.connect() as conn:
+        if target_kind == "role":
+            task_id = _ready_review_card(conn, repo, base, candidate)
+        else:
+            requested = repo
+            if target_kind == "custom":
+                requested = repo / "custom-checkout"
+            elif target_kind == "inherited":
+                requested = _add_worktree(repo, repo / ".worktrees" / "sibling", "wt/sibling")
+            task_id = kb.create_task(
+                conn, title="ordinary worktree", assignee="worker",
+                workspace_kind="worktree", workspace_path=str(requested))
+        task = kb.get_task(conn, task_id)
+    target = repo / "custom-checkout" if target_kind == "custom" else repo / ".worktrees" / task_id
+    assert not target.exists()
+    if target_kind == "role":
+        resolve = kbw._role_worktree
+
+        def create_before_role_reuse(*args):
+            _git(repo, "worktree", "add", "--detach", str(target), candidate)
+            return resolve(*args)
+
+        monkeypatch.setattr(kbw, "_role_worktree", create_before_role_reuse)
+    else:
+        resolve = kbw._ensure_git_worktree
+
+        def create_before_reuse(repo_root, path, branch):
+            _add_worktree(repo_root, path, branch)
+            return resolve(repo_root, path, branch)
+
+        monkeypatch.setattr(kbw, "_ensure_git_worktree", create_before_reuse)
+    path, branch, created = kbw.resolve_workspace_created(task, candidate_head=candidate)
+    assert path == target
+    assert branch == ("" if target_kind == "role" else f"wt/{task_id}")
+    assert created is False
+    assert _head(target) == candidate

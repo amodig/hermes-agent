@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import json
 import os
 import posixpath
@@ -548,6 +549,7 @@ def _scan_source(
     """Build one bounded inventory from tracked paths plus granted extra source files."""
     if authority.git is None:
         raise WorkerExecutionRefused("workspace_not_a_repository", "granted workspace is not a Git repository")
+    from_commit = from_commit or authority.role == "review"
     git = SyntheticGit(authority.workspace_path, authority.git)
     try:
         head_result = git.run(["rev-parse", "HEAD"])
@@ -566,10 +568,10 @@ def _scan_source(
                 branch = symbolic.stdout.decode("utf-8", "strict").strip().removeprefix("refs/heads/")
             except UnicodeDecodeError:
                 raise WorkerExecutionRefused("git_unsupported", "Git branch is malformed")
-        if materialize is not None and str(getattr(authority, "role", "unknown")) == "review":
-            # Materializing means running the recipe against a COPY. For a review
-            # claim the copy must be the reviewed commit itself: same HEAD as the
-            # granted pair, and no tracked or staged modification on top of it.
+        if authority.role == "review":
+            # A review's source is the bound commit: inspection, paging and the recipe
+            # must describe the same bytes, not checkout normalization or staged edits.
+            # Enforce this at inspection and the final scan, not just before copying.
             if authority.review is None:
                 raise WorkerExecutionRefused(
                     "source_changed", "no immutable candidate handoff is bound to this claim")
@@ -916,12 +918,18 @@ def _line_page(data: bytes, start_line: int, line_count: int) -> tuple[list[str]
 
 def _read_file_page(
     root: SafeRoot, parts: list[str], entry: SourceEntry, start_line: int, line_count: int,
+    *, blob: Optional[bytes] = None,
 ) -> tuple[str, Optional[int]]:
-    """One pass over the opened file: hash every byte AND collect the requested lines."""
-    try:
-        fd = root.open_file(parts)
-    except OSError as exc:
-        raise WorkerExecutionRefused("source_unreadable", _bounded(exc))
+    """One paging pass over worktree or committed bytes, hashing every byte."""
+    fd = None
+    if blob is None:
+        try:
+            fd = root.open_file(parts)
+        except OSError as exc:
+            raise WorkerExecutionRefused("source_unreadable", _bounded(exc))
+        reader = os.fdopen(fd, "rb")
+    else:
+        reader = io.BytesIO(blob)
     digest = hashlib.sha256()
     wanted_start = max(0, start_line - 1)
     wanted_end = wanted_start + line_count
@@ -931,14 +939,15 @@ def _read_file_page(
     pending = bytearray()
     last_chunk = b""
     binary = False
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or int(info.st_nlink) != 1:
-            _refuse("unsupported_source_type", "requested source is not a single regular file")
-        if info.st_size > MAX_INVENTORY_BYTES:
+    with reader:
+        if fd is not None:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or int(info.st_nlink) != 1:
+                _refuse("unsupported_source_type", "requested source is not a single regular file")
+        if (info.st_size if fd is not None else len(blob)) > MAX_INVENTORY_BYTES:
             _refuse("source_too_large", "requested source exceeds the byte bound")
         while True:
-            chunk = os.read(fd, 1024 * 1024)
+            chunk = reader.read(1024 * 1024)
             if not chunk:
                 break
             digest.update(chunk)
@@ -973,11 +982,10 @@ def _read_file_page(
                 _refuse("page_too_large", "the requested page exceeds the byte bound")
             page.append(bytes(pending))
         total_lines = completed_lines + (1 if last_chunk and not last_chunk.endswith(b"\n") else 0)
-        after = os.fstat(fd)
-        if (after.st_size, after.st_mtime_ns, after.st_ino) != (info.st_size, info.st_mtime_ns, info.st_ino):
-            raise WorkerExecutionRefused("source_changed", "requested source changed during inspection")
-    finally:
-        os.close(fd)
+        if fd is not None:
+            after = os.fstat(fd)
+            if (after.st_size, after.st_mtime_ns, after.st_ino) != (info.st_size, info.st_mtime_ns, info.st_ino):
+                raise WorkerExecutionRefused("source_changed", "requested source changed during inspection")
     if binary:
         raise WorkerExecutionRefused("binary_content", "requested source is binary")
     if "sha256:" + digest.hexdigest() != entry.digest:
@@ -1157,8 +1165,21 @@ def _inspect_read(args: Mapping[str, Any], authority: ExecutionAuthority) -> dic
     _check_expected(args, "expected_source_digest", snapshot.source_digest)
     start_line = int(args.get("start_line", 1))
     line_count = int(args.get("line_count", PAGE_DEFAULT_LINES))
+    blob = None
+    if authority.role == "review":
+        git = SyntheticGit(authority.workspace_path, authority.git)
+        try:
+            if name in _git_tracked(git):
+                # The scan already bounded this immutable commit's blob. Granted
+                # extra files still come from the checkout, just as in the scan.
+                result = git.run(["cat-file", "blob", f"{snapshot.head}:{name}"])
+                if result.returncode != 0:
+                    _refuse("git_unavailable", "a reviewed blob could not be read")
+                blob = result.stdout
+        finally:
+            git.close()
     with SafeRoot(authority.workspace_path) as root:
-        text, next_line = _read_file_page(root, parts, entry, start_line, line_count)
+        text, next_line = _read_file_page(root, parts, entry, start_line, line_count, blob=blob)
     return {
         "ok": True,
         "operation": "read",
@@ -1285,10 +1306,7 @@ def _materialize_source(authority: ExecutionAuthority, run_root: Path) -> tuple[
     """Copy reviewed commit bytes for review; retain working edits for implementation."""
     source_dir = run_root / "source"
     source_dir.mkdir(mode=0o700)
-    snapshot = _scan_source(
-        authority, materialize=source_dir,
-        from_commit=str(getattr(authority, "role", "")) == "review",
-    )
+    snapshot = _scan_source(authority, materialize=source_dir)
     return snapshot, source_dir
 
 

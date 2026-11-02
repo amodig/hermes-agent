@@ -725,12 +725,12 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> bool:
+    """Materialize ``target``, returning False when reusing a linked worktree."""
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None and _path_key(_git_common_dir(target)) == _path_key(repo_common):
-        return
+        return False
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
         args = ["worktree", "add", str(target), branch_name]
@@ -742,13 +742,13 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
+    return True
 
 
 def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple[Path, str, bool]:
     """Materialize the canonical worktree, reporting whether this call created it."""
     target = repo_root / ".worktrees" / task_id
-    created = not target.exists()
-    _ensure_git_worktree(repo_root, target, branch_name)
+    created = _ensure_git_worktree(repo_root, target, branch_name)
     return target, branch_name, created
 
 
@@ -997,11 +997,11 @@ def _commit_referenced(repo: Path, commit: str) -> bool:
     return result.returncode == 0 and bool((result.stdout or "").strip())
 
 
-def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Path, str]:
+def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Path, str, bool]:
     """Materialize this role card's own worktree at ``candidate_head``.
 
-    Returns ``(path, branch)`` with an empty branch for the detached checkout that a
-    role worktree normally is. An existing canonical worktree is reused only when it
+    Returns ``(path, branch, created)`` with an empty branch for the detached checkout
+    that a role worktree normally is. An existing canonical worktree is reused only when it
     is already ``candidate_head``; a clean named-branch checkout of another commit is
     moved onto the candidate with a non-force detach (its branch ref is untouched),
     and anything dirtier is refused with the files preserved.
@@ -1029,7 +1029,7 @@ def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Pa
         if _git_head(target) != head:
             raise ValueError(
                 f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} did not land on {head}")
-        return target.resolve(strict=False), ""
+        return target.resolve(strict=False), "", True
     # An existing canonical checkout: prove it belongs to this repository, then never
     # discard what is in it.
     repo_root = repo_root.resolve(strict=False)
@@ -1051,7 +1051,7 @@ def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Pa
     current = _git_head(target)
     branch = _git_current_branch(target) or ""
     if current == head:
-        return target.resolve(strict=False), branch
+        return target.resolve(strict=False), branch, False
     if not branch:
         # A detached checkout is the normal shape for a role worktree, and after a
         # rework its old candidate is simply not the new one. Follow the new candidate
@@ -1071,7 +1071,7 @@ def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Pa
         if _git_head(target) != head:
             raise ValueError(
                 f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} did not land on {head}")
-        return target.resolve(strict=False), ""
+        return target.resolve(strict=False), "", False
     # Detaching leaves the branch ref behind, and the completion cleanup deletes a
     # ``wt/<id>`` branch once the *detached* HEAD is clean and pushed. So only move a
     # branch whose tip the candidate already contains: anything else is unique work.
@@ -1089,7 +1089,7 @@ def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Pa
     if _git_head(target) != head:
         raise ValueError(
             f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} did not land on {head}")
-    return target.resolve(strict=False), ""
+    return target.resolve(strict=False), "", False
 
 
 def _validate_role_directory(task: Task, path: Path, candidate_head: Optional[str]) -> None:
@@ -1134,9 +1134,7 @@ def _resolve_worktree_workspace_created(
                 f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {task.id} is a typed role card; its "
                 "worktree is materialized at the candidate commit, never at HEAD")
         repo_root = _role_repo_root(task, board)
-        created = not (repo_root / ".worktrees" / task.id).exists()
-        path, branch = _role_worktree(repo_root, task, candidate_head)
-        return path, branch, created
+        return _role_worktree(repo_root, task, candidate_head)
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if not task.workspace_path:
         board_slug = board if board else _kb.get_current_board()
@@ -1183,8 +1181,7 @@ def _resolve_worktree_workspace_created(
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if _path_key(fallback.resolve(strict=False)) != _path_key(requested_resolved):
-                created = not fallback.exists()
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                created = _ensure_git_worktree(fallback_root, fallback, branch_name)
                 return fallback.resolve(strict=False), branch_name, created
         # No repo to anchor a fallback on (or the occupied path IS this task's
         # own canonical worktree): keep the legacy reuse rather than fail dispatch.
@@ -1200,8 +1197,7 @@ def _resolve_worktree_workspace_created(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    created = not requested.exists()
-    _ensure_git_worktree(repo_root, requested, branch_name)
+    created = _ensure_git_worktree(repo_root, requested, branch_name)
     return requested, branch_name, created
 
 

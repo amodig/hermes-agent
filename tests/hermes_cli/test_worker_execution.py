@@ -748,6 +748,8 @@ def test_diff_only_accepts_the_granted_review_pair(fixture, monkeypatch):
     # A review claim only keeps execution authority while the board names the
     # immutable pair and the workspace HEAD is on it; this test is about the diff
     # capability, so it supplies that pair and then pins the diff itself.
+    _git(fixture.repo, "reset", "-q")
+    _git(fixture.repo, "checkout", "--", "app.py")
     pair = {"base": fixture.base, "head": fixture.head}
     monkeypatch.setattr(wep, "resolve_review_context", lambda *_a, **_k: ("review", pair))
     authority = _authority(fixture, status="review", review=pair)
@@ -1096,9 +1098,10 @@ def test_materialized_review_source_must_be_the_reviewed_commit(fixture, monkeyp
         lambda *_a, **_k: ("review", {"base": fixture.base, "head": fixture.head}))
     authority = _authority(fixture)
     assert authority.role == "review"
-    # Inspection still works against a dirty reviewed candidate — that is how a
-    # reviewer explains the dirt.
-    assert wes._scan_source(authority).head == fixture.head
+    # Inspection and verification describe the same immutable source; dirt refuses.
+    with pytest.raises(wec.WorkerExecutionRefused) as inspected:
+        wes._scan_source(authority)
+    assert inspected.value.code == "source_changed"
     run_root = fixture.root / "run"
     run_root.mkdir()
     with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
@@ -1174,6 +1177,59 @@ def test_review_materialization_preserves_each_committed_file_mode(fixture, monk
     assert (source / "a.sh").stat().st_mode & 0o777 == 0o755
     assert (source / "z.txt").stat().st_mode & 0o777 == 0o644
     assert (source / "a.sh").read_bytes() == script.read_bytes()
+
+
+@pytest.mark.parametrize("drift", ["none", "worktree", "index"])
+def test_review_verifies_the_inspected_digest_with_eol_normalization(fixture, monkeypatch, drift):
+    from hermes_cli import worker_execution_podman as backend
+
+    (fixture.repo / ".gitattributes").write_text("*.txt text eol=crlf\n", encoding="utf-8")
+    (fixture.repo / "normalized.txt").write_bytes(b"first\nsecond\n")
+    _git(fixture.repo, "add", "-A")
+    _git(fixture.repo, "commit", "-qm", "normalized candidate")
+    head = _git(fixture.repo, "rev-parse", "HEAD")
+    (fixture.repo / "normalized.txt").unlink()
+    _git(fixture.repo, "checkout", "--", "normalized.txt")
+    assert (fixture.repo / "normalized.txt").read_bytes() == b"first\r\nsecond\r\n"
+    monkeypatch.setattr(
+        wep, "resolve_review_context",
+        lambda *_a, **_k: ("review", {"base": fixture.base, "head": head}))
+    authority = _authority(fixture, recipes={"check": {
+        "image": PINNED_PY, "argv": ["/bin/true"], "timeout_seconds": 30, "services": [],
+    }})
+    grant = SimpleNamespace(task_id="review", run_id=7, profile="reviewer", preparation_id="probe")
+    inspected = wes._inspect_summary(grant, authority)
+    page = wes._inspect_read({
+        "path": "normalized.txt", "start_line": 2, "line_count": 1,
+        "expected_source_digest": inspected["source_digest"],
+    }, authority)
+    assert page["text"] == "second\n"
+    assert page["next_line"] is None
+    assert page["source_digest"] == inspected["source_digest"]
+    monkeypatch.setattr(we, "_authorize_execution", lambda: (grant, authority))
+    monkeypatch.setattr(we, "_require_execution_approval", lambda *a, **kw: None)
+    monkeypatch.setattr(we, "_reauthorize_live_claim", lambda *a: None)
+    ran = []
+
+    def run_verification(**kwargs):
+        ran.append(kwargs["source_dir"])
+        assert (kwargs["source_dir"] / "normalized.txt").read_bytes() == b"first\nsecond\n"
+        if drift != "none":
+            (fixture.repo / "normalized.txt").write_bytes(b"changed\r\n")
+            if drift == "index":
+                _git(fixture.repo, "add", "normalized.txt")
+        return {"ok": True, "accepted": True, "cleanup_ok": True}
+
+    monkeypatch.setattr(backend, "run_verification", run_verification)
+    result = json.loads(we.worker_verify({"recipe": "check", "source_digest": inspected["source_digest"]}))
+    assert len(ran) == 1
+    if drift == "none":
+        assert result["accepted"] is True, result
+        assert result["source_digest"] == inspected["source_digest"]
+        assert result["head"] == head
+    else:
+        assert result["accepted"] is False
+        assert result["error"] == "source_changed"
 
 
 @pytest.mark.parametrize("replacement", ["deleted", "symlink", "directory"])
