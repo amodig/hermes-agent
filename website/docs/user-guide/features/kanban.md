@@ -610,6 +610,10 @@ and completed with an immutable head.
 Typed reviewer/tester workspaces resolve at the bound candidate commit, including
 when recovery selects an older run with only top-level handoff metadata. Deferred
 launches refuse if either the bound base or head changes during preparation.
+Role worktrees must have their own Git registration: the checkout's `.git`
+pointer, the administrative directory's backlink, and `git worktree list` must
+all identify that checkout. A copied sibling pointer refuses with
+`candidate_workspace_unavailable` before either checkout is moved.
 Existing checkouts with `assume-unchanged` or `skip-worktree` index flags refuse
 with `candidate_workspace_unavailable`, even when `git status` looks clean: clear
 those flags and preserve or commit any local edits before retrying. A refused
@@ -617,7 +621,11 @@ claim or deferred launch may remove only a checkout that attempt created, never
 one with index flags or ignored entries. Its prepared commit must still be reachable
 from a Git ref: even a newly created detached checkout survives if it is the last
 reference to that commit. Reused detached checkouts always remain anchored.
-CLI candidate-mismatch rollback leaves a successor run's claim and checkout intact.
+Before persisting a direct role claim, the CLI rechecks the registration and
+prepared head. A changed checkout or candidate binding releases only this
+attempt's claim; a successor run and a moved checkout are preserved. Duplicate
+task ids across boards sharing a repository are an operator setup error: this
+check fences a moved checkout, not same-head sharing, and is not a cross-board lock.
 Ordinary worktree cards retain custom target paths; an inherited sibling checkout
 resolves to the card's own worktree rather than sharing the sibling's branch.
 

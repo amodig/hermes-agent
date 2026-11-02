@@ -1051,49 +1051,64 @@ def _cmd_claim(args: argparse.Namespace) -> int:
         # claim; that changes neither this row nor its version, so the fence above cannot
         # see it. Re-read the binding before reporting a workspace, and undo the claim
         # rather than leaving a worker pinned to a candidate the board no longer names.
+        claim_error = None
         if candidate_head is not None:
             try:
                 confirmed = kbw.candidate_head_for_task(conn, task)
             except ValueError:
                 confirmed = None
             if confirmed != candidate_head:
-                from hermes_cli.kanban_db_dispatch import _record_task_failure
+                claim_error = f"candidate moved from {candidate_head} to {confirmed}"
+            else:
+                # Duplicate task ids across boards sharing a repository are an operator
+                # setup error. This fences only a moving checkout, not same-head sharing;
+                # it does not provide cross-board locking.
+                try:
+                    if resolved_kind == "worktree":
+                        kbw._validate_worktree_registration(
+                            kbw._role_repo_root(pending, None), workspace)
+                    current_head = kbw._git_head(workspace)
+                    if current_head != prepared_head:
+                        raise ValueError(
+                            f"candidate_workspace_unavailable: prepared workspace {workspace} "
+                            f"moved from {prepared_head} to {current_head}")
+                except ValueError as exc:
+                    claim_error = str(exc)
+        if claim_error is not None:
+            from hermes_cli.kanban_db_dispatch import _record_task_failure
 
-                deadline = time.monotonic() + 1.0
-                rolled_back = False
-                while True:
-                    with kbc._dispatch_admission_lock(allow_nested=True) as admitted:
-                        if admitted:
+            deadline = time.monotonic() + 1.0
+            rolled_back = False
+            while True:
+                with kbc._dispatch_admission_lock(allow_nested=True) as admitted:
+                    if admitted:
+                        current = kb.get_task(conn, task.id)
+                        if (current is not None
+                                and current.current_run_id == task.current_run_id
+                                and current.claim_lock == task.claim_lock):
+                            kbw.discard_prepared_worktree(
+                                pending, workspace, prepared_head, prepared_new=prepared_new)
+                            _record_task_failure(
+                                conn, task.id, f"{claim_error} during the claim",
+                                outcome="spawn_failed", release_claim=True, end_run=True,
+                                expected_run_id=task.current_run_id,
+                            )
                             current = kb.get_task(conn, task.id)
-                            if (current is not None
-                                    and current.current_run_id == task.current_run_id
-                                    and current.claim_lock == task.claim_lock):
-                                kbw.discard_prepared_worktree(
-                                    pending, workspace, prepared_head, prepared_new=prepared_new)
-                                _record_task_failure(
-                                    conn, task.id,
-                                    f"candidate moved from {candidate_head} to {confirmed} during the claim",
-                                    outcome="spawn_failed", release_claim=True, end_run=True,
-                                    expected_run_id=task.current_run_id,
-                                )
-                                current = kb.get_task(conn, task.id)
-                                rolled_back = (current is not None
-                                               and current.current_run_id is None
-                                               and current.claim_lock is None)
-                            break
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        return _err(
-                            f"kanban: candidate moved from {candidate_head} to {confirmed} while "
-                            f"{args.task_id} was claimed; the claim could not be rolled back and "
-                            f"remains open (run {task.current_run_id}): admission lock unavailable")
-                    time.sleep(min(0.05, remaining))
-                outcome = ("the claim was released" if rolled_back else
-                           f"the claim could not be rolled back (run {task.current_run_id}): "
-                           "claim ownership changed")
-                return _err(
-                    f"kanban: candidate moved from {candidate_head} to {confirmed} while "
-                    f"{args.task_id} was claimed; {outcome}")
+                            rolled_back = (current is not None
+                                           and current.current_run_id is None
+                                           and current.claim_lock is None)
+                        break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return _err(
+                        f"kanban: {claim_error} while "
+                        f"{args.task_id} was claimed; the claim could not be rolled back and "
+                        f"remains open (run {task.current_run_id}): admission lock unavailable")
+                time.sleep(min(0.05, remaining))
+            outcome = ("the claim was released" if rolled_back else
+                       f"the claim could not be rolled back (run {task.current_run_id}): "
+                       "claim ownership changed")
+            return _err(f"kanban: {claim_error} while {args.task_id} was claimed; {outcome}")
         kbw.set_workspace_path(
             conn, task.id, str(workspace),
             kind=resolved_kind if resolved_kind != (pending.workspace_kind or "scratch") else None,

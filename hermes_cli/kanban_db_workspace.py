@@ -13,6 +13,7 @@ import shutil
 import sqlite3
 import subprocess
 import time
+import stat
 import unicodedata
 import bisect
 from pathlib import Path
@@ -707,6 +708,39 @@ def _is_linked_worktree_checkout(path: Path) -> bool:
     )
 
 
+def _validate_worktree_registration(repo_root: Path, target: Path) -> None:
+    """A copied .git pointer must never authorize moving a sibling's HEAD/index."""
+    from hermes_cli.worker_execution_policy import _worktree_registration_backlinks
+
+    try:
+        pointer = target / ".git"
+        info = pointer.lstat()
+        if target.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+            raise ValueError
+        contents = pointer.read_text(encoding="utf-8").strip()
+        if not contents.startswith("gitdir: ") or not contents[8:].strip():
+            raise ValueError
+        git_dir = (target / contents[8:].strip()).resolve()
+        common = _git_common_dir(repo_root)
+        if common is None or _path_key(_git_common_dir(target)) != _path_key(common):
+            raise ValueError
+        if not _worktree_registration_backlinks(
+            str(common), str(git_dir), str(target.resolve()),
+        ):
+            raise ValueError
+        registered = _git(repo_root, "worktree", "list", "--porcelain", "-z", timeout=30)
+        if registered.returncode != 0 or not any(
+            _path_key(Path(field[9:]).resolve()) == _path_key(target.resolve())
+            for field in registered.stdout.split("\0") if field.startswith("worktree ")
+        ):
+            raise ValueError
+    except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: unregistered checkout {target}; "
+            f"its .git pointer, registration backlink and worktree list must agree in {repo_root}"
+        ) from None
+
+
 def _nearest_existing_path(path: Path) -> Path:
     current = path
     while not current.exists() and current != current.parent:
@@ -1026,19 +1060,14 @@ def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Pa
             raise ValueError(
                 f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: git worktree add failed for {target} at "
                 f"{head}: {(result.stderr or result.stdout or '').strip()[:300]}")
+        _validate_worktree_registration(repo_root, target)
         if _git_head(target) != head:
             raise ValueError(
                 f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} did not land on {head}")
         return target.resolve(strict=False), "", True
     # An existing canonical checkout: prove it belongs to this repository, then never
     # discard what is in it.
-    repo_root = repo_root.resolve(strict=False)
-    if not _is_linked_worktree_checkout(target) or (
-        _path_key(_git_common_dir(target)) != _path_key(_git_common_dir(repo_root))
-    ):
-        raise ValueError(
-            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is not a linked worktree of "
-            f"{repo_root}")
+    _validate_worktree_registration(repo_root, target)
     _clean_tree(target, str(target))
     # …and ignored files are not "local changes" to git, so a candidate that starts
     # tracking one of them would overwrite it without any warning.
@@ -1339,6 +1368,7 @@ def discard_prepared_worktree(
             return False
         if not target.is_dir() or not _is_linked_worktree_checkout(target):
             return False
+        _validate_worktree_registration(repo_root, target)
         if _git_head(target) != prepared_head:
             return False
         _clean_tree(target, str(target))

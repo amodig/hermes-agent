@@ -235,6 +235,32 @@ def test_role_cards_get_their_own_worktree_at_the_candidate(kanban_home, tmp_pat
     assert _head(reviewer_path) == candidate
 
 
+def test_role_worktree_refuses_a_copied_git_pointer(kanban_home, tmp_path):
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    sibling = _add_worktree(repo, repo / ".worktrees" / "sibling", "wt/sibling")
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+    with kbc.connect_closing() as conn:
+        implementation = _candidate_card(conn, repo, base=base, head=candidate)
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        task = kb.get_task(conn, review)
+    target = repo / ".worktrees" / review
+    target.mkdir()
+    pointer = (sibling / ".git").read_bytes()
+    (target / ".git").write_bytes(pointer)
+    (target / "README.md").write_bytes((sibling / "README.md").read_bytes())
+
+    with pytest.raises(ValueError, match="candidate_workspace_unavailable.*unregistered checkout") as error:
+        kbw.resolve_workspace(task, candidate_head=candidate)
+    assert str(target) in str(error.value)
+    assert _head(sibling) == _head(target) == base
+    assert (target / ".git").read_bytes() == (sibling / ".git").read_bytes() == pointer
+    assert (target / "README.md").read_bytes() == (sibling / "README.md").read_bytes() == b"base\n"
+    assert not (target / "candidate.txt").exists()
+    assert not (sibling / "candidate.txt").exists()
+    assert _head(repo) == candidate
+
+
 def test_role_worktree_refuses_a_dirty_checkout_and_preserves_it(kanban_home, tmp_path):
     repo = _make_repo(tmp_path)
     base = _head(repo)
@@ -1565,6 +1591,51 @@ def test_cli_refusal_discards_only_new_worktrees(
     with kbc.connect() as conn:
         assert kb.get_task(conn, review).current_run_id is None
 
+
+
+def test_cli_claim_releases_a_checkout_moved_by_another_board(
+    kanban_home, tmp_path, monkeypatch, capsys,
+):
+    from hermes_cli import kanban as kc
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "app.py", "first\n")
+    with kbc.connect_closing() as conn:
+        review = _ready_review_card(conn, repo, base, candidate)
+    other_source = _add_worktree(repo, tmp_path / "other-source", "other-source")
+    other_head = _commit(other_source, "app.py", "second\n")
+    kb.create_board("other")
+    with kbc.connect_closing(board="other") as other, monkeypatch.context() as patch:
+        ids = iter(("t_11111111", review))
+        patch.setattr(kb, "_new_task_id", lambda: next(ids))
+        assert _ready_review_card(other, other_source, base, other_head) == review
+        kbw.set_workspace_path(other, review, str(repo))
+
+    resolve = kbw.resolve_workspace_created
+
+    def prepare_then_move(task, **kwargs):
+        prepared = resolve(task, **kwargs)
+        assert _head(prepared[0]) == candidate and prepared[2]
+        with kbc.connect_closing(board="other") as other:
+            rival = kb.get_task(other, review)
+            moved = resolve(rival, board="other", candidate_head=other_head)
+            assert moved[0] == prepared[0] and not moved[2]
+        return prepared
+
+    monkeypatch.setattr(kbw, "resolve_workspace_created", prepare_then_move)
+    assert kc._cmd_claim(_claim_args(review)) != 0
+    error = capsys.readouterr().err
+    assert "candidate_workspace_unavailable" in error and "the claim was released" in error
+    assert candidate in error and other_head in error
+    with kbc.connect_closing() as conn:
+        after = kb.get_task(conn, review)
+        assert after.current_run_id is None and after.claim_lock is None
+        assert after.status != "running" and after.workspace_path == str(repo)
+        assert kb.latest_run(conn, review).outcome == "spawn_failed"
+    target = repo / ".worktrees" / review
+    assert target.is_dir() and _head(target) == other_head
+    assert (target / "app.py").read_text() == "second\n"
 
 @pytest.mark.parametrize("release_during_wait", [False, True])
 def test_cli_candidate_rollback_reports_an_open_run_when_admission_stays_locked(
