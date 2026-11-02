@@ -109,6 +109,9 @@ materialization, and the final verification comparison refuse a checkout with
 tracked or staged changes (`source_changed`). Implementation inspection continues
 to include working-tree edits. Explicitly granted extra source files are read from
 the checkout in both roles.
+Frozen inventories use one Git batch size check before buffering any blobs, then
+one batch read of those same index object IDs. Entry and byte limits still apply;
+no checkout filters or line-ending conversion run during the copy.
 
 The injected `KANBAN_GUIDANCE` covers both graph shapes, `kanban_complete`, the same-card review loop, and `kanban_block` for genuine blockers.
 

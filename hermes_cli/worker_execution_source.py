@@ -39,7 +39,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Iterator, Mapping, Optional
 
 TOOL_INSPECT = "kanban_worker_inspect"
 TOOL_VERIFY = "kanban_worker_verify"
@@ -439,7 +439,9 @@ class SyntheticGit:
             dirnames[:] = [name for name in dirnames if not (base / name).is_symlink()]
         return objects
 
-    def run(self, args: list[str], *, cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
+    def run(
+        self, args: list[str], *, cwd: Optional[Path] = None, input: Optional[bytes] = None,
+    ) -> subprocess.CompletedProcess:
         from hermes_cli._subprocess_compat import harden_git_argv
 
         objects = self.object_dir()
@@ -452,7 +454,8 @@ class SyntheticGit:
         ]
         try:
             return subprocess.run(  # noqa: S603 -- fixed executable, validated argv
-                argv, cwd=str(cwd or self.root), env=env, stdin=subprocess.DEVNULL,
+                argv, cwd=str(cwd or self.root), env=env,
+                stdin=subprocess.DEVNULL if input is None else None, input=input,
                 capture_output=True, timeout=GIT_TIMEOUT_SECONDS,
             )
         except (OSError, subprocess.SubprocessError) as exc:
@@ -540,6 +543,53 @@ def _index_digest(git: SyntheticGit) -> str:
         return "sha256:" + sha256_hex(handle.read())
 
 
+def _committed_blobs(git: SyntheticGit, oids: list[str]) -> Iterator[tuple[int, bytes]]:
+    """Bound the whole frozen inventory before buffering any committed bytes."""
+    if not oids:
+        return
+    # Keep the frozen index's object names, with the same blob peeling as
+    # ``cat-file blob <oid>`` (not HEAD:path, filters or checkout conversion).
+    # Check both sizes: ``-s`` measures a tag itself, while ``blob`` peels it.
+    requests = "".join(f"{oid}\n{oid}^{{blob}}\n" for oid in oids).encode("ascii")
+    checked = git.run(["cat-file", "--batch-check=%(objectsize)"], input=requests)
+    lines = checked.stdout.splitlines()
+    if checked.returncode != 0 or len(lines) != 2 * len(oids):
+        _refuse("git_unavailable", "a reviewed blob size could not be read")
+    sizes = []
+    total = 0
+    for index in range(0, len(lines), 2):
+        pair = []
+        for offset, label in ((0, "blob size"), (1, "blob")):
+            raw = lines[index + offset]
+            if raw.endswith(b" missing"):
+                _refuse("git_unavailable", f"a reviewed {label} could not be read")
+            try:
+                size = int(raw)
+            except ValueError:
+                _refuse("git_unsupported", "a reviewed blob size is malformed")
+            if size < 0:
+                _refuse("git_unsupported", "a reviewed blob size is malformed")
+            if size > MAX_INVENTORY_BYTES - total:
+                _refuse("source_too_large", "the granted source set exceeds the byte bound")
+            pair.append(size)
+        sizes.append(pair)
+        total += pair[1]
+    blobs = git.run(
+        ["cat-file", "--batch=%(objectsize)"],
+        input="".join(f"{oid}^{{blob}}\n" for oid in oids).encode("ascii"),
+    )
+    if blobs.returncode != 0:
+        _refuse("git_unavailable", "a reviewed blob could not be read")
+    stream = io.BytesIO(blobs.stdout)
+    for original_size, size in sizes:
+        if stream.readline() != f"{size}\n".encode("ascii"):
+            _refuse("git_unavailable", "a reviewed blob could not be read")
+        data = stream.read(size)
+        if len(data) != size or stream.read(1) != b"\n":
+            _refuse("git_unavailable", "a reviewed blob could not be read")
+        yield original_size, data
+
+
 def _scan_source(
     authority: ExecutionAuthority,
     *,
@@ -625,6 +675,9 @@ def _scan_source(
         total_bytes = 0
         if len(accepted) > MAX_INVENTORY_ENTRIES:
             raise WorkerExecutionRefused("source_too_large", "the granted source set exceeds the entry bound")
+        committed_blobs = _committed_blobs(
+            git, [tracked[name][1] for name in sorted(tracked)] if from_commit else [],
+        )
         with SafeRoot(authority.workspace_path) as root:
             for name in sorted(accepted):
                 parts = name.split("/")
@@ -633,28 +686,9 @@ def _scan_source(
                     # The frozen index names the reviewed commit's type and bytes.
                     # Worktree deletion or replacement after the cleanliness proof
                     # must not change the copy. Granted extras still use the worktree.
-                    entry_mode, oid = tracked[name]
-                    size_result = git.run(["cat-file", "-s", oid])
-                    if size_result.returncode != 0:
-                        raise WorkerExecutionRefused(
-                            "git_unavailable", "a reviewed blob size could not be read")
-                    try:
-                        size = int(size_result.stdout)
-                    except ValueError:
-                        raise WorkerExecutionRefused(
-                            "git_unsupported", "a reviewed blob size is malformed")
-                    if size < 0:
-                        raise WorkerExecutionRefused(
-                            "git_unsupported", "a reviewed blob size is malformed")
-                    if size > MAX_INVENTORY_BYTES - total_bytes:
-                        raise WorkerExecutionRefused(
-                            "source_too_large", "the granted source set exceeds the byte bound")
-                    blob = git.run(["cat-file", "blob", oid])
-                    if blob.returncode != 0:
-                        raise WorkerExecutionRefused(
-                            "git_unavailable", "a reviewed blob could not be read")
-                    data = blob.stdout
-                    if len(data) > MAX_INVENTORY_BYTES - total_bytes:
+                    entry_mode, _oid = tracked[name]
+                    size, data = next(committed_blobs)
+                    if max(size, len(data)) > MAX_INVENTORY_BYTES - total_bytes:
                         raise WorkerExecutionRefused(
                             "source_too_large", "the granted source set exceeds the byte bound")
                     total_bytes += len(data)

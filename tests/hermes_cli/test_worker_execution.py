@@ -1311,6 +1311,48 @@ def test_implementation_materialization_preserves_working_tree_edits(fixture):
     assert snapshot.entry("app.py").digest == inspected.entry("app.py").digest
 
 
+def test_review_many_files_use_bounded_git_batches(fixture, monkeypatch):
+    for index in range(64):
+        (fixture.repo / f"small-{index:03}.bin").write_bytes(
+            b"\x00\n" + bytes([index]) + b"\r\ncommitted bytes\n")
+    _git(fixture.repo, "add", "-A")
+    _git(fixture.repo, "commit", "-qm", "many small blobs")
+    head = _git(fixture.repo, "rev-parse", "HEAD")
+    monkeypatch.setattr(
+        wep, "resolve_review_context",
+        lambda *_a, **_k: ("review", {"base": fixture.base, "head": head}))
+    authority = _authority(fixture)
+    # The previous per-file path is the byte oracle, outside the measured scan.
+    expected = {}
+    for record in _git(fixture.repo, "ls-files", "--stage").splitlines():
+        metadata, name = record.split("\t")
+        oid = metadata.split()[1]
+        expected[name] = subprocess.run(
+            ["git", "-C", str(fixture.repo), "cat-file", "blob", oid],
+            check=True, capture_output=True,
+        ).stdout
+    calls = []
+    run = wes.SyntheticGit.run
+
+    def record(self, args, **kwargs):
+        calls.append(args)
+        return run(self, args, **kwargs)
+
+    monkeypatch.setattr(wes.SyntheticGit, "run", record)
+    source = fixture.root / "many-files-copy"
+    source.mkdir()
+    snapshot = wes._scan_source(authority, materialize=source)
+    assert {entry.path for entry in snapshot.entries} == set(expected)
+    for entry in snapshot.entries:
+        assert (source / entry.path).read_bytes() == expected[entry.path]
+        assert entry.size == len(expected[entry.path])
+        assert entry.digest == "sha256:" + wec.sha256_hex(expected[entry.path])
+    cat_file_calls = [args for args in calls if args[0] == "cat-file"]
+    print(f"frozen scan: files={len(expected)}, run={len(calls)}, cat-file={len(cat_file_calls)}")
+    assert len(cat_file_calls) <= 2
+    assert len(calls) <= 7
+
+
 def test_review_blob_bound_is_checked_before_buffering(fixture, monkeypatch):
     _git(fixture.repo, "add", "-A")
     _git(fixture.repo, "commit", "-qm", "clean candidate")
@@ -1321,13 +1363,14 @@ def test_review_blob_bound_is_checked_before_buffering(fixture, monkeypatch):
     authority = _authority(fixture)
     first_oid = _git(fixture.repo, "rev-parse", "HEAD:app.py")
     oversized_oid = _git(fixture.repo, "rev-parse", "HEAD:docs/readme.md")
+    last_oid = _git(fixture.repo, "rev-parse", "HEAD:notes.txt")
     monkeypatch.setattr(wes, "MAX_INVENTORY_BYTES", (fixture.repo / "app.py").stat().st_size)
     calls = []
     run = wes.SyntheticGit.run
 
     def record(self, args, **kwargs):
         if args[0] == "cat-file":
-            calls.append(args)
+            calls.append((args, kwargs.get("input")))
         return run(self, args, **kwargs)
 
     monkeypatch.setattr(wes.SyntheticGit, "run", record)
@@ -1336,8 +1379,9 @@ def test_review_blob_bound_is_checked_before_buffering(fixture, monkeypatch):
     with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
         wes._materialize_source(authority, run_root)
     assert excinfo.value.code == "source_too_large"
-    assert calls == [
-        ["cat-file", "-s", first_oid],
-        ["cat-file", "blob", first_oid],
-        ["cat-file", "-s", oversized_oid],
-    ]
+    assert calls == [(
+        ["cat-file", "--batch-check=%(objectsize)"],
+        "".join(f"{oid}\n{oid}^{{blob}}\n" for oid in (
+            first_oid, oversized_oid, last_oid,
+        )).encode("ascii"),
+    )]
