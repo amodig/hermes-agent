@@ -1134,6 +1134,25 @@ def _resolve_worktree_workspace_created(
                 f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {task.id} is a typed role card; its "
                 "worktree is materialized at the candidate commit, never at HEAD")
         repo_root = _role_repo_root(task, board)
+        target = repo_root / ".worktrees" / task.id
+        if target.exists():
+            from hermes_cli.sqlite_safe_read import connect_tracked
+
+            db_path = _kb.kanban_db_path(board=board).resolve()
+            try:
+                with contextlib.closing(connect_tracked(
+                    db_path.as_uri() + "?mode=ro", tracking_path=db_path,
+                    uri=True, timeout=1.0,
+                )) as conn:
+                    conn.row_factory = sqlite3.Row
+                    shared = _workspace_in_use_by_other(conn, task.id, target)
+            except (OSError, sqlite3.Error):
+                shared = "unknown"
+            if shared is not None:
+                detail = ("is registered to another non-terminal task" if shared == "shared"
+                          else "cannot be checked for another task's registration")
+                raise ValueError(
+                    f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: checkout collision at {target}: {detail}")
         return _role_worktree(repo_root, task, candidate_head)
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if not task.workspace_path:

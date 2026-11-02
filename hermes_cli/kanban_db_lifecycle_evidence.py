@@ -416,7 +416,7 @@ def _prepare_completion_handoff(
         and task_contract.get("kind") == "code"
         and task_contract.get("review_mode") == "same_card"
     ):
-        implementation_handoff = _kb.latest_handoff(conn, task_id)
+        implementation_handoff = _kb.bound_handoff(conn, task_id)
         if not implementation_handoff.get("head_sha"):
             raise _kb.HandoffValidationError(
                 task_id, "implementation handoff head_sha is required"

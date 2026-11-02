@@ -1006,6 +1006,25 @@ def test_opt_in_refuses_a_retargeted_checkout_behind_a_registration(fixture):
     assert grant is None and refusal == "workspace_not_granted"
 
 
+def test_opt_in_resolves_relative_registry_backlinks_without_granting_a_sibling(fixture):
+    task_id, db_path, target = _task_worktree(fixture)
+    git_dir = Path(_git(target, "rev-parse", "--absolute-git-dir"))
+    pointer = git_dir / "gitdir"
+    for backlink, allowed in ((target / ".git", True),
+                              (target.parent / "unrelated" / ".git", False)):
+        pointer.write_text(os.path.relpath(backlink, git_dir) + "\n", encoding="utf-8")
+        grant, refusal = _resolve(
+            fixture, _opt_in_section(fixture.repo, fixture.images),
+            workspace=str(target), task_id=task_id, db_path=db_path,
+        )
+        if allowed:
+            assert refusal is None and grant is not None
+            assert grant.workspace["path"] == str(target)
+            assert grant.git["git_dir"] == str(git_dir)
+        else:
+            assert grant is None and refusal == "workspace_not_granted"
+
+
 def test_claimed_legacy_review_card_still_has_the_review_role(fixture):
     """A claimed review reads ``running``; its lane is the recorded resume status."""
     from hermes_cli import kanban_db

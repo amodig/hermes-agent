@@ -442,7 +442,7 @@ def _worktree_registration_backlinks(common_dir: str, git_dir: str, workspace: s
     except (OSError, UnicodeDecodeError):
         return False
     wanted = os.path.normpath(os.path.join(workspace, ".git"))
-    return bool(recorded) and os.path.normpath(recorded) == wanted
+    return bool(recorded) and os.path.normpath(os.path.join(captured, recorded)) == wanted
 
 
 def _resolve_worktree_opt_in(

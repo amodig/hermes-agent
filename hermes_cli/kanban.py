@@ -1059,22 +1059,41 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             if confirmed != candidate_head:
                 from hermes_cli.kanban_db_dispatch import _record_task_failure
 
-                with kbc._dispatch_admission_lock(allow_nested=True) as admitted:
-                    current = kb.get_task(conn, task.id) if admitted else None
-                    if (current is not None
-                            and current.current_run_id == task.current_run_id
-                            and current.claim_lock == task.claim_lock):
-                        kbw.discard_prepared_worktree(
-                            pending, workspace, prepared_head, prepared_new=prepared_new)
-                        _record_task_failure(
-                            conn, task.id,
-                            f"candidate moved from {candidate_head} to {confirmed} during the claim",
-                            outcome="spawn_failed", release_claim=True, end_run=True,
-                            expected_run_id=task.current_run_id,
-                        )
+                deadline = time.monotonic() + 1.0
+                rolled_back = False
+                while True:
+                    with kbc._dispatch_admission_lock(allow_nested=True) as admitted:
+                        if admitted:
+                            current = kb.get_task(conn, task.id)
+                            if (current is not None
+                                    and current.current_run_id == task.current_run_id
+                                    and current.claim_lock == task.claim_lock):
+                                kbw.discard_prepared_worktree(
+                                    pending, workspace, prepared_head, prepared_new=prepared_new)
+                                _record_task_failure(
+                                    conn, task.id,
+                                    f"candidate moved from {candidate_head} to {confirmed} during the claim",
+                                    outcome="spawn_failed", release_claim=True, end_run=True,
+                                    expected_run_id=task.current_run_id,
+                                )
+                                current = kb.get_task(conn, task.id)
+                                rolled_back = (current is not None
+                                               and current.current_run_id is None
+                                               and current.claim_lock is None)
+                            break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return _err(
+                            f"kanban: candidate moved from {candidate_head} to {confirmed} while "
+                            f"{args.task_id} was claimed; the claim could not be rolled back and "
+                            f"remains open (run {task.current_run_id}): admission lock unavailable")
+                    time.sleep(min(0.05, remaining))
+                outcome = ("the claim was released" if rolled_back else
+                           f"the claim could not be rolled back (run {task.current_run_id}): "
+                           "claim ownership changed")
                 return _err(
                     f"kanban: candidate moved from {candidate_head} to {confirmed} while "
-                    f"{args.task_id} was claimed; the claim was released")
+                    f"{args.task_id} was claimed; {outcome}")
         kbw.set_workspace_path(
             conn, task.id, str(workspace),
             kind=resolved_kind if resolved_kind != (pending.workspace_kind or "scratch") else None,

@@ -1425,6 +1425,77 @@ def test_role_candidate_head_follows_the_bound_run_not_the_newest(
     assert newest == second          # the newest handoff is the rejected candidate
 
 
+def test_same_card_review_completes_with_the_rebound_implementation_head(
+    kanban_home, tmp_path,
+):
+    from hermes_cli.kanban_db_receipts import rebind_candidate
+    from hermes_cli.kanban_runtime import runtime_identity
+
+    receipt = runtime_identity(Path(__file__).resolve().parents[2]).as_dict()
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    first = _commit(repo, "app.py", "first\n")
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn, title="same-card candidate", assignee="coder",
+            workspace_kind="dir", workspace_path=str(repo),
+            lifecycle_contract={
+                "kind": "code", "review_mode": "same_card", "reviewer": "reviewer",
+                "validation_required": False,
+            },
+        )
+        first_run = kb.claim_task(conn, task_id, claimer=kb._claimer_id())
+        assert first_run is not None
+        assert kb.complete_task(
+            conn, task_id, expected_run_id=first_run.current_run_id, summary="first",
+            metadata={"base_sha": base, "head_sha": first, "changed_files": ["app.py"]},
+        )
+        review = kb.claim_review_task(conn, task_id, claimer=kb._claimer_id())
+        assert review is not None
+        # Start a second implementation without rejecting H1: opposite verdicts
+        # on the restored run would intentionally leave acceptance conflicted.
+        assert kb.block_task(
+            conn, task_id, expected_run_id=review.current_run_id,
+            reason="operator considering another candidate", kind="needs_input",
+        )
+        assert kb.promote_task(
+            conn, task_id, actor="operator", reason="try another implementation", force=True,
+        ) == (True, None)
+        second_run = kb.claim_task(conn, task_id, claimer=kb._claimer_id())
+        assert second_run is not None
+        second = _commit(repo, "app.py", "second\n")
+        assert kb.complete_task(
+            conn, task_id, expected_run_id=second_run.current_run_id, summary="second",
+            metadata={"base_sha": base, "head_sha": second, "changed_files": ["app.py"]},
+        )
+        with kb.write_txn(conn):
+            for run in (first_run, second_run):
+                kb._append_event(
+                    conn, task_id, "spawned", {"runtime_identity": receipt},
+                    run_id=run.current_run_id,
+                )
+        rebind_candidate(
+            conn, task_id, run_id=first_run.current_run_id, head_sha=first,
+            reason="restore earlier implementation", replace=True,
+            replaced_run=second_run.current_run_id,
+        )
+        _git(repo, "checkout", "--detach", first)
+        assert kb.latest_handoff(conn, task_id)["head_sha"] == second
+        review = kb.claim_review_task(conn, task_id, claimer=kb._claimer_id())
+        assert review is not None
+        assert kb.complete_task(
+            conn, task_id, expected_run_id=review.current_run_id, verdict="APPROVE",
+            summary="approve restored implementation", metadata={"head_sha": first},
+        )
+        evidence = json.loads(conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?", (review.current_run_id,),
+        ).fetchone()[0])["lifecycle"]
+        assert evidence["candidate_run_id"] == first_run.current_run_id
+        assert evidence["head_sha"] == first
+        assert kb.get_task(conn, task_id).status == "done"
+        assert kb.get_lifecycle_state(conn, task_id)["acceptance"] == "accepted"
+
+
 @pytest.mark.parametrize("flag", ["skip-worktree", "assume-unchanged"])
 def test_role_checkout_refuses_index_hidden_changes(kanban_home, tmp_path, flag):
     repo = _make_repo(tmp_path)
@@ -1493,6 +1564,68 @@ def test_cli_refusal_discards_only_new_worktrees(
     assert (repo / ".worktrees" / review).exists() is reused
     with kbc.connect() as conn:
         assert kb.get_task(conn, review).current_run_id is None
+
+
+@pytest.mark.parametrize("release_during_wait", [False, True])
+def test_cli_candidate_rollback_reports_an_open_run_when_admission_stays_locked(
+    kanban_home, tmp_path, monkeypatch, capsys, release_during_wait,
+):
+    from hermes_cli import kanban as kc
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "app.py", "candidate\n")
+    with kbc.connect_closing() as conn:
+        review = _ready_review_card(conn, repo, base, candidate)
+    claim = kb.claim_task
+    runs = []
+    waits = []
+    sleep = kc.time.sleep
+    lock_path = kb.kanban_home() / "kanban" / ".dispatch-admission.lock"
+    with lock_path.open("a+b") as holder:
+        def claim_then_contend(conn, task_id, **kwargs):
+            task = claim(conn, task_id, **kwargs)
+            assert task is not None
+            runs.append(task.current_run_id)
+            # Independent file-lock connection, not a nested owner in this thread.
+            assert kbc._try_lock_nb(holder)
+            return task
+
+        def wait_for_admission(delay):
+            waits.append(delay)
+            if release_during_wait:
+                kbc._unlock(holder)
+            sleep(delay)
+
+        monkeypatch.setattr(kb, "claim_task", claim_then_contend)
+        monkeypatch.setattr(kc.time, "sleep", wait_for_admission)
+        heads = iter((candidate, base))
+        monkeypatch.setattr(kbw, "candidate_head_for_task", lambda *args: next(heads))
+        try:
+            assert kc._cmd_claim(_claim_args(review)) != 0
+        finally:
+            kbc._unlock(holder)
+    assert waits
+    error = capsys.readouterr().err
+    path = repo / ".worktrees" / review
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, review)
+        run = conn.execute("SELECT * FROM task_runs WHERE id = ?", (runs[0],)).fetchone()
+        if release_during_wait:
+            assert "the claim was released" in error
+            assert task.current_run_id is None
+            assert run["outcome"] == "spawn_failed"
+            assert not path.exists()
+        else:
+            assert "claim could not be rolled back and remains open" in error
+            assert f"run {runs[0]}" in error
+            assert "the claim was released" not in error
+            assert task.status == run["status"] == "running"
+            assert task.current_run_id == runs[0]
+            assert task.worker_pid is None
+            assert task.consecutive_failures == 0
+            assert run["outcome"] is None
+            assert _head(path) == candidate
 
 
 @pytest.mark.parametrize("takeover", ["claim", "row"])
@@ -1841,3 +1974,46 @@ def test_worktree_creation_is_reported_at_the_reuse_decision(
     assert branch == ("" if target_kind == "role" else f"wt/{task_id}")
     assert created is False
     assert _head(target) == candidate
+
+
+@pytest.mark.parametrize("owner", ["other-live", "other-terminal", "own"])
+def test_role_preparation_preserves_another_boards_registered_checkout(
+    kanban_home, tmp_path, owner,
+):
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "app.py", "candidate\n")
+    with kbc.connect_closing() as conn:
+        review = _ready_review_card(conn, repo, base, candidate)
+        task = kb.get_task(conn, review)
+    target = repo / ".worktrees" / review
+    _git(repo, "worktree", "add", "--detach", str(target), base)
+    board = "default"
+    if owner != "own":
+        kb.create_board("other")
+        board = "other"
+        with kbc.connect_closing(board=board) as conn:
+            other = kb.create_task(
+                conn, title="other board's checkout", assignee="reviewer",
+                workspace_kind="worktree", workspace_path=str(target),
+            )
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET id = ? WHERE id = ?", (review, other))
+            assert kb.claim_task(conn, review, claimer="reviewer:other") is not None
+            if owner == "other-terminal":
+                assert kb.complete_task(conn, review, summary="finished")
+    else:
+        with kbc.connect_closing() as conn:
+            kbw.set_workspace_path(conn, review, str(target))
+
+    if owner == "other-live":
+        with pytest.raises(ValueError, match="candidate_workspace_unavailable.*checkout collision") as error:
+            kbw.resolve_workspace(task, board="default", candidate_head=candidate)
+        assert str(target) in str(error.value)
+        assert "another non-terminal task" in str(error.value)
+        assert _head(target) == base
+        with kbc.connect_closing(board="other") as conn:
+            assert kb.get_task(conn, review).status == "running"
+    else:
+        assert kbw.resolve_workspace(task, board="default", candidate_head=candidate) == target
+        assert _head(target) == candidate

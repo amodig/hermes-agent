@@ -92,9 +92,15 @@ For code-changing tasks, pick the review model encoded by the task graph:
 
 Both review models carry their structured handoff on the lifecycle transition itself. Do not place secrets, tokens, or raw PII in `summary` or `metadata`; run rows are durable.
 
-Review completion follows the **bound candidate run**, including an earlier attested
-run restored with `rebind-candidate --replace`; a newer rejected run does not change
-the head stamped into the verdict.
+Review completion preparation and verdict stamping both follow the **bound candidate
+run**, including an earlier attested run restored with `rebind-candidate --replace`;
+a newer rejected run does not replace the supplied or stamped review head.
+
+Role checkout preparation refuses `candidate_workspace_unavailable` if another
+non-terminal card, including the same task ID on another board, has registered the
+canonical checkout. It leaves that checkout's HEAD untouched; the owning card and
+terminal registrations do not block reuse. Repository `include_worktrees` grants
+accept Git's absolute and relative registry backlinks, but never a sibling's backlink.
 
 When granted, `kanban_worker_inspect` reports and pages the reviewed commit's bytes,
 not the checkout's line-ending normalization. Its source digest is the one
@@ -148,6 +154,9 @@ So lane authors don't have to reimplement these:
   run receives no failure counter, claim release, or event from the losing attempt.
   Worktree reuse is recorded where the resolver decides to reuse it: an existing
   operator-created checkout is never marked as attempt-created for rollback removal.
+  Rollback waits up to one second for admission. If the lock stays unavailable, it
+  preserves the checkout and reports that the claim remains open, with the run ID
+  for operator recovery; it never reports an unperformed release.
 - **Per-task max runtime** — `task.max_runtime_seconds` hard-caps wall-clock time per run, regardless of PID liveness. Catches genuinely-deadlocked workers that the live-PID extension would otherwise keep running.
 - **Stranded-task detection** — a ready task whose assignee never produces a claim within `kanban.stranded_threshold_seconds` (default 30 min) shows up in `hermes kanban diagnostics` as a `stranded_in_ready` warning. Severity escalates to error at 2x the threshold and critical at 6x. Catches typo'd assignees, deleted profiles, and down external worker pools in one signal — identity-agnostic, no per-board allowlist to curate.
 - **Running with open parents** — a `running` card whose direct parent is not `done`/`archived` (the parent reopened mid-run, or the link predates the running-child refusal) shows a `running_with_open_parents` warning: the dependency gate is not serialising the two runs and `kanban_complete` will be refused until the parent finishes. Read-only; suggests `hermes kanban unlink`.
