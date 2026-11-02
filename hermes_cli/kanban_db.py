@@ -4192,9 +4192,9 @@ def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str
 
 
 def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
-    """Done-parent handoffs: newest ``completed`` run's summary+metadata,
-    falling back to ``task.result`` for pre-runs-table data. Stamped with a
-    relative age so the worker re-verifies stale upstream results."""
+    """Done-parent handoffs from the bound candidate, or newest completed run
+    when unbound. Pre-runs-table data falls back to ``task.result``. Stamped
+    with a relative age so the worker re-verifies stale upstream results."""
     parent_rows = conn.execute(
         "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id", (task_id,),
     ).fetchall()
@@ -4203,9 +4203,12 @@ def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str
         pt = get_task(conn, pid)
         if not pt or pt.status != "done":
             continue
-        runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
-        runs.sort(key=lambda r: r.started_at, reverse=True)
-        run = runs[0] if runs else None
+        runs = list_runs(conn, pid)
+        if pt.candidate_run_id is not None:
+            run = next((r for r in runs if r.id == pt.candidate_run_id), None)
+        else:
+            run = max((r for r in runs if r.outcome == "completed"),
+                      key=lambda r: r.started_at, default=None)
         if not wrote_header:
             lines.append("## Parent task results")
             lines.append(
@@ -4228,7 +4231,7 @@ def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str
         meta_line = _ctx_metadata_line(run.metadata) if run is not None else None
         if meta_line:
             lines.append(meta_line)
-        handoff = latest_handoff(conn, pid)
+        handoff = bound_handoff(conn, pid)
         if handoff.get("head_sha"):
             lines.extend([
                 "Immutable handoff (review this exact commit, not the moving branch tip):",

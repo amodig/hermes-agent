@@ -626,50 +626,11 @@ def _scan_source(
         with SafeRoot(authority.workspace_path) as root:
             for name in sorted(accepted):
                 parts = name.split("/")
-                try:
-                    info = root.lstat(parts)
-                except FileNotFoundError:
-                    entries.append(SourceEntry(name, "deleted", False, 0, "deleted"))
-                    continue
-                except OSError as exc:
-                    raise WorkerExecutionRefused("source_unreadable", _bounded(exc))
-                # The worktree entry's ACTUAL type decides how it is hashed and copied;
-                # the index only selects the path. A tracked symlink replaced by a file
-                # (or the reverse) is therefore represented, never silently dropped.
-                if stat.S_ISLNK(info.st_mode):
-                    target = root.readlink(parts)
-                    parent = "/".join(parts[:-1])
-                    joined = posixpath.normpath(posixpath.join(parent, target)) if parent else posixpath.normpath(target)
-                    normalized = joined.replace(os.sep, "/")
-                    if (
-                        os.path.isabs(target) or "\x00" in target
-                        or normalized in ("", ".", "..") or normalized.startswith("../")
-                    ):
-                        raise WorkerExecutionRefused("unsafe_symlink", "the granted source set contains an escaping symlink")
-                    if normalized not in accepted:
-                        raise WorkerExecutionRefused("unsafe_symlink", "the granted source set contains an unaccepted symlink target")
-                    if normalized == name:
-                        raise WorkerExecutionRefused("unsafe_symlink", "the granted source set contains a symlink cycle")
-                    # The digest binds the exact link text that is copied; normalization
-                    # is only for containment and graph validation.
-                    digest = "sha256:" + sha256_hex(target.encode("utf-8", "surrogateescape"))
-                    link_targets[name] = (target, normalized)
-                    entries.append(SourceEntry(name, "link", False, len(target), digest))
-                    if materialize is not None:
-                        target_path = materialize / name
-                        target_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                        os.symlink(target, target_path)
-                    continue
-                if not stat.S_ISREG(info.st_mode):
-                    raise WorkerExecutionRefused("unsupported_source_type", "the granted source set contains a non-regular entry")
-                if int(info.st_nlink) != 1:
-                    raise WorkerExecutionRefused("hardlinked_source", "the granted source set contains a hard-linked file")
+                target = None
                 if from_commit and name in tracked:
-                    # The copy IS the reviewed commit: read the blob the index names
-                    # rather than the working tree, so no interleaving between the
-                    # cleanliness proof and this copy can substitute other bytes.
-                    # A granted extra file is not in the commit — it falls through to the
-                    # working-tree branch, where its digest binds the bytes copied.
+                    # The frozen index names the reviewed commit's type and bytes.
+                    # Worktree deletion or replacement after the cleanliness proof
+                    # must not change the copy. Granted extras still use the worktree.
                     entry_mode, oid = tracked[name]
                     size_result = git.run(["cat-file", "-s", oid])
                     if size_result.returncode != 0:
@@ -695,17 +656,58 @@ def _scan_source(
                         raise WorkerExecutionRefused(
                             "source_too_large", "the granted source set exceeds the byte bound")
                     total_bytes += len(data)
+                    if entry_mode == "120000":
+                        target = data.decode("utf-8", "surrogateescape")
+                    else:
+                        if materialize is not None:
+                            target_path = materialize / name
+                            target_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                            with open(target_path, "xb") as written_commit:
+                                written_commit.write(data)
+                            with contextlib.suppress(OSError):
+                                os.chmod(target_path, 0o755 if entry_mode == "100755" else 0o644)
+                        entries.append(SourceEntry(
+                            name, "file", entry_mode == "100755", len(data),
+                            "sha256:" + sha256_hex(data),
+                        ))
+                        continue
+                else:
+                    try:
+                        info = root.lstat(parts)
+                    except FileNotFoundError:
+                        entries.append(SourceEntry(name, "deleted", False, 0, "deleted"))
+                        continue
+                    except OSError as exc:
+                        raise WorkerExecutionRefused("source_unreadable", _bounded(exc))
+                    # Outside commit mode the actual worktree type is authoritative.
+                    if stat.S_ISLNK(info.st_mode):
+                        target = root.readlink(parts)
+                    elif not stat.S_ISREG(info.st_mode):
+                        raise WorkerExecutionRefused("unsupported_source_type", "the granted source set contains a non-regular entry")
+                    elif int(info.st_nlink) != 1:
+                        raise WorkerExecutionRefused("hardlinked_source", "the granted source set contains a hard-linked file")
+                if target is not None:
+                    parent = "/".join(parts[:-1])
+                    joined = posixpath.normpath(posixpath.join(parent, target)) if parent else posixpath.normpath(target)
+                    normalized = joined.replace(os.sep, "/")
+                    if (
+                        os.path.isabs(target) or "\x00" in target
+                        or normalized in ("", ".", "..") or normalized.startswith("../")
+                    ):
+                        raise WorkerExecutionRefused("unsafe_symlink", "the granted source set contains an escaping symlink")
+                    if normalized not in accepted:
+                        raise WorkerExecutionRefused("unsafe_symlink", "the granted source set contains an unaccepted symlink target")
+                    if normalized == name:
+                        raise WorkerExecutionRefused("unsafe_symlink", "the granted source set contains a symlink cycle")
+                    # The digest binds the exact link text that is copied; normalization
+                    # is only for containment and graph validation.
+                    digest = "sha256:" + sha256_hex(target.encode("utf-8", "surrogateescape"))
+                    link_targets[name] = (target, normalized)
+                    entries.append(SourceEntry(name, "link", False, len(target), digest))
                     if materialize is not None:
                         target_path = materialize / name
                         target_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                        with open(target_path, "xb") as written_commit:
-                            written_commit.write(data)
-                        with contextlib.suppress(OSError):
-                            os.chmod(target_path, 0o755 if entry_mode == "100755" else 0o644)
-                    entries.append(SourceEntry(
-                        name, "file", entry_mode == "100755", len(data),
-                        "sha256:" + sha256_hex(data),
-                    ))
+                        os.symlink(target, target_path)
                     continue
                 try:
                     fd = root.open_file(parts)

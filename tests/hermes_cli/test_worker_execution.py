@@ -489,14 +489,15 @@ def test_validation_card_resolves_review_role(fixture):
     assert pair == {"base": fixture.base, "head": fixture.head}
 
 
-def test_symlink_cycle_is_refused(fixture):
+@pytest.mark.parametrize("from_commit", [False, True])
+def test_symlink_cycle_is_refused(fixture, from_commit):
     os.symlink("b.py", fixture.repo / "a.py")
     os.symlink("a.py", fixture.repo / "b.py")
     _git(fixture.repo, "add", "a.py", "b.py")
     _git(fixture.repo, "commit", "-qm", "cycle")
     authority = _authority(fixture)
     with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
-        wes._scan_source(authority)
+        wes._scan_source(authority, from_commit=from_commit)
     assert excinfo.value.code == "unsafe_symlink"
 
 
@@ -1173,6 +1174,52 @@ def test_review_materialization_preserves_each_committed_file_mode(fixture, monk
     assert (source / "a.sh").stat().st_mode & 0o777 == 0o755
     assert (source / "z.txt").stat().st_mode & 0o777 == 0o644
     assert (source / "a.sh").read_bytes() == script.read_bytes()
+
+
+@pytest.mark.parametrize("replacement", ["deleted", "symlink", "directory"])
+def test_review_materialization_ignores_worktree_deletion_and_type_changes(
+    fixture, monkeypatch, replacement,
+):
+    committed = b"print('reviewed commit')\n"
+    path = fixture.repo / "gone.py"
+    path.write_bytes(committed)
+    path.chmod(0o755)
+    link = fixture.repo / "docs" / "link"
+    link.symlink_to("../gone.py")
+    _git(fixture.repo, "add", "-A")
+    _git(fixture.repo, "commit", "-qm", "reviewed files and link")
+    head = _git(fixture.repo, "rev-parse", "HEAD")
+    monkeypatch.setattr(
+        wep, "resolve_review_context",
+        lambda *_a, **_k: ("review", {"base": fixture.base, "head": head}))
+    (fixture.repo / "extra.txt").write_bytes(b"granted extra\n")
+    authority = _authority(fixture, extras=["extra.txt"])
+    expected = wes._scan_source(authority)
+    tracked = wes._git_tracked
+
+    def replace_after_cleanliness_proof(git):
+        entries = tracked(git)
+        path.unlink()
+        if replacement == "symlink":
+            path.symlink_to("app.py")
+        elif replacement == "directory":
+            path.mkdir()
+        link.unlink()
+        link.write_bytes(b"not the committed link\n")
+        return entries
+
+    monkeypatch.setattr(wes, "_git_tracked", replace_after_cleanliness_proof)
+    run_root = fixture.root / "replaced-run"
+    run_root.mkdir()
+    snapshot, source = wes._materialize_source(authority, run_root)
+
+    assert snapshot.source_digest == expected.source_digest
+    assert snapshot.entry("gone.py") == expected.entry("gone.py")
+    assert not (source / "gone.py").is_symlink()
+    assert (source / "gone.py").read_bytes() == committed
+    assert (source / "gone.py").stat().st_mode & 0o777 == 0o755
+    assert (source / "docs" / "link").readlink() == Path("../gone.py")
+    assert (source / "extra.txt").read_bytes() == b"granted extra\n"
 
 
 def test_implementation_materialization_preserves_working_tree_edits(fixture):

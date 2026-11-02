@@ -1388,12 +1388,18 @@ def test_role_candidate_head_follows_the_bound_run_not_the_newest(
             conn, implementation, run_id=run_a_id, head_sha=first,
             reason="restore earlier candidate", replace=True, replaced_run=run_b.current_run_id)
         review = _role_card(conn, "review", implementation, repo, "reviewer")
+        kb.link_tasks(conn, implementation, review, requirement="phase_finished")
         task = kb.get_task(conn, review)
         state = kb.get_lifecycle_state(conn, review)
         assert state["candidate_run_id"] == run_a_id
         assert state["head_sha"] == first
         bound = kbw.candidate_head_for_task(conn, task)
         newest = kb.latest_handoff(conn, implementation)["head_sha"]
+        context = kb.build_worker_context(conn, review)
+        assert f"- Head: `{first}`" in context
+        assert "first attempt" in context
+        assert second not in context
+        assert "second attempt" not in context
 
     assert bound == first
     assert newest == second          # the newest handoff is the rejected candidate
