@@ -1536,7 +1536,8 @@ def _handle_unblock(args: dict, **kw) -> str:
                 conn, tid, expected_version=expected_version,
                 reason=reason, author=_persisted_identity() if reason else None,
             ),
-            (f"could not unblock {tid}: stale version, changed state, or active claim"
+            (f"could not unblock {tid}: stale version, changed state, or active claim; "
+             "refresh with kanban_show before retrying"
              if fenced else f"could not unblock {tid} (not blocked or unknown)"),
         )
         return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)))

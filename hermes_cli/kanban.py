@@ -1488,7 +1488,8 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             op = _commented(conn, reason, author, "UNBLOCK", op)
         failure = (
             "cannot unblock {} (not blocked/scheduled?)" if expected_version is None
-            else "cannot unblock {}: stale version, changed state, or active claim"
+            else "cannot unblock {}: stale version, changed state, or active claim; "
+                 "refresh with kanban show before retrying"
         )
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
                            lambda tid: failure.format(tid))

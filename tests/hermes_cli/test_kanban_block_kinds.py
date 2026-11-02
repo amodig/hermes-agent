@@ -347,6 +347,36 @@ def test_fenced_unblock_refuses_a_stale_version_without_any_write(kanban_home: P
         assert _snapshot(conn, tid) == before
 
 
+def test_fenced_unblock_cannot_release_a_newer_human_gate(
+    kanban_home: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+        initial_version = kb.get_task(conn, tid).version
+        goal = kb.get_effective_goal(conn, tid)
+        assert kb.block_task(conn, tid, kind="capability", reason="missing capability")
+        version = kb.get_task(conn, tid).version
+        assert version == initial_version + 1
+        assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).version == version + 1
+        assert kb.block_task(conn, tid, kind="needs_input", reason="fresh human decision")
+        parked = kb.get_task(conn, tid)
+        assert parked.version == version + 2
+        before = _snapshot(conn, tid)
+
+        args = argparse.Namespace(
+            task_ids=[tid], expected_version=version, reason="capability repaired",
+        )
+        assert kanban_cli._cmd_unblock(args) == 1
+        assert "refresh with kanban show" in capsys.readouterr().err
+        assert _snapshot(conn, tid) == before
+        current = kb.get_task(conn, tid)
+        assert (current.status, current.block_kind, current.block_recurrences) == (
+            "blocked", "needs_input", 1,
+        )
+        assert kb.get_effective_goal(conn, tid) == goal
+
+
 def test_fenced_unblock_refuses_an_active_claim_before_reclaiming(kanban_home: Path) -> None:
     with kbc.connect_closing() as conn:
         tid = _blocked_task(conn)
@@ -414,15 +444,14 @@ def test_fenced_unblock_preserves_resume_gating_and_phase(kanban_home: Path) -> 
         assert (resumed.status, resumed.version) == ("todo", parked.version + 1)
 
 
-def test_unfenced_unblock_keeps_its_old_behaviour(kanban_home: Path) -> None:
+def test_unfenced_unblock_advances_version_without_audit_comment(kanban_home: Path) -> None:
     with kbc.connect_closing() as conn:
         tid = _blocked_task(conn)
         version = kb.get_task(conn, tid).version
         assert kb.unblock_task(conn, tid)
         task = kb.get_task(conn, tid)
         assert task.status == "ready"
-        # No fence, no version bump and no comment: the existing contract is untouched.
-        assert task.version == version
+        assert task.version == version + 1
         assert not [c for c in kb.list_comments(conn, tid) if c.body.startswith("UNBLOCK:")]
 
 

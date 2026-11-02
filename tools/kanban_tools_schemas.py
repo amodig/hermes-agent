@@ -117,7 +117,7 @@ KANBAN_SHOW_SCHEMA = _schema(
         },
         "offset": {
             "type": "integer", "minimum": 0, "default": 0,
-            "description": "Unicode-codepoint offset in strings, entry offset in objects/arrays; positive requires snapshot.",
+            "description": "Raw stored Unicode-codepoint offset in strings, entry offset in objects/arrays; positive requires snapshot. Secret boundaries can move the reported string start backwards.",
         },
         "limit": {
             "type": "integer", "minimum": 1, "maximum": 200, "default": 20,
@@ -125,7 +125,7 @@ KANBAN_SHOW_SCHEMA = _schema(
         },
         "chars": {
             "type": "integer", "minimum": 1, "maximum": 8192, "default": 4096,
-            "description": "Maximum string codepoints per chunk; envelope escaping may reduce it.",
+            "description": "Requested raw string codepoints per chunk; whole-secret boundaries may expand the slice, while the JSON envelope bound may reduce it. Follow next_offset, not rendered text length.",
         },
         "snapshot": {
             "type": "string",

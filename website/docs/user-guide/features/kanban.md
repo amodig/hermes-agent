@@ -543,6 +543,20 @@ Dispatcher-owned workers receive their task lifecycle tools automatically.
 | `kanban_archive` | (Orchestrators) retire a detached invalid card without falsely completing it. | `board`, `task_id`, `expected_version`, `reason` |
 | `kanban_requeue_handoff` | (Orchestrators) recover a pre-enforcement completion lacking immutable `head_sha`. | `board`, `task_id`, `expected_version`, `reason`, historical evidence as needed |
 
+For operator recovery, pass the observed `expected_version` to `kanban_unblock`
+(CLI: `unblock ID --expected-version V`) and an audit reason. Every successful
+block, in-place block classification, and unblock advances the task version,
+including ordinary unfenced unblocks. An old fence cannot release a newer human
+gate: refresh with `kanban_show`/`kanban show` after a refusal. These increments
+do not revise the effective goal or reset the independent block-recurrence counter.
+
+Bounded `kanban_show` string pages use raw stored character positions for
+`offset`, `next_offset`, and `total_chars`, not the length of the redacted output.
+Slices expand across whole secrets before redaction; a newly registered secret
+can move a page's reported start backwards, but never skips subsequent evidence.
+Use the returned continuation, not the rendered text length, for the next page.
+The complete JSON response remains bounded to 32 KiB.
+
 A typical worker turn looks like:
 
 ```

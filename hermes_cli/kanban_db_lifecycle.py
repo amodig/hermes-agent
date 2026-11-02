@@ -710,8 +710,9 @@ def unblock_task(
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first.
 
-    ``expected_version`` fences the transition for operator recovery: a stale
-    version, a non-blocked card, or any surviving claim/run/pid refuses before a
+    Every unblock advances the task version, as does blocking, so an intervening
+    episode invalidates ``expected_version``. A stale version, a non-blocked
+    card, or any surviving claim/run/pid refuses before a
     single write instead of reclaiming ownership this call cannot prove. Only a
     fenced call records its audit ``UNBLOCK: <reason>`` comment, and only after the
     version-fenced update has actually landed — a refusal leaves rows, events,
@@ -759,12 +760,9 @@ def unblock_task(
         # is a fresh start for the retry budget.
         statement = (
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL"
+            "consecutive_failures = 0, last_failure_error = NULL, version = version + 1"
         )
         params: list[Any] = [new_status]
-        if expected_version is not None:
-            # Incremented exactly once, and only for the version that was checked.
-            statement += ", version = version + 1"
         statement += " WHERE id = ? AND status IN ('blocked', 'scheduled')"
         params.append(task_id)
         if expected_version is not None:

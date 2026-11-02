@@ -232,15 +232,16 @@ def _reconstruct_evidence(page):
         return page["value"]
     if "chunk" in page:
         pieces = []
-        start = page["chunk"]["offset"]
+        cursor = page["chunk"]["offset"]
         while True:
             chunk = page["chunk"]
-            assert chunk["offset"] == start + sum(map(len, pieces))
+            assert chunk["offset"] == cursor
             pieces.append(chunk["text"])
             if chunk["next_offset"] is None:
-                assert start + sum(map(len, pieces)) == chunk["total_chars"]
+                assert page["complete"] and chunk["total_chars"] >= cursor
                 return "".join(pieces)
             assert chunk["next_offset"] > chunk["offset"]
+            cursor = chunk["next_offset"]
             page = _continue_evidence(page["continuation"])
     entries = []
     total = page["total_entries"]
@@ -331,6 +332,72 @@ def test_bounded_show_reconstructs_large_evidence(evidence_board, monkeypatch, c
     with capsys.disabled():
         print(f"\nbounded evidence: {len(body)} body codepoints; {len(events)} history events; "
               f"{len(sizes)} pages; maximum envelope {max(sizes)} UTF-8 bytes")
+
+
+@pytest.mark.parametrize("register_before,chars", [(False, 5000), (True, 4500), (False, 4500)])
+def test_bounded_show_uses_raw_offsets_across_vault_registration(evidence_board, register_before, chars):
+    from agent.redact import register_vault_redaction_value, clear_vault_redaction_values
+
+    kb, conn, _ = evidence_board
+    password = "p4ssword!?" * 100
+    body = "A" * 4000 + password + " NEVER DEPLOY " + "B" * 8000
+    tid = kb.create_task(conn, title="raw cursor", body=body)
+    try:
+        if register_before:
+            register_vault_redaction_value(password)
+        token = _evidence({"task_id": tid, "section": "task"})["snapshot"]
+        first = _evidence({
+            "task_id": tid, "section": "task", "snapshot": token,
+            "pointer": "/body", "chars": chars,
+        })
+        assert first["chunk"]["total_chars"] == len(body)
+        assert first["chunk"]["next_offset"] == (5000 if register_before else chars)
+        if register_before:
+            assert first["chunk"]["text"] == "A" * 4000 + "«redacted-vault-secret»"
+        else:
+            register_vault_redaction_value(password)
+        second = _continue_evidence(first["continuation"])
+        assert " NEVER DEPLOY " in second["chunk"]["text"]
+        assert second["chunk"]["total_chars"] == len(body)
+        assert "p4ssword" not in second["chunk"]["text"]
+        if chars == 4500 and not register_before:
+            # A registry change may put an old cursor inside a newly known secret.
+            assert second["chunk"]["offset"] == 4000
+            assert second["chunk"]["text"].startswith("«redacted-vault-secret» NEVER DEPLOY ")
+            assert second["chunk"]["next_offset"] == chars + 8192
+        else:
+            assert second["complete"]
+            assert second["chunk"]["next_offset"] is None
+            assert second["chunk"]["text"] == " NEVER DEPLOY " + "B" * 8000
+    finally:
+        clear_vault_redaction_values()
+
+
+@pytest.mark.parametrize("kind", ["pem", "json"])
+def test_bounded_show_expands_unbounded_multiline_redaction(evidence_board, kind):
+    kb, conn, _ = evidence_board
+    secret = ("opaque-CREDENTIAL-material\n" * 3000)
+    sensitive = (
+        "-----" + "BEGIN PRIVATE KEY-----\n" + secret + "-----" + "END PRIVATE KEY-----"
+        if kind == "pem" else '"password": "' + secret + '"'
+    )
+    prefix = "A" * 4000 + "\n"
+    suffix = " NEVER DEPLOY " + "B" * 8000
+    body = prefix + sensitive + suffix
+    tid = kb.create_task(conn, title="unbounded secret", body=body)
+    token = _evidence({"task_id": tid, "section": "task"})["snapshot"]
+    first = _evidence({
+        "task_id": tid, "section": "task", "snapshot": token,
+        "pointer": "/body", "chars": 4500,
+    })
+    assert first["chunk"]["text"] == kb.redact_review_value(prefix + sensitive)
+    assert first["chunk"]["next_offset"] == len(prefix + sensitive)
+    assert first["chunk"]["total_chars"] == len(body)
+    assert not first["complete"]
+    second = _continue_evidence(first["continuation"])
+    assert second["chunk"]["text"] == suffix
+    assert second["chunk"]["offset"] == len(prefix + sensitive)
+    assert second["complete"]
 
 
 @pytest.mark.parametrize("extra,code", [
@@ -569,7 +636,7 @@ def test_bounded_show_refuses_damaged_evidence(evidence_board, column, value):
                      ok=False)["code"] == "evidence_unavailable"
 
 
-def test_bounded_show_redacts_complete_values_before_chunking(evidence_board):
+def test_bounded_show_expands_raw_slice_before_redacting(evidence_board):
     kb, conn, tid = evidence_board
     secret = "sk-" + "aB3x" * 12
     prefix = ("public restriction " * 500)[:8179] + " api_key="
@@ -580,6 +647,8 @@ def test_bounded_show_redacts_complete_values_before_chunking(evidence_board):
     token = _evidence({"task_id": tid, "section": "task"})["snapshot"]
     page = _evidence({"task_id": tid, "section": "task", "pointer": "/body",
                       "snapshot": token, "chars": 8192})
+    assert page["chunk"]["next_offset"] == len(prefix + secret)
+    assert page["chunk"]["total_chars"] == len(body)
     result = _reconstruct_evidence(page)
     assert result == kb.redact_review_value(body)
     assert secret not in result and result.endswith(" no production writes")
@@ -2640,8 +2709,7 @@ def test_orchestrator_fenced_unblock_requires_the_current_version(monkeypatch, t
     final = kbc.connect()
     try:
         assert kb.get_task(final, tid).version == version + 1
-        # The ordinary unfenced call is untouched by the fence (fresh card, so the
-        # block-loop breaker cannot route it out of the blocked bucket).
+        # Ordinary unblocks also advance the fence, without adding an audit comment.
         other = kb.create_task(final, title="plain unblock", assignee="worker")
         with kb.write_txn(final):
             final.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (other,))
@@ -2653,7 +2721,7 @@ def test_orchestrator_fenced_unblock_requires_the_current_version(monkeypatch, t
     assert plain.get("ok") is True, plain
     check = kbc.connect()
     try:
-        assert kb.get_task(check, other).version == plain_version
+        assert kb.get_task(check, other).version == plain_version + 1
     finally:
         check.close()
 

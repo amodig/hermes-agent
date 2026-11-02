@@ -204,7 +204,6 @@ def _pointer(parent, key):
 
 def _node(base, value, *, item, pointer, parts, offset, limit, chars):
     _depth(value)
-    value = kb.redact_review_value(value)
     for part in parts:
         if isinstance(value, dict):
             _require(part in value, "invalid_pointer")
@@ -218,21 +217,26 @@ def _node(base, value, *, item, pointer, parts, offset, limit, chars):
         else:
             raise _Unavailable("invalid_pointer")
     if isinstance(value, str):
+        from agent.redact import redaction_safe_bounds
+
         _require(offset <= len(value))
 
         def chunk(length):
-            end = offset + length
+            start, end = redaction_safe_bounds(value, offset, offset + length)
             # ``complete`` says in the result whether this value is fully delivered:
             # an unfinished read must never look finished to the caller.
             result = {**base, "complete": end >= len(value),
-                      "chunk": {"pointer": pointer, "offset": offset,
-                      "text": value[offset:end], "total_chars": len(value),
+                      "chunk": {"pointer": pointer, "offset": start,
+                      "text": kb.redact_review_value(value[start:end]), "total_chars": len(value),
                       "next_offset": end if end < len(value) else None}}
             if end < len(value):
                 result["continuation"] = _continuation(base, item=item, pointer=pointer, offset=end)
             return result
 
         low, high = 0, min(chars, len(value) - offset)
+        result = chunk(high)
+        if _fits(result):
+            return result
         while low < high:
             middle = (low + high + 1) // 2
             if _fits(chunk(middle)):
@@ -242,6 +246,7 @@ def _node(base, value, *, item, pointer, parts, offset, limit, chars):
         result = chunk(low)
         _require(_fits(result) and (low > 0 or offset == len(value)), "evidence_unavailable")
         return result
+    value = kb.redact_review_value(value)
     if not isinstance(value, (dict, list)):
         _require(offset == 0)
         result = {**base, "complete": True, "value": value}

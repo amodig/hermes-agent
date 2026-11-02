@@ -3501,7 +3501,7 @@ def block_task(
             if normalized_kind is None or expected_run_id is not None or _row_get(cur_row, "block_kind") is not None:
                 return False
             classified = conn.execute(
-                "UPDATE tasks SET block_kind = ?, block_recurrences = 1 "
+                "UPDATE tasks SET block_kind = ?, block_recurrences = 1, version = version + 1 "
                 "WHERE id = ? AND status = 'blocked' AND block_kind IS NULL "
                 "AND current_run_id IS NULL",
                 (normalized_kind, task_id),
@@ -3545,6 +3545,7 @@ def block_task(
         sql = f"""
                 UPDATE tasks
                    SET status        = '{new_status}',
+                       version       = version + 1,
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,

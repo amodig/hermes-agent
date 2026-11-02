@@ -17,6 +17,17 @@ from agent.file_safety import _BLOCKED_PROJECT_ENV_BASENAMES as _ENV_FILE_BASENA
 
 logger = logging.getLogger(__name__)
 
+# Register the actual compiled matchers at their definitions, not a second
+# pattern list. Only the opt-in raw-slice boundary helper consumes this index.
+_SLICE_PATTERNS = []
+
+
+def _slice_pattern(pattern, flags=0, *, gate=None):
+    compiled = re.compile(pattern, flags)
+    _SLICE_PATTERNS.append((compiled, gate))
+    return compiled
+
+
 # ---------------------------------------------------------------------------
 # Vault-value redaction registry (profile-scoped, bounded)
 # ---------------------------------------------------------------------------
@@ -218,13 +229,13 @@ _PREFIX_PATTERNS = [
 # ``token=``, ``KEYBOARD=``, ``PASSAGE=``) do not match — those are handled by the config/form/URL paths,
 # and a bare ``password=…`` in a form body must not be swallowed greedily by ``\S+``. See #77484.
 _SECRET_ENV_NAMES = r"(?:API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|PW|CREDENTIAL|AUTH)"
-_ENV_ASSIGN_RE = re.compile(rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(['\"]?)(\S+)\2")
+_ENV_ASSIGN_RE = _slice_pattern(rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(['\"]?)(\S+)\2")
 # Lowercase env names: only underscore-boundary forms (``openai_key=``) — NOT
 # bare ``password=``/``token=``, which appear in prose, URLs, and form bodies.
 # The lookbehind anchors each attempt to the start of an identifier run; without
 # it re.sub retries the greedy prefix at every byte of a long opaque payload.
 # See #77484.
-_ENV_ASSIGN_LOWER_RE = re.compile(
+_ENV_ASSIGN_LOWER_RE = _slice_pattern(
     rf"(?<![a-z0-9_])([a-z0-9_]+(?:_|^)(?:key|pass|pw|token|secret|password|passwd|credential|auth)(?=[^a-z0-9_]|$))\s*=\s*(['\"]?)(\S+)\2",
     re.IGNORECASE,
 )
@@ -260,19 +271,19 @@ _ENV_LOOKUP_VALUE_RE = re.compile(r"^(?:os\.(?:getenv|environ)|process\.env|\$EN
 # exponentially); the ``*`` runs bordering {_SECRET_CFG_NAMES} must stay
 # backtrackable (``app.api.key=``). The lookbehind anchors each attempt to a key
 # run start so re.sub is not quadratic; the match set is unchanged.
-_CFG_DOTTED_RE = re.compile(
+_CFG_DOTTED_RE = _slice_pattern(
     rf"(?<![A-Za-z0-9_.\-])"
     rf"([A-Za-z0-9_\-]++\.[A-Za-z0-9_.\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_.\-]*+"
     rf"|[A-Za-z0-9_.\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_.\-]*\.[A-Za-z0-9_.\-]++)"
     rf"={_CFG_VALUE}",
-    re.IGNORECASE,
+    re.IGNORECASE, gate=_CFG_SECRET_WORD_RE.search,
 )
 # Line-anchored bare key: ``password=…`` / ``export api_key=…`` at start of line.
 # ``{_LINE_NUMBER_GUTTER}``: line-numbered dumps put the key behind a rendered gutter —
 # ``read_file`` emits ``5|      ADS_API_TOKEN: …``, ``grep -n`` emits ``6:      ADS_API_TOKEN: …``
 # and ``cat -n`` emits ``     7\tADS_API_TOKEN: …``. Anchored at ``^`` without it, none of those
 # matched, so the rendered read of a secret-bearing file leaked what the raw text masked.
-_CFG_ANCHORED_RE = re.compile(
+_CFG_ANCHORED_RE = _slice_pattern(
     rf"(^[ \t]*{_LINE_NUMBER_GUTTER}(?:export[ \t]+)?[A-Za-z0-9_\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_\-]*)={_CFG_VALUE}",
     re.IGNORECASE | re.MULTILINE,
 )
@@ -285,7 +296,7 @@ _CFG_ANCHORED_RE = re.compile(
 # NOTE(perf): possessive where the successor is disjoint; the leading class
 # stays backtrackable (see _CFG_DOTTED_RE).
 _YAML_CFG_NAMES = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential)"
-_YAML_ASSIGN_RE = re.compile(
+_YAML_ASSIGN_RE = _slice_pattern(
     rf"(^[ \t]*+{_LINE_NUMBER_GUTTER}[A-Za-z0-9_.\-]*{_YAML_CFG_NAMES}[A-Za-z0-9_.\-]*+)(:[ \t]*+)(?!['\"])([^\s&]++)",
     re.IGNORECASE | re.MULTILINE,
 )
@@ -421,7 +432,7 @@ def _should_redact_assignment(key: str, value: str, *, check_keyword: bool) -> b
 
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
 _JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
-_JSON_FIELD_RE = re.compile(rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"', re.IGNORECASE)
+_JSON_FIELD_RE = _slice_pattern(rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"', re.IGNORECASE)
 
 # Python ``repr`` uses single-quoted mapping fields, so opaque credentials in
 # tracebacks and pytest failure introspection bypass the double-quoted JSON rule
@@ -472,7 +483,7 @@ _PYTHON_REPR_CREDENTIAL_SUFFIXES = (
     "credential",
     "credentials",
 )
-_PYTHON_REPR_FIELD_RE = re.compile(
+_PYTHON_REPR_FIELD_RE = _slice_pattern(
     r"'(?P<key>[A-Za-z_][A-Za-z0-9_]*)'(?P<sep>\s*:\s*)"
     r"(?:"
     r"(?P<single_prefix>[bB]?)'(?P<single_value>(?:\\.|[^'\\])+)'"
@@ -493,22 +504,22 @@ _PYTHON_EXCEPTION_LINE_RE = re.compile(
 # name and scheme word preserved. The credential class excludes quotes: pulling
 # a closing quote into the mask turns value corruption into SYNTAX corruption
 # (unterminated quote → shell EOF / SyntaxError).
-_AUTH_HEADER_RE = re.compile(r"((?:Proxy-)?Authorization:\s*)([A-Za-z][\w.+-]*\s+)?([^\s\"']+)", re.IGNORECASE)
+_AUTH_HEADER_RE = _slice_pattern(r"((?:Proxy-)?Authorization:\s*)([A-Za-z][\w.+-]*\s+)?([^\s\"']+)", re.IGNORECASE)
 
 # API-key style headers (single opaque value, no scheme word): non-vendor-prefix
 # values would otherwise leak when a curl command is echoed into tool output.
 SECRET_HEADER_NAME_LIST = ("x-api-key", "x-goog-api-key", "api-key", "apikey", "x-api-token", "x-auth-token", "x-access-token")
 _SECRET_HEADER_NAMES = rf"(?:{'|'.join(SECRET_HEADER_NAME_LIST)})"
-_SECRET_HEADER_RE = re.compile(rf"({_SECRET_HEADER_NAMES}\s*:\s*)(\S+)", re.IGNORECASE)
+_SECRET_HEADER_RE = _slice_pattern(rf"({_SECRET_HEADER_NAMES}\s*:\s*)(\S+)", re.IGNORECASE)
 
 # Telegram bot tokens: [bot]<digits>:<token>, token >= 30 chars. The lookbehind
 # anchors the id at the start of its digit run: without it, a long run of digits
 # with no ":<token>" after it (a Unity/YAML ``_typelessdata`` blob in a 2 MB PR
 # diff, hex/decimal dumps) retried the greedy ``\d{8,}`` from every digit —
 # quadratic, one core at 100% for hours while holding the GIL.
-_TELEGRAM_RE = re.compile(r"(?<!\d)(bot)?(\d{8,}):([-A-Za-z0-9_]{30,})")
+_TELEGRAM_RE = _slice_pattern(r"(?<!\d)(bot)?(\d{8,}):([-A-Za-z0-9_]{30,})")
 
-_PRIVATE_KEY_RE = re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----")
+_PRIVATE_KEY_RE = _slice_pattern(r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----")
 
 # Database connection strings: protocol://user:PASSWORD@host. The userinfo and
 # password groups forbid whitespace so a match can never span a line break (a
@@ -518,7 +529,7 @@ _PRIVATE_KEY_RE = re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END
 # greedy [^@]+ would scan past the end of a code line to the next stray "@" (e.g. a Python decorator),
 # swallowing intervening lines and corrupting tool OUTPUT for any source containing a postgresql:// f-string
 # template. See issue #33801.
-_DB_CONNSTR_RE = re.compile(
+_DB_CONNSTR_RE = _slice_pattern(
     r"((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^:\s]+:)([^@\s]+)(@)",
     re.IGNORECASE,
 )
@@ -534,7 +545,7 @@ _DB_CONNSTR_RE = re.compile(
 # ``user:pass@`` is deliberately left to pass through (commit "pass web URLs through unchanged", #34029) and
 # is NOT matched here — the token class forbids ``:``. DB schemes are handled by _DB_CONNSTR_RE above and
 # excluded here. Guards against false positives:
-_URL_BARE_TOKEN_RE = re.compile(
+_URL_BARE_TOKEN_RE = _slice_pattern(
     r"((?:https?|wss?|git|ssh|ftp|ftps|sftp)://)"  # scheme
     r"([^\s:@/]{8,})"                               # bare token (no colon/slash/@), 8+ chars
     r"(@[^\s]+)",                                   # @host...
@@ -542,10 +553,10 @@ _URL_BARE_TOKEN_RE = re.compile(
 )
 
 # JWTs always start with "eyJ" (base64 "{"); 1-, 2- and 3-part forms.
-_JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_=-]{4,}){0,2}")
+_JWT_RE = _slice_pattern(r"eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_=-]{4,}){0,2}")
 
 # E.164 phone numbers, 7-15 digits; the lookahead rejects hex strings / identifiers.
-_SIGNAL_PHONE_RE = re.compile(r"(\+[1-9]\d{6,14})(?![A-Za-z0-9])")
+_SIGNAL_PHONE_RE = _slice_pattern(r"(\+[1-9]\d{6,14})(?![A-Za-z0-9])")
 
 # CDP-URL path: web URLs with a query string / with ``user:password@`` userinfo
 # (DB protocols are covered by _DB_CONNSTR_RE).
@@ -564,7 +575,7 @@ _STRICT_URL_PARAM_RE = re.compile(r"([?#&;])([A-Za-z0-9_.~+%\-]+)=([^#&;\s\"'<>]
 _STRICT_URL_USERINFO_RE = re.compile(r"//[^/\s?#@]+@")
 
 # Form-urlencoded body: only when the ENTIRE text is a k=v&k=v string.
-_FORM_BODY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*(?:&[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*)+$")
+_FORM_BODY_RE = _slice_pattern(r"^[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*(?:&[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*)+$")
 
 # Control / zero-width characters that can split a token body (``sk-abc\x1bdef``,
 # ``ghp_abc\n123``) and escape the contiguous prefix regexes.
@@ -587,7 +598,7 @@ _PREFIX_RE = _compile_prefix_matcher(_PREFIX_PATTERNS)
 # the ID is exactly 32 lowercase hex chars and the credential suffix is a run of
 # at least 16 alphanumerics, so content-hash filenames (``<sha>.bundle``,
 # ``<md5>.sqlite3``) never match.
-_ZHIPU_API_KEY_RE = re.compile(
+_ZHIPU_API_KEY_RE = _slice_pattern(
     r"(?<![A-Za-z0-9_.-])([0-9a-f]{32}\.[A-Za-z0-9]{16,})(?![A-Za-z0-9_.-])"
 )
 
@@ -987,6 +998,50 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         text = _SIGNAL_PHONE_RE.sub(_redact_phone, text)
 
     return text
+
+
+def redaction_safe_bounds(text: str, start: int, end: int) -> tuple[int, int]:
+    """Expand a raw slice across whole secrets before forced default redaction.
+
+    Matchers retain their original objects and redaction order. This does not
+    redact or change existing callers; it keeps their full match context in an
+    opt-in slice, including unbounded/multiline values and plugin prefixes.
+    """
+    spans = []
+    with _VAULT_REDACTION_LOCK:
+        values = tuple(_VAULT_REDACTION_VALUES.get(_vault_scope(), ()))
+    for value in values:
+        at = text.find(value)
+        while at >= 0:
+            spans.append((at, at + len(value)))
+            at = text.find(value, at + 1)
+    for pattern, gate in [(_PREFIX_RE, None), *_SLICE_PATTERNS]:
+        if gate is not None and not gate(text):
+            continue
+        for match in pattern.finditer(text):
+            # Assignment matchers also recognize public fields. Keep only
+            # candidates the canonical redactor actually changes.
+            if redact_sensitive_text(match[0], force=True) != match[0]:
+                spans.append(match.span())
+    if _has_known_prefix_substring(text):
+        stripped = _CONTROL_CHARS_RE.sub("", text)
+        if stripped != text:
+            positions = [i for i, char in enumerate(text) if not _CONTROL_CHARS_RE.match(char)]
+            for match in _PREFIX_RE.finditer(stripped):
+                spans.append((positions[match.start()], positions[match.end() - 1] + 1))
+    # Merge overlaps first: expanding into one match can cross another.
+    merged = []
+    for left, right in sorted(spans):
+        if merged and left < merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(right, merged[-1][1]))
+        else:
+            merged.append((left, right))
+    for left, right in merged:
+        if left < start < right:
+            start = left
+        if left < end < right:
+            end = right
+    return start, end
 
 
 # Commands whose stdout is an env-var dump: terminal redaction runs the
