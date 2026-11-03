@@ -1116,12 +1116,79 @@ def test_discard_preserves_the_last_candidate_reference(kanban_home, tmp_path, r
         if not referenced:
             _git(repo, "update-ref", "-d", "refs/heads/candidate")
 
-        assert kbw.discard_prepared_worktree(task, path, candidate) is referenced
-        assert path.is_dir() is not referenced
+        assert kbw.discard_prepared_worktree(task, path, candidate)
+        assert not path.exists()
         if not referenced:
+            path, = path.parent.glob(f"{review}.recovery-*")
             assert _head(path) == candidate
             assert (path / "candidate.txt").read_text() == "candidate\n"
     assert _head(repo) == base
+
+
+def test_discard_recovers_unreferenced_candidate_and_allows_rebound_retry(
+    kanban_home, tmp_path,
+):
+    from hermes_cli.kanban_db_receipts import rebind_candidate
+    from hermes_cli.kanban_runtime import runtime_identity
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    _git(repo, "checkout", "--detach", base)
+    first = _commit(repo, "candidate.txt", "first\n")
+    receipt = runtime_identity(Path(__file__).resolve().parents[2]).as_dict()
+    with kbc.connect_closing() as conn:
+        review = _ready_review_card(conn, repo, base, first)
+        task = kb.get_task(conn, review)
+        implementation = task.lifecycle_contract["candidate_task_id"]
+        first_run = kb.get_task(conn, implementation).candidate_run_id
+        _git(repo, "checkout", "main")
+        second = _commit(repo, "candidate.txt", "second\n")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (implementation,))
+        second_run = kb.claim_task(conn, implementation, claimer=kb._claimer_id())
+        assert second_run is not None
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=second_run.current_run_id,
+            summary="replacement candidate",
+            metadata={"base_sha": base, "head_sha": second, "changed_files": []},
+        )
+        with kb.write_txn(conn):
+            for run_id in (first_run, second_run.current_run_id):
+                kb._append_event(conn, implementation, "spawned",
+                                 {"runtime_identity": receipt}, run_id=run_id)
+        rebind_candidate(
+            conn, implementation, run_id=first_run, head_sha=first,
+            reason="restore first", replace=True, replaced_run=second_run.current_run_id)
+        path, _, created = kbw.resolve_workspace_created(task, candidate_head=first)
+        assert created
+        private = _commit(path, "private.txt", "private recovery history\n")
+        _git(path, "update-ref", "refs/worktree/private", private)
+        _git(path, "reset", "--hard", first)
+        rebind_candidate(
+            conn, implementation, run_id=second_run.current_run_id, head_sha=second,
+            reason="use replacement", replace=True, replaced_run=first_run)
+        assert not kbw._commit_referenced(repo, first)
+        assert not kbw._is_ancestor(repo, first, second)
+        assert kbw.discard_prepared_worktree(task, path, first, prepared_new=False) is False
+        assert path.is_dir()
+        _git(repo, "worktree", "lock", str(path))
+        assert kbw.discard_prepared_worktree(task, path, first, prepared_new=created) is False
+        assert _head(path) == first
+        assert kb._git_out(path, "rev-parse", "refs/worktree/private") == private
+        _git(repo, "worktree", "unlock", str(path))
+        kbw.discard_prepared_worktree(task, path, first, prepared_new=created)
+        assert not path.exists(), "failed preparation must free the canonical path for retry"
+        recovery, = path.parent.glob(f"{review}.recovery-*")
+        retry, _, retry_created = kbw.resolve_workspace_created(
+            task, candidate_head=kbw.candidate_head_for_task(conn, task))
+        assert retry == path and retry_created
+        assert _head(retry) == second
+        assert _head(recovery) == first
+        assert kb._git_out(recovery, "rev-parse", "ORIG_HEAD") == private
+        assert kb._git_out(recovery, "rev-parse", "refs/worktree/private") == private
+        assert private in kb._git_out(recovery, "reflog", "show", "--format=%H", "HEAD")
+        unreachable = kb._git_out(recovery, "fsck", "--unreachable") or ""
+        assert first not in unreachable and private not in unreachable
 
 
 @pytest.mark.parametrize("namespace", ["worktree", "bisect", "rewritten"])
@@ -1145,9 +1212,10 @@ def test_discard_protects_every_worktree_ref_commit(
             _git(repo, "update-ref", "refs/keep/rescued", unique)
 
         with caplog.at_level("INFO", logger=kb._log.name):
-            assert kbw.discard_prepared_worktree(task, path, candidate) is surviving
-        assert path.is_dir() is not surviving
+            assert kbw.discard_prepared_worktree(task, path, candidate)
+        assert not path.exists()
         if not surviving:
+            path, = path.parent.glob(f"{review}.recovery-*")
             assert _head(path) == candidate
             assert unique in caplog.text and ref in caplog.text
             assert kb._git_out(path, "rev-parse", "--verify", ref) == unique
@@ -1179,11 +1247,12 @@ def test_discard_protects_private_recovery_anchors(
         if surviving:
             _git(repo, "update-ref", "refs/keep/operator", unique)
         with caplog.at_level("INFO", logger=kb._log.name):
-            assert kbw.discard_prepared_worktree(task, path, candidate) is surviving
-        assert path.is_dir() is not surviving
+            assert kbw.discard_prepared_worktree(task, path, candidate)
+        assert not path.exists()
         if surviving:
             assert kb._git_out(repo, "rev-parse", "refs/keep/operator") == unique
         else:
+            path, = path.parent.glob(f"{review}.recovery-*")
             assert unique in caplog.text
             if anchor != "reflog":
                 assert kb._git_out(path, "rev-parse", "ORIG_HEAD") == unique
@@ -1247,9 +1316,12 @@ def test_worktree_removal_with_git_without_root_ref_option(
     monkeypatch.setenv("PATH", str(binary_dir) + os.pathsep + os.environ["PATH"])
     with caplog.at_level("INFO", logger=kb._log.name):
         if operation == "discard":
-            assert kbw.discard_prepared_worktree(task, path, candidate) is (anchor == "referenced")
+            assert kbw.discard_prepared_worktree(task, path, candidate)
         else:
             kbw._cleanup_worktree_workspace(review, str(path), branch)
+    if operation == "discard" and anchor != "referenced":
+        assert not path.exists()
+        path, = path.parent.glob(f"{review}.recovery-*")
     assert path.exists() is (anchor != "referenced")
     if anchor == "unreferenced":
         assert unique in caplog.text and root_ref in caplog.text
@@ -1308,10 +1380,13 @@ def test_modern_git_removal_protects_multivalued_pseudorefs(
     monkeypatch.setattr(kbw, "_git", modern_git)
     with caplog.at_level("INFO", logger=kb._log.name):
         if operation == "discard":
-            assert kbw.discard_prepared_worktree(task, path, candidate) is surviving
+            assert kbw.discard_prepared_worktree(task, path, candidate)
         else:
             kbw._cleanup_worktree_workspace(review, str(path), branch)
     assert enumerated
+    if operation == "discard" and not surviving:
+        assert not path.exists()
+        path, = path.parent.glob(f"{review}.recovery-*")
     assert path.is_dir() is not surviving
     if not surviving:
         assert unique in caplog.text and root_ref in caplog.text
@@ -1358,9 +1433,12 @@ def test_worktree_removal_protects_noncommit_anchors(
         _git(repo, "update-ref", "refs/worktree/not-common", commit)
     with caplog.at_level("INFO", logger=kb._log.name):
         if operation == "discard":
-            assert kbw.discard_prepared_worktree(task, path, candidate) is surviving
+            assert kbw.discard_prepared_worktree(task, path, candidate)
         else:
             kbw._cleanup_worktree_workspace(review, str(path), branch)
+    if operation == "discard" and not surviving:
+        assert not path.exists()
+        path, = path.parent.glob(f"{review}.recovery-*")
     assert path.is_dir() is not surviving
     if not surviving:
         assert unique in caplog.text and ref in caplog.text
@@ -1479,6 +1557,24 @@ def test_cleanup_preserves_an_adopted_branch_holding_unique_work(kanban_home, tm
         ["git", "-C", str(repo), "rev-parse", "wt/adopted"],
         capture_output=True, text=True, check=True,
     ).stdout.strip() == unique
+
+def test_discard_preserves_an_unignored_empty_directory(kanban_home, tmp_path):
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+    with kbc.connect_closing() as conn:
+        review = _ready_review_card(conn, repo, base, candidate)
+        task = kb.get_task(conn, review)
+        path, _, created = kbw.resolve_workspace_created(task, candidate_head=candidate)
+        (path / "operator-empty").mkdir()
+        assert not kb._git_out(path, "status", "--porcelain", "--untracked-files=all")
+        assert kbw.discard_prepared_worktree(
+            task, path, candidate, prepared_new=created) is False
+        assert (path / "operator-empty").is_dir()
+        (path / "operator-empty").rmdir()
+        assert kbw.discard_prepared_worktree(task, path, candidate, prepared_new=created)
+        assert not path.exists()
+
 
 def test_discard_preserves_a_worktree_holding_an_ignored_empty_directory(
     kanban_home, tmp_path,
@@ -1730,26 +1826,47 @@ def test_role_candidate_head_follows_the_bound_run_not_the_newest(
         assert "first attempt" in context
         assert second not in context
         assert "second attempt" not in context
-        if nested_metadata:
-            # Restore the implementation checkout too; claim admission correctly
-            # refuses a bound handoff whose recorded workspace still points at B.
-            _git(repo, "checkout", "--detach", first)
-            workspace = kbw.resolve_workspace(task, candidate_head=bound)
-            kbw.set_workspace_path(conn, review, str(workspace))
-            kb.recompute_ready(conn)
-            review_run = kb.claim_review_task(conn, review, claimer=kb._claimer_id())
-            assert review_run is not None
-            assert kb.complete_task(
-                conn, review, expected_run_id=review_run.current_run_id,
-                summary="approve restored candidate", verdict="APPROVE",
-                metadata={"head_sha": first},
-            )
-            evidence = json.loads(conn.execute(
-                "SELECT metadata FROM task_runs WHERE id = ?",
-                (review_run.current_run_id,)).fetchone()[0])["lifecycle"]
-            assert evidence["candidate_run_id"] == run_a_id
-            assert evidence["head_sha"] == first
-            assert kb.get_lifecycle_state(conn, implementation)["review_verdict"] == "APPROVE"
+        # Restore the implementation checkout too; claim admission correctly
+        # refuses a bound handoff whose recorded workspace still points at B.
+        _git(repo, "checkout", "--detach", first)
+        workspace = kbw.resolve_workspace(task, candidate_head=bound)
+        kbw.set_workspace_path(conn, review, str(workspace))
+        kb.recompute_ready(conn)
+        review_run = kb.claim_review_task(conn, review, claimer=kb._claimer_id())
+        assert review_run is not None
+        assert kb.complete_task(
+            conn, review, expected_run_id=review_run.current_run_id,
+            summary="approve restored candidate", verdict="APPROVE",
+            metadata={"head_sha": first},
+        )
+        evidence = json.loads(conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?",
+            (review_run.current_run_id,)).fetchone()[0])["lifecycle"]
+        from hermes_cli.kanban_lifecycle import _freshness
+
+        assert _freshness(conn, evidence, implementation, evidence_task_id=review) == (
+            True, None,
+        ), f"candidate run {run_a_id}, review run {review_run.current_run_id}: {evidence}"
+        assert evidence["candidate_run_id"] == run_a_id != review_run.current_run_id
+        assert evidence["head_sha"] == first
+        assert kb.get_lifecycle_state(conn, implementation)["review_verdict"] == "APPROVE"
+        validation = _role_card(conn, "validation", implementation, repo, "tester")
+        kb.link_tasks(conn, review, validation, requirement="review_approved")
+        kb.recompute_ready(conn)
+        assert kb.evaluate_dependencies(conn, validation)["satisfied"]
+        validation_run = kb.claim_task(conn, validation, claimer=kb._claimer_id())
+        assert validation_run is not None
+        assert kb.complete_task(
+            conn, validation, expected_run_id=validation_run.current_run_id,
+            summary="validated restored candidate", verdict="PASS",
+            metadata={"head_sha": first},
+        )
+        validation_evidence = json.loads(conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?",
+            (validation_run.current_run_id,)).fetchone()[0])["lifecycle"]
+        assert validation_evidence["candidate_run_id"] == run_a_id
+        assert _freshness(conn, validation_evidence, implementation,
+                          evidence_task_id=validation) == (True, None)
 
     assert bound == first
     assert newest == second          # the newest handoff is the rejected candidate

@@ -1354,23 +1354,20 @@ def _set_task_column(conn: sqlite3.Connection, task_id: str, column: str, value:
 def _worktree_removal_blockers(worktree: Path) -> list[str]:
     """Content ``git worktree remove`` would delete although ``status`` calls it clean.
 
-    Two classes are invisible to a plain status check, and both are operator work:
-    files under ``assume-unchanged``/``skip-worktree`` (reported clean while modified) and
-    ignored entries (never reported at all, and removed with the directory). Verified
-    against Git: non-force ``worktree remove`` exits 0 and deletes all of them.
+    Index flags hide modified files; status also omits ignored entries and
+    untracked empty directories. Non-force ``worktree remove`` deletes them all.
     """
     reasons: list[str] = []
     flagged = _index_flagged_paths(worktree)
     if flagged:
         reasons.append(f"index flags prevent verification: {', '.join(flagged[:3])}")
-    ignored = _git(
-        worktree, "ls-files", "--others", "--ignored", "--exclude-standard",
-        "--directory", "-z", timeout=60,
+    untracked = _git(
+        worktree, "ls-files", "--others", "--directory", "-z", timeout=60,
     )
-    if ignored.returncode != 0:
-        reasons.append("ignored entries could not be read")
-    elif (ignored.stdout or "").strip("\0"):
-        reasons.append("ignored entries are present")
+    if untracked.returncode != 0:
+        reasons.append("untracked entries could not be read")
+    elif (untracked.stdout or "").strip("\0"):
+        reasons.append("untracked entries (including ignored files or empty directories) are present")
     return reasons
 
 
@@ -1469,14 +1466,12 @@ def discard_prepared_worktree(
     task: Task, path: Path | str, prepared_head: str, *, board: Optional[str] = None,
     prepared_new: bool = True,
 ) -> bool:
-    """Remove a worktree prepared for a claim that was then refused.
+    """Reclaim a worktree prepared for a claim that was then refused.
 
-    Only when nothing can be lost: this card's canonical linked worktree, clean by git's
-    own check, sitting exactly at the head the attempt prepared, with every referenced
-    object still reachable from a surviving ref and no ignored files. Any doubt preserves
-    it, and removal never deletes a branch. Without this, a refused attempt leaves a
-    checkout at a candidate a retry may be unable to move away from, poisoning every
-    later dispatch.
+    Only this attempt's new, clean canonical checkout at its prepared head can be
+    reclaimed. If removing it would lose private refs or recovery history, move the
+    whole registered worktree aside instead, leaving the canonical path free for a
+    retry at a different candidate. Return True when that path has been reclaimed.
     """
     # A reused detached checkout's commit can be its last anchor, so an attempt
     # that did not create the directory must not remove it.
@@ -1497,7 +1492,15 @@ def discard_prepared_worktree(
         if _worktree_removal_blockers(target):
             return False
         if not _worktree_refs_survive_removal(repo_root, target):
-            return False
+            recovery = target.with_name(f"{task.id}.recovery-{time.time_ns()}")
+            result = _git(repo_root, "worktree", "move", str(target), str(recovery), timeout=60)
+            if result.returncode != 0:
+                _kb._log.warning(
+                    "prepared workspace at %s could not move to %s: %s",
+                    target, recovery, (result.stderr or result.stdout or "").strip()[:300])
+                return False
+            _kb._log.info("Preserved prepared workspace for task %s at %s", task.id, recovery)
+            return True
         result = _git(repo_root, "worktree", "remove", str(target), timeout=60)
         if result.returncode != 0:
             # Not atomic: a partial removal leaves a checkout that resolves as dirty, so

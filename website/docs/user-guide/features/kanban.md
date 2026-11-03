@@ -641,9 +641,11 @@ worktree, and optional patch hash. The original completion, runs, comments,
 and edges remain; dependents stay gated until the same parent is recommitted
 and completed with an immutable head.
 
-Typed reviewer/tester workspaces resolve at the bound candidate commit, including
-when recovery selects an older run with only top-level handoff metadata. Deferred
-launches refuse if either the bound base or head changes during preparation.
+Typed reviewer/tester workspaces and completion evidence use the bound implementation
+run and its head, including when recovery selects an older run with only top-level
+handoff metadata. The review or validation execution's own run id never substitutes
+for that candidate id. Deferred launches refuse if either the bound base or head
+changes during preparation.
 Role worktrees must have their own Git registration: the checkout's `.git`
 pointer, the administrative directory's backlink, and `git worktree list` must
 all identify that checkout. A copied sibling pointer refuses with
@@ -656,8 +658,9 @@ Existing checkouts with `assume-unchanged` or `skip-worktree` index flags refuse
 with `candidate_workspace_unavailable`, even when `git status` looks clean: clear
 those flags and preserve or commit any local edits before retrying. A refused
 claim or failed launch may remove only a checkout that attempt created, never one
-with index flags or ignored entries. For custom launchers, automatic preparation
-discard stops at callback entry, not its return: a callback that creates a commit,
+with index flags or untracked entries, including ignored files and unignored empty
+directories. Completion cleanup uses the same content guard. For custom launchers,
+automatic preparation discard stops at callback entry, not its return: a callback that creates a commit,
 resets HEAD, and raises may leave that commit only in `ORIG_HEAD` or the private
 HEAD reflog, which worktree removal would destroy.
 Completion, teardown, and prepared-checkout discard share the same surviving-ref
@@ -673,10 +676,14 @@ is checked on all Git versions: even `--include-root-refs` omits these multivalu
 pseudorefs. Tree/blob anchors also preserve the checkout unless traversal from
 surviving common refs proves the object is retained.
 An enumeration or resolution failure still preserves the checkout. A refusal names the
-unprotected object and ref. Even a newly created detached checkout survives if
-removal would lose an object's last reference. Moving a reused detached
-checkout likewise requires its commit to be contained in the new candidate or
-anchored by a surviving ref.
+unprotected object and ref. When removal cannot prove history survives, a newly created
+clean checkout is moved intact to `.worktrees/<id>.recovery-<unique-suffix>` using
+`git worktree move`; its private refs and reflogs remain reachable there, and the
+canonical task path is free for a fresh preparation after a candidate rebind. Failure
+to move leaves it in place and logs a warning. Existing creation and claim-ownership
+fences still apply: a reused or successor-owned checkout is never moved by discard.
+Moving a reused detached checkout onto a new candidate still requires its commit to
+be contained in the new candidate or anchored by a surviving ref.
 Before persisting a direct role claim, the CLI rechecks the registration and
 prepared head. A changed checkout or candidate binding releases only this
 attempt's claim; a successor run and a moved checkout are preserved. Duplicate

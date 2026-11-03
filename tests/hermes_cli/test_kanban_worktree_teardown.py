@@ -247,6 +247,19 @@ def test_complete_task_reaps_clean_worktree(kanban_home: Path, repo: Path) -> No
     assert not _branch_exists(repo, f"wt/{tid}")
 
 
+def test_complete_task_preserves_an_unignored_empty_directory(kanban_home: Path, repo: Path) -> None:
+    with kbc.connect_closing() as conn:
+        tid, wt = _worktree_task(conn, repo)
+        (wt / "operator-empty").mkdir()
+        assert not _git("-C", str(wt), "status", "--porcelain", "--untracked-files=all")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.complete_task(conn, tid, summary="done")
+    assert (wt / "operator-empty").is_dir()
+    assert _branch_exists(repo, f"wt/{tid}")
+
+
 def test_complete_task_preserves_dirty_worktree(kanban_home: Path, repo: Path) -> None:
     with kbc.connect_closing() as conn:
         tid, wt = _worktree_task(conn, repo)

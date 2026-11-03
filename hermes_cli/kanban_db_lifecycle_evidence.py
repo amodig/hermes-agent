@@ -127,30 +127,43 @@ def _stamp_lifecycle_metadata(
     if not candidate_task_id:
         raise LifecycleEvidenceError("typed lifecycle evidence requires a candidate task")
     candidate_task_id = str(candidate_task_id)
-    candidate_run_id = (
-        run_id
-        if phase == "implementation"
-        else _latest_lifecycle_run_id(conn, candidate_task_id, "implementation")
-    )
-
-    if candidate_run_id is None:
-        candidate_run_id = _kb._row_get(
-            conn.execute(
-                "SELECT candidate_run_id FROM tasks WHERE id = ?", (task_id,)
-            ).fetchone(),
-            "candidate_run_id",
-        )
     supplied_head = (
         updated.get("head_sha")
         or updated.get("reviewed_head_sha")
         or _kb._handoff_fields(updated).get("head_sha")
     )
-    candidate = _kb.get_task(conn, candidate_task_id)
-    current_head = (
-        _kb.bound_handoff(conn, candidate_task_id).get("head_sha")
-        if candidate is not None and candidate.candidate_run_id is not None
-        else _latest_head(conn, candidate_task_id)
-    )
+    if phase == "implementation":
+        candidate_run_id = run_id
+        candidate = _kb.get_task(conn, candidate_task_id)
+        current_head = (
+            _kb.bound_handoff(conn, candidate_task_id).get("head_sha")
+            if candidate is not None and candidate.candidate_run_id is not None
+            else _latest_head(conn, candidate_task_id)
+        )
+    else:
+        # A restored legacy handoff may have no lifecycle envelope. Its binding,
+        # not this review/validation execution, identifies the implementation run.
+        candidate_run = conn.execute(
+            "SELECT r.id, r.metadata FROM tasks t JOIN task_runs r "
+            "ON r.id = t.candidate_run_id AND r.task_id = t.id "
+            "WHERE t.id = ? AND r.status != 'running' "
+            "AND r.outcome IN ('completed', 'review_requested')",
+            (candidate_task_id,),
+        ).fetchone()
+        candidate_lifecycle = _kb._json_dict(
+            _kb._row_get(candidate_run, "metadata")).get("lifecycle")
+        if candidate_run is None or (
+            isinstance(candidate_lifecycle, dict)
+            and candidate_lifecycle.get("phase", "implementation") != "implementation"
+        ):
+            raise LifecycleEvidenceError("lifecycle evidence requires a bound implementation handoff")
+        candidate_run_id = candidate_run["id"]
+        current_head = _kb.handoff_for_run(
+            conn, candidate_task_id, candidate_run_id).get("head_sha")
+        if not current_head:
+            raise LifecycleEvidenceError("bound implementation handoff requires an immutable head_sha")
+    if candidate_run_id is None:
+        raise LifecycleEvidenceError("lifecycle evidence requires a candidate run id")
     if phase == "implementation":
         prior_rework = conn.execute(
             "SELECT kind, payload FROM task_events WHERE task_id = ? "
