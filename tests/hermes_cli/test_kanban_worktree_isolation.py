@@ -801,8 +801,19 @@ def test_clean_role_checkout_follows_a_new_candidate_after_rework(kanban_home, t
     assert _head(workspace) == second
 
 
-def test_role_checkout_detached_at_an_unreachable_commit_is_refused(kanban_home, tmp_path):
-    """Moving a checkout whose commits nothing reaches would lose that work."""
+@pytest.mark.parametrize("ref,survives", [
+    (None, False),
+    ("refs/worktree/saved", False),
+    ("refs/bisect/saved", False),
+    ("refs/rewritten/saved", False),
+    ("refs/heads/saved", True),
+    ("refs/tags/saved", True),
+    ("refs/remotes/origin/saved", True),
+    ("refs/stash", True),
+    ("refs/other/saved", True),
+])
+def test_role_checkout_requires_a_reference_surviving_removal(kanban_home, tmp_path, ref, survives):
+    """A detached unique commit needs a common ref, not one removed with its checkout."""
     repo = _make_repo(tmp_path)
     base = _head(repo)
     candidate = _commit(repo, "candidate.txt", "candidate\n")
@@ -826,14 +837,30 @@ def test_role_checkout_detached_at_an_unreachable_commit_is_refused(kanban_home,
         workspace, _branch = kbw._resolve_worktree_workspace(
             task, candidate_head=kbw.candidate_head_for_task(conn, task))
 
-    # An empty detached commit inside the role checkout is reachable from no ref.
-    _git(workspace, "commit", "--allow-empty", "-m", "unreferenced work")
-    stranded = _head(workspace)
-    assert stranded != candidate
+    stranded = _commit(workspace, "unique.txt", "preserve this work\n")
+    if ref:
+        _git(workspace, "update-ref", ref, stranded)
     with kbc.connect() as conn:
-        with pytest.raises(ValueError, match="would strand work"):
-            kbw._resolve_worktree_workspace(kb.get_task(conn, review), candidate_head=candidate)
-    assert _head(workspace) == stranded
+        task = kb.get_task(conn, review)
+        if survives:
+            kbw._resolve_worktree_workspace(task, candidate_head=candidate)
+        else:
+            with pytest.raises(ValueError, match="would strand work"):
+                kbw._resolve_worktree_workspace(task, candidate_head=candidate)
+    assert _head(repo) == candidate
+    assert (repo / "candidate.txt").read_text() == "candidate\n"
+    assert not (repo / "unique.txt").exists()
+    if survives:
+        assert _head(workspace) == candidate
+        _git(repo, "worktree", "remove", str(workspace))
+        _git(repo, "merge-base", "--is-ancestor", stranded, ref)
+    else:
+        assert _head(workspace) == stranded
+        assert (workspace / "unique.txt").read_text() == "preserve this work\n"
+        assert (workspace / "candidate.txt").read_text() == "candidate\n"
+        if ref:
+            _git(workspace, "merge-base", "--is-ancestor", stranded, ref)
+
 
 def test_role_worktree_refuses_to_overwrite_an_ignored_local_file(kanban_home, tmp_path):
     """An ignored file is invisible to `git status`, so only this guard protects it.

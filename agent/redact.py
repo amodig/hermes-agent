@@ -4,6 +4,7 @@ Short tokens (< 18 chars) are fully masked; longer ones keep the first 6 and
 last 4 characters for debuggability.
 """
 
+from difflib import SequenceMatcher
 import logging
 import os
 import re
@@ -1003,12 +1004,13 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
 def redaction_safe_bounds(text: str, start: int, end: int) -> tuple[int, int, str]:
     """Return raw bounds and a forced-redacted slice using full match context.
 
-    Scalar secrets remain indivisible. Containers protect only their changed
-    region, so public fields can page without losing the context that masks a
-    later password. Offsets always refer to the original text.
+    Scalar secrets remain indivisible. Containers protect each changed region
+    separately, so public fields can page without losing the context that masks
+    later passwords. Offsets always refer to the original text.
     """
     spans = []
     container = None
+    edits = []
     with _VAULT_REDACTION_LOCK:
         values = tuple(_VAULT_REDACTION_VALUES.get(_vault_scope(), ()))
     for value in values:
@@ -1019,32 +1021,45 @@ def redaction_safe_bounds(text: str, start: int, end: int) -> tuple[int, int, st
     for pattern, gate in [(_PREFIX_RE, None), *_SLICE_PATTERNS]:
         if gate is not None and not gate(text):
             continue
-        for match in pattern.finditer(text):
-            raw = match[0]
+        # Match the same stripped view as _redact_form_body, but diff/render the
+        # raw span below so removed wrapping whitespace keeps its original offsets.
+        is_form = pattern is _FORM_BODY_RE
+        if is_form and "\n" in text:
+            continue
+        for match in pattern.finditer(text.strip() if is_form else text):
+            raw = text if is_form else match[0]
             redacted = redact_sensitive_text(raw, force=True)
             # Assignment matchers also recognize public fields.
             if redacted == raw:
                 continue
-            left, right = match.span()
-            if pattern is _FORM_BODY_RE:
-                prefix = 0
-                while prefix < min(len(raw), len(redacted)) and raw[prefix] == redacted[prefix]:
-                    prefix += 1
-                suffix = 0
-                while (
-                    suffix < min(len(raw), len(redacted)) - prefix
-                    and raw[len(raw) - suffix - 1] == redacted[len(redacted) - suffix - 1]
-                ):
-                    suffix += 1
-                left += prefix
-                right -= suffix
-                # This matcher owns the whole form. Preserve its original input
-                # context even when a page starts midway through a public value.
-                container = (
-                    right, len(redacted) - len(raw),
-                    text[:match.start()] + redacted + text[match.end():],
-                )
-            spans.append((left, right))
+            if not is_form:
+                spans.append(match.span())
+                continue
+            container = redacted
+            # Equal form fields are anchors, even huge repetitive public values.
+            # Character-level diff's popular-character heuristic can miss those,
+            # while disabling it makes a long repeated value quadratic.
+            before, after = re.split("(&)", raw), re.split("(&)", redacted)
+            raw_offsets, rendered_offsets = [0], [0]
+            for part in before:
+                raw_offsets.append(raw_offsets[-1] + len(part))
+            for part in after:
+                rendered_offsets.append(rendered_offsets[-1] + len(part))
+            for kind, a, b, c, d in SequenceMatcher(
+                None, before, after, autojunk=False,
+            ).get_opcodes():
+                if kind == "equal":
+                    continue
+                left, right = raw_offsets[a], raw_offsets[b]
+                rendered_left, rendered_right = rendered_offsets[c], rendered_offsets[d]
+                while left < right and rendered_left < rendered_right and raw[left] == redacted[rendered_left]:
+                    left += 1
+                    rendered_left += 1
+                while left < right and rendered_left < rendered_right and raw[right - 1] == redacted[rendered_right - 1]:
+                    right -= 1
+                    rendered_right -= 1
+                spans.append((left, right))
+                edits.append((left, right, rendered_left, rendered_right))
     if _has_known_prefix_substring(text):
         stripped = _CONTROL_CHARS_RE.sub("", text)
         if stripped != text:
@@ -1064,10 +1079,14 @@ def redaction_safe_bounds(text: str, start: int, end: int) -> tuple[int, int, st
         if left < end < right:
             end = right
     if container is not None:
-        right, delta, redacted = container
-        rendered_start = start + (delta if start >= right else 0)
-        rendered_end = end + (delta if end >= right else 0)
-        return start, end, redacted[rendered_start:rendered_end]
+        rendered_start, rendered_end = start, end
+        for left, right, rendered_left, rendered_right in edits:
+            delta = (rendered_right - rendered_left) - (right - left)
+            if start >= right:
+                rendered_start += delta
+            if end >= right:
+                rendered_end += delta
+        return start, end, container[rendered_start:rendered_end]
     return start, end, redact_sensitive_text(text[start:end], force=True)
 
 

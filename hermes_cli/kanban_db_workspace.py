@@ -1031,11 +1031,16 @@ def _is_ancestor(repo: Path, commit: str, head: str) -> bool:
 
 
 def _commit_referenced(repo: Path, commit: str) -> bool:
-    """True when some ref still reaches ``commit``, so moving a checkout loses nothing."""
+    """True when a ref that survives worktree removal still reaches ``commit``."""
     if not commit:
         return False
-    result = _git(repo, "for-each-ref", "--count=1", "--contains", commit, timeout=60)
-    return result.returncode == 0 and bool((result.stdout or "").strip())
+    result = _git(repo, "for-each-ref", "--format=%(refname)", "--contains", commit, timeout=60)
+    # Git stores these three namespaces in the worktree's administrative directory,
+    # not the common ref store; removing that worktree deletes them along with HEAD.
+    return result.returncode == 0 and any(
+        not ref.startswith(("refs/worktree/", "refs/bisect/", "refs/rewritten/"))
+        for ref in (result.stdout or "").splitlines()
+    )
 
 
 def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Path, str, bool]:
@@ -1092,7 +1097,7 @@ def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Pa
         # A detached checkout is the normal shape for a role worktree, and after a
         # rework its old candidate is simply not the new one. Follow the new candidate
         # when moving cannot strand anything — the old commit is contained in the new
-        # candidate, or some ref still reaches it — and refuse otherwise.
+        # candidate, or a common ref still reaches it — and refuse otherwise.
         if not (_is_ancestor(target, current, head) or _commit_referenced(target, current)):
             raise ValueError(
                 f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is detached at "

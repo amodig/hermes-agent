@@ -412,6 +412,56 @@ def test_bounded_show_pages_public_form_bulk_without_exposing_password(evidence_
     assert page["chunk"]["next_offset"] is None and page["complete"]
 
 
+@pytest.mark.parametrize("padding", ["leading", "trailing"])
+def test_bounded_show_masks_whitespace_wrapped_forms(evidence_board, padding, capsys):
+    kb, conn, _ = evidence_board
+    body = "message=" + "A" * 40000 + "&password=opaque"
+    body = " " + body if padding == "leading" else body + " "
+    tid = kb.create_task(conn, title="wrapped form", body=body)
+    token = _evidence({"task_id": tid, "section": "task"})["snapshot"]
+    args = {"task_id": tid, "section": "task", "pointer": "/body", "snapshot": token}
+    page = _evidence({**args, "offset": 39995, "chars": 4096})
+    rendered = page["chunk"]["text"]
+    assert rendered == "A" * (14 if padding == "leading" else 13) + "&password=***"
+    assert "opaque" not in rendered and page["complete"]
+    # Neither a start nor an end inside the value can drop its masking context.
+    secret_at = body.index("opaque")
+    for offset, chars in ((secret_at + 2, 1), (secret_at - 2, 3)):
+        piece = _evidence({**args, "offset": offset, "chars": chars})
+        assert "***" in piece["chunk"]["text"]
+        assert "opaque" not in piece["chunk"]["text"]
+    with capsys.disabled():
+        print(f"\n{padding}-space form at 39995: {len(rendered)} rendered characters")
+
+
+@pytest.mark.parametrize("chars", [4096, 8192])
+def test_bounded_show_pages_disjoint_form_secrets(evidence_board, chars, capsys):
+    kb, conn, _ = evidence_board
+    body = "password=one&message=" + "A" * 40000 + "&token=two"
+    tid = kb.create_task(conn, title="disjoint secrets", body=body)
+    token = _evidence({"task_id": tid, "section": "task"})["snapshot"]
+    args = {"task_id": tid, "section": "task", "pointer": "/body", "snapshot": token, "chars": chars}
+    pieces, envelopes = [], []
+    cursor = 0
+    while True:
+        page = _evidence({**args, "offset": cursor})
+        chunk = page["chunk"]
+        assert chunk["offset"] == cursor
+        assert len(chunk["text"]) <= chars
+        assert "one" not in chunk["text"] and "two" not in chunk["text"]
+        envelopes.append(len(json.dumps(page, ensure_ascii=False).encode()))
+        pieces.append(chunk["text"])
+        if page["complete"]:
+            break
+        assert chunk["next_offset"] > cursor
+        cursor = chunk["next_offset"]
+    assert "".join(pieces) == "password=***&message=" + "A" * 40000 + "&token=***"
+    assert max(envelopes) <= 32768
+    with capsys.disabled():
+        print(f"\ndisjoint form chars={chars}: rendered page lengths={list(map(len, pieces))}; "
+              f"maximum envelope={max(envelopes)} bytes")
+
+
 @pytest.mark.parametrize("kind", ["pem", "json"])
 def test_bounded_show_expands_unbounded_multiline_redaction(evidence_board, kind):
     kb, conn, _ = evidence_board

@@ -559,9 +559,10 @@ Slices expand across whole secrets before redaction; a newly registered secret
 can move a page's reported start backwards, but never skips subsequent evidence.
 Use the returned continuation, not the rendered text length, for the next page.
 The complete JSON response remains bounded to 32 KiB.
-Public fields in a redacted form page normally; only the changed credential
-region is indivisible, and masking uses the original form context even when a
-continuation starts inside a public field.
+Public fields between redacted form credentials page normally; each changed
+region is indivisible, not the entire span from the first secret to the last.
+Masking uses the original form context even when a continuation starts inside a
+public field or the form has leading/trailing whitespace.
 
 A candidate mismatch during deferred worker preparation rolls back only its
 own run. If an operator reclaimed it meanwhile, the restored card and history
@@ -643,8 +644,11 @@ with `candidate_workspace_unavailable`, even when `git status` looks clean: clea
 those flags and preserve or commit any local edits before retrying. A refused
 claim or deferred launch may remove only a checkout that attempt created, never
 one with index flags or ignored entries. Its prepared commit must still be reachable
-from a Git ref: even a newly created detached checkout survives if it is the last
-reference to that commit. Reused detached checkouts always remain anchored.
+from a common Git ref that survives worktree removal, not `refs/worktree/*`,
+`refs/bisect/*`, or `refs/rewritten/*`. Even a newly created detached checkout
+survives if it is the last reference to that commit. Moving a reused detached
+checkout likewise requires its commit to be contained in the new candidate or
+anchored by a surviving ref.
 Before persisting a direct role claim, the CLI rechecks the registration and
 prepared head. A changed checkout or candidate binding releases only this
 attempt's claim; a successor run and a moved checkout are preserved. Duplicate
