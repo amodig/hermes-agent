@@ -563,6 +563,8 @@ Public fields between redacted form credentials page normally; each changed
 region is indivisible, not the entire span from the first secret to the last.
 Masking uses the original form context even when a continuation starts inside a
 public field or the form has leading/trailing whitespace.
+Bare-token URL credentials are indivisible too, but their public host, path and
+query page normally; starting inside userinfo does not lose the masking context.
 
 A candidate mismatch during deferred worker preparation rolls back only its
 own run. If an operator reclaimed it meanwhile, the restored card and history
@@ -642,8 +644,10 @@ all identify that checkout. A copied sibling pointer refuses with
 Existing checkouts with `assume-unchanged` or `skip-worktree` index flags refuse
 with `candidate_workspace_unavailable`, even when `git status` looks clean: clear
 those flags and preserve or commit any local edits before retrying. A refused
-claim or deferred launch may remove only a checkout that attempt created, never
-one with index flags or ignored entries. Its prepared commit, detached HEAD, and
+claim or failed launch (including a custom launcher) may remove only a checkout
+that attempt created, never one with index flags or ignored entries.
+Completion, teardown, and prepared-checkout discard share the same surviving-ref
+guard: the prepared commit, detached HEAD, and
 every commit referenced inside the checkout (including private refs and annotated
 tags) must still be reachable from a common Git ref that survives worktree removal,
 not `refs/worktree/*`, `refs/bisect/*`, or `refs/rewritten/*`. A refusal names the

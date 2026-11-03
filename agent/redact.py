@@ -1011,6 +1011,7 @@ def redaction_safe_bounds(text: str, start: int, end: int) -> tuple[int, int, st
     spans = []
     container = None
     edits = []
+    url_edits = []
     with _VAULT_REDACTION_LOCK:
         values = tuple(_VAULT_REDACTION_VALUES.get(_vault_scope(), ()))
     for value in values:
@@ -1027,6 +1028,14 @@ def redaction_safe_bounds(text: str, start: int, end: int) -> tuple[int, int, st
         if is_form and "\n" in text:
             continue
         for match in pattern.finditer(text.strip() if is_form else text):
+            if pattern is _URL_BARE_TOKEN_RE:
+                # Only userinfo is indivisible, not an arbitrarily long public URL.
+                # Keep the mask recognized with full URL context even when the
+                # requested slice starts inside the credential, after its scheme.
+                left, right = match.span(2)
+                spans.append((left, right))
+                url_edits.append((left, right, _mask_token(match[2])))
+                continue
             raw = text if is_form else match[0]
             redacted = redact_sensitive_text(raw, force=True)
             # Assignment matchers also recognize public fields.
@@ -1087,7 +1096,11 @@ def redaction_safe_bounds(text: str, start: int, end: int) -> tuple[int, int, st
             if end >= right:
                 rendered_end += delta
         return start, end, container[rendered_start:rendered_end]
-    return start, end, redact_sensitive_text(text[start:end], force=True)
+    rendered = text[start:end]
+    for left, right, replacement in reversed(url_edits):
+        if start <= left and right <= end:
+            rendered = rendered[:left - start] + replacement + rendered[right - start:]
+    return start, end, redact_sensitive_text(rendered, force=True)
 
 
 # Commands whose stdout is an env-var dump: terminal redaction runs the

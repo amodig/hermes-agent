@@ -3036,15 +3036,9 @@ def _dispatch_lane_task(
             return False
         try:
             candidate_head = _kbw.candidate_head_for_task(conn, claimed)
-            # A typed role card resolves as a worktree even from the scratch default, so
-            # branch bookkeeping and cleanup must follow the effective kind, not the column.
-            role_kind = _kbw.effective_workspace_kind(claimed)
-            if role_kind == "worktree":
-                workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(
-                    claimed, board=board, candidate_head=candidate_head)
-            else:
-                workspace = _kbw.resolve_workspace(
-                    claimed, board=board, candidate_head=candidate_head)
+            workspace, resolved_branch_name, prepared_new = _kbw.resolve_workspace_created(
+                claimed, board=board, candidate_head=candidate_head)
+            prepared_head = candidate_head or ((_kbw._git_head(workspace) or "") if prepared_new else "")
         except Exception as exc:
             if _record_task_failure(
                 conn, claimed.id, f"workspace: {exc}",
@@ -3112,11 +3106,17 @@ def _dispatch_lane_task(
     except WorkerLaunchInterrupted as exc:
         if launch is not None and launch.cancel:
             launch.cancel()
+        if not use_default_spawn and launch is None:
+            _kbw.discard_prepared_worktree(
+                claimed, workspace, prepared_head, board=board, prepared_new=prepared_new)
         _pause_claimed_run_for_shutdown(conn, claimed, result, exc)
         return False
     except Exception as exc:
         if launch is not None and launch.cancel:
             launch.cancel()
+        if not use_default_spawn and launch is None:
+            _kbw.discard_prepared_worktree(
+                claimed, workspace, prepared_head, board=board, prepared_new=prepared_new)
         from tools.autonomous_resources import AutonomousResourceUnavailable
         from tools.process_registry import RestartSafeScopeUnavailable
 

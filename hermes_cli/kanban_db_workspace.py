@@ -466,6 +466,8 @@ def _cleanup_worktree_workspace(
                 task_id, "; ".join(blockers), wp,
             )
             return
+        if not _worktree_refs_survive_removal(repo_root, wp):
+            return
         # Windows cannot delete a directory while this process has its current
         # directory inside it. Completed workers normally run from their own
         # linked worktree, so move this process back to the main checkout
@@ -1369,6 +1371,29 @@ def _worktree_removal_blockers(worktree: Path) -> list[str]:
     return reasons
 
 
+def _worktree_refs_survive_removal(repo_root: Path, worktree: Path) -> bool:
+    """Preserve HEAD and every checkout ref unless a surviving ref reaches its commit."""
+    refs = _git(worktree, "for-each-ref", "--format=%(refname)", timeout=60)
+    if refs.returncode != 0:
+        _kb._log.warning("Preserving worktree at %s: cannot enumerate checkout refs", worktree)
+        return False
+    for ref in ["HEAD", *(refs.stdout or "").splitlines()]:
+        # Peel annotated tags too; tree/blob refs do not reference commits.
+        peeled = _git(worktree, "rev-parse", "--verify", f"{ref}^{{}}", timeout=60)
+        commit = (peeled.stdout or "").strip()
+        kind = _git(worktree, "cat-file", "-t", commit, timeout=60)
+        if peeled.returncode != 0 or kind.returncode != 0:
+            _kb._log.warning(
+                "Preserving worktree at %s: cannot resolve checkout ref %s", worktree, ref)
+            return False
+        if kind.stdout.strip() == "commit" and not _commit_referenced(repo_root, commit):
+            _kb._log.info(
+                "Preserving worktree at %s: no surviving ref reaches commit %s from %s",
+                worktree, commit, ref)
+            return False
+    return True
+
+
 def discard_prepared_worktree(
     task: Task, path: Path | str, prepared_head: str, *, board: Optional[str] = None,
     prepared_new: bool = True,
@@ -1400,29 +1425,8 @@ def discard_prepared_worktree(
         _clean_tree(target, str(target))
         if _worktree_removal_blockers(target):
             return False
-        if not _commit_referenced(repo_root, prepared_head):
-            _kb._log.info(
-                "preserving prepared workspace at %s: no ref reaches prepared HEAD commit %s",
-                target, prepared_head)
+        if not _worktree_refs_survive_removal(repo_root, target):
             return False
-        refs = _git(target, "for-each-ref", "--format=%(refname)", timeout=60)
-        if refs.returncode != 0:
-            raise ValueError("cannot enumerate checkout refs before discard")
-        for ref in (refs.stdout or "").splitlines():
-            # Peel annotated tags as well as direct commit refs. Tree/blob refs do
-            # not reference commits; an unreadable object still refuses removal.
-            peeled = _git(target, "rev-parse", "--verify", f"{ref}^{{}}", timeout=60)
-            commit = (peeled.stdout or "").strip()
-            kind = _git(target, "cat-file", "-t", commit, timeout=60)
-            if peeled.returncode != 0 or kind.returncode != 0:
-                raise ValueError(f"cannot resolve checkout ref {ref} before discard")
-            if kind.stdout.strip() != "commit":
-                continue
-            if not _commit_referenced(repo_root, commit):
-                _kb._log.info(
-                    "preserving prepared workspace at %s: no surviving ref reaches commit %s from %s",
-                    target, commit, ref)
-                return False
         result = _git(repo_root, "worktree", "remove", str(target), timeout=60)
         if result.returncode != 0:
             # Not atomic: a partial removal leaves a checkout that resolves as dirty, so

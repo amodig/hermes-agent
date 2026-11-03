@@ -557,8 +557,9 @@ def test_cli_fenced_unblock_requires_a_single_task(
         assert (_snapshot(conn, first), _snapshot(conn, second)) == before
 
 
+@pytest.mark.parametrize("reused", [False, True])
 def test_failed_launch_preparation_discards_its_prepared_worktree(
-    kanban_home: Path, tmp_path: Path,
+    kanban_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reused: bool,
 ) -> None:
     """No worker ran, so the checkout it prepared must not poison later retries.
 
@@ -569,6 +570,10 @@ def test_failed_launch_preparation_discards_its_prepared_worktree(
     import subprocess
 
     from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_db_workspace as kbw
+
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda name: name == "worker")
+    calls = []
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -586,16 +591,23 @@ def test_failed_launch_preparation_discards_its_prepared_worktree(
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
         target = repo / ".worktrees" / tid
+        if reused:
+            assert kbw.resolve_workspace(kb.get_task(conn, tid)) == target
 
         def exploding_spawn(*_args, **_kwargs):
+            calls.append(True)
+            assert target.is_dir()
             raise RuntimeError("launcher refused")
 
         result = kbd.dispatch_once(
             conn, max_spawn=1, max_in_progress=4, max_in_progress_per_profile=4,
             spawn_fn=exploding_spawn, reconcile_orphans=False,
         )
+        assert calls == [True]
+        assert not result.skipped_nonspawnable
         assert not result.spawned
         after = kb.get_task(conn, tid)
         assert after.status != "running"
-        # The checkout prepared for the failed launch is gone, not left to block a retry.
-        assert not target.exists(), sorted(p.name for p in target.parent.glob("*"))
+        assert after.last_failure_error == "launcher refused"
+        # Only a checkout created by this attempt is disposable.
+        assert target.exists() is reused

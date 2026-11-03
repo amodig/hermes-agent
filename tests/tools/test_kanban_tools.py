@@ -412,6 +412,37 @@ def test_bounded_show_pages_public_form_bulk_without_exposing_password(evidence_
     assert page["chunk"]["next_offset"] is None and page["complete"]
 
 
+@pytest.mark.parametrize("suffix", ["/" + "A" * 40000, "/?public=" + "A" * 40000])
+def test_bounded_show_pages_public_url_without_exposing_credentials(evidence_board, suffix):
+    kb, conn, _ = evidence_board
+    credential = "opaquecredential"
+    body = f"https://{credential}@example.invalid{suffix}"
+    tid = kb.create_task(conn, title="large public URL", body=body)
+    token = _evidence({"task_id": tid, "section": "task"})["snapshot"]
+    args = {"task_id": tid, "section": "task", "pointer": "/body", "snapshot": token}
+    pieces = []
+    cursor = 0
+    while True:
+        page = _evidence({**args, "offset": cursor, "chars": 4096})
+        chunk = page["chunk"]
+        assert chunk["offset"] == cursor
+        assert len(chunk["text"]) <= 4096
+        assert credential not in chunk["text"]
+        assert len(json.dumps(page, ensure_ascii=False).encode()) <= 32768
+        pieces.append(chunk["text"])
+        if page["complete"]:
+            break
+        assert chunk["next_offset"] > cursor
+        cursor = chunk["next_offset"]
+    assert len(pieces) > 1
+    assert "".join(pieces) == f"https://***@example.invalid{suffix}"
+    # A slice inside userinfo still uses the full URL context to mask it.
+    page = _evidence({**args, "offset": len("https://") + 2, "chars": 1})
+    assert page["chunk"]["offset"] == len("https://")
+    assert page["chunk"]["text"] == "***"
+    assert page["chunk"]["next_offset"] == len("https://") + len(credential)
+
+
 @pytest.mark.parametrize("padding", ["leading", "trailing"])
 def test_bounded_show_masks_whitespace_wrapped_forms(evidence_board, padding, capsys):
     kb, conn, _ = evidence_board

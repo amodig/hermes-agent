@@ -1110,6 +1110,45 @@ def test_discard_protects_every_worktree_ref_commit(
     assert _head(repo) == candidate
 
 
+@pytest.mark.parametrize("surviving", [False, True])
+def test_role_completion_protects_worktree_rescue_ref(
+    kanban_home, tmp_path, caplog, surviving,
+):
+    from hermes_cli import kanban as kc
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+    _git(repo, "update-ref", "refs/remotes/origin/main", candidate)
+    kb.write_board_metadata(None, default_workdir=str(repo))
+    with kbc.connect_closing() as conn:
+        review = _ready_review_card(conn, repo, base, candidate)
+        kbw.set_workspace_path(conn, review, "", kind="scratch")
+    assert kc._cmd_claim(_claim_args(review)) == 0
+    path = repo / ".worktrees" / review
+    unique = _commit(path, "rescue.txt", "worktree-only commit\n")
+    ref = "refs/worktree/rescue"
+    _git(path, "update-ref", ref, unique)
+    _git(path, "checkout", "--detach", candidate)
+    if surviving:
+        _git(repo, "update-ref", "refs/keep/rescued", unique)
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, review)
+        assert task.workspace_kind == "worktree"
+        with caplog.at_level("INFO", logger=kb._log.name):
+            assert kb.complete_task(
+                conn, review, expected_run_id=task.current_run_id,
+                summary="approved", verdict="APPROVE", metadata={"head_sha": candidate})
+        assert kb.get_task(conn, review).status == "done"
+    assert path.exists() is not surviving
+    if not surviving:
+        assert _head(path) == candidate
+        assert kb._git_out(path, "rev-parse", "--verify", ref) == unique
+        assert unique in caplog.text and ref in caplog.text
+    else:
+        assert kb._git_out(repo, "rev-parse", "--verify", "refs/keep/rescued") == unique
+
+
 def test_discard_preserves_a_worktree_holding_ignored_content(kanban_home, tmp_path):
     """`git worktree remove` deletes ignored files too, so any ignored entry preserves it."""
     repo = _make_repo(tmp_path)
@@ -1987,6 +2026,44 @@ def test_deferred_dispatch_discards_only_new_worktrees(
             assert result.cancelled == [review]
         else:
             assert kb.get_task(conn, review).last_failure_error == "preparation failed"
+
+
+@pytest.mark.parametrize("reused", [False, True])
+def test_custom_spawn_failure_discards_only_new_role_worktrees(
+    kanban_home, tmp_path, monkeypatch, reused,
+):
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda name: name == "reviewer")
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "app.py", "candidate\n")
+    calls = []
+    with kbc.connect_closing() as conn:
+        review = _ready_review_card(conn, repo, base, candidate)
+        if reused:
+            kbw.resolve_workspace(kb.get_task(conn, review), candidate_head=candidate)
+        path = repo / ".worktrees" / review
+
+        def exploding_spawn(task, workspace, **kwargs):
+            calls.append(task.id)
+            assert Path(workspace) == path and _head(path) == candidate
+            raise RuntimeError("custom launcher refused")
+
+        result = kbd.DispatchResult()
+        assert not kbd._dispatch_lane_task(
+            conn, {"id": review}, "reviewer", result, lane="ready", dry_run=False,
+            ttl_seconds=None, board=None, failure_limit=3, spawn_fn=exploding_spawn,
+            per_profile_cap=None, per_profile_running={},
+        )
+        assert calls == [review] and not result.spawned
+        task = kb.get_task(conn, review)
+        assert task.current_run_id is None and task.claim_lock is None
+        assert task.last_failure_error == "custom launcher refused"
+    assert path.exists() is reused
+    if reused:
+        assert _head(path) == candidate
 
 
 @pytest.mark.parametrize("lane", ["ready", "review"])
