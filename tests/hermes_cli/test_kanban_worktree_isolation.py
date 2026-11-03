@@ -973,15 +973,18 @@ def test_ignored_directory_that_the_candidate_turns_into_a_file_is_refused(
     assert _head(workspace) == candidate
 
 
-@pytest.mark.parametrize("collision", [False, True])
-def test_role_worktree_preserves_nested_ignored_empty_directory(
-    kanban_home, tmp_path, collision,
+@pytest.mark.parametrize("layout", ["exact", "nested", "addition"])
+@pytest.mark.parametrize("ignored", [pytest.param(False, id="unignored"), pytest.param(True, id="ignored")])
+@pytest.mark.parametrize("detached", [pytest.param(True, id="detached"), pytest.param(False, id="branch")])
+def test_role_worktree_preserves_untracked_empty_directories(
+    kanban_home, tmp_path, layout, ignored, detached,
 ):
     repo = _make_repo(tmp_path)
-    base = _commit(repo, ".gitignore", "top\n")
-    (repo / "top").mkdir()
-    (repo / "top" / "nested").write_text("candidate file\n")
-    _git(repo, "add", "-f", "top/nested")
+    base = _commit(repo, ".gitignore", "top\n" if ignored else "")
+    candidate_path = "top" if layout == "exact" else "top/nested"
+    (repo / candidate_path).parent.mkdir(parents=True, exist_ok=True)
+    (repo / candidate_path).write_text("candidate file\n")
+    _git(repo, "add", "-f", candidate_path)
     _git(repo, "commit", "-m", "track nested file")
     candidate = _head(repo)
     with kbc.connect() as conn:
@@ -989,19 +992,28 @@ def test_role_worktree_preserves_nested_ignored_empty_directory(
         review = _role_card(conn, "review", implementation, repo, "reviewer")
         task = kb.get_task(conn, review)
         workspace = repo / ".worktrees" / review
-        _git(repo, "worktree", "add", "--detach", str(workspace), base)
+        checkout = ("--detach",) if detached else ("-b", f"wt/{review}")
+        _git(repo, "worktree", "add", *checkout, str(workspace), base)
         (workspace / "top").mkdir()
-        nested = workspace / "top" / "nested"
-        if collision:
-            nested.mkdir()
-            with pytest.raises(ValueError, match="top/nested"):
+        local = workspace / candidate_path
+        if layout == "nested":
+            local.mkdir()
+        assert not subprocess.run(
+            ["git", "-C", str(workspace), "status", "--porcelain", "--untracked-files=all"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        if layout != "addition":
+            with pytest.raises(ValueError, match=candidate_path):
                 kbw._resolve_worktree_workspace(task, candidate_head=candidate)
-            assert nested.is_dir() and not list(nested.iterdir())
+            assert local.is_dir() and not list(local.iterdir())
             assert _head(workspace) == base
         else:
             kbw._resolve_worktree_workspace(task, candidate_head=candidate)
-            assert nested.read_text() == "candidate file\n"
+            assert (workspace / "top").is_dir()
+            assert local.read_text() == "candidate file\n"
             assert _head(workspace) == candidate
+        if not detached:
+            _git(repo, "merge-base", "--is-ancestor", base, f"wt/{review}")
 
 
 def test_cleanup_never_deletes_a_branch_the_role_never_recorded(kanban_home, tmp_path):

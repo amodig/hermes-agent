@@ -648,9 +648,10 @@ Role worktrees must have their own Git registration: the checkout's `.git`
 pointer, the administrative directory's backlink, and `git worktree list` must
 all identify that checkout. A copied sibling pointer refuses with
 `candidate_workspace_unavailable` before either checkout is moved.
-Ignored empty directories, including descendants beneath a collapsed ignored root,
-also refuse if the candidate would replace them with files. New files can still
-be added beneath an ignored directory when no existing directory is overwritten.
+Untracked empty directories, ignored or not, also refuse if the candidate would
+replace them with files, including descendants beneath a collapsed directory root.
+New files can still be added inside an existing directory when no existing
+directory is overwritten.
 Existing checkouts with `assume-unchanged` or `skip-worktree` index flags refuse
 with `candidate_workspace_unavailable`, even when `git status` looks clean: clear
 those flags and preserve or commit any local edits before retrying. A refused

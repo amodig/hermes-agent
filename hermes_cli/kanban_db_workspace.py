@@ -844,26 +844,24 @@ def _git_head(path: Path) -> Optional[str]:
     return out
 
 
-def _ignored_paths_target_tracks(repo: Path, worktree: Path, head: str) -> list[str]:
-    """Present ignored files whose path the target commit tracks.
+def _untracked_paths_target_tracks(repo: Path, worktree: Path, head: str) -> list[str]:
+    """Ignored files and untracked directories the target would overwrite.
 
-    ``git status --porcelain --untracked-files=all`` cannot see them: an ignored file is
-    invisible, so a checkout reports "clean" and then overwrites it in place. Git only
-    guards *untracked* files, so this is the only backstop for an operator's ignored
-    notes when the candidate starts tracking the same path.
+    ``git status --porcelain --untracked-files=all`` misses ignored files and empty
+    directories. Even ``checkout --no-overwrite-ignore`` can replace an unignored
+    empty directory with a tracked file.
     """
     # Two listings on purpose. Per-file first: ``--directory`` collapses a nonempty
     # ignored directory to ``dir/``, losing which children exist, and a tracked sibling
     # (``cache/new`` beside an ignored ``cache/local``) is not a conflict. The second
-    # listing adds ignored directory roots, including empty ones. Git collapses
-    # descendants, so check candidate paths beneath those roots on disk below.
+    # listing adds all untracked directory roots, regardless of ignore status. Git
+    # collapses descendants, so check candidate paths beneath those roots on disk.
     files = _git(
         worktree, "ls-files", "--others", "--ignored", "--exclude-standard", "-z", timeout=60)
     if files.returncode != 0:
         return []
     directories = _git(
-        worktree, "ls-files", "--others", "--ignored", "--exclude-standard",
-        "--directory", "-z", timeout=60,
+        worktree, "ls-files", "--others", "--directory", "-z", timeout=60,
     )
     if directories.returncode != 0:
         return []
@@ -908,7 +906,7 @@ def _ignored_paths_target_tracks(repo: Path, worktree: Path, head: str) -> list[
         if exact_or_tracked_child(entry) or ancestor_tracked(entry):
             hits.append(entry)
     for entry in empty_dirs:
-        # Git collapses ignored directories, hiding empty descendants. Inspect each
+        # Git collapses untracked directories, hiding empty descendants. Inspect each
         # tracked descendant too: adding a file is safe, replacing a directory is not.
         index = bisect.bisect_left(paths, entry)
         if index < len(paths) and paths[index] == entry:
@@ -1118,14 +1116,14 @@ def _role_worktree(
     # discard what is in it.
     _validate_worktree_registration(repo_root, target)
     _clean_tree(target, str(target))
-    # …and ignored files are not "local changes" to git, so a candidate that starts
-    # tracking one of them would overwrite it without any warning.
-    clobbered = _ignored_paths_target_tracks(repo_root, target, head)
+    # Ignored files and empty directories are invisible to the clean-tree check.
+    clobbered = _untracked_paths_target_tracks(repo_root, target, head)
     if clobbered:
         shown = ", ".join(clobbered[:3])
         raise ValueError(
-            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} holds ignored file(s) the "
-            f"candidate {head} tracks ({shown}); moving it would overwrite them")
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} holds ignored file(s) or "
+            f"untracked directories the candidate {head} tracks ({shown}); "
+            "moving it would overwrite them")
     current = _git_head(target)
     branch = _git_current_branch(target) or ""
     if current == head:
