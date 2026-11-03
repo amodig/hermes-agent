@@ -97,6 +97,41 @@ def _pending_candidate_supersession(
     return provenance
 
 
+def _retain_review_candidate(conn: sqlite3.Connection, claimed: Any,
+                             candidate_id: str, review: dict) -> None:
+    """Persist the already-retained grant pair before releasing its worker."""
+    with _kb.write_txn(conn):
+        row = conn.execute(
+            "SELECT r.metadata FROM task_runs r JOIN tasks t ON t.current_run_id = r.id "
+            "WHERE t.id = ? AND r.task_id = t.id AND r.id = ? "
+            "AND t.claim_lock = ? AND r.status = 'running' AND r.ended_at IS NULL",
+            (claimed.id, claimed.current_run_id, claimed.claim_lock),
+        ).fetchone()
+        if row is None:
+            raise LifecycleEvidenceError("review claim changed before its grant")
+        candidate = _kb.get_task(conn, candidate_id)
+        candidate_run_id = candidate.candidate_run_id if candidate else None
+        handoff = (
+            _kb.handoff_for_run(conn, candidate_id, candidate_run_id)
+            if candidate_run_id is not None else {}
+        )
+        base, head = (str(handoff.get(key) or "").strip() for key in ("base_sha", "head_sha"))
+        if not base or not head or (base, head) != (review.get("base"), review.get("head")):
+            raise LifecycleEvidenceError(
+                f"run {claimed.current_run_id} execution grant range "
+                f"{review.get('base') or '<missing>'}..{review.get('head') or '<missing>'} "
+                f"differs from accepted candidate {base or '<missing>'}..{head or '<missing>'}")
+        metadata = _kb._json_dict(row["metadata"])
+        metadata["review_candidate"] = {
+            "task_id": candidate_id, "run_id": candidate_run_id,
+            "base": review["base"], "head": review["head"],
+        }
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (_kb._json_or_null(metadata), claimed.current_run_id),
+        )
+
+
 def _stamp_lifecycle_metadata(
     conn: sqlite3.Connection,
     task_id: str,
@@ -150,6 +185,30 @@ def _stamp_lifecycle_metadata(
             "AND r.outcome IN ('completed', 'review_requested')",
             (candidate_task_id,),
         ).fetchone()
+        candidate_run_id = candidate_run["id"] if candidate_run is not None else None
+        handoff = (
+            _kb.handoff_for_run(conn, candidate_task_id, candidate_run_id)
+            if candidate_run_id is not None else {}
+        )
+        review_run = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ? AND task_id = ?", (run_id, task_id),
+        ).fetchone()
+        retained = _kb._json_dict(_kb._row_get(review_run, "metadata")).get("review_candidate")
+        if retained is not None:
+            current = {
+                "task_id": candidate_task_id, "run_id": candidate_run_id,
+                "base": str(handoff.get("base_sha") or "").strip(),
+                "head": str(handoff.get("head_sha") or "").strip(),
+            }
+            if not isinstance(retained, dict):
+                raise LifecycleEvidenceError("review run has malformed retained candidate evidence")
+            if retained != current:
+                raise LifecycleEvidenceError(
+                    f"run {run_id} granted candidate run {retained.get('run_id')} range "
+                    f"{retained.get('base') or '<missing>'}..{retained.get('head') or '<missing>'} "
+                    f"differs from current candidate run {candidate_run_id} range "
+                    f"{current['base'] or '<missing>'}..{current['head'] or '<missing>'}")
+            updated["review_candidate"] = retained
         candidate_lifecycle = _kb._json_dict(
             _kb._row_get(candidate_run, "metadata")).get("lifecycle")
         if candidate_run is None or (
@@ -157,9 +216,7 @@ def _stamp_lifecycle_metadata(
             and candidate_lifecycle.get("phase", "implementation") != "implementation"
         ):
             raise LifecycleEvidenceError("lifecycle evidence requires a bound implementation handoff")
-        candidate_run_id = candidate_run["id"]
-        current_head = _kb.handoff_for_run(
-            conn, candidate_task_id, candidate_run_id).get("head_sha")
+        current_head = handoff.get("head_sha")
         if not current_head:
             raise LifecycleEvidenceError("bound implementation handoff requires an immutable head_sha")
     if candidate_run_id is None:

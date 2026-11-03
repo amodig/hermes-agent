@@ -3089,6 +3089,16 @@ def _dispatch_lane_task(
                 # forbids.
                 with _grant_boundary(grant_guard):
                     _check_not_stopping(should_stop, claimed.id)
+                    if use_default_spawn and candidate_id and (
+                        spawn_task.lifecycle_contract or {}
+                    ).get("kind") in {"code", "review", "validation"}:
+                        from hermes_cli.kanban_db_lifecycle_evidence import _retain_review_candidate
+
+                        review = (
+                            launch.execution_grant.review if launch.execution_grant is not None
+                            else {"base": candidate_pair[0], "head": candidate_pair[1]}
+                        )
+                        _retain_review_candidate(conn, claimed, candidate_id, review or {})
                     launch.grant(int(claimed.current_run_id), claimed.claim_lock)
                 return _record_granted_spawn(
                     conn, claimed, launch, str(workspace), result, board, _count_spawn,

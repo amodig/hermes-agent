@@ -11,6 +11,7 @@ import stat
 import psutil
 
 from hermes_cli.managed_scope import get_managed_dir
+from hermes_constants import PROFILE_ID_RE, named_profile_is_live
 from utils import atomic_json_write
 
 _SNAPSHOT_NAME = "gateway_startup_inputs.json"
@@ -114,7 +115,10 @@ def begin_gateway_startup_inputs(home: Path, project_env: Path) -> None:
     _started = True
     try:
         profiles = home / "profiles"
-        secondary = tuple(path for path in profiles.iterdir() if path.is_dir()) if profiles.is_dir() else ()
+        secondary = tuple(
+            path for path in sorted(profiles.iterdir())
+            if path.name != "default" and PROFILE_ID_RE.match(path.name) and named_profile_is_live(path)
+        ) if profiles.is_dir() else ()
         _context = (home, project_env, secondary)
         _pending = capture_startup_inputs(*_context)
     except (OSError, ValueError, psutil.Error):

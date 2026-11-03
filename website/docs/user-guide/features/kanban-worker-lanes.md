@@ -92,9 +92,13 @@ For code-changing tasks, pick the review model encoded by the task graph:
 
 Both review models carry their structured handoff on the lifecycle transition itself. Do not place secrets, tokens, or raw PII in `summary` or `metadata`; run rows are durable.
 
-Review completion preparation and verdict stamping both follow the **bound candidate
-run**, including an earlier attested run restored with `rebind-candidate --replace`;
-a newer rejected run does not replace the supplied or stamped review head.
+Review grants retain the accepted candidate run and exact `base..head` range on
+the review run before releasing the worker. Completion checks the current binding
+against that retained pair, again inside the completion write transaction. A rebind
+after the grant refuses with both ranges (even when the head is unchanged), leaving
+the review attempt open rather than approving another run. An unchanged binding,
+including an earlier attested run restored before the grant with
+`rebind-candidate --replace`, completes against that candidate.
 
 Role checkout preparation refuses `candidate_workspace_unavailable` if another
 non-terminal card, including the same task ID on another board, has registered the

@@ -2628,6 +2628,106 @@ def test_deferred_dispatch_fences_a_rebound_base_with_the_same_head(
         assert not (repo / ".worktrees" / review).exists()
 
 
+@pytest.mark.parametrize("rebind_at", ["after-grant", "during-completion", "same-pair", "unchanged"])
+def test_review_completion_is_fenced_to_granted_candidate(
+    kanban_home, tmp_path, monkeypatch, rebind_at,
+):
+    from types import SimpleNamespace
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_pr_acceptance_store
+    from hermes_cli.kanban_db_receipts import rebind_candidate
+    from hermes_cli.kanban_lifecycle import LifecycleEvidenceError
+    from hermes_cli.kanban_runtime import runtime_identity
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    middle = _commit(repo, "middle.txt", "middle\n")
+    head = _commit(repo, "candidate.txt", "candidate\n")
+    other_base = base if rebind_at == "same-pair" else middle
+    identity = runtime_identity(Path(__file__).resolve().parents[2])
+    granted = []
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
+    monkeypatch.setattr(kbd, "_require_autonomous_worker_capacity", lambda: None)
+    with kbc.connect() as conn:
+        review = _ready_review_card(conn, repo, base, head)
+        implementation = kb.get_task(conn, review).lifecycle_contract["candidate_task_id"]
+        first_run = kb.get_task(conn, implementation).candidate_run_id
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (implementation,))
+        second = kb.claim_task(conn, implementation)
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=second.current_run_id,
+            summary="legacy candidate with the same head",
+            metadata={"base_sha": other_base, "head_sha": head, "changed_files": []})
+        with kb.write_txn(conn):
+            for run_id in (first_run, second.current_run_id):
+                kb._append_event(conn, implementation, "spawned",
+                                 {"runtime_identity": identity.as_dict()}, run_id=run_id)
+            legacy = json.loads(conn.execute(
+                "SELECT metadata FROM task_runs WHERE id = ?", (second.current_run_id,),
+            ).fetchone()[0])
+            legacy.pop("lifecycle")
+            conn.execute("UPDATE task_runs SET metadata = ? WHERE id = ?",
+                         (json.dumps(legacy), second.current_run_id))
+        rebind_candidate(
+            conn, implementation, run_id=first_run, head_sha=head, reason="review A",
+            replace=True, replaced_run=second.current_run_id)
+
+        monkeypatch.setattr(kbd, "_default_spawn", lambda *args, **kwargs: kbd.WorkerLaunch(
+            identity.pid, identity.as_dict(), "completion-pair",
+            grant=lambda *args: granted.append(args),
+            execution_grant=SimpleNamespace(role="review", review={"base": base, "head": head}),
+        ))
+        result = kbd.DispatchResult()
+        assert kbd._dispatch_lane_task(
+            conn, {"id": review}, "reviewer", result, lane="ready", dry_run=False,
+            ttl_seconds=None, board=None, failure_limit=3, spawn_fn=None,
+            per_profile_cap=None, per_profile_running={})
+        review_run = granted[0][0]
+        retained = json.loads(conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?", (review_run,),
+        ).fetchone()[0])["review_candidate"]
+        assert retained == {"task_id": implementation, "run_id": first_run, "base": base, "head": head}
+
+        def rebind():
+            rebind_candidate(
+                conn, implementation, run_id=second.current_run_id, head_sha=head,
+                reason="operator replacement after grant", replace=True, replaced_run=first_run)
+
+        if rebind_at in {"after-grant", "same-pair"}:
+            rebind()
+        elif rebind_at == "during-completion":
+            def prepare_acceptance(*args):
+                rebind()
+                return None
+            monkeypatch.setattr(kanban_pr_acceptance_store, "prepare_acceptance", prepare_acceptance)
+
+        def complete():
+            return kb.complete_task(
+                conn, review, expected_run_id=review_run,
+                summary="reviewed granted range", verdict="APPROVE", metadata={"head_sha": head})
+
+        if rebind_at != "unchanged":
+            with pytest.raises(LifecycleEvidenceError) as error:
+                complete()
+            assert f"{base}..{head}" in str(error.value)
+            assert f"{other_base}..{head}" in str(error.value)
+            current = kb.get_task(conn, review)
+            assert current.status == "running" and current.current_run_id == review_run
+            assert kb.get_lifecycle_state(conn, implementation)["acceptance"] != "accepted"
+            assert not any(event.kind == "review_approved" for event in kb.list_events(conn, review))
+            run = next(run for run in kb.list_runs(conn, review) if run.id == review_run)
+            assert run.ended_at is None and run.outcome is None
+        else:
+            assert complete()
+            assert kb.get_task(conn, review).status == "done"
+            evidence = json.loads(conn.execute(
+                "SELECT metadata FROM task_runs WHERE id = ?", (review_run,),
+            ).fetchone()[0])["lifecycle"]
+            assert evidence["candidate_run_id"] == first_run
+            assert evidence["head_sha"] == head and evidence["verdict"] == "APPROVE"
+
+
 @pytest.mark.parametrize("surface", ["cli", "deferred"])
 @pytest.mark.parametrize("target_kind", ["custom", "inherited"])
 @pytest.mark.parametrize("reused", [False, True])

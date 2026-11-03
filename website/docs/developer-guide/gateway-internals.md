@@ -272,6 +272,10 @@ The gateway runs as a long-lived process, managed via:
   `hermes_cli/gateway_startup_inputs.py` owns the shared input inventory and reader:
   launch/secondary `.env` and `.op.env`, project `.env`, deployed
   `config.yaml`/`gateway.json`, and the managed `.env`/configuration layer.
+  Secondary inputs include only canonical live profiles: valid named IDs other than
+  `default`, carrying an identity marker and no deletion tombstone. Backup directories
+  and marker-less shells cannot prevent publication; broken inputs in a live profile
+  still fail closed.
   Startup freezes explicit absence or file identity, size, timestamps and SHA-256
   before loading these inputs; dotenv-selected managed paths are added before
   loading that layer. Only the startup PID-claim winner atomically publishes the

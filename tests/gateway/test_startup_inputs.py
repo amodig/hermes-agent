@@ -97,3 +97,34 @@ def test_startup_snapshot_refuses_changed_inputs_and_identity(tmp_path, monkeypa
         identity[change] += 1
     with pytest.raises((OSError, ValueError)):
         inputs.require_unchanged_startup_inputs(home, project_env, **identity)
+
+
+@pytest.mark.parametrize("ignored", [".backup", "default", "ghost", "deleted"])
+def test_startup_snapshot_ignores_non_live_profiles(tmp_path, monkeypatch, ignored):
+    from hermes_constants import mark_named_profile_deleted
+
+    home = tmp_path / "home"
+    live = home / "profiles" / "reviewer"
+    live.mkdir(parents=True)
+    (live / ".env").write_text("FIXTURE_LIVE=value\n")
+    stray = home / "profiles" / ignored
+    stray.mkdir()
+    # .op.env is an input, but not an identity marker.
+    (stray / (".op.env" if ignored == "ghost" else ".env")).symlink_to("missing")
+    if ignored == "deleted":
+        mark_named_profile_deleted(stray)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "managed"))
+    for name, value in (("_started", False), ("_published", False), ("_pending", None), ("_context", None)):
+        monkeypatch.setattr(inputs, name, value)
+
+    project_env = tmp_path / "runtime.env"
+    inputs.begin_gateway_startup_inputs(home, project_env)
+    inputs.publish_gateway_startup_inputs()
+    snapshot_path = home / "gateway_startup_inputs.json"
+    assert snapshot_path.is_file(), "an irrelevant profile directory must not prevent publication"
+    snapshot = json.loads(snapshot_path.read_bytes())
+    assert snapshot["inputs"][str(live / ".env")]["state"] is not None
+    assert not any(str(stray) + "/" in path for path in snapshot["inputs"])
+    inputs.require_unchanged_startup_inputs(
+        home, project_env, [live], pid=snapshot["pid"], start_time=snapshot["start_time"])
