@@ -731,12 +731,25 @@ def _validate_worktree_registration(repo_root: Path, target: Path) -> None:
         ):
             raise ValueError
         registered = _git(repo_root, "worktree", "list", "--porcelain", "-z", timeout=30)
+        fields = registered.stdout.split("\0")
+        if registered.returncode == 129:  # Git before 2.36 has no worktree-list -z.
+            import ast
+
+            registered = _git(
+                repo_root, "-c", "core.quotePath=true", "worktree", "list", "--porcelain",
+                timeout=30)
+            # Porcelain without -z C-quotes unusual paths, including UTF-8 octets.
+            fields = [
+                "worktree " + ast.literal_eval("b" + field[9:]).decode("utf-8")
+                if field.startswith('worktree "') else field
+                for field in registered.stdout.split("\n")
+            ]
         if registered.returncode != 0 or not any(
             _path_key(Path(field[9:]).resolve()) == _path_key(target.resolve())
-            for field in registered.stdout.split("\0") if field.startswith("worktree ")
+            for field in fields if field.startswith("worktree ")
         ):
             raise ValueError
-    except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
+    except (OSError, UnicodeError, ValueError, SyntaxError, subprocess.SubprocessError):
         raise ValueError(
             f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: unregistered checkout {target}; "
             f"its .git pointer, registration backlink and worktree list must agree in {repo_root}"

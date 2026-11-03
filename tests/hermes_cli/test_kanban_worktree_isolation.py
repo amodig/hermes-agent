@@ -239,6 +239,72 @@ def test_role_cards_get_their_own_worktree_at_the_candidate(kanban_home, tmp_pat
     assert _head(reviewer_path) == candidate
 
 
+@pytest.mark.parametrize("registration", ["valid", "copied-pointer", "unlisted"])
+def test_role_dispatch_with_git_without_nul_worktree_listing(
+    kanban_home, tmp_path, monkeypatch, registration,
+):
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli.kanban_runtime import runtime_identity
+
+    parent = tmp_path / 'quoted "café"\tpath'
+    parent.mkdir()
+    repo = _make_repo(parent)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+    identity = runtime_identity(Path(__file__).resolve().parents[2])
+    granted = []
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
+    monkeypatch.setattr(kbd, "_require_autonomous_worker_capacity", lambda: None)
+    monkeypatch.setattr(kbd, "_default_spawn", lambda *args, **kwargs: kbd.WorkerLaunch(
+        identity.pid, identity.as_dict(), "old-git",
+        grant=lambda *args: granted.append(args)))
+    with kbc.connect_closing() as conn:
+        review = _ready_review_card(conn, repo, base, candidate)
+        target = repo / ".worktrees" / review
+        if registration == "copied-pointer":
+            sibling = _add_worktree(repo, repo / ".worktrees" / "sibling", "wt/sibling")
+            shutil.copytree(sibling, target)
+        elif registration == "unlisted":
+            _add_worktree(repo, target, f"wt/{review}")
+        real_git = shutil.which("git")
+        binary_dir = tmp_path / "bin"
+        binary_dir.mkdir()
+        stub = binary_dir / "git"
+        stub.write_text(
+            f"#!{sys.executable}\n"
+            "import os, sys\n"
+            "args = sys.argv[1:]\n"
+            "if 'worktree' in args and 'list' in args:\n"
+            "    if '-z' in args:\n"
+            "        sys.stderr.write(\"error: unknown switch `z'\\n\")\n"
+            "        sys.exit(129)\n"
+            f"    if {registration == 'unlisted'!r}:\n"
+            "        sys.exit(0)\n"
+            f"os.execv({real_git!r}, [{real_git!r}, *args])\n"
+        )
+        stub.chmod(0o700)
+        monkeypatch.setenv("PATH", str(binary_dir) + os.pathsep + os.environ["PATH"])
+        result = kbd.DispatchResult()
+        accepted = kbd._dispatch_lane_task(
+            conn, {"id": review}, "reviewer", result, lane="ready", dry_run=False,
+            ttl_seconds=None, board=None, failure_limit=3, spawn_fn=None,
+            per_profile_cap=None, per_profile_running={})
+        assert accepted is (registration == "valid")
+        current = kb.get_task(conn, review)
+        if accepted:
+            assert result.spawned == [(review, "reviewer", str(target))]
+            assert current.status == "running" and current.current_run_id
+            assert granted and _head(target) == candidate
+        else:
+            assert not result.spawned and not granted
+            assert current.current_run_id is None and current.claim_lock is None
+            assert "unregistered checkout" in current.last_failure_error
+            assert _head(target) == candidate
+            if registration == "copied-pointer":
+                assert (target / ".git").read_bytes() == (sibling / ".git").read_bytes()
+                assert _head(sibling) == candidate
+
+
 def test_role_worktree_refuses_a_copied_git_pointer(kanban_home, tmp_path):
     repo = _make_repo(tmp_path)
     base = _head(repo)

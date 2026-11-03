@@ -650,6 +650,8 @@ Role worktrees must have their own Git registration: the checkout's `.git`
 pointer, the administrative directory's backlink, and `git worktree list` must
 all identify that checkout. A copied sibling pointer refuses with
 `candidate_workspace_unavailable` before either checkout is moved.
+Git before 2.36 uses the newline-delimited porcelain listing when `-z` is
+unsupported, decoding quoted paths without relaxing any registration check.
 Untracked empty directories, ignored or not, also refuse if the candidate would
 replace them with files, including descendants beneath a collapsed directory root.
 New files can still be added inside an existing directory when no existing

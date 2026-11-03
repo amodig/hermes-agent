@@ -8,7 +8,11 @@ from hermes_cli import gateway_startup_inputs as inputs
 from hermes_cli.env_loader import load_hermes_dotenv
 
 
-def test_startup_input_snapshot_is_published_once_before_reload(tmp_path, monkeypatch):
+@pytest.mark.parametrize("unterminated", [None, "home", "project", "managed", "secondary"])
+@pytest.mark.parametrize("edit_before_publish", [False, True])
+def test_startup_input_snapshot_is_published_once_before_reload(
+    tmp_path, monkeypatch, unterminated, edit_before_publish,
+):
     home = tmp_path / "home"
     home.mkdir()
     secondary = home / "profiles" / "secondary"
@@ -22,6 +26,11 @@ def test_startup_input_snapshot_is_published_once_before_reload(tmp_path, monkey
     (secondary / ".op.env").write_text("FIXTURE_BOOTSTRAP=metadata-fixture-value\n")
     (managed / ".env").write_text("FIXTURE_MANAGED=metadata-fixture-value\n")
     (managed / "config.yaml").write_text("{}")
+    project_env.write_text("FIXTURE_PROJECT=metadata-fixture-value\n")
+    if unterminated:
+        source = {"home": home / ".env", "project": project_env,
+                  "managed": managed / ".env", "secondary": secondary / ".env"}[unterminated]
+        source.write_text(source.read_text().rstrip("\n"))
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "not-managed"))
     for name, value in (("_started", False), ("_published", False), ("_pending", None), ("_context", None)):
@@ -31,7 +40,15 @@ def test_startup_input_snapshot_is_published_once_before_reload(tmp_path, monkey
     snapshot_path = home / "gateway_startup_inputs.json"
     assert not snapshot_path.exists()  # A competing startup has not claimed ownership.
     load_hermes_dotenv(hermes_home=home, project_env=project_env, load_external_secrets=False)
+    if edit_before_publish:
+        (home / ".env").write_text("FIXTURE_EDIT=after-start\n")
     inputs.publish_gateway_startup_inputs()
+    if edit_before_publish:
+        assert not snapshot_path.exists(), "publication must refuse a genuine post-start edit"
+        return
+    assert snapshot_path.is_file(), "loader normalization must not invalidate startup evidence"
+    if unterminated:
+        assert source.read_bytes().endswith(b"\n")
     original = snapshot_path.read_bytes()
     snapshot = json.loads(original)
     identity = {"pid": snapshot["pid"], "start_time": snapshot["start_time"]}

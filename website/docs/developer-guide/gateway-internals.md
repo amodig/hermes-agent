@@ -276,9 +276,11 @@ The gateway runs as a long-lived process, managed via:
   `default`, carrying an identity marker and no deletion tombstone. Backup directories
   and marker-less shells cannot prevent publication; broken inputs in a live profile
   still fail closed.
-  Startup freezes explicit absence or file identity, size, timestamps and SHA-256
-  before loading these inputs; dotenv-selected managed paths are added before
-  loading that layer. Only the startup PID-claim winner atomically publishes the
+  Startup applies the dotenv loader's normalization before freezing explicit absence
+  or file identity, size, timestamps and SHA-256, then loads the inputs. Dotenv-selected
+  managed paths are likewise normalized and captured before loading that layer.
+  Publication still rejects any subsequent input drift; it never recaptures files.
+  Only the startup PID-claim winner atomically publishes the
   metadata (mode 0600), bound to its PID and process start time. No values or
   contents are stored, and neither status ticks nor reloads refresh the evidence.
   An installed verifier can therefore distinguish optional absence from deletion

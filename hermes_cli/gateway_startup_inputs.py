@@ -62,6 +62,14 @@ def _file_metadata(path: Path) -> dict | None:
     }
 
 
+def _capture_input(path: Path, kind: str) -> dict:
+    if kind == "dotenv" and path.is_file():
+        from hermes_cli.env_loader import _sanitize_env_file_if_needed
+
+        _sanitize_env_file_if_needed(path)
+    return {"kind": kind, "state": _file_metadata(path)}
+
+
 def capture_startup_inputs(home: Path, project_env: Path, secondary_homes=(), *,
                            pid: int | None = None, start_time: float | None = None) -> dict:
     pid = os.getpid() if pid is None else pid
@@ -70,7 +78,7 @@ def capture_startup_inputs(home: Path, project_env: Path, secondary_homes=(), *,
         "pid": pid,
         "start_time": psutil.Process(pid).create_time() if start_time is None else start_time,
         "managed_dirs": [str(managed.absolute())] if managed is not None else [],
-        "inputs": {str(path.absolute()): {"kind": kind, "state": _file_metadata(path)}
+        "inputs": {str(path.absolute()): _capture_input(path, kind)
                    for path, kind in startup_input_paths(home, project_env, secondary_homes).items()},
     }
 
@@ -108,7 +116,7 @@ def require_unchanged_startup_inputs(home: Path, project_env: Path, secondary_ho
 
 
 def begin_gateway_startup_inputs(home: Path, project_env: Path) -> None:
-    """Freeze inputs before loading them. Incidental imports never write evidence."""
+    """Normalize dotenv, then freeze inputs before loading; imports never publish."""
     global _started, _pending, _context
     if _started:
         return
@@ -137,7 +145,7 @@ def extend_gateway_startup_inputs() -> None:
         for path, kind in startup_input_paths(*_context).items():
             key = str(path.absolute())
             if key not in _pending["inputs"]:
-                _pending["inputs"][key] = {"kind": kind, "state": _file_metadata(path)}
+                _pending["inputs"][key] = _capture_input(path, kind)
     except (OSError, ValueError):
         _pending = None
         _log.warning("Gateway startup input metadata unavailable; installed verification will refuse", exc_info=True)
