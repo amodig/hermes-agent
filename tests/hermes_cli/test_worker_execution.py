@@ -1025,6 +1025,49 @@ def test_opt_in_resolves_relative_registry_backlinks_without_granting_a_sibling(
             assert grant is None and refusal == "workspace_not_granted"
 
 
+def test_relative_worktree_is_inspected_and_verified(fixture, monkeypatch):
+    from hermes_cli import worker_execution_podman as backend
+
+    _git(fixture.repo, "config", "worktree.useRelativePaths", "true")
+    task_id, db_path, target = _task_worktree(fixture)
+    git_dir = Path(_git(target, "rev-parse", "--absolute-git-dir"))
+    assert not Path((git_dir / "gitdir").read_text().strip()).is_absolute()
+    assert _git(fixture.repo, "config", "extensions.relativeworktrees") == "true"
+    grant, refusal = _resolve(
+        fixture, _opt_in_section(fixture.repo, fixture.images, recipes={"check": {
+            "image": PINNED_PY, "argv": ["/bin/true"], "timeout_seconds": 30, "services": [],
+        }}), workspace=str(target), task_id=task_id, db_path=db_path)
+    assert refusal is None and grant is not None
+    stub = SimpleNamespace(
+        task_id=task_id, profile="tester", board="fixture", preparation_id="prep-fixture",
+        run_id=7, claim_lock="claim-fixture", workspace=str(target),
+        db_path=db_path, runtime_identity=_identity(),
+    )
+    authority = wep.parse_grant_section(grant.bind(7, "claim-fixture"), stub)
+    monkeypatch.setattr(we, "_authorize_execution", lambda: (stub, authority))
+    monkeypatch.setattr(we, "_require_execution_approval", lambda *a, **kw: None)
+    monkeypatch.setattr(we, "_reauthorize_live_claim", lambda *a: None)
+    ran = []
+
+    def run_verification(**kwargs):
+        ran.append(kwargs["source_dir"])
+        assert (kwargs["source_dir"] / "app.py").read_bytes() == (target / "app.py").read_bytes()
+        return {"ok": True, "accepted": True, "cleanup_ok": True}
+
+    monkeypatch.setattr(backend, "run_verification", run_verification)
+    inspected = json.loads(we.worker_inspect({"operation": "summary"}))
+    assert inspected["ok"], inspected
+    assert inspected["git"]["head"] == fixture.head
+    verified = json.loads(we.worker_verify({"recipe": "check", "source_digest": inspected["source_digest"]}))
+    assert verified["accepted"] is True, verified
+    assert len(ran) == 1
+    assert verified["source_digest"] == inspected["source_digest"]
+    # Unknown extensions still refuse even after a grant was resolved successfully.
+    _git(fixture.repo, "config", "extensions.unsupported", "true")
+    refused = json.loads(we.worker_inspect({"operation": "summary"}))
+    assert refused["error"] == "git_unsupported", refused
+
+
 def test_claimed_legacy_review_card_still_has_the_review_role(fixture):
     """A claimed review reads ``running``; its lane is the recorded resume status."""
     from hermes_cli import kanban_db

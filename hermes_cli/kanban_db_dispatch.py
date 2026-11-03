@@ -2865,6 +2865,7 @@ def _dispatch_lane_task(
 
     use_default_spawn = spawn_fn is None
     launch: WorkerLaunch | None = None
+    spawn_entered = False
     claimed = None
     workspace = None
     resolved_branch_name = None
@@ -3071,6 +3072,8 @@ def _dispatch_lane_task(
         if lane == "review":
             claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
         if launch is None:
+            # A callback may create commits before raising or returning no launch.
+            spawn_entered = True
             launch = _call_spawn_fn(spawn_fn, claimed, str(workspace), board)
         if isinstance(launch, WorkerLaunch):
             pid = launch.pid
@@ -3106,7 +3109,7 @@ def _dispatch_lane_task(
     except WorkerLaunchInterrupted as exc:
         if launch is not None and launch.cancel:
             launch.cancel()
-        if not use_default_spawn and launch is None:
+        if not use_default_spawn and not spawn_entered:
             _kbw.discard_prepared_worktree(
                 claimed, workspace, prepared_head, board=board, prepared_new=prepared_new)
         _pause_claimed_run_for_shutdown(conn, claimed, result, exc)
@@ -3114,7 +3117,7 @@ def _dispatch_lane_task(
     except Exception as exc:
         if launch is not None and launch.cancel:
             launch.cancel()
-        if not use_default_spawn and launch is None:
+        if not use_default_spawn and not spawn_entered:
             _kbw.discard_prepared_worktree(
                 claimed, workspace, prepared_head, board=board, prepared_new=prepared_new)
         from tools.autonomous_resources import AutonomousResourceUnavailable

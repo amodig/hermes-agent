@@ -565,6 +565,8 @@ Masking uses the original form context even when a continuation starts inside a
 public field or the form has leading/trailing whitespace.
 Bare-token URL credentials are indivisible too, but their public host, path and
 query page normally; starting inside userinfo does not lose the masking context.
+Control-split tokens use the redactor's same eligibility rules: an independently
+matching token followed by a newline does not make the next public line indivisible.
 
 A candidate mismatch during deferred worker preparation rolls back only its
 own run. If an operator reclaimed it meanwhile, the restored card and history
@@ -644,8 +646,11 @@ all identify that checkout. A copied sibling pointer refuses with
 Existing checkouts with `assume-unchanged` or `skip-worktree` index flags refuse
 with `candidate_workspace_unavailable`, even when `git status` looks clean: clear
 those flags and preserve or commit any local edits before retrying. A refused
-claim or failed launch (including a custom launcher) may remove only a checkout
-that attempt created, never one with index flags or ignored entries.
+claim or failed launch may remove only a checkout that attempt created, never one
+with index flags or ignored entries. For custom launchers, automatic preparation
+discard stops at callback entry, not its return: a callback that creates a commit,
+resets HEAD, and raises may leave that commit only in `ORIG_HEAD` or the private
+HEAD reflog, which worktree removal would destroy.
 Completion, teardown, and prepared-checkout discard share the same surviving-ref
 guard: the prepared commit, detached HEAD, and
 every commit referenced inside the checkout (including private refs and annotated
@@ -667,6 +672,10 @@ Verification materializes committed bytes and per-file executable modes for revi
 claims, checking each blob against the remaining inventory bound before reading it.
 Implementation claims instead copy the granted working-tree source, including
 tracked edits, so the verified digest describes the worker's actual changes.
+Both inspection and verification accept validated `extensions.worktreeConfig` and
+`extensions.relativeWorktrees` booleans without copying them into the synthetic
+repository; it uses neither the source's per-worktree config nor its registration.
+Other unsupported Git extensions still refuse inspection.
 
 ### Unstartable review quarantine
 

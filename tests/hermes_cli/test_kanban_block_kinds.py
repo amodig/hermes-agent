@@ -594,16 +594,20 @@ def test_failed_launch_preparation_discards_its_prepared_worktree(
         if reused:
             assert kbw.resolve_workspace(kb.get_task(conn, tid)) == target
 
-        def exploding_spawn(*_args, **_kwargs):
-            calls.append(True)
+        def fail_before_spawn(*_args, **_kwargs):
             assert target.is_dir()
             raise RuntimeError("launcher refused")
 
+        def spawn(*_args, **_kwargs):
+            calls.append(True)
+
+        monkeypatch.setattr(kbw, "set_workspace_path", fail_before_spawn)
+
         result = kbd.dispatch_once(
             conn, max_spawn=1, max_in_progress=4, max_in_progress_per_profile=4,
-            spawn_fn=exploding_spawn, reconcile_orphans=False,
+            spawn_fn=spawn, reconcile_orphans=False,
         )
-        assert calls == [True]
+        assert calls == []
         assert not result.skipped_nonspawnable
         assert not result.spawned
         after = kb.get_task(conn, tid)

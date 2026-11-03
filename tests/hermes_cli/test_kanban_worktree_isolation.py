@@ -2029,8 +2029,10 @@ def test_deferred_dispatch_discards_only_new_worktrees(
 
 
 @pytest.mark.parametrize("reused", [False, True])
-def test_custom_spawn_failure_discards_only_new_role_worktrees(
-    kanban_home, tmp_path, monkeypatch, reused,
+@pytest.mark.parametrize("entered", [False, True])
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_custom_spawn_discard_stops_at_callback_entry(
+    kanban_home, tmp_path, monkeypatch, reused, entered, interrupted,
 ):
     from hermes_cli import kanban_db_dispatch as kbd
 
@@ -2040,6 +2042,8 @@ def test_custom_spawn_failure_discards_only_new_role_worktrees(
     base = _head(repo)
     candidate = _commit(repo, "app.py", "candidate\n")
     calls = []
+    commits = []
+    failure = kbd.WorkerLaunchInterrupted if interrupted else RuntimeError
     with kbc.connect_closing() as conn:
         review = _ready_review_card(conn, repo, base, candidate)
         if reused:
@@ -2049,7 +2053,17 @@ def test_custom_spawn_failure_discards_only_new_role_worktrees(
         def exploding_spawn(task, workspace, **kwargs):
             calls.append(task.id)
             assert Path(workspace) == path and _head(path) == candidate
-            raise RuntimeError("custom launcher refused")
+            # U is no longer HEAD, but ORIG_HEAD and the private reflog retain it.
+            commits.append(_commit(path, "callback.txt", "unpublished\n"))
+            _git(path, "reset", "--hard", candidate)
+            raise failure("custom launcher refused")
+
+        if not entered:
+            def fail_before_callback(*args, **kwargs):
+                assert path.is_dir()
+                raise failure("custom launcher refused")
+
+            monkeypatch.setattr(kbw, "set_branch_name", fail_before_callback)
 
         result = kbd.DispatchResult()
         assert not kbd._dispatch_lane_task(
@@ -2057,13 +2071,22 @@ def test_custom_spawn_failure_discards_only_new_role_worktrees(
             ttl_seconds=None, board=None, failure_limit=3, spawn_fn=exploding_spawn,
             per_profile_cap=None, per_profile_running={},
         )
-        assert calls == [review] and not result.spawned
+        assert calls == ([review] if entered else []) and not result.spawned
         task = kb.get_task(conn, review)
         assert task.current_run_id is None and task.claim_lock is None
-        assert task.last_failure_error == "custom launcher refused"
-    assert path.exists() is reused
-    if reused:
+        if interrupted:
+            assert result.interrupted == [review]
+        else:
+            assert task.last_failure_error == "custom launcher refused"
+    assert path.exists() is (entered or reused)
+    if entered or reused:
         assert _head(path) == candidate
+    if entered:
+        assert subprocess.check_output(
+            ["git", "-C", str(path), "rev-parse", "ORIG_HEAD"], text=True).strip() == commits[0]
+        reachable = subprocess.check_output(
+            ["git", "-C", str(path), "rev-list", "--all", "--reflog"], text=True).splitlines()
+        assert commits[0] in reachable
 
 
 @pytest.mark.parametrize("lane", ["ready", "review"])

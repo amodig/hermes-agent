@@ -604,8 +604,8 @@ _ZHIPU_API_KEY_RE = _slice_pattern(
 )
 
 
-def _mask_control_split_tokens(text: str, mask_fn) -> str:
-    """Mask tokens whose body is split by control/zero-width characters.
+def _control_split_token_matches(text: str):
+    """Yield eligible raw spans and tokens split by control/zero-width characters.
 
     Match on a control-stripped copy, then mask the corresponding span in the
     ORIGINAL — only when that span holds solely token-body and control chars, so
@@ -617,9 +617,8 @@ def _mask_control_split_tokens(text: str, mask_fn) -> str:
     """
     stripped = _CONTROL_CHARS_RE.sub("", text)
     if stripped == text:
-        return text
+        return
     orig_idx = [i for i, c in enumerate(text) if not _CONTROL_CHARS_RE.match(c)]
-    out, matches = list(text), []
     for m in _PREFIX_RE.finditer(stripped):
         start_orig = orig_idx[m.start(1)]
         end_orig = orig_idx[m.end(1) - 1] + 1
@@ -634,9 +633,16 @@ def _mask_control_split_tokens(text: str, mask_fn) -> str:
         # matched across lines) and matches running into a ``KEY=`` name.
         if (all(c in _TOKEN_BODY_CHARS or _CONTROL_CHARS_RE.match(c) for c in span)
                 and (end_orig >= len(text) or text[end_orig] != "=")):
-            matches.append((start_orig, end_orig, mask_fn(m.group(1))))
-    for start_orig, end_orig, replacement in reversed(matches):
-        out[start_orig:end_orig] = list(replacement)
+            yield start_orig, end_orig, m.group(1)
+
+
+def _mask_control_split_tokens(text: str, mask_fn) -> str:
+    matches = list(_control_split_token_matches(text))
+    if not matches:
+        return text
+    out = list(text)
+    for start_orig, end_orig, token in reversed(matches):
+        out[start_orig:end_orig] = list(mask_fn(token))
     return "".join(out)
 
 
@@ -1070,11 +1076,7 @@ def redaction_safe_bounds(text: str, start: int, end: int) -> tuple[int, int, st
                 spans.append((left, right))
                 edits.append((left, right, rendered_left, rendered_right))
     if _has_known_prefix_substring(text):
-        stripped = _CONTROL_CHARS_RE.sub("", text)
-        if stripped != text:
-            positions = [i for i, char in enumerate(text) if not _CONTROL_CHARS_RE.match(char)]
-            for match in _PREFIX_RE.finditer(stripped):
-                spans.append((positions[match.start()], positions[match.end() - 1] + 1))
+        spans.extend((left, right) for left, right, _ in _control_split_token_matches(text))
     # Merge overlaps first: expanding into one match can cross another.
     merged = []
     for left, right in sorted(spans):
