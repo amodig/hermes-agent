@@ -643,10 +643,12 @@ Existing checkouts with `assume-unchanged` or `skip-worktree` index flags refuse
 with `candidate_workspace_unavailable`, even when `git status` looks clean: clear
 those flags and preserve or commit any local edits before retrying. A refused
 claim or deferred launch may remove only a checkout that attempt created, never
-one with index flags or ignored entries. Its prepared commit must still be reachable
-from a common Git ref that survives worktree removal, not `refs/worktree/*`,
-`refs/bisect/*`, or `refs/rewritten/*`. Even a newly created detached checkout
-survives if it is the last reference to that commit. Moving a reused detached
+one with index flags or ignored entries. Its prepared commit, detached HEAD, and
+every commit referenced inside the checkout (including private refs and annotated
+tags) must still be reachable from a common Git ref that survives worktree removal,
+not `refs/worktree/*`, `refs/bisect/*`, or `refs/rewritten/*`. A refusal names the
+unprotected commit and ref. Even a newly created detached checkout survives if
+removal would lose a commit's last reference. Moving a reused detached
 checkout likewise requires its commit to be contained in the new candidate or
 anchored by a surviving ref.
 Before persisting a direct role claim, the CLI rechecks the registration and

@@ -1376,11 +1376,11 @@ def discard_prepared_worktree(
     """Remove a worktree prepared for a claim that was then refused.
 
     Only when nothing can be lost: this card's canonical linked worktree, clean by git's
-    own check, sitting exactly at the head the attempt prepared, with that head still
-    reachable from a ref and no ignored files. Any doubt preserves it, and removal never
-    deletes a branch. Without this, a refused attempt leaves a checkout at a candidate
-    a retry may be unable to move
-    away from, poisoning every later dispatch.
+    own check, sitting exactly at the head the attempt prepared, with every referenced
+    commit still reachable from a surviving ref and no ignored files. Any doubt preserves
+    it, and removal never deletes a branch. Without this, a refused attempt leaves a
+    checkout at a candidate a retry may be unable to move away from, poisoning every
+    later dispatch.
     """
     # A reused detached checkout's commit can be its last anchor, so an attempt
     # that did not create the directory must not remove it.
@@ -1402,9 +1402,27 @@ def discard_prepared_worktree(
             return False
         if not _commit_referenced(repo_root, prepared_head):
             _kb._log.info(
-                "preserving prepared workspace at %s: no ref reaches prepared head %s",
+                "preserving prepared workspace at %s: no ref reaches prepared HEAD commit %s",
                 target, prepared_head)
             return False
+        refs = _git(target, "for-each-ref", "--format=%(refname)", timeout=60)
+        if refs.returncode != 0:
+            raise ValueError("cannot enumerate checkout refs before discard")
+        for ref in (refs.stdout or "").splitlines():
+            # Peel annotated tags as well as direct commit refs. Tree/blob refs do
+            # not reference commits; an unreadable object still refuses removal.
+            peeled = _git(target, "rev-parse", "--verify", f"{ref}^{{}}", timeout=60)
+            commit = (peeled.stdout or "").strip()
+            kind = _git(target, "cat-file", "-t", commit, timeout=60)
+            if peeled.returncode != 0 or kind.returncode != 0:
+                raise ValueError(f"cannot resolve checkout ref {ref} before discard")
+            if kind.stdout.strip() != "commit":
+                continue
+            if not _commit_referenced(repo_root, commit):
+                _kb._log.info(
+                    "preserving prepared workspace at %s: no surviving ref reaches commit %s from %s",
+                    target, commit, ref)
+                return False
         result = _git(repo_root, "worktree", "remove", str(target), timeout=60)
         if result.returncode != 0:
             # Not atomic: a partial removal leaves a checkout that resolves as dirty, so

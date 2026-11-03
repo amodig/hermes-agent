@@ -1078,6 +1078,38 @@ def test_discard_preserves_the_last_candidate_reference(kanban_home, tmp_path, r
     assert _head(repo) == base
 
 
+@pytest.mark.parametrize("namespace", ["worktree", "bisect", "rewritten"])
+@pytest.mark.parametrize("surviving", [False, True])
+def test_discard_protects_every_worktree_ref_commit(
+    kanban_home, tmp_path, caplog, namespace, surviving,
+):
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+    with kbc.connect() as conn:
+        implementation = _candidate_card(conn, repo, base=base, head=candidate)
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        task = kb.get_task(conn, review)
+        path, _branch = kbw._resolve_worktree_workspace(task, candidate_head=candidate)
+        unique = _commit(path, "private.txt", "worktree-only commit\n")
+        ref = f"refs/{namespace}/private"
+        _git(path, "update-ref", ref, unique)
+        _git(path, "checkout", "--detach", candidate)
+        if surviving:
+            _git(repo, "update-ref", "refs/keep/rescued", unique)
+
+        with caplog.at_level("INFO", logger=kb._log.name):
+            assert kbw.discard_prepared_worktree(task, path, candidate) is surviving
+        assert path.is_dir() is not surviving
+        if not surviving:
+            assert _head(path) == candidate
+            assert unique in caplog.text and ref in caplog.text
+            assert kb._git_out(path, "rev-parse", "--verify", ref) == unique
+        else:
+            assert kb._git_out(repo, "rev-parse", "--verify", "refs/keep/rescued") == unique
+    assert _head(repo) == candidate
+
+
 def test_discard_preserves_a_worktree_holding_ignored_content(kanban_home, tmp_path):
     """`git worktree remove` deletes ignored files too, so any ignored entry preserves it."""
     repo = _make_repo(tmp_path)
