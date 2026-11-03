@@ -1025,6 +1025,7 @@ def redaction_safe_bounds(text: str, start: int, end: int) -> tuple[int, int, st
         while at >= 0:
             spans.append((at, at + len(value)))
             at = text.find(value, at + 1)
+    vault_spans = tuple(spans)
     for pattern, gate in [(_PREFIX_RE, None), *_SLICE_PATTERNS]:
         if gate is not None and not gate(text):
             continue
@@ -1040,7 +1041,11 @@ def redaction_safe_bounds(text: str, start: int, end: int) -> tuple[int, int, st
                 # requested slice starts inside the credential, after its scheme.
                 left, right = match.span(2)
                 spans.append((left, right))
-                url_edits.append((left, right, _mask_token(match[2])))
+                # Do not split a registered value that crosses the URL userinfo.
+                # Contained values must be scrubbed before the weaker head/tail mask.
+                if not any(a < right and left < b and (a < left or b > right)
+                           for a, b in vault_spans):
+                    url_edits.append((left, right, _mask_token(redact_registered_vault_values(match[2]))))
                 continue
             raw = text if is_form else match[0]
             redacted = redact_sensitive_text(raw, force=True)

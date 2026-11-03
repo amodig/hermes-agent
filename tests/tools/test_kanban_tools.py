@@ -469,6 +469,33 @@ def test_bounded_show_pages_public_url_without_exposing_credentials(evidence_boa
     assert page["chunk"]["next_offset"] == len("https://") + len(credential)
 
 
+@pytest.mark.parametrize("registration", ["credential", "url", "overlap"])
+def test_bounded_show_url_mask_preserves_registered_vault_redaction(evidence_board, registration):
+    from agent.redact import clear_vault_redaction_values, register_vault_redaction_value
+
+    kb, conn, _ = evidence_board
+    credential = "vaultsecret1234567890"
+    body = f"https://{credential}@example.invalid"
+    tid = kb.create_task(conn, title="vault URL", body=body)
+    try:
+        registered = {"credential": credential, "url": body, "overlap": body[:20]}[registration]
+        register_vault_redaction_value(registered)
+        token = _evidence({"task_id": tid, "section": "task"})["snapshot"]
+        page = _evidence({
+            "task_id": tid, "section": "task", "pointer": "/body",
+            "snapshot": token, "offset": 10, "chars": 1,
+        })
+        assert page["chunk"]["offset"] == (8 if registration == "credential" else 0)
+        assert page["chunk"]["next_offset"] == (None if registration == "url" else 8 + len(credential))
+        assert credential[:6] not in page["chunk"]["text"]
+        if registration != "overlap":
+            assert credential[-4:] not in page["chunk"]["text"]
+        if registration == "url":
+            assert page["chunk"]["text"] == "«redacted-vault-secret»"
+    finally:
+        clear_vault_redaction_values()
+
+
 @pytest.mark.parametrize("padding", ["leading", "trailing"])
 def test_bounded_show_masks_whitespace_wrapped_forms(evidence_board, padding, capsys):
     kb, conn, _ = evidence_board

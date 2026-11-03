@@ -568,6 +568,8 @@ Masking uses the original form context even when a continuation starts inside a
 public field or the form has leading/trailing whitespace.
 Bare-token URL credentials are indivisible too, but their public host, path and
 query page normally; starting inside userinfo does not lose the masking context.
+Registered vault values are scrubbed before generic URL head/tail masking, including
+values overlapping userinfo boundaries; paging must not reveal their prefix or suffix.
 Control-split tokens use the redactor's same eligibility rules: an independently
 matching token followed by a newline does not make the next public line indivisible.
 
