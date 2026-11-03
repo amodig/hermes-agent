@@ -268,6 +268,17 @@ The gateway runs as a long-lived process, managed via:
 - `hermes gateway start` / `hermes gateway stop` — manual control
 - `systemctl` (Linux) or `launchctl` (macOS) — service management
 - PID file at `~/.hermes/gateway.pid` — profile-scoped process tracking
+- Startup input evidence at `gateway_startup_inputs.json`, beside `gateway_state.json`.
+  `hermes_cli/gateway_startup_inputs.py` owns the shared input inventory and reader:
+  launch/secondary `.env` and `.op.env`, project `.env`, deployed
+  `config.yaml`/`gateway.json`, and the managed `.env`/configuration layer.
+  Startup freezes explicit absence or file identity, size, timestamps and SHA-256
+  before loading these inputs; dotenv-selected managed paths are added before
+  loading that layer. Only the startup PID-claim winner atomically publishes the
+  metadata (mode 0600), bound to its PID and process start time. No values or
+  contents are stored, and neither status ticks nor reloads refresh the evidence.
+  An installed verifier can therefore distinguish optional absence from deletion
+  without treating unrelated state-file renames as configuration changes.
 
 **Profile-scoped vs global**: `start_gateway()` uses profile-scoped PID files. Standalone (one gateway per profile), `hermes -p x gateway stop` stops only that profile's gateway. Under multiplexing there is ONE gateway process per host, owned by whichever profile launched it (`gateway/host_rendezvous.py` publishes its PID, home and served set; `gateway/host_attach.py` is the attach/rescan/refuse decision every lifecycle verb goes through): `hermes gateway stop` on the owner takes every served profile down, and `hermes -p x gateway stop` for a served secondary refuses with exit 78 (it has no gateway of its own). A second `gateway run` for a served profile attaches and exits 0 — under a service supervisor it exits 75 (EX_TEMPFAIL) instead, so the redundant unit is RETRIED rather than parked: "someone else serves me right now" is a runtime observation that ends when that process does, and 78 (which systemd, s6 and launchd all treat as permanent) would strand the profile. ATTACH requires a live `identify` answer from the owner; a rendezvous record with nothing answering behind it proves an owner exists but never that it serves you, so it yields a transient refusal (exit 75), never an attach. An owner that answers `multiplex: False` to the rescan is another profile's *standalone* gateway, not a multiplexer that excluded you: the verb starts this profile's own gateway beside it (the one-process-per-profile topology), it does not refuse — refusing there exited 78 and parked every launchd unit but the first to claim the host lock. `hermes gateway stop --all` uses global `ps aux` scanning to kill all gateway processes (used during updates). Liveness is decided by `gateway.status.live_gateway_pid_for_home` (PID + start-time fingerprint), never bare PID existence.
 

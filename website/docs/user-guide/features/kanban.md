@@ -664,7 +664,11 @@ guard: the prepared commit, detached HEAD, and
 every commit referenced inside the checkout (including private pseudoreferences
 such as `ORIG_HEAD`, private reflog history, private refs and annotated tags) must
 still be reachable from a common Git ref that survives worktree removal,
-not `refs/worktree/*`, `refs/bisect/*`, or `refs/rewritten/*`. A refusal names the
+not `refs/worktree/*`, `refs/bisect/*`, or `refs/rewritten/*`. Root-ref enumeration
+uses `for-each-ref --include-root-refs` only when `git for-each-ref -h` advertises
+it; older Git enumerates the checkout's recovery-ref files instead, including
+`NOTES_MERGE_PARTIAL`/`NOTES_MERGE_REF` and every object in `FETCH_HEAD`/`MERGE_HEAD`.
+An enumeration or resolution failure still preserves the checkout. A refusal names the
 unprotected commit and ref. Even a newly created detached checkout survives if
 removal would lose a commit's last reference. Moving a reused detached
 checkout likewise requires its commit to be contained in the new candidate or

@@ -335,6 +335,10 @@ from agent.i18n import t as _t  # noqa: E402
 
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
+if "--gateway" in sys.argv[1:]:
+    from hermes_cli.gateway_startup_inputs import begin_gateway_startup_inputs
+
+    begin_gateway_startup_inputs(_hermes_home, _project_env)
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
 
 

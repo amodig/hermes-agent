@@ -522,6 +522,11 @@ def load_hermes_dotenv(
         _load_dotenv_with_fallback(project_env_path, override=not loaded, load_pass=load_pass)
         loaded.append(project_env_path)
 
+    # A gateway may select its managed layer in dotenv. Record its metadata
+    # before either the secret-source config or the managed overlay reads it.
+    from hermes_cli.gateway_startup_inputs import extend_gateway_startup_inputs
+    extend_gateway_startup_inputs()
+
     # The override=True loads above wrote the raw .env line (``__BITWARDEN_MANAGED__`` placeholder, stale
     # token) back over a value an external source resolved on an earlier call, and the source pass below is a
     # once-per-home no-op — so the clobber stuck for the life of the process (#74265). Re-assert only what the

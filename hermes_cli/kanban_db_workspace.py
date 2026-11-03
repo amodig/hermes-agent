@@ -1378,14 +1378,46 @@ def _worktree_removal_blockers(worktree: Path) -> list[str]:
 
 def _worktree_refs_survive_removal(repo_root: Path, worktree: Path) -> bool:
     """Preserve checkout refs and private recovery history until common refs reach them."""
-    refs = _git(
-        worktree, "for-each-ref", "--include-root-refs", "--format=%(refname)", timeout=60)
+    help_result = _git(worktree, "for-each-ref", "-h", timeout=60)
+    if help_result.returncode not in (0, 129):
+        _kb._log.warning("Preserving worktree at %s: cannot probe checkout refs", worktree)
+        return False
+    root_refs_supported = "--include-root-refs" in (
+        (help_result.stdout or "") + (help_result.stderr or ""))
+    options = ["--include-root-refs"] if root_refs_supported else []
+    refs = _git(worktree, "for-each-ref", *options, "--format=%(refname)", timeout=60)
     if refs.returncode != 0:
         _kb._log.warning("Preserving worktree at %s: cannot enumerate checkout refs", worktree)
         return False
-    for ref in ["HEAD", *(refs.stdout or "").splitlines()]:
+    revisions = [(ref, ref) for ref in ["HEAD", *(refs.stdout or "").splitlines()]]
+    if not root_refs_supported:
+        # Older Git keeps these recovery refs in the checkout's administrative
+        # directory, not under refs/. Enumerate files so absence is distinct from
+        # a failed rev-parse of a present (possibly broken) ref.
+        git_dir = _git_abs_path(worktree, "--git-dir")
+        if git_dir is None:
+            return False
+        try:
+            for path in git_dir.iterdir():
+                ref = path.name
+                if ref in {"FETCH_HEAD", "MERGE_HEAD"}:
+                    # These two pseudorefs can contain several object IDs.
+                    for line in path.read_text(encoding="ascii").splitlines():
+                        commit = line.split()[0]
+                        if not _COMMIT_ID.fullmatch(commit):
+                            raise ValueError("invalid pseudoref")
+                        revisions.append((ref, commit))
+                elif ref.endswith("_HEAD") or ref in {
+                    "AUTO_MERGE", "BISECT_EXPECTED_REV", "MERGE_AUTOSTASH",
+                    "NOTES_MERGE_PARTIAL", "NOTES_MERGE_REF",
+                }:
+                    revisions.append((ref, ref))
+        except (OSError, ValueError, IndexError):
+            _kb._log.warning("Preserving worktree at %s: cannot enumerate checkout refs", worktree)
+            return False
+    for ref, revision in revisions:
         # Peel annotated tags too; tree/blob refs do not reference commits.
-        peeled = _git(worktree, "rev-parse", "--verify", f"{ref}^{{}}", timeout=60)
+        peeled = _git(worktree, "rev-parse", "--verify", f"{revision}^{{}}", timeout=60)
         commit = (peeled.stdout or "").strip()
         kind = _git(worktree, "cat-file", "-t", commit, timeout=60)
         if peeled.returncode != 0 or kind.returncode != 0:

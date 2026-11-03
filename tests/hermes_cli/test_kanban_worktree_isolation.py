@@ -19,6 +19,9 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import json
 import subprocess
+import os
+import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -1177,6 +1180,71 @@ def test_discard_protects_private_recovery_anchors(
                 assert unique in kb._git_out(path, "reflog", "show", "--format=%H", "HEAD")
                 # Recovery history must keep U reachable, not merely unpruned.
                 assert unique not in (kb._git_out(path, "fsck", "--unreachable") or "")
+
+
+@pytest.mark.parametrize("root_ref", ["ORIG_HEAD", "NOTES_MERGE_PARTIAL", "NOTES_MERGE_REF",
+                                    "FETCH_HEAD", "MERGE_HEAD"])
+@pytest.mark.parametrize("operation", ["discard", "cleanup"])
+@pytest.mark.parametrize("anchor", ["unreferenced", "referenced", "enumeration_failure"])
+def test_worktree_removal_with_git_without_root_ref_option(
+    kanban_home, tmp_path, monkeypatch, caplog, operation, anchor, root_ref,
+):
+    """Old Git must still protect private history without blocking safe removal."""
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+    _git(repo, "update-ref", "refs/remotes/origin/main", candidate)
+    with kbc.connect() as conn:
+        implementation = _candidate_card(conn, repo, base=base, head=candidate)
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        task = kb.get_task(conn, review)
+        path, branch = kbw._resolve_worktree_workspace(task, candidate_head=candidate)
+    unique = _commit(path, "operator.txt", f"{root_ref}-only recovery\n")
+    _git(path, "reset", "--hard", candidate)
+    _git(path, "reflog", "expire", "--expire=now", "HEAD")
+    if root_ref != "ORIG_HEAD":
+        _git(path, "update-ref", "-d", "ORIG_HEAD")
+        git_dir = Path(kb._git_out(path, "rev-parse", "--absolute-git-dir"))
+        # FETCH_HEAD and MERGE_HEAD can hold more than one commit. The second
+        # object must be checked too, not merely the first peelable revision.
+        contents = f"{candidate}\n{unique}\n" if root_ref in {"FETCH_HEAD", "MERGE_HEAD"} else f"{unique}\n"
+        (git_dir / root_ref).write_text(contents)
+    if anchor != "unreferenced":
+        _git(repo, "update-ref", "refs/keep/operator", unique)
+
+    real_git = shutil.which("git")
+    binary_dir = tmp_path / "bin"
+    binary_dir.mkdir()
+    stub = binary_dir / "git"
+    stub.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "args = sys.argv[1:]\n"
+        "if '--include-root-refs' in args:\n"
+        "    sys.stderr.write(\"error: unknown option `include-root-refs'\\n\")\n"
+        "    sys.exit(129)\n"
+        "if 'for-each-ref' in args and '-h' in args:\n"
+        "    sys.stdout.write('usage: git for-each-ref [options]\\n')\n"
+        "    sys.exit(129)\n"
+        f"if {anchor == 'enumeration_failure'!r} and args[-2:] == ['for-each-ref', '--format=%(refname)']:\n"
+        "    sys.stderr.write('fatal: unable to enumerate refs\\n')\n"
+        "    sys.exit(128)\n"
+        f"os.execv({real_git!r}, [{real_git!r}, *args])\n"
+    )
+    stub.chmod(0o700)
+    monkeypatch.setenv("PATH", str(binary_dir) + os.pathsep + os.environ["PATH"])
+    with caplog.at_level("INFO", logger=kb._log.name):
+        if operation == "discard":
+            assert kbw.discard_prepared_worktree(task, path, candidate) is (anchor == "referenced")
+        else:
+            kbw._cleanup_worktree_workspace(review, str(path), branch)
+    assert path.exists() is (anchor != "referenced")
+    if anchor == "unreferenced":
+        assert unique in caplog.text and root_ref in caplog.text
+        assert unique in (Path(kb._git_out(path, "rev-parse", "--absolute-git-dir")) / root_ref).read_text()
+    elif anchor == "enumeration_failure":
+        assert "cannot enumerate checkout refs" in caplog.text
+
 
 
 @pytest.mark.parametrize("surviving", [False, True])

@@ -1579,6 +1579,8 @@ _hermes_home = get_process_hermes_home()
 # Load ~/.hermes/.env first: user-managed env files must override stale shell exports on restart.
 from hermes_cli.env_loader import load_hermes_dotenv
 _env_path = _hermes_home / '.env'
+from hermes_cli.gateway_startup_inputs import begin_gateway_startup_inputs
+begin_gateway_startup_inputs(_hermes_home, Path(__file__).resolve().parents[1] / ".env")
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
 
 
@@ -5939,6 +5941,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # mid-upgrade) blocks every other unit with exit 75 until it exits; only --force gets past it.
     if not _start_gateway_claim_pid_file(force=force):
         return False
+
+    from hermes_cli.gateway_startup_inputs import publish_gateway_startup_inputs
+    publish_gateway_startup_inputs()
 
     # Right after the PID claim (which makes us authoritative); non-fatal — consumers fall back to scan.
     _control_server = await _start_gateway_start_control_socket(runner)
