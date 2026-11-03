@@ -970,6 +970,37 @@ def test_ignored_directory_that_the_candidate_turns_into_a_file_is_refused(
     assert _head(workspace) == candidate
 
 
+@pytest.mark.parametrize("collision", [False, True])
+def test_role_worktree_preserves_nested_ignored_empty_directory(
+    kanban_home, tmp_path, collision,
+):
+    repo = _make_repo(tmp_path)
+    base = _commit(repo, ".gitignore", "top\n")
+    (repo / "top").mkdir()
+    (repo / "top" / "nested").write_text("candidate file\n")
+    _git(repo, "add", "-f", "top/nested")
+    _git(repo, "commit", "-m", "track nested file")
+    candidate = _head(repo)
+    with kbc.connect() as conn:
+        implementation = _candidate_card(conn, repo, base=base, head=candidate)
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        task = kb.get_task(conn, review)
+        workspace = repo / ".worktrees" / review
+        _git(repo, "worktree", "add", "--detach", str(workspace), base)
+        (workspace / "top").mkdir()
+        nested = workspace / "top" / "nested"
+        if collision:
+            nested.mkdir()
+            with pytest.raises(ValueError, match="top/nested"):
+                kbw._resolve_worktree_workspace(task, candidate_head=candidate)
+            assert nested.is_dir() and not list(nested.iterdir())
+            assert _head(workspace) == base
+        else:
+            kbw._resolve_worktree_workspace(task, candidate_head=candidate)
+            assert nested.read_text() == "candidate file\n"
+            assert _head(workspace) == candidate
+
+
 def test_cleanup_never_deletes_a_branch_the_role_never_recorded(kanban_home, tmp_path):
     """An empty recorded branch is the truth for a detached checkout, not ``wt/<id>``."""
     from hermes_cli import kanban_db_workspace as workspace_module
@@ -1108,6 +1139,44 @@ def test_discard_protects_every_worktree_ref_commit(
         else:
             assert kb._git_out(repo, "rev-parse", "--verify", "refs/keep/rescued") == unique
     assert _head(repo) == candidate
+
+
+@pytest.mark.parametrize("anchor", ["both", "ORIG_HEAD", "reflog"])
+@pytest.mark.parametrize("surviving", [False, True])
+def test_discard_protects_private_recovery_anchors(
+    kanban_home, tmp_path, caplog, anchor, surviving,
+):
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "candidate.txt", "candidate\n")
+    with kbc.connect() as conn:
+        implementation = _candidate_card(conn, repo, base=base, head=candidate)
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        task = kb.get_task(conn, review)
+        path, _branch = kbw._resolve_worktree_workspace(task, candidate_head=candidate)
+        unique = _commit(path, "operator.txt", "operator recovery commit\n")
+        _git(path, "reset", "--hard", candidate)
+        assert kb._git_out(path, "rev-parse", "ORIG_HEAD") == unique
+        if anchor == "ORIG_HEAD":
+            _git(path, "reflog", "expire", "--expire=now", "HEAD")
+        elif anchor == "reflog":
+            _git(path, "update-ref", "-d", "ORIG_HEAD")
+        if surviving:
+            _git(repo, "update-ref", "refs/keep/operator", unique)
+        with caplog.at_level("INFO", logger=kb._log.name):
+            assert kbw.discard_prepared_worktree(task, path, candidate) is surviving
+        assert path.is_dir() is not surviving
+        if surviving:
+            assert kb._git_out(repo, "rev-parse", "refs/keep/operator") == unique
+        else:
+            assert unique in caplog.text
+            if anchor != "reflog":
+                assert kb._git_out(path, "rev-parse", "ORIG_HEAD") == unique
+                assert unique in kb._git_out(path, "rev-list", "ORIG_HEAD")
+            if anchor != "ORIG_HEAD":
+                assert unique in kb._git_out(path, "reflog", "show", "--format=%H", "HEAD")
+                # Recovery history must keep U reachable, not merely unpruned.
+                assert unique not in (kb._git_out(path, "fsck", "--unreachable") or "")
 
 
 @pytest.mark.parametrize("surviving", [False, True])

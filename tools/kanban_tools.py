@@ -770,6 +770,12 @@ def _handle_bounded_show(args: dict) -> str:
         if grant is not None:
             worker_startup._read_startup(conn, grant)
         result = evidence.read_evidence(conn, board=board, task_id=tid, **options)
+        if grant is None and args.get("board") is None and os.environ.get("HERMES_KANBAN_DB", "").strip():
+            # A resolved slug is display/snapshot identity, not explicit routing intent.
+            # Preserve the env-pinned path for both page and deferred-value continuations.
+            for node in (result, *result.get("entries", ()), *result.get("items", ())):
+                if "continuation" in node:
+                    node["continuation"].pop("board", None)
         after = path.stat()
         if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
             return refuse("stale_snapshot" if args.get("snapshot") else "board_unavailable")

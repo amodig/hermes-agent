@@ -745,6 +745,49 @@ def test_bounded_show_snapshot_binds_task_board_and_file(evidence_board, monkeyp
                          ok=False)["code"] == "stale_snapshot"
 
 
+@pytest.mark.parametrize("explicit", [False, True])
+def test_bounded_show_continuations_preserve_env_pinned_routing(
+    evidence_board, monkeypatch, tmp_path, explicit,
+):
+    import sqlite3
+    from hermes_cli import kanban_db_connect as kbc
+
+    kb, conn, _ = evidence_board
+    body = "same database across pages " * 400
+    tid = kb.create_task(conn, title="pinned evidence", body=body)
+    pinned = tmp_path / "pinned.db"
+    with sqlite3.connect(pinned) as target:
+        conn.backup(target)
+    kb.init_db(board="other")
+    with kbc.connect(board="other") as other:
+        other_tid = kb.create_task(other, title="explicit evidence", body=body + "other board")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
+    route = {"board": "other"} if explicit else {}
+    task_id = other_tid if explicit else tid
+    token = _evidence({"task_id": task_id, "section": "task", **route})["snapshot"]
+    page = _evidence({
+        "task_id": task_id, "section": "task", "pointer": "/body",
+        "chars": 8192, "snapshot": token, **route,
+    })
+    continuation = page["continuation"]
+    assert ("board" in continuation) is explicit
+    if explicit:
+        assert continuation["board"] == "other"
+    second = _evidence(continuation)
+    assert second["snapshot"] == token
+    assert second["complete"]
+    assert page["chunk"]["text"] + second["chunk"]["text"] == body + ("other board" if explicit else "")
+    # Deferred entry continuations must carry the same routing intent.
+    kb_body = "A" * 40000
+    with sqlite3.connect(pinned) as target:
+        target.execute("UPDATE tasks SET body = ? WHERE id = ?", (kb_body, tid))
+    if not explicit:
+        page = _evidence({"task_id": tid, "section": "task"})
+        deferred = next(entry for entry in page["entries"] if entry["key"] == "body")
+        assert "board" not in deferred["continuation"]
+        assert _evidence(deferred["continuation"])["chunk"]["text"] == kb_body[:4096]
+
+
 def test_bounded_show_projection_and_fingerprint_share_one_transaction(evidence_board, monkeypatch):
     kb, conn, tid = evidence_board
     from hermes_cli import kanban_db_evidence as evidence

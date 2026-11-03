@@ -558,6 +558,9 @@ Bounded `kanban_show` string pages use raw stored character positions for
 Slices expand across whole secrets before redaction; a newly registered secret
 can move a page's reported start backwards, but never skips subsequent evidence.
 Use the returned continuation, not the rendered text length, for the next page.
+An implicit request pinned by `HERMES_KANBAN_DB` keeps `board` absent from its
+continuations; explicit cross-board requests keep their board. The snapshot still
+binds the original resolved board and database file, so changing the route refuses.
 The complete JSON response remains bounded to 32 KiB.
 Public fields between redacted form credentials page normally; each changed
 region is indivisible, not the entire span from the first secret to the last.
@@ -643,6 +646,9 @@ Role worktrees must have their own Git registration: the checkout's `.git`
 pointer, the administrative directory's backlink, and `git worktree list` must
 all identify that checkout. A copied sibling pointer refuses with
 `candidate_workspace_unavailable` before either checkout is moved.
+Ignored empty directories, including descendants beneath a collapsed ignored root,
+also refuse if the candidate would replace them with files. New files can still
+be added beneath an ignored directory when no existing directory is overwritten.
 Existing checkouts with `assume-unchanged` or `skip-worktree` index flags refuse
 with `candidate_workspace_unavailable`, even when `git status` looks clean: clear
 those flags and preserve or commit any local edits before retrying. A refused
@@ -653,8 +659,9 @@ resets HEAD, and raises may leave that commit only in `ORIG_HEAD` or the private
 HEAD reflog, which worktree removal would destroy.
 Completion, teardown, and prepared-checkout discard share the same surviving-ref
 guard: the prepared commit, detached HEAD, and
-every commit referenced inside the checkout (including private refs and annotated
-tags) must still be reachable from a common Git ref that survives worktree removal,
+every commit referenced inside the checkout (including private pseudoreferences
+such as `ORIG_HEAD`, private reflog history, private refs and annotated tags) must
+still be reachable from a common Git ref that survives worktree removal,
 not `refs/worktree/*`, `refs/bisect/*`, or `refs/rewritten/*`. A refusal names the
 unprotected commit and ref. Even a newly created detached checkout survives if
 removal would lose a commit's last reference. Moving a reused detached

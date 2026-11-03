@@ -855,8 +855,8 @@ def _ignored_paths_target_tracks(repo: Path, worktree: Path, head: str) -> list[
     # Two listings on purpose. Per-file first: ``--directory`` collapses a nonempty
     # ignored directory to ``dir/``, losing which children exist, and a tracked sibling
     # (``cache/new`` beside an ignored ``cache/local``) is not a conflict. The second
-    # listing adds directories that are *empty*, which the first cannot report at all
-    # even though a checkout or removal deletes them.
+    # listing adds ignored directory roots, including empty ones. Git collapses
+    # descendants, so check candidate paths beneath those roots on disk below.
     files = _git(
         worktree, "ls-files", "--others", "--ignored", "--exclude-standard", "-z", timeout=60)
     if files.returncode != 0:
@@ -908,11 +908,16 @@ def _ignored_paths_target_tracks(repo: Path, worktree: Path, head: str) -> list[
         if exact_or_tracked_child(entry) or ancestor_tracked(entry):
             hits.append(entry)
     for entry in empty_dirs:
-        # An empty directory is only at risk when a tracked file takes its own path;
-        # tracked children would simply be added inside it.
+        # Git collapses ignored directories, hiding empty descendants. Inspect each
+        # tracked descendant too: adding a file is safe, replacing a directory is not.
         index = bisect.bisect_left(paths, entry)
         if index < len(paths) and paths[index] == entry:
             hits.append(entry)
+        index = bisect.bisect_left(paths, entry + "/")
+        while index < len(paths) and paths[index].startswith(entry + "/"):
+            if (worktree / paths[index]).is_dir():
+                hits.append(paths[index])
+            index += 1
     return hits
 
 
@@ -1372,8 +1377,9 @@ def _worktree_removal_blockers(worktree: Path) -> list[str]:
 
 
 def _worktree_refs_survive_removal(repo_root: Path, worktree: Path) -> bool:
-    """Preserve HEAD and every checkout ref unless a surviving ref reaches its commit."""
-    refs = _git(worktree, "for-each-ref", "--format=%(refname)", timeout=60)
+    """Preserve checkout refs and private recovery history until common refs reach them."""
+    refs = _git(
+        worktree, "for-each-ref", "--include-root-refs", "--format=%(refname)", timeout=60)
     if refs.returncode != 0:
         _kb._log.warning("Preserving worktree at %s: cannot enumerate checkout refs", worktree)
         return False
@@ -1391,6 +1397,28 @@ def _worktree_refs_survive_removal(repo_root: Path, worktree: Path) -> bool:
                 "Preserving worktree at %s: no surviving ref reaches commit %s from %s",
                 worktree, commit, ref)
             return False
+    # --single-worktree excludes sibling HEAD logs; shared branch logs survive
+    # removal and must not hold an otherwise disposable checkout hostage.
+    reflog = _git(
+        worktree, "reflog", "show", "--single-worktree", "--all",
+        "--format=%H %gD", timeout=60)
+    if reflog.returncode != 0:
+        _kb._log.warning("Preserving worktree at %s: cannot enumerate reflogs", worktree)
+        return False
+    checked = set()
+    for entry in (reflog.stdout or "").splitlines():
+        commit, selector = entry.split(" ", 1)
+        ref = selector.split("@{", 1)[0]
+        if ref.startswith("refs/") and not ref.startswith(
+            ("refs/worktree/", "refs/bisect/", "refs/rewritten/")
+        ):
+            continue
+        if commit not in checked and not _commit_referenced(repo_root, commit):
+            _kb._log.info(
+                "Preserving worktree at %s: no surviving ref reaches commit %s from %s",
+                worktree, commit, selector)
+            return False
+        checked.add(commit)
     return True
 
 
