@@ -1390,44 +1390,57 @@ def _worktree_refs_survive_removal(repo_root: Path, worktree: Path) -> bool:
         _kb._log.warning("Preserving worktree at %s: cannot enumerate checkout refs", worktree)
         return False
     revisions = [(ref, ref) for ref in ["HEAD", *(refs.stdout or "").splitlines()]]
-    if not root_refs_supported:
-        # Older Git keeps these recovery refs in the checkout's administrative
-        # directory, not under refs/. Enumerate files so absence is distinct from
-        # a failed rev-parse of a present (possibly broken) ref.
-        git_dir = _git_abs_path(worktree, "--git-dir")
-        if git_dir is None:
-            return False
-        try:
-            for path in git_dir.iterdir():
-                ref = path.name
-                if ref in {"FETCH_HEAD", "MERGE_HEAD"}:
-                    # These two pseudorefs can contain several object IDs.
-                    for line in path.read_text(encoding="ascii").splitlines():
-                        commit = line.split()[0]
-                        if not _COMMIT_ID.fullmatch(commit):
-                            raise ValueError("invalid pseudoref")
-                        revisions.append((ref, commit))
-                elif ref.endswith("_HEAD") or ref in {
-                    "AUTO_MERGE", "BISECT_EXPECTED_REV", "MERGE_AUTOSTASH",
-                    "NOTES_MERGE_PARTIAL", "NOTES_MERGE_REF",
-                }:
-                    revisions.append((ref, ref))
-        except (OSError, ValueError, IndexError):
-            _kb._log.warning("Preserving worktree at %s: cannot enumerate checkout refs", worktree)
-            return False
+    # Even --include-root-refs omits multivalued FETCH_HEAD/MERGE_HEAD.
+    # Scan their files on every Git version; older Git needs other root refs too.
+    git_dir = _git_abs_path(worktree, "--git-dir")
+    if git_dir is None:
+        return False
+    try:
+        for path in git_dir.iterdir():
+            ref = path.name
+            if ref in {"FETCH_HEAD", "MERGE_HEAD"}:
+                for line in path.read_text(encoding="ascii").splitlines():
+                    object_id = line.split()[0]
+                    if not _COMMIT_ID.fullmatch(object_id):
+                        raise ValueError("invalid pseudoref")
+                    revisions.append((ref, object_id))
+            elif not root_refs_supported and (ref.endswith("_HEAD") or ref in {
+                "AUTO_MERGE", "BISECT_EXPECTED_REV", "MERGE_AUTOSTASH",
+                "NOTES_MERGE_PARTIAL", "NOTES_MERGE_REF",
+            }):
+                revisions.append((ref, ref))
+    except (OSError, ValueError, IndexError):
+        _kb._log.warning("Preserving worktree at %s: cannot enumerate checkout refs", worktree)
+        return False
+    common_objects = None
     for ref, revision in revisions:
-        # Peel annotated tags too; tree/blob refs do not reference commits.
+        # Peeling a tag to a tree/blob still requires proof that the object survives.
         peeled = _git(worktree, "rev-parse", "--verify", f"{revision}^{{}}", timeout=60)
-        commit = (peeled.stdout or "").strip()
-        kind = _git(worktree, "cat-file", "-t", commit, timeout=60)
+        object_id = (peeled.stdout or "").strip()
+        kind = _git(worktree, "cat-file", "-t", object_id, timeout=60)
         if peeled.returncode != 0 or kind.returncode != 0:
             _kb._log.warning(
                 "Preserving worktree at %s: cannot resolve checkout ref %s", worktree, ref)
             return False
-        if kind.stdout.strip() == "commit" and not _commit_referenced(repo_root, commit):
+        if kind.stdout.strip() == "commit":
+            survives = _commit_referenced(repo_root, object_id)
+        else:
+            if common_objects is None:
+                # Only common refs count: --all would also include private HEADs.
+                objects = _git(
+                    repo_root, "rev-list", "--objects", "--no-object-names",
+                    "--exclude=refs/worktree/*", "--exclude=refs/bisect/*",
+                    "--exclude=refs/rewritten/*", "--glob=refs/*", timeout=60)
+                if objects.returncode != 0:
+                    _kb._log.warning(
+                        "Preserving worktree at %s: cannot enumerate surviving objects", worktree)
+                    return False
+                common_objects = set((objects.stdout or "").splitlines())
+            survives = object_id in common_objects
+        if not survives:
             _kb._log.info(
-                "Preserving worktree at %s: no surviving ref reaches commit %s from %s",
-                worktree, commit, ref)
+                "Preserving worktree at %s: no surviving ref reaches %s %s from %s",
+                worktree, kind.stdout.strip(), object_id, ref)
             return False
     # --single-worktree excludes sibling HEAD logs; shared branch logs survive
     # removal and must not hold an otherwise disposable checkout hostage.
@@ -1462,7 +1475,7 @@ def discard_prepared_worktree(
 
     Only when nothing can be lost: this card's canonical linked worktree, clean by git's
     own check, sitting exactly at the head the attempt prepared, with every referenced
-    commit still reachable from a surviving ref and no ignored files. Any doubt preserves
+    object still reachable from a surviving ref and no ignored files. Any doubt preserves
     it, and removal never deletes a branch. Without this, a refused attempt leaves a
     checkout at a candidate a retry may be unable to move away from, poisoning every
     later dispatch.

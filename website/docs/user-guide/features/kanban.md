@@ -667,10 +667,13 @@ still be reachable from a common Git ref that survives worktree removal,
 not `refs/worktree/*`, `refs/bisect/*`, or `refs/rewritten/*`. Root-ref enumeration
 uses `for-each-ref --include-root-refs` only when `git for-each-ref -h` advertises
 it; older Git enumerates the checkout's recovery-ref files instead, including
-`NOTES_MERGE_PARTIAL`/`NOTES_MERGE_REF` and every object in `FETCH_HEAD`/`MERGE_HEAD`.
+`NOTES_MERGE_PARTIAL`/`NOTES_MERGE_REF`. Every object in `FETCH_HEAD`/`MERGE_HEAD`
+is checked on all Git versions: even `--include-root-refs` omits these multivalued
+pseudorefs. Tree/blob anchors also preserve the checkout unless traversal from
+surviving common refs proves the object is retained.
 An enumeration or resolution failure still preserves the checkout. A refusal names the
-unprotected commit and ref. Even a newly created detached checkout survives if
-removal would lose a commit's last reference. Moving a reused detached
+unprotected object and ref. Even a newly created detached checkout survives if
+removal would lose an object's last reference. Moving a reused detached
 checkout likewise requires its commit to be contained in the new candidate or
 anchored by a surviving ref.
 Before persisting a direct role claim, the CLI rechecks the registration and

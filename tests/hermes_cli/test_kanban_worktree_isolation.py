@@ -1246,6 +1246,117 @@ def test_worktree_removal_with_git_without_root_ref_option(
         assert "cannot enumerate checkout refs" in caplog.text
 
 
+@pytest.mark.parametrize("root_ref", ["FETCH_HEAD", "MERGE_HEAD"])
+@pytest.mark.parametrize("operation", ["discard", "cleanup"])
+@pytest.mark.parametrize("surviving", [False, True])
+def test_modern_git_removal_protects_multivalued_pseudorefs(
+    kanban_home, tmp_path, monkeypatch, caplog, root_ref, operation, surviving,
+):
+    repo = _make_repo(tmp_path)
+    candidate = _head(repo)
+    _git(repo, "update-ref", "refs/remotes/origin/main", candidate)
+    with kbc.connect() as conn:
+        implementation = _candidate_card(conn, repo, base=candidate, head=candidate)
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        task = kb.get_task(conn, review)
+        path, branch = kbw._resolve_worktree_workspace(task, candidate_head=candidate)
+    # Fetch without a destination ref: no local branch, ORIG_HEAD or reflog
+    # ever points at this commit in the repository being cleaned up.
+    source = tmp_path / "source"
+    _git(tmp_path, "clone", str(repo), str(source))
+    unique = _commit(source, "operator.txt", "fetched recovery\n")
+    _git(path, "fetch", str(source), "main")
+    git_dir = Path(kb._git_out(path, "rev-parse", "--absolute-git-dir"))
+    fetched = (git_dir / "FETCH_HEAD").read_text()
+    assert fetched.split()[0] == unique
+    if root_ref == "FETCH_HEAD":
+        (git_dir / root_ref).write_text(f"{candidate}\t\talready saved\n" + fetched)
+    else:
+        (git_dir / "FETCH_HEAD").unlink()
+        (git_dir / root_ref).write_text(f"{candidate}\n{unique}\n")
+    if surviving:
+        _git(repo, "update-ref", "refs/keep/operator", unique)
+
+    real_git = kbw._git
+    enumerated = []
+
+    def modern_git(repo_root, *args, timeout):
+        if args == ("for-each-ref", "-h"):
+            return subprocess.CompletedProcess(args, 129, "usage: --include-root-refs\n", "")
+        if "--include-root-refs" in args:
+            enumerated.append(True)
+            # Modern Git includes root refs but omits these multivalued files.
+            # HEAD is the only other root ref in this fixture.
+            result = real_git(repo_root, *(arg for arg in args if arg != "--include-root-refs"),
+                              timeout=timeout)
+            result.stdout += "HEAD\n"
+            return result
+        return real_git(repo_root, *args, timeout=timeout)
+
+    monkeypatch.setattr(kbw, "_git", modern_git)
+    with caplog.at_level("INFO", logger=kb._log.name):
+        if operation == "discard":
+            assert kbw.discard_prepared_worktree(task, path, candidate) is surviving
+        else:
+            kbw._cleanup_worktree_workspace(review, str(path), branch)
+    assert enumerated
+    assert path.is_dir() is not surviving
+    if not surviving:
+        assert unique in caplog.text and root_ref in caplog.text
+        assert unique in (git_dir / root_ref).read_text()
+        assert unique in kb._git_out(path, "rev-list", unique)
+    else:
+        assert kb._git_out(repo, "rev-parse", "refs/keep/operator") == unique
+
+
+@pytest.mark.parametrize("kind", ["blob", "tree", "commit"])
+@pytest.mark.parametrize("operation", ["discard", "cleanup"])
+@pytest.mark.parametrize("surviving", [False, True])
+def test_worktree_removal_protects_noncommit_anchors(
+    kanban_home, tmp_path, caplog, kind, operation, surviving,
+):
+    repo = _make_repo(tmp_path)
+    candidate = _head(repo)
+    _git(repo, "update-ref", "refs/remotes/origin/main", candidate)
+    with kbc.connect() as conn:
+        implementation = _candidate_card(conn, repo, base=candidate, head=candidate)
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        task = kb.get_task(conn, review)
+        path, branch = kbw._resolve_worktree_workspace(task, candidate_head=candidate)
+    # Build objects without moving HEAD or leaving recovery reflogs.
+    payload = tmp_path / "saved.txt"
+    payload.write_text("private saved object\n")
+    blob = kb._git_out(path, "hash-object", "-w", str(payload))
+    tree = subprocess.run(
+        ["git", "-C", str(path), "mktree"], input=f"100644 blob {blob}\tsaved.txt\n",
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    commit = kb._git_out(
+        path, "-c", "user.name=Test User", "-c", "user.email=test@example.com",
+        "commit-tree", tree, "-p", candidate, "-m", "saved objects")
+    unique = {"blob": blob, "tree": tree, "commit": commit}[kind]
+    ref = "refs/worktree/saved"
+    _git(path, "update-ref", ref, unique)
+    assert kb._git_out(path, "cat-file", "-t", unique) == kind
+    if surviving:
+        # A common commit ref transitively retains its tree and blob too.
+        _git(repo, "update-ref", "refs/keep/operator", commit)
+    else:
+        # The main checkout's private ref is not evidence of a common anchor.
+        _git(repo, "update-ref", "refs/worktree/not-common", commit)
+    with caplog.at_level("INFO", logger=kb._log.name):
+        if operation == "discard":
+            assert kbw.discard_prepared_worktree(task, path, candidate) is surviving
+        else:
+            kbw._cleanup_worktree_workspace(review, str(path), branch)
+    assert path.is_dir() is not surviving
+    if not surviving:
+        assert unique in caplog.text and ref in caplog.text
+        assert kb._git_out(path, "rev-parse", ref) == unique
+    else:
+        assert unique in kb._git_out(repo, "rev-list", "--objects", "refs/keep/operator")
+
+
 
 @pytest.mark.parametrize("surviving", [False, True])
 def test_role_completion_protects_worktree_rescue_ref(
