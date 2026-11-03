@@ -717,7 +717,13 @@ def test_patch_expected_version_advances_direct_mutations(
 
 
 @pytest.mark.parametrize("edit_goal", [False, True])
-def test_patch_block_unblock_uses_transition_version_and_rejects_stale_edits(client, edit_goal):
+def test_patch_block_unblock_uses_transition_version_and_rejects_stale_edits(
+    client, edit_goal, monkeypatch,
+):
+    # Derived age is second-granular; freeze this test's shared wall clock so
+    # full-response equality is deterministic without relaxing any assertion.
+    now = time.time()
+    monkeypatch.setattr(time, "time", lambda: now)
     task = client.post(
         "/api/plugins/kanban/tasks",
         json={"title": "before", "assignee": "old"},

@@ -1043,7 +1043,9 @@ def _commit_referenced(repo: Path, commit: str) -> bool:
     )
 
 
-def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Path, str, bool]:
+def _role_worktree(
+    repo_root: Path, task: Task, candidate_head: str, board: Optional[str] = None,
+) -> tuple[Path, str, bool]:
     """Materialize this role card's own worktree at ``candidate_head``.
 
     Returns ``(path, branch, created)`` with an empty branch for the detached checkout
@@ -1062,11 +1064,39 @@ def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Pa
             f"in {repo_root}")
     head = resolved
     target = repo_root / ".worktrees" / task.id
+
+    def confirm_candidate() -> None:
+        from hermes_cli.sqlite_safe_read import connect_tracked
+
+        db_path = _kb.kanban_db_path(board=board).resolve()
+        try:
+            with contextlib.closing(connect_tracked(
+                db_path.as_uri() + "?mode=ro", tracking_path=db_path,
+                uri=True, timeout=1.0,
+            )) as conn:
+                conn.row_factory = sqlite3.Row
+                shared = _workspace_in_use_by_other(conn, task.id, target) if target.exists() else None
+                # Operator rebinds do not take admission. Re-read immediately before
+                # checkout, not before the potentially slow Git safety checks.
+                confirmed = candidate_head_for_task(conn, task)
+                if confirmed != candidate_head:
+                    raise ValueError(
+                        f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: candidate moved from "
+                        f"{candidate_head} to {confirmed} before workspace preparation")
+        except (OSError, sqlite3.Error):
+            shared = "unknown"
+        if shared is not None:
+            detail = ("is registered to another non-terminal task" if shared == "shared"
+                      else "cannot be checked for another task's registration")
+            raise ValueError(
+                f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: checkout collision at {target}: {detail}")
+
     if target.is_symlink() or (target.exists() and not target.is_dir()):
         raise ValueError(
             f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is not a real directory")
     if not target.exists():
         target.parent.mkdir(parents=True, exist_ok=True)
+        confirm_candidate()
         result = _git(repo_root, "worktree", "add", "--detach", str(target), head, timeout=120)
         if result.returncode != 0:
             raise ValueError(
@@ -1092,6 +1122,7 @@ def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Pa
     current = _git_head(target)
     branch = _git_current_branch(target) or ""
     if current == head:
+        confirm_candidate()
         return target.resolve(strict=False), branch, False
     if not branch:
         # A detached checkout is the normal shape for a role worktree, and after a
@@ -1103,6 +1134,7 @@ def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Pa
                 f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is detached at "
                 f"{current or 'an unknown commit'}, not the candidate {head}, and nothing "
                 "reaches that commit; moving it would strand work")
+        confirm_candidate()
         result = _git(
             target, "checkout", "--no-overwrite-ignore", "--detach", head, timeout=120)
         if result.returncode != 0:
@@ -1121,6 +1153,7 @@ def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Pa
             f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is checked out on {branch} at "
             f"{current}, which the candidate {head} does not contain; detaching would "
             "strand that work")
+    confirm_candidate()
     result = _git(
             target, "checkout", "--no-overwrite-ignore", "--detach", head, timeout=120)
     if result.returncode != 0:
@@ -1175,26 +1208,7 @@ def _resolve_worktree_workspace_created(
                 f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {task.id} is a typed role card; its "
                 "worktree is materialized at the candidate commit, never at HEAD")
         repo_root = _role_repo_root(task, board)
-        target = repo_root / ".worktrees" / task.id
-        if target.exists():
-            from hermes_cli.sqlite_safe_read import connect_tracked
-
-            db_path = _kb.kanban_db_path(board=board).resolve()
-            try:
-                with contextlib.closing(connect_tracked(
-                    db_path.as_uri() + "?mode=ro", tracking_path=db_path,
-                    uri=True, timeout=1.0,
-                )) as conn:
-                    conn.row_factory = sqlite3.Row
-                    shared = _workspace_in_use_by_other(conn, task.id, target)
-            except (OSError, sqlite3.Error):
-                shared = "unknown"
-            if shared is not None:
-                detail = ("is registered to another non-terminal task" if shared == "shared"
-                          else "cannot be checked for another task's registration")
-                raise ValueError(
-                    f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: checkout collision at {target}: {detail}")
-        return _role_worktree(repo_root, task, candidate_head)
+        return _role_worktree(repo_root, task, candidate_head, board)
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if not task.workspace_path:
         board_slug = board if board else _kb.get_current_board()

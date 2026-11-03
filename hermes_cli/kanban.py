@@ -986,7 +986,10 @@ def _claim_preflight(conn, task) -> Optional[str]:
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
-    with kbc.connect_closing() as conn:
+    # One admission fence owns preparation through persistence, never worker execution.
+    with kbc.connect_closing() as conn, kbc._dispatch_admission_lock() as admitted:
+        if not admitted or not kbc._claim_connection_is_current(conn):
+            return _err(f"cannot claim {args.task_id}: dispatch admission unavailable")
         # Derive the candidate AND materialize the workspace before claiming: either
         # step can refuse (an unresolvable candidate, a dirty canonical worktree, a
         # missing candidate commit, a checkout sitting on another commit), and a claim
@@ -1077,34 +1080,22 @@ def _cmd_claim(args: argparse.Namespace) -> int:
         if claim_error is not None:
             from hermes_cli.kanban_db_dispatch import _record_task_failure
 
-            deadline = time.monotonic() + 1.0
             rolled_back = False
-            while True:
-                with kbc._dispatch_admission_lock(allow_nested=True) as admitted:
-                    if admitted:
-                        current = kb.get_task(conn, task.id)
-                        if (current is not None
-                                and current.current_run_id == task.current_run_id
-                                and current.claim_lock == task.claim_lock):
-                            kbw.discard_prepared_worktree(
-                                pending, workspace, prepared_head, prepared_new=prepared_new)
-                            _record_task_failure(
-                                conn, task.id, f"{claim_error} during the claim",
-                                outcome="spawn_failed", release_claim=True, end_run=True,
-                                expected_run_id=task.current_run_id,
-                            )
-                            current = kb.get_task(conn, task.id)
-                            rolled_back = (current is not None
-                                           and current.current_run_id is None
-                                           and current.claim_lock is None)
-                        break
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return _err(
-                        f"kanban: {claim_error} while "
-                        f"{args.task_id} was claimed; the claim could not be rolled back and "
-                        f"remains open (run {task.current_run_id}): admission lock unavailable")
-                time.sleep(min(0.05, remaining))
+            current = kb.get_task(conn, task.id)
+            if (current is not None
+                    and current.current_run_id == task.current_run_id
+                    and current.claim_lock == task.claim_lock):
+                kbw.discard_prepared_worktree(
+                    pending, workspace, prepared_head, prepared_new=prepared_new)
+                _record_task_failure(
+                    conn, task.id, f"{claim_error} during the claim",
+                    outcome="spawn_failed", release_claim=True, end_run=True,
+                    expected_run_id=task.current_run_id,
+                )
+                current = kb.get_task(conn, task.id)
+                rolled_back = (current is not None
+                               and current.current_run_id is None
+                               and current.claim_lock is None)
             outcome = ("the claim was released" if rolled_back else
                        f"the claim could not be rolled back (run {task.current_run_id}): "
                        "claim ownership changed")

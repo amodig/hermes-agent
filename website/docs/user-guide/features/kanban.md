@@ -1252,10 +1252,15 @@ through preparation, claim commit, and grant. Contention or an unavailable
 shared lock defers the whole tick without board writes. This serializes
 preparation, not worker execution; it does not replace native worker admission.
 
-Direct `ready` and `review` claims, including `hermes kanban claim`, take the
-same gate through transaction commit. A busy/unavailable gate refuses the
-claim without opening a run. Only claims may reuse a gate already owned by
-their process/thread/root; nested dispatch and board removal remain exclusive.
+Direct `ready` and `review` claims take the same gate through transaction commit.
+`hermes kanban claim` holds it from the initial task/candidate read through workspace
+preparation, claim, rollback if needed, and path/kind/branch persistence; it exits
+before reporting the result and never spans worker execution or cancellation.
+Role worktrees re-read the bound candidate immediately before checkout mutation,
+so an operator rebind refuses stale preparation without moving a successor's checkout.
+A busy/unavailable gate refuses the claim without opening a run. Only claims may
+reuse a gate already owned by their process/thread/root; nested dispatch and board
+removal remain exclusive.
 
 Disk connections capture their shared root, original logical open path, and
 physical file identity under admission. Dispatch and direct claims revalidate

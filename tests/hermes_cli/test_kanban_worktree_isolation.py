@@ -16,6 +16,7 @@ Two-part fix under test:
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import subprocess
 from pathlib import Path
@@ -769,6 +770,7 @@ def test_clean_role_checkout_follows_a_new_candidate_after_rework(kanban_home, t
     is contained in the new one, so following it strands nothing.
     """
     repo = _make_repo(tmp_path)
+    _commit(repo, ".gitignore", ".worktrees/\n")
     base = _head(repo)
     first = _commit(repo, "candidate.txt", "candidate\n")
 
@@ -795,6 +797,14 @@ def test_clean_role_checkout_follows_a_new_candidate_after_rework(kanban_home, t
     # The implementer answers REQUEST_CHANGES with a second candidate on top.
     second = _commit(repo, "fix.txt", "fixed\n")
     with kbc.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (implementation,))
+        run = kb.claim_task(conn, implementation, claimer=kb._claimer_id())
+        assert run is not None
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=run.current_run_id,
+            summary="reworked candidate",
+            metadata={"base_sha": base, "head_sha": second, "changed_files": []})
         resolved = kbw._resolve_worktree_workspace(
             kb.get_task(conn, review), candidate_head=second)
     assert resolved[0] == workspace
@@ -1529,6 +1539,133 @@ def _ready_review_card(conn, repo: Path, base: str, candidate: str) -> str:
     return review
 
 
+@pytest.mark.parametrize("surface", ["cli", "resolver"])
+def test_stale_role_preparation_refuses_rebound_successor_checkout(
+    kanban_home, tmp_path, monkeypatch, capsys, surface,
+):
+    from hermes_cli import kanban as kc
+    from hermes_cli.kanban_db_receipts import rebind_candidate
+    from hermes_cli.kanban_runtime import runtime_identity
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    first = _commit(repo, "app.py", "first\n")
+    receipt = runtime_identity(Path(__file__).resolve().parents[2]).as_dict()
+    with kbc.connect_closing() as conn:
+        review = _ready_review_card(conn, repo, base, first)
+        pending = kb.get_task(conn, review)
+        implementation = pending.lifecycle_contract["candidate_task_id"]
+        first_run = kb.get_task(conn, implementation).candidate_run_id
+        second = _commit(repo, "app.py", "second\n")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (implementation,))
+        run = kb.claim_task(conn, implementation, claimer=kb._claimer_id())
+        assert run is not None
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=run.current_run_id,
+            summary="second candidate",
+            metadata={"base_sha": base, "head_sha": second, "changed_files": []})
+        with kb.write_txn(conn):
+            for run_id in (first_run, run.current_run_id):
+                kb._append_event(conn, implementation, "spawned",
+                                 {"runtime_identity": receipt}, run_id=run_id)
+        rebind_candidate(
+            conn, implementation, run_id=first_run, head_sha=first,
+            reason="restore first", replace=True, replaced_run=run.current_run_id)
+        assert kbw.candidate_head_for_task(conn, pending) == first
+        target = kbw.resolve_workspace(pending, candidate_head=first)
+
+    def rebind_and_claim():
+        with kbc.connect_closing() as other:
+            rebind_candidate(
+                other, implementation, run_id=run.current_run_id, head_sha=second,
+                reason="use second", replace=True, replaced_run=first_run)
+        return kc._cmd_claim(_claim_args(review))
+
+    if surface == "resolver":
+        # A cached H1 before it acquired admission. B now owns this same task at H2.
+        assert rebind_and_claim() == 0
+        with pytest.raises(ValueError, match="candidate moved"):
+            kbw.resolve_workspace_created(pending, candidate_head=first)
+    else:
+        resolve_candidate = kbw.candidate_head_for_task
+        paused = False
+
+        def read_then_rebind(conn, task):
+            nonlocal paused
+            head = resolve_candidate(conn, task)
+            if not paused:
+                paused = True
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    assert pool.submit(rebind_and_claim).result(timeout=30) != 0
+            return head
+
+        with monkeypatch.context() as patch:
+            patch.setattr(kbw, "candidate_head_for_task", read_then_rebind)
+            assert kc._cmd_claim(_claim_args(review)) != 0
+        assert "candidate moved" in capsys.readouterr().err
+        assert _head(target) == first  # No checkout mutation on the stale attempt.
+        assert kc._cmd_claim(_claim_args(review)) == 0
+    with kbc.connect_closing() as conn:
+        successor = kb.get_task(conn, review)
+        assert successor.status == "running" and successor.current_run_id
+        assert successor.workspace_path == str(target)
+    assert _head(target) == second
+    assert (target / "app.py").read_text() == "second\n"
+
+
+def test_cli_persistence_fences_reclaim_and_scratch_to_role_successor(
+    kanban_home, tmp_path, monkeypatch,
+):
+    from hermes_cli import kanban as kc
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "app.py", "candidate\n")
+    kb.write_board_metadata(None, default_workdir=str(repo))
+    with kbc.connect_closing() as conn:
+        review = _ready_review_card(conn, repo, base, candidate)
+        contract = kb.get_task(conn, review).lifecycle_contract
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET lifecycle_contract = NULL, workspace_kind = 'scratch', "
+                "workspace_path = NULL, branch_name = 'obsolete' WHERE id = ?", (review,))
+    claim = kb.claim_task
+    attempts = []
+    old_runs = []
+
+    def reclaim_and_take_over():
+        with kbc.connect_closing() as other:
+            assert kb.reclaim_task(other, review, reason="operator recovery", signal_fn=lambda *a: None)
+            with kb.write_txn(other):
+                other.execute("UPDATE tasks SET lifecycle_contract = ? WHERE id = ?",
+                              (json.dumps(contract), review))
+        return kc._cmd_claim(_claim_args(review))
+
+    def claim_then_reclaim(conn, task_id, **kwargs):
+        task = claim(conn, task_id, **kwargs)
+        if task is not None and not old_runs:
+            old_runs.append(task.current_run_id)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                attempts.append(pool.submit(reclaim_and_take_over).result(timeout=30))
+        return task
+
+    with monkeypatch.context() as patch:
+        patch.setattr(kb, "claim_task", claim_then_reclaim)
+        assert kc._cmd_claim(_claim_args(review)) == 0
+    assert len(attempts) == 1 and attempts[0] != 0
+    # The successor can enter only after A's path AND branch persistence have ended.
+    assert kc._cmd_claim(_claim_args(review)) == 0
+    target = repo / ".worktrees" / review
+    with kbc.connect_closing() as conn:
+        successor = kb.get_task(conn, review)
+        assert successor.current_run_id != old_runs[0] and successor.status == "running"
+        assert successor.workspace_kind == "worktree" and successor.workspace_path == str(target)
+        assert successor.branch_name == ""
+    assert _head(target) == candidate
+
+
+
 @pytest.mark.parametrize("managed", [True, False])
 def test_retained_scratch_role_dispatch_uses_only_managed_path_as_no_anchor(
     kanban_home, tmp_path, monkeypatch, managed,
@@ -1606,7 +1743,7 @@ def test_cli_refusal_discards_only_new_worktrees(
     if refusal == "claim":
         monkeypatch.setattr(kb, "claim_task", lambda *a, **kw: None)
     else:
-        heads = iter((candidate, base))
+        heads = iter((candidate, candidate, base))
         monkeypatch.setattr(kbw, "candidate_head_for_task", lambda *a: next(heads))
     assert kc._cmd_claim(_claim_args(review)) != 0
     assert ("the task changed" if refusal == "claim" else "candidate moved") in capsys.readouterr().err
@@ -1660,9 +1797,9 @@ def test_cli_claim_releases_a_checkout_moved_by_another_board(
     assert target.is_dir() and _head(target) == other_head
     assert (target / "app.py").read_text() == "second\n"
 
-@pytest.mark.parametrize("release_during_wait", [False, True])
-def test_cli_candidate_rollback_reports_an_open_run_when_admission_stays_locked(
-    kanban_home, tmp_path, monkeypatch, capsys, release_during_wait,
+@pytest.mark.parametrize("contend_at", ["entry", "rollback"])
+def test_cli_candidate_rollback_reuses_preparation_admission(
+    kanban_home, tmp_path, monkeypatch, capsys, contend_at,
 ):
     from hermes_cli import kanban as kc
 
@@ -1673,53 +1810,38 @@ def test_cli_candidate_rollback_reports_an_open_run_when_admission_stays_locked(
         review = _ready_review_card(conn, repo, base, candidate)
     claim = kb.claim_task
     runs = []
-    waits = []
-    sleep = kc.time.sleep
     lock_path = kb.kanban_home() / "kanban" / ".dispatch-admission.lock"
     with lock_path.open("a+b") as holder:
         def claim_then_contend(conn, task_id, **kwargs):
             task = claim(conn, task_id, **kwargs)
             assert task is not None
             runs.append(task.current_run_id)
-            # Independent file-lock connection, not a nested owner in this thread.
-            assert kbc._try_lock_nb(holder)
+            # A competing file-lock owner can no longer open a rollback gap.
+            assert not kbc._try_lock_nb(holder)
             return task
 
-        def wait_for_admission(delay):
-            waits.append(delay)
-            if release_during_wait:
-                kbc._unlock(holder)
-            sleep(delay)
-
         monkeypatch.setattr(kb, "claim_task", claim_then_contend)
-        monkeypatch.setattr(kc.time, "sleep", wait_for_admission)
-        heads = iter((candidate, base))
+        heads = iter((candidate, candidate, base))
         monkeypatch.setattr(kbw, "candidate_head_for_task", lambda *args: next(heads))
+        if contend_at == "entry":
+            assert kbc._try_lock_nb(holder)
         try:
             assert kc._cmd_claim(_claim_args(review)) != 0
         finally:
             kbc._unlock(holder)
-    assert waits
+        assert kbc._try_lock_nb(holder)  # Every refusal has left the fence.
+        kbc._unlock(holder)
     error = capsys.readouterr().err
     path = repo / ".worktrees" / review
     with kbc.connect_closing() as conn:
         task = kb.get_task(conn, review)
-        run = conn.execute("SELECT * FROM task_runs WHERE id = ?", (runs[0],)).fetchone()
-        if release_during_wait:
-            assert "the claim was released" in error
-            assert task.current_run_id is None
-            assert run["outcome"] == "spawn_failed"
-            assert not path.exists()
+        assert task.current_run_id is None and task.claim_lock is None
+        assert not path.exists()
+        if contend_at == "entry":
+            assert not runs and "dispatch admission unavailable" in error
         else:
-            assert "claim could not be rolled back and remains open" in error
-            assert f"run {runs[0]}" in error
-            assert "the claim was released" not in error
-            assert task.status == run["status"] == "running"
-            assert task.current_run_id == runs[0]
-            assert task.worker_pid is None
-            assert task.consecutive_failures == 0
-            assert run["outcome"] is None
-            assert _head(path) == candidate
+            assert "the claim was released" in error
+            assert kb.latest_run(conn, review).outcome == "spawn_failed"
 
 
 @pytest.mark.parametrize("takeover", ["claim", "row"])
@@ -1757,7 +1879,7 @@ def test_cli_candidate_rollback_preserves_a_successor_claim(
         return original
 
     monkeypatch.setattr(kb, "claim_task", replace_claim)
-    heads = iter((candidate, base))
+    heads = iter((candidate, candidate, base))
     monkeypatch.setattr(kbw, "candidate_head_for_task", lambda *a: next(heads))
     assert kc._cmd_claim(_claim_args(review)) != 0
     path = repo / ".worktrees" / review
@@ -1812,7 +1934,7 @@ def test_deferred_dispatch_discards_only_new_worktrees(
 
         monkeypatch.setattr(kbd, "_default_spawn", prepare)
         if refusal == "candidate":
-            heads = iter((candidate, base))
+            heads = iter((candidate, candidate, base))
             monkeypatch.setattr(kbw, "candidate_head_for_task", lambda *a: next(heads))
         result = kbd.DispatchResult()
         assert not kbd._dispatch_lane_task(
@@ -1871,7 +1993,7 @@ def test_deferred_candidate_rollback_preserves_operator_reclaim(
             )
 
         monkeypatch.setattr(kbd, "_default_spawn", prepare)
-        heads = iter((candidate, base))
+        heads = iter((candidate, candidate, base))
         monkeypatch.setattr(kbw, "candidate_head_for_task", lambda *a: next(heads))
         result = kbd.DispatchResult()
         assert not kbd._dispatch_lane_task(
@@ -2107,7 +2229,7 @@ def test_candidate_rollback_fences_failure_after_takeover_inside_admission(
 
     monkeypatch.setattr(kbw, "discard_prepared_worktree", discard_then_take_over)
     monkeypatch.setattr(kbd, "_record_task_failure", record_fenced_failure)
-    heads = iter((candidate, base))
+    heads = iter((candidate, candidate, base))
     monkeypatch.setattr(kbw, "candidate_head_for_task", lambda *args: next(heads))
     assert kc._cmd_claim(_claim_args(review)) != 0
     assert results == [False]
