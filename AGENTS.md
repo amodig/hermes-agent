@@ -550,4 +550,6 @@ extract, not to regex around it.
 Long-form background lives in `website/docs/developer-guide/` (agent-loop, prompt-assembly,
 context-compression-and-caching, gateway-internals, tools-runtime, plugins/, cron-internals,
 session-storage, ...). Workflow rules (PR/issue/review/salvage process) live in the
-`hermes-agent-dev` skill, not here.
+`hermes-agent-dev` skill, not here. This fork adds its own verification and review rules in
+`AGENTS.loota.md` — read it before verifying or deploying work done here or in
+`hermes-agent-wt/…`.

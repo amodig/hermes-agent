@@ -1,0 +1,23 @@
+# Tests that already fail on the base branch, independent of any PR.
+#
+# Why this file exists: when the same unrelated tests fail on `loota-main`, every
+# CI run needs a manual "is this mine?" investigation, and red stops meaning
+# anything. `scripts/check_known_failures.py REPORT` answers the question
+# mechanically: failures listed here are "known", anything else is "UNEXPECTED"
+# and exits 1.
+#
+# Format: `<path>::<test>` or `<path>::*`, optionally followed by `# reason`.
+# Every entry must name the base commit where it was observed and a date. An
+# entry without provenance is indistinguishable from a test someone disabled.
+# Remove an entry as soon as it stops failing; `--fail-on-stale` enforces that.
+
+# Image-provider catalog drift: the OpenRouter model list in the catalog no
+# longer matches what the provider advertises. Observed on base 439d574, 2026-11-04.
+tests/plugins/image_gen/test_openrouter_compat_provider.py::TestImageApiSurface::test_catalog_models_are_offered_only_by_openrouter
+
+# Intermittent: the test budgets the first serialized replay page plus one byte,
+# but a later event's JSON timestamp can serialize longer, so the page budget is
+# exceeded. Reproduces deterministically with .12 then .123456 timestamps on
+# base 439d574, 2026-11-04. Fixing it means making the budget timestamp-width
+# independent — a real change, not a flake suppression.
+tests/gateway/test_hosted_rooms.py::test_room_log_pages_are_bounded_by_serialized_event_bytes
