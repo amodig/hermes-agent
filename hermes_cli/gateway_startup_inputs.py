@@ -11,7 +11,7 @@ import stat
 import psutil
 
 from hermes_cli.managed_scope import get_managed_dir
-from hermes_constants import PROFILE_ID_RE, named_profile_is_live
+from hermes_constants import PROFILE_ID_RE, get_process_hermes_home, named_profile_is_live
 from utils import atomic_json_write
 
 _SNAPSHOT_NAME = "gateway_startup_inputs.json"
@@ -70,6 +70,12 @@ def _capture_input(path: Path, kind: str) -> dict:
     return {"kind": kind, "state": _file_metadata(path)}
 
 
+def _authority_selection(home: Path) -> dict:
+    managed = get_managed_dir()
+    return {"home": str(home.absolute()),
+            "managed_dir": str(managed.absolute()) if managed is not None else None}
+
+
 def capture_startup_inputs(home: Path, project_env: Path, secondary_homes=(), *,
                            pid: int | None = None, start_time: float | None = None) -> dict:
     pid = os.getpid() if pid is None else pid
@@ -78,6 +84,7 @@ def capture_startup_inputs(home: Path, project_env: Path, secondary_homes=(), *,
         "pid": pid,
         "start_time": psutil.Process(pid).create_time() if start_time is None else start_time,
         "managed_dirs": [str(managed.absolute())] if managed is not None else [],
+        "authority": _authority_selection(home),
         "inputs": {str(path.absolute()): _capture_input(path, kind)
                    for path, kind in startup_input_paths(home, project_env, secondary_homes).items()},
     }
@@ -98,11 +105,13 @@ def write_startup_inputs(home: Path, snapshot: dict) -> None:
 
 
 def require_unchanged_startup_inputs(home: Path, project_env: Path, secondary_homes=(), *,
-                                     pid: int, start_time: float) -> None:
+                                     pid: int, start_time: float, check_authority: bool = True) -> None:
     snapshot = json.loads((home / _SNAPSHOT_NAME).read_text(encoding="utf-8"))
     if (not isinstance(snapshot, dict) or snapshot.get("pid") != pid
             or snapshot.get("start_time") != start_time or not isinstance(snapshot.get("inputs"), dict)):
         raise ValueError("startup input snapshot does not identify the serving gateway PID/start time")
+    if check_authority and snapshot.get("authority") != _authority_selection(home):
+        raise ValueError("startup authority selection differs from the reconstructed home/managed layer")
     managed_dirs = snapshot.get("managed_dirs")
     if not isinstance(managed_dirs, list) or any(not isinstance(p, str) for p in managed_dirs):
         raise ValueError("startup input snapshot has no managed-layer inventory")
@@ -134,15 +143,19 @@ def begin_gateway_startup_inputs(home: Path, project_env: Path) -> None:
 
 
 def extend_gateway_startup_inputs() -> None:
-    """Capture a dotenv-selected managed layer before the loader reads that layer."""
+    """Freeze newly selected layers before consumption and retain the current authority."""
     global _pending
     if _pending is None or _published:
         return
     try:
+        home = get_process_hermes_home()
+        _pending["authority"] = _authority_selection(home)
         managed = get_managed_dir()
         if managed is not None and str(managed.absolute()) not in _pending["managed_dirs"]:
             _pending["managed_dirs"].append(str(managed.absolute()))
-        for path, kind in startup_input_paths(*_context).items():
+        paths = startup_input_paths(*_context)
+        paths.update(startup_input_paths(home, _context[1]))
+        for path, kind in paths.items():
             key = str(path.absolute())
             if key not in _pending["inputs"]:
                 _pending["inputs"][key] = _capture_input(path, kind)

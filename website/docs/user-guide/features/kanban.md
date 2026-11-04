@@ -653,7 +653,8 @@ all identify that checkout. A copied sibling pointer refuses with
 Git before 2.36 uses the newline-delimited porcelain listing when `-z` is
 unsupported, decoding quoted paths without relaxing any registration check.
 Untracked empty directories, ignored or not, also refuse if the candidate would
-replace them with files, including descendants beneath a collapsed directory root.
+replace them or any ancestor with files, including descendants beneath a collapsed
+directory root and empty siblings beneath currently tracked directories.
 New files can still be added inside an existing directory when no existing
 directory is overwritten.
 Existing checkouts with `assume-unchanged` or `skip-worktree` index flags refuse

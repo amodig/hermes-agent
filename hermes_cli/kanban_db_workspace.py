@@ -922,7 +922,7 @@ def _untracked_paths_target_tracks(repo: Path, worktree: Path, head: str) -> lis
         # Git collapses untracked directories, hiding empty descendants. Inspect each
         # tracked descendant too: adding a file is safe, replacing a directory is not.
         index = bisect.bisect_left(paths, entry)
-        if index < len(paths) and paths[index] == entry:
+        if (index < len(paths) and paths[index] == entry) or ancestor_tracked(entry):
             hits.append(entry)
         index = bisect.bisect_left(paths, entry + "/")
         while index < len(paths) and paths[index].startswith(entry + "/"):

@@ -1178,6 +1178,38 @@ def test_role_worktree_preserves_untracked_empty_directories(
             _git(repo, "merge-base", "--is-ancestor", base, f"wt/{review}")
 
 
+@pytest.mark.parametrize("local_path", ["cache/sub", "unrelated/sub"])
+def test_role_worktree_preserves_empty_directory_beneath_tracked_ancestor(
+    kanban_home, tmp_path, local_path,
+):
+    repo = _make_repo(tmp_path)
+    (repo / "cache").mkdir()
+    base = _commit(repo, "cache/keep.txt", "tracked before checkout\n")
+    _git(repo, "rm", "cache/keep.txt")
+    (repo / "cache").write_text("candidate file\n")
+    _git(repo, "add", "cache")
+    _git(repo, "commit", "-m", "replace cache directory")
+    candidate = _head(repo)
+    with kbc.connect() as conn:
+        implementation = _candidate_card(conn, repo, base=base, head=candidate)
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        task = kb.get_task(conn, review)
+        workspace = repo / ".worktrees" / review
+        _git(repo, "worktree", "add", "--detach", str(workspace), base)
+        local = workspace / local_path
+        local.mkdir(parents=True)
+        if local_path.startswith("cache/"):
+            with pytest.raises(ValueError, match="cache/sub"):
+                kbw._resolve_worktree_workspace(task, candidate_head=candidate)
+            assert _head(workspace) == base
+            assert (workspace / "cache/keep.txt").read_text() == "tracked before checkout\n"
+        else:
+            kbw._resolve_worktree_workspace(task, candidate_head=candidate)
+            assert _head(workspace) == candidate
+            assert (workspace / "cache").read_text() == "candidate file\n"
+        assert local.is_dir() and not list(local.iterdir())
+
+
 def test_cleanup_never_deletes_a_branch_the_role_never_recorded(kanban_home, tmp_path):
     """An empty recorded branch is the truth for a detached checkout, not ``wt/<id>``."""
     from hermes_cli import kanban_db_workspace as workspace_module

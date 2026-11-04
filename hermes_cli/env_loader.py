@@ -551,7 +551,11 @@ def load_hermes_dotenv(
     # managed env still load in both cases; only external source resolution is unnecessary for the updater.
     if load_external_secrets and not _early_recovery._should_skip_external_secret_sources():
         _apply_external_secret_sources(home_path)
+    # Secret sources may change authority selectors too; freeze that layer before
+    # consumption, then record the final selection if managed dotenv redirects it.
+    extend_gateway_startup_inputs()
     _apply_managed_env(load_pass=load_pass)
+    extend_gateway_startup_inputs()
 
     # config.yaml owns terminal.*, but the override=True loads above let a stale TERMINAL_ENV=docker in
     # ~/.hermes/.env win on every reload and flip the backend mid-session in long-lived processes.

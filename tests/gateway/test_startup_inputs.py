@@ -145,3 +145,50 @@ def test_startup_snapshot_ignores_non_live_profiles(tmp_path, monkeypatch, ignor
     assert not any(str(stray) + "/" in path for path in snapshot["inputs"])
     inputs.require_unchanged_startup_inputs(
         home, project_env, [live], pid=snapshot["pid"], start_time=snapshot["start_time"])
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("selector", ["HERMES_MANAGED_DIR", "HERMES_HOME"])
+def test_secret_selected_authority_is_captured_by_the_startup_writer(tmp_path, monkeypatch, selector):
+    from hermes_cli import env_loader
+    from hermes_cli.managed_scope import get_managed_dir
+
+    home = tmp_path / "home"
+    managed = tmp_path / "managed"
+    alternate = tmp_path / "alternate"
+    for path in (home, managed, alternate):
+        path.mkdir()
+    helper = tmp_path / "helper"
+    helper.write_text(f"#!/bin/sh\nprintf '{selector}={alternate}\\n'\n")
+    helper.chmod(0o700)
+    (home / "config.yaml").write_text(
+        "secrets:\n  command:\n    enabled: true\n    override_existing: true\n"
+        f"    command: {helper}\n")
+    (alternate / "config.yaml").write_text("{}")
+    (alternate / ".env").write_text("FIXTURE_SELECTED=value")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    monkeypatch.delenv("FIXTURE_SELECTED", raising=False)
+    for name, value in (("_started", False), ("_published", False), ("_pending", None), ("_context", None)):
+        monkeypatch.setattr(inputs, name, value)
+    env_loader.reset_secret_source_cache()
+    project = tmp_path / "runtime.env"
+    try:
+        inputs.begin_gateway_startup_inputs(home, project)
+        load_hermes_dotenv(hermes_home=home, project_env=project)
+        inputs.publish_gateway_startup_inputs()
+        snapshot = json.loads((home / "gateway_startup_inputs.json").read_text())
+        assert snapshot["authority"] == {
+            "home": str(alternate if selector == "HERMES_HOME" else home),
+            "managed_dir": str(get_managed_dir()),
+        }
+        for name in (".env", "config.yaml"):
+            assert snapshot["inputs"][str(alternate / name)]["state"]["sha256"] == (
+                inputs._file_metadata(alternate / name)["sha256"])
+        # Verification starts with exec-time selectors and deliberately skips sources.
+        monkeypatch.setenv(selector, str(managed if selector == "HERMES_MANAGED_DIR" else home))
+        with pytest.raises(ValueError, match="authority selection differs"):
+            inputs.require_unchanged_startup_inputs(
+                home, project, pid=snapshot["pid"], start_time=snapshot["start_time"])
+    finally:
+        env_loader.reset_secret_source_cache()
