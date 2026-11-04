@@ -36,7 +36,14 @@ DEFAULT_BASELINE = Path(__file__).resolve().parent.parent / ".github" / "known-p
 
 # pytest short summary lines: ``FAILED tests/x.py::test_y - AssertionError``
 # and ``ERROR tests/x.py::test_y``. ``-`` separates the traceback's first line.
-_FAILED_LINE = re.compile(r"^(?:FAILED|ERROR)\s+([\w./-]+\.py::[\w\[\]().:'\- ]+?)(?:\s+-\s|\s*$)")
+#
+# Not anchored: `scripts/run_tests.sh` renders each file's summary behind a
+# ``║`` gutter, and CI adds a ``job<TAB>step<TAB>timestamp`` prefix, so the line
+# this sees usually starts with something else. An anchored pattern parsed
+# nothing in CI while passing every unit test.
+# The captured id must look like a test id (``path.py::name``); prose such as
+# "environment: FAILED — cannot read" must not become a phantom failure.
+_FAILED_LINE = re.compile(r"(?:^|\s)(?:FAILED|ERROR)\s+([\w./-]+\.py::\S.*?)(?:\s+-\s|\s*$)")
 
 
 def load_baseline(path: Path) -> list[tuple[str, str]]:
@@ -54,7 +61,8 @@ def load_baseline(path: Path) -> list[tuple[str, str]]:
 def failures_from_text(text: str) -> set[str]:
     found: set[str] = set()
     for line in text.splitlines():
-        match = _FAILED_LINE.match(line.strip())
+        # search(), not match(): the marker sits behind a gutter or a CI prefix.
+        match = _FAILED_LINE.search(line)
         if match:
             found.add(match.group(1).strip())
     return found
@@ -78,8 +86,13 @@ def failures_from_junit(text: str) -> set[str]:
     return found
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
 def collect_failures(report: Path) -> set[str]:
-    text = report.read_text(encoding="utf-8-sig", errors="replace")
+    # CI renders ``FAILED`` inside ANSI colour runs, so the escape sits between
+    # the marker and the id; strip them before matching.
+    text = _ANSI.sub("", report.read_text(encoding="utf-8-sig", errors="replace"))
     if text.lstrip().startswith("<"):
         return failures_from_junit(text)
     return failures_from_text(text)

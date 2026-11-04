@@ -70,6 +70,31 @@ def test_junit_report_is_understood(tmp_path: Path) -> None:
     assert "known     tests/a/test_known.py::test_listed" in result.stdout
 
 
+def test_ansi_and_gutter_prefixed_lines_are_parsed(tmp_path: Path) -> None:
+    """Real CI lines carry a colour run, a `║` gutter and a job/step prefix.
+
+    An anchored, un-stripped parser passed every local test while finding nothing
+    in a real shard log — which with --require-failures turns every shard red.
+    """
+    realistic = (
+        "Python tests / Run tests (3/4)\tUNKNOWN STEP\t2026-11-04T07:11:09Z   ║ "
+        "\x1b[31mFAILED tests/a/test_known.py::test_listed - AssertionError: assert 1 == 2\x1b[0m\n"
+        "Python tests / Run tests (3/4)\tUNKNOWN STEP\t2026-11-04T07:21:11Z "
+        "FAILED tests/a/test_file.py::test_any - RuntimeError: boom\n"
+    )
+    result = _run(tmp_path, realistic, "--require-failures")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "known     tests/a/test_known.py::test_listed" in result.stdout
+    assert "known     tests/a/test_file.py::test_any" in result.stdout
+
+
+def test_prose_mentioning_failed_is_not_a_failure(tmp_path: Path) -> None:
+    prose = "CTO gateway environment: FAILED — cannot read serving gateway\n"
+    result = _run(tmp_path, prose)
+    assert result.returncode == 0
+    assert "UNEXPECTED" not in result.stdout
+
+
 def test_unparseable_failing_run_is_not_treated_as_known(tmp_path: Path) -> None:
     """A crashed or timed-out shard leaves no FAILED line; it must still fail."""
     crash = "subprocess killed by signal 9\n"
