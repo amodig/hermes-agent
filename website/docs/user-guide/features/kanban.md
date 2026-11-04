@@ -668,7 +668,7 @@ HEAD reflog, which worktree removal would destroy.
 Completion, teardown, and prepared-checkout discard share the same surviving-ref
 guard: the prepared commit, detached HEAD, and
 every commit referenced inside the checkout (including private pseudoreferences
-such as `ORIG_HEAD`, private reflog history, private refs and annotated tags) must
+such as `ORIG_HEAD`, private reflog history and private refs) must
 still be reachable from a common Git ref that survives worktree removal,
 not `refs/worktree/*`, `refs/bisect/*`, or `refs/rewritten/*`. Private reflogs
 are located with `git rev-parse --git-path logs/<ref>` and read as raw records:
@@ -678,8 +678,12 @@ uses `for-each-ref --include-root-refs` only when `git for-each-ref -h` advertis
 it; older Git enumerates the checkout's recovery-ref files instead, including
 `NOTES_MERGE_PARTIAL`/`NOTES_MERGE_REF`. Every object in `FETCH_HEAD`/`MERGE_HEAD`
 is checked on all Git versions: even `--include-root-refs` omits these multivalued
-pseudorefs. Tree/blob anchors also preserve the checkout unless traversal from
-surviving common refs proves the object is retained.
+pseudorefs. Non-commit anchors (including annotated tags, trees and blobs) require
+their raw object ID to be named directly by a surviving common ref, for both
+checkout refs and reflog records. Peeling a tag or finding its commit with
+`--contains` does not protect the tag's own message or signature. The guard uses
+`git for-each-ref --format='%(objectname) %(refname)'` without peeling, excluding
+the three private namespaces above.
 An enumeration or resolution failure still preserves the checkout. A refusal names the
 unprotected object and ref. When removal cannot prove history survives, a newly created
 clean checkout is moved intact to `.worktrees/<id>.recovery-<unique-suffix>` using

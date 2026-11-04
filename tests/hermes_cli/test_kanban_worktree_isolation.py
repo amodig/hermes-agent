@@ -1504,10 +1504,11 @@ def test_modern_git_removal_protects_multivalued_pseudorefs(
 
 @pytest.mark.parametrize("kind", ["blob", "tree", "commit"])
 @pytest.mark.parametrize("operation", ["discard", "cleanup"])
-@pytest.mark.parametrize("surviving", [False, True])
+@pytest.mark.parametrize("anchor", ["private", "transitive", "direct"])
 def test_worktree_removal_protects_noncommit_anchors(
-    kanban_home, tmp_path, caplog, kind, operation, surviving,
+    kanban_home, tmp_path, caplog, kind, operation, anchor,
 ):
+    surviving = anchor == "direct" or (anchor == "transitive" and kind == "commit")
     repo = _make_repo(tmp_path)
     candidate = _head(repo)
     _git(repo, "update-ref", "refs/remotes/origin/main", candidate)
@@ -1531,9 +1532,9 @@ def test_worktree_removal_protects_noncommit_anchors(
     ref = "refs/worktree/saved"
     _git(path, "update-ref", ref, unique)
     assert kb._git_out(path, "cat-file", "-t", unique) == kind
-    if surviving:
-        # A common commit ref transitively retains its tree and blob too.
-        _git(repo, "update-ref", "refs/keep/operator", commit)
+    if anchor != "private":
+        # Only commit anchors may use transitive reachability, not raw tree/blob IDs.
+        _git(repo, "update-ref", "refs/keep/operator", unique if anchor == "direct" else commit)
     else:
         # The main checkout's private ref is not evidence of a common anchor.
         _git(repo, "update-ref", "refs/worktree/not-common", commit)
@@ -1550,8 +1551,56 @@ def test_worktree_removal_protects_noncommit_anchors(
         assert unique in caplog.text and ref in caplog.text
         assert kb._git_out(path, "rev-parse", ref) == unique
     else:
-        assert unique in kb._git_out(repo, "rev-list", "--objects", "refs/keep/operator")
+        assert kb._git_out(repo, "rev-parse", "refs/keep/operator") == unique
 
+
+
+@pytest.mark.parametrize("operation", ["discard", "cleanup"])
+@pytest.mark.parametrize("anchor", ["ref", "reflog"])
+@pytest.mark.parametrize("surviving", [False, True])
+def test_worktree_removal_preserves_annotated_tag_objects(
+    kanban_home, tmp_path, operation, anchor, surviving,
+):
+    repo = _make_repo(tmp_path)
+    candidate = _head(repo)
+    _git(repo, "update-ref", "refs/remotes/origin/main", candidate)
+    with kbc.connect() as conn:
+        implementation = _candidate_card(conn, repo, base=candidate, head=candidate)
+        review = _role_card(conn, "review", implementation, repo, "reviewer")
+        task = kb.get_task(conn, review)
+        path, branch = kbw._resolve_worktree_workspace(task, candidate_head=candidate)
+    _git(path, "tag", "-a", "operator-note", "-m", "unique operator annotation", candidate)
+    tag = kb._git_out(path, "rev-parse", "refs/tags/operator-note")
+    assert tag != candidate
+    assert kb._git_out(path, "cat-file", "-t", tag) == "tag"
+    ref = "refs/worktree/operator"
+    _git(path, "update-ref", "--create-reflog", ref, tag)
+    _git(path, "tag", "-d", "operator-note")
+    if anchor == "reflog":
+        _git(path, "update-ref", ref, candidate)
+        assert kb._git_out(path, "rev-parse", ref) == candidate
+        assert tag in kb._git_out(repo, "fsck", "--unreachable", "--no-reflogs")
+    if surviving:
+        _git(repo, "update-ref", "refs/keep/operator", tag)
+
+    if operation == "discard":
+        assert kbw.discard_prepared_worktree(task, path, candidate)
+        assert not path.exists()
+        recoveries = list(path.parent.glob(f"{review}.recovery-*"))
+        assert len(recoveries) == (0 if surviving else 1)
+        if recoveries:
+            path, = recoveries
+    else:
+        kbw._cleanup_worktree_workspace(review, str(path), branch)
+    assert path.is_dir() is not surviving
+    # Private refs belong to the preserved checkout, not the main checkout.
+    retained = repo if surviving else path
+    # Object existence alone would pass until GC; prove its anchor survived.
+    assert tag not in (kb._git_out(retained, "fsck", "--unreachable") or "")
+    if anchor == "ref":
+        assert tag not in (kb._git_out(retained, "fsck", "--unreachable", "--no-reflogs") or "")
+    if surviving:
+        assert kb._git_out(repo, "rev-parse", "refs/keep/operator") == tag
 
 
 @pytest.mark.parametrize("surviving", [False, True])

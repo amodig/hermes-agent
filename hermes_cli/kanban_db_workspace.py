@@ -1421,12 +1421,14 @@ def _worktree_refs_survive_removal(repo_root: Path, worktree: Path) -> bool:
         _kb._log.warning("Preserving worktree at %s: cannot enumerate checkout refs", worktree)
         return False
     common_objects = None
-    for ref, revision in revisions:
-        # Peeling a tag to a tree/blob still requires proof that the object survives.
-        peeled = _git(worktree, "rev-parse", "--verify", f"{revision}^{{}}", timeout=60)
-        object_id = (peeled.stdout or "").strip()
+
+    def anchor_survives(ref: str, revision: str) -> bool:
+        nonlocal common_objects
+        # A tag's message/signature belongs to its raw object, not its peeled commit.
+        resolved = _git(worktree, "rev-parse", "--verify", revision, timeout=60)
+        object_id = (resolved.stdout or "").strip()
         kind = _git(worktree, "cat-file", "-t", object_id, timeout=60)
-        if peeled.returncode != 0 or kind.returncode != 0:
+        if resolved.returncode != 0 or kind.returncode != 0:
             _kb._log.warning(
                 "Preserving worktree at %s: cannot resolve checkout ref %s", worktree, ref)
             return False
@@ -1434,21 +1436,28 @@ def _worktree_refs_survive_removal(repo_root: Path, worktree: Path) -> bool:
             survives = _commit_referenced(repo_root, object_id)
         else:
             if common_objects is None:
-                # Only common refs count: --all would also include private HEADs.
+                # Default objectname is unpeeled; --contains would peel tag objects.
                 objects = _git(
-                    repo_root, "rev-list", "--objects", "--no-object-names",
-                    "--exclude=refs/worktree/*", "--exclude=refs/bisect/*",
-                    "--exclude=refs/rewritten/*", "--glob=refs/*", timeout=60)
+                    repo_root, "for-each-ref", "--format=%(objectname) %(refname)", timeout=60)
                 if objects.returncode != 0:
                     _kb._log.warning(
                         "Preserving worktree at %s: cannot enumerate surviving objects", worktree)
                     return False
-                common_objects = set((objects.stdout or "").splitlines())
+                common_objects = {
+                    oid for oid, name in (
+                        line.split(" ", 1) for line in (objects.stdout or "").splitlines()
+                    )
+                    if not name.startswith(("refs/worktree/", "refs/bisect/", "refs/rewritten/"))
+                }
             survives = object_id in common_objects
         if not survives:
             _kb._log.info(
                 "Preserving worktree at %s: no surviving ref reaches %s %s from %s",
                 worktree, kind.stdout.strip(), object_id, ref)
+        return survives
+
+    for ref, revision in revisions:
+        if not anchor_survives(ref, revision):
             return False
     # --single-worktree excludes sibling HEAD logs; shared branch logs survive
     # removal and must not hold an otherwise disposable checkout hostage.
@@ -1467,7 +1476,7 @@ def _worktree_refs_survive_removal(repo_root: Path, worktree: Path) -> bool:
         ):
             continue
         # %H exposes only new IDs. The oldest retained record's old ID may be
-        # the sole anchor of a commit, so inspect both columns of the raw log.
+        # an object's sole anchor, so inspect both columns of the raw log.
         log_path = _git(
             worktree, "rev-parse", "--path-format=absolute", "--git-path", f"logs/{ref}",
             timeout=60)
@@ -1478,17 +1487,14 @@ def _worktree_refs_survive_removal(repo_root: Path, worktree: Path) -> bool:
                 for entry in entries:
                     old, new, _ = entry.split(b" ", 2)
                     for raw in (old, new):
-                        commit = raw.decode("ascii")
-                        if not _COMMIT_ID.fullmatch(commit):
+                        object_id = raw.decode("ascii")
+                        if not _COMMIT_ID.fullmatch(object_id):
                             raise ValueError("invalid reflog object ID")
-                        if not commit.strip("0") or commit in checked:
+                        if not object_id.strip("0") or object_id in checked:
                             continue
-                        if not _commit_referenced(repo_root, commit):
-                            _kb._log.info(
-                                "Preserving worktree at %s: no surviving ref reaches commit %s from %s",
-                                worktree, commit, ref)
+                        if not anchor_survives(f"{ref} reflog", object_id):
                             return False
-                        checked.add(commit)
+                        checked.add(object_id)
         except (OSError, ValueError):
             _kb._log.warning(
                 "Preserving worktree at %s: cannot read reflog %s", worktree, ref)
