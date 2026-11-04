@@ -1329,6 +1329,46 @@ def test_discard_protects_private_recovery_anchors(
                 assert unique not in (kb._git_out(path, "fsck", "--unreachable") or "")
 
 
+@pytest.mark.parametrize("operation", ["discard", "cleanup"])
+@pytest.mark.parametrize("surviving", [False, True])
+def test_worktree_removal_protects_old_reflog_object_ids(
+    kanban_home, tmp_path, monkeypatch, operation, surviving,
+):
+    repo = _make_repo(tmp_path)
+    candidate = _head(repo)
+    _git(repo, "update-ref", "refs/remotes/origin/main", candidate)
+    with monkeypatch.context() as dated:
+        dated.setenv("GIT_COMMITTER_DATE", "2002-01-01T00:00:00Z")
+        with kbc.connect() as conn:
+            implementation = _candidate_card(conn, repo, base=candidate, head=candidate)
+            review = _role_card(conn, "review", implementation, repo, "reviewer")
+            task = kb.get_task(conn, review)
+            path, branch = kbw._resolve_worktree_workspace(task, candidate_head=candidate)
+        unique = _commit(path, "operator.txt", "old-side-only recovery\n")
+        dated.setenv("GIT_COMMITTER_DATE", "2004-01-01T00:00:00Z")
+        _git(path, "reset", "--hard", candidate)
+    _git(path, "update-ref", "-d", "ORIG_HEAD")
+    _git(path, "reflog", "expire", "--expire=2003-01-01T00:00:00Z",
+         "--expire-unreachable=never", "HEAD")
+    assert kb._git_out(path, "reflog", "show", "--format=%H", "HEAD") == candidate
+    assert unique not in (kb._git_out(repo, "fsck", "--unreachable") or "")
+    assert unique in kb._git_out(repo, "fsck", "--unreachable", "--no-reflogs")
+    if surviving:
+        _git(repo, "update-ref", "refs/keep/operator", unique)
+
+    if operation == "discard":
+        assert kbw.discard_prepared_worktree(task, path, candidate)
+        assert not path.exists()
+        recoveries = list(path.parent.glob(f"{review}.recovery-*"))
+        assert len(recoveries) == (0 if surviving else 1)
+        if recoveries:
+            path, = recoveries
+    else:
+        kbw._cleanup_worktree_workspace(review, str(path), branch)
+    assert path.is_dir() is not surviving
+    assert unique not in (kb._git_out(repo, "fsck", "--unreachable") or "")
+
+
 @pytest.mark.parametrize("root_ref", ["ORIG_HEAD", "NOTES_MERGE_PARTIAL", "NOTES_MERGE_REF",
                                     "FETCH_HEAD", "MERGE_HEAD"])
 @pytest.mark.parametrize("operation", ["discard", "cleanup"])

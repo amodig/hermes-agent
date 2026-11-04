@@ -1454,24 +1454,45 @@ def _worktree_refs_survive_removal(repo_root: Path, worktree: Path) -> bool:
     # removal and must not hold an otherwise disposable checkout hostage.
     reflog = _git(
         worktree, "reflog", "show", "--single-worktree", "--all",
-        "--format=%H %gD", timeout=60)
+        "--format=%gD", timeout=60)
     if reflog.returncode != 0:
         _kb._log.warning("Preserving worktree at %s: cannot enumerate reflogs", worktree)
         return False
     checked = set()
-    for entry in (reflog.stdout or "").splitlines():
-        commit, selector = entry.split(" ", 1)
-        ref = selector.split("@{", 1)[0]
+    for ref in dict.fromkeys(
+        entry.split("@{", 1)[0] for entry in (reflog.stdout or "").splitlines()
+    ):
         if ref.startswith("refs/") and not ref.startswith(
             ("refs/worktree/", "refs/bisect/", "refs/rewritten/")
         ):
             continue
-        if commit not in checked and not _commit_referenced(repo_root, commit):
-            _kb._log.info(
-                "Preserving worktree at %s: no surviving ref reaches commit %s from %s",
-                worktree, commit, selector)
+        # %H exposes only new IDs. The oldest retained record's old ID may be
+        # the sole anchor of a commit, so inspect both columns of the raw log.
+        log_path = _git(
+            worktree, "rev-parse", "--path-format=absolute", "--git-path", f"logs/{ref}",
+            timeout=60)
+        try:
+            if log_path.returncode != 0 or not (log_path.stdout or "").strip():
+                raise ValueError("cannot locate reflog")
+            with Path(log_path.stdout.strip()).open("rb") as entries:
+                for entry in entries:
+                    old, new, _ = entry.split(b" ", 2)
+                    for raw in (old, new):
+                        commit = raw.decode("ascii")
+                        if not _COMMIT_ID.fullmatch(commit):
+                            raise ValueError("invalid reflog object ID")
+                        if not commit.strip("0") or commit in checked:
+                            continue
+                        if not _commit_referenced(repo_root, commit):
+                            _kb._log.info(
+                                "Preserving worktree at %s: no surviving ref reaches commit %s from %s",
+                                worktree, commit, ref)
+                            return False
+                        checked.add(commit)
+        except (OSError, ValueError):
+            _kb._log.warning(
+                "Preserving worktree at %s: cannot read reflog %s", worktree, ref)
             return False
-        checked.add(commit)
     return True
 
 

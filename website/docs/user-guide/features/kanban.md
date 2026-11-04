@@ -670,7 +670,10 @@ guard: the prepared commit, detached HEAD, and
 every commit referenced inside the checkout (including private pseudoreferences
 such as `ORIG_HEAD`, private reflog history, private refs and annotated tags) must
 still be reachable from a common Git ref that survives worktree removal,
-not `refs/worktree/*`, `refs/bisect/*`, or `refs/rewritten/*`. Root-ref enumeration
+not `refs/worktree/*`, `refs/bisect/*`, or `refs/rewritten/*`. Private reflogs
+are located with `git rev-parse --git-path logs/<ref>` and read as raw records:
+both old and new object IDs must survive, including the oldest retained entry's
+old ID, which `git reflog show --format=%H` does not report. Root-ref enumeration
 uses `for-each-ref --include-root-refs` only when `git for-each-ref -h` advertises
 it; older Git enumerates the checkout's recovery-ref files instead, including
 `NOTES_MERGE_PARTIAL`/`NOTES_MERGE_REF`. Every object in `FETCH_HEAD`/`MERGE_HEAD`
