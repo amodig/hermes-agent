@@ -552,6 +552,8 @@ An old fence cannot release a newer gate: refresh with `kanban_show`/`kanban sho
 after a refusal. Existing boards acquire this invariant on their first writable
 open under the updated runtime.
 These increments do not revise the effective goal or reset the independent block-recurrence counter.
+Read the current version again after a gate transition before revising a goal;
+the version observed while it was blocked is stale even if it is now terminal.
 
 Bounded `kanban_show` string pages use raw stored character positions for
 `offset`, `next_offset`, and `total_chars`, not the length of the redacted output.
@@ -728,6 +730,12 @@ when no branch was recorded — never the review card's assigned branch.
 For this explicit provenance, a dirty recorded workspace also refuses as
 `handoff_unverifiable`; ordinary implementation handoffs retain their existing
 exact-head check without a claim-time dirty-worktree check.
+
+Typed review preparation still requires a repository anchor, including when the
+card was created with the default scratch workspace. If a valid parent handoff
+changes while the worker is being prepared, the claim recheck cancels that
+ungranted worker without opening a run; eligible READY work can use the slot.
+A competing claim is preserved and is not reported as our handoff refusal.
 
 `hermes kanban dispatch --dry-run --json` predicts the same refusal without
 writing anything: each `handoff_refused` entry carries `task_id`, the guard

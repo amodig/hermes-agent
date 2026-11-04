@@ -369,11 +369,11 @@ def test_handoff_change_during_preparation_cancels_without_grant(
     kanban_home, all_assignees_spawnable, monkeypatch, tmp_path, change,
 ):
     from hermes_cli.kanban_runtime import prospective_identity
-    from tests.hermes_cli.test_kanban_handoff import _repo, _lane, _commit
+    from tests.hermes_cli.test_kanban_handoff import _repo, _lane, _commit, _git
 
     monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: True)
     repo, base, branch = _repo(tmp_path)
-    grants, cancelled = [], []
+    prepared, grants, cancelled = [], [], []
     changed_head = None
     with kbc.connect() as conn:
         parent, review = _lane(conn, repo, branch)
@@ -385,17 +385,19 @@ def test_handoff_change_during_preparation_cancels_without_grant(
             summary="implemented src/changed.py",
             metadata={"base_sha": base, "head_sha": approved_head},
         )
-        # Preparation is a local stand-in; the guard still resolves the real
-        # parent's Git checkout, independent of the review worker's workspace.
+        # A typed review needs a repository even with a stand-in worker. Resolve
+        # its real candidate checkout before racing the parent's handoff.
         conn.execute(
-            "UPDATE tasks SET workspace_kind = 'scratch', workspace_path = NULL, "
-            "branch_name = NULL WHERE id = ?", (review,),
+            "UPDATE tasks SET workspace_kind = 'worktree', workspace_path = ?, "
+            "branch_name = NULL WHERE id = ?", (str(repo), review),
         )
         ready = kb.create_task(conn, title="ready", assignee="alice")
 
         def prepare(task, workspace, **kwargs):
             nonlocal changed_head
+            prepared.append(task.id)
             if task.id == review:
+                assert _git(Path(workspace), "rev-parse", "HEAD") == approved_head
                 if change == "claimed_elsewhere":
                     with kbc.connect() as other:
                         assert kb.claim_review_task(other, review, claimer="other:reviewer") is not None
@@ -413,6 +415,7 @@ def test_handoff_change_during_preparation_cancels_without_grant(
         monkeypatch.setattr(kbd, "_default_spawn", prepare)
         result = kbd.dispatch_once(conn, max_in_progress=1, board="default")
         expected = [] if change == "claimed_elsewhere" else [ready]
+        assert prepared == [review, *expected]
         assert [tid for tid, *_ in result.spawned] == expected
         assert grants == expected
         assert cancelled == [review]
