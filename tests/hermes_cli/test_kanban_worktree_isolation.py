@@ -2655,6 +2655,149 @@ def test_deferred_dispatch_discards_only_new_worktrees(
         else:
             assert kb.get_task(conn, review).last_failure_error == "preparation failed"
 
+@pytest.mark.parametrize("reused", [False, True])
+def test_retention_failure_recovers_only_its_new_default_checkout(
+    kanban_home, tmp_path, monkeypatch, reused,
+):
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_db_lifecycle_evidence as evidence
+    from hermes_cli.kanban_db_receipts import rebind_candidate
+    from hermes_cli.kanban_runtime import runtime_identity
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    _git(repo, "checkout", "--detach", base)
+    first = _commit(repo, "candidate.txt", "first\n")
+    identity = runtime_identity(Path(__file__).resolve().parents[2])
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
+    monkeypatch.setattr(kbd, "_require_autonomous_worker_capacity", lambda: None)
+    cancelled, granted = [], []
+    with kbc.connect_closing() as conn:
+        review = _ready_review_card(conn, repo, base, first)
+        task = kb.get_task(conn, review)
+        implementation = task.lifecycle_contract["candidate_task_id"]
+        first_run = kb.get_task(conn, implementation).candidate_run_id
+        _git(repo, "checkout", "main")
+        second = _commit(repo, "candidate.txt", "second\n")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (implementation,))
+        second_run = kb.claim_task(conn, implementation)
+        assert second_run is not None
+        assert kb.complete_task(
+            conn, implementation, expected_run_id=second_run.current_run_id,
+            summary="replacement candidate",
+            metadata={"base_sha": base, "head_sha": second, "changed_files": []})
+        with kb.write_txn(conn):
+            for run_id in (first_run, second_run.current_run_id):
+                kb._append_event(conn, implementation, "spawned",
+                                 {"runtime_identity": identity.as_dict()}, run_id=run_id)
+        rebind_candidate(
+            conn, implementation, run_id=first_run, head_sha=first,
+            reason="restore first", replace=True, replaced_run=second_run.current_run_id)
+        _git(repo, "checkout", "--detach", first)
+        if reused:
+            kbw.resolve_workspace(task, candidate_head=first)
+        path = repo / ".worktrees" / review
+        retain = evidence._retain_review_candidate
+
+        def rebind_before_retention(connection, claimed, candidate_id, pair):
+            assert _head(path) == first
+            _git(repo, "checkout", "main")
+            rebind_candidate(
+                connection, implementation, run_id=second_run.current_run_id, head_sha=second,
+                reason="use replacement", replace=True, replaced_run=first_run)
+            assert not kbw._commit_referenced(repo, first)
+            assert not kbw._is_ancestor(repo, first, second)
+            retain(connection, claimed, candidate_id, pair)
+
+        monkeypatch.setattr(evidence, "_retain_review_candidate", rebind_before_retention)
+        monkeypatch.setattr(kbd, "_default_spawn", lambda *args, **kwargs: kbd.WorkerLaunch(
+            identity.pid, identity.as_dict(), "retention-rebind",
+            cancel=lambda: cancelled.append(True), grant=lambda *args: granted.append(args)))
+        result = kbd.DispatchResult()
+        assert not kbd._dispatch_lane_task(
+            conn, {"id": review}, "reviewer", result, lane="ready", dry_run=False,
+            ttl_seconds=None, board=None, failure_limit=3, spawn_fn=None,
+            per_profile_cap=None, per_profile_running={})
+        current = kb.get_task(conn, review)
+        assert current.status == "ready" and current.current_run_id is None
+        assert current.consecutive_failures == 1
+        assert "differs from accepted candidate" in current.last_failure_error
+        assert cancelled == [True] and not granted and not result.spawned
+        assert path.exists() is reused, "failed retention must free only its own canonical checkout"
+        if reused:
+            assert _head(path) == first
+            assert not list(path.parent.glob(f"{review}.recovery-*"))
+        else:
+            recovery, = path.parent.glob(f"{review}.recovery-*")
+            assert _head(recovery) == first
+            retry, _, created = kbw.resolve_workspace_created(
+                current, candidate_head=kbw.candidate_head_for_task(conn, current))
+            assert created and retry == path and _head(retry) == second
+            assert first not in (kb._git_out(recovery, "fsck", "--unreachable") or "")
+
+
+@pytest.mark.parametrize("lane", ["ready", "review"])
+@pytest.mark.parametrize("reclaimed", [False, True])
+def test_retention_failure_is_fenced_to_the_claimed_run(
+    kanban_home, tmp_path, monkeypatch, lane, reclaimed,
+):
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_db_lifecycle_evidence as evidence
+    from hermes_cli.kanban_runtime import runtime_identity
+
+    repo = _make_repo(tmp_path)
+    base = _head(repo)
+    candidate = _commit(repo, "app.py", "candidate\n")
+    identity = runtime_identity(Path(__file__).resolve().parents[2])
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
+    monkeypatch.setattr(kbd, "_require_autonomous_worker_capacity", lambda: None)
+    cancelled, granted, snapshot = [], [], {}
+    retain = evidence._retain_review_candidate
+
+    def reclaim_before_retention(connection, claimed, candidate_id, pair):
+        if reclaimed:
+            with kbc.connect_closing() as other:
+                assert kb.reclaim_task(other, claimed.id, reason="operator recovery",
+                                       signal_fn=lambda *args: None)
+                snapshot["task"] = kb.get_task(other, claimed.id)
+                snapshot["runs"] = kb.list_runs(other, claimed.id)
+                snapshot["events"] = kb.list_events(other, claimed.id)
+            retain(connection, claimed, candidate_id, pair)
+        else:
+            raise evidence.LifecycleEvidenceError("genuine retention failure")
+
+    monkeypatch.setattr(evidence, "_retain_review_candidate", reclaim_before_retention)
+    monkeypatch.setattr(kbd, "_default_spawn", lambda *args, **kwargs: kbd.WorkerLaunch(
+        identity.pid, identity.as_dict(), "retention-reclaim",
+        cancel=lambda: cancelled.append(True), grant=lambda *args: granted.append(args)))
+    with kbc.connect_closing() as conn:
+        review = _ready_review_card(conn, repo, base, candidate)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (lane, review))
+        result = kbd.DispatchResult()
+        assert not kbd._dispatch_lane_task(
+            conn, {"id": review}, "reviewer", result, lane=lane, dry_run=False,
+            ttl_seconds=None, board=None, failure_limit=1, spawn_fn=None,
+            per_profile_cap=None, per_profile_running={})
+        current = kb.get_task(conn, review)
+        assert cancelled == [True] and not granted and not result.spawned
+        if reclaimed:
+            assert current.status == lane, "retention rollback must not block a reclaimed card"
+            assert current == snapshot["task"]
+            assert current.current_run_id is None and current.consecutive_failures == 0
+            assert kb.list_runs(conn, review) == snapshot["runs"]
+            assert kb.list_events(conn, review) == snapshot["events"]
+            assert not result.auto_blocked
+            assert not any(event.kind == "gave_up" for event in kb.list_events(conn, review))
+        else:
+            assert current.status == "blocked" and current.consecutive_failures == 1
+            assert current.last_failure_error == "genuine retention failure"
+            assert kb.latest_run(conn, review).outcome == "gave_up"
+            assert result.auto_blocked == [review]
+            assert any(event.kind == "gave_up" for event in kb.list_events(conn, review))
+
+
 
 @pytest.mark.parametrize("reused", [False, True])
 @pytest.mark.parametrize("entered", [False, True])

@@ -2897,6 +2897,7 @@ def _dispatch_lane_task(
             )
             workspace, resolved_branch_name, prepared_new = _kbw.resolve_workspace_created(
                 spawn_task, board=board, candidate_head=candidate_head)
+            prepared_head = candidate_head or ((_kbw._git_head(workspace) or "") if prepared_new else "")
             launch = _default_spawn(
                 spawn_task, str(workspace), board=board, defer_grant=True,
                 should_stop=should_stop,
@@ -2922,9 +2923,7 @@ def _dispatch_lane_task(
                 if launch.cancel:
                     launch.cancel()
                 _kbw.discard_prepared_worktree(
-                    spawn_task, workspace,
-                    candidate_head or (_kbw._git_head(workspace) or ""), board=board,
-                    prepared_new=prepared_new,
+                    spawn_task, workspace, prepared_head, board=board, prepared_new=prepared_new,
                 )
                 _note_claim_hold(
                     conn, task_id, result, lane=lane, board=board, expected_task=preflight,
@@ -2964,7 +2963,7 @@ def _dispatch_lane_task(
                 # unable to move away from it, so discard it when nothing can be lost.
                 if workspace is not None:
                     _kbw.discard_prepared_worktree(
-                        claimed, workspace, candidate_head or "", board=board,
+                        claimed, workspace, prepared_head, board=board,
                         prepared_new=prepared_new,
                     )
                 if _record_task_failure(
@@ -2981,9 +2980,7 @@ def _dispatch_lane_task(
             # workspace was never persisted, so database-driven cleanup has no path to it.
             if workspace is not None and spawn_task is not None:
                 _kbw.discard_prepared_worktree(
-                    spawn_task, workspace,
-                    candidate_head or (_kbw._git_head(workspace) or ""), board=board,
-                    prepared_new=prepared_new,
+                    spawn_task, workspace, prepared_head, board=board, prepared_new=prepared_new,
                 )
             _note_launch_cancelled(task_id, str(exc), result)
             return False
@@ -2996,9 +2993,7 @@ def _dispatch_lane_task(
             # refuse. Discard it while nothing can be lost.
             if workspace is not None and spawn_task is not None:
                 _kbw.discard_prepared_worktree(
-                    spawn_task, workspace,
-                    candidate_head or (_kbw._git_head(workspace) or ""), board=board,
-                    prepared_new=prepared_new,
+                    spawn_task, workspace, prepared_head, board=board, prepared_new=prepared_new,
                 )
             from tools.autonomous_resources import AutonomousResourceUnavailable
             from tools.process_registry import RestartSafeScopeUnavailable
@@ -3119,7 +3114,7 @@ def _dispatch_lane_task(
     except WorkerLaunchInterrupted as exc:
         if launch is not None and launch.cancel:
             launch.cancel()
-        if not use_default_spawn and not spawn_entered:
+        if not spawn_entered:
             _kbw.discard_prepared_worktree(
                 claimed, workspace, prepared_head, board=board, prepared_new=prepared_new)
         _pause_claimed_run_for_shutdown(conn, claimed, result, exc)
@@ -3127,7 +3122,7 @@ def _dispatch_lane_task(
     except Exception as exc:
         if launch is not None and launch.cancel:
             launch.cancel()
-        if not use_default_spawn and not spawn_entered:
+        if not spawn_entered:
             _kbw.discard_prepared_worktree(
                 claimed, workspace, prepared_head, board=board, prepared_new=prepared_new)
         from tools.autonomous_resources import AutonomousResourceUnavailable
@@ -3144,7 +3139,7 @@ def _dispatch_lane_task(
         if _record_task_failure(
             conn, claimed.id, str(exc),
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
-            infrastructure=infrastructure,
+            infrastructure=infrastructure, expected_run_id=claimed.current_run_id,
         ):
             result.auto_blocked.append(claimed.id)
         return False

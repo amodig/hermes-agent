@@ -665,6 +665,12 @@ directories. Completion cleanup uses the same content guard. For custom launcher
 automatic preparation discard stops at callback entry, not its return: a callback that creates a commit,
 resets HEAD, and raises may leave that commit only in `ORIG_HEAD` or the private
 HEAD reflog, which worktree removal would destroy.
+Default deferred launches also reclaim their newly created checkout on failures
+before the grant, including candidate retention after the workspace was persisted.
+Cleanup uses the head captured at preparation, never a newly rebound candidate;
+reused checkouts are untouched. Failure accounting is fenced to the claimed run:
+an operator reclaim before retention leaves its restored lane and retry budget
+unchanged, with no stale `gave_up` event.
 Completion, teardown, and prepared-checkout discard share the same surviving-ref
 guard: the prepared commit, detached HEAD, and
 every commit referenced inside the checkout (including private pseudoreferences
