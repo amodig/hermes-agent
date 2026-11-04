@@ -192,3 +192,73 @@ def test_secret_selected_authority_is_captured_by_the_startup_writer(tmp_path, m
                 home, project, pid=snapshot["pid"], start_time=snapshot["start_time"])
     finally:
         env_loader.reset_secret_source_cache()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("secondary", [False, True])
+@pytest.mark.parametrize("proxy", ["", "http://proxy.example:8080/", "http://user:fixture-credential@proxy.example"])
+def test_startup_route_snapshot_uses_hydrated_adapter_inputs(tmp_path, monkeypatch, secondary, proxy):
+    from agent.secret_scope import (
+        build_profile_secret_scope, reset_multiplex_context, reset_secret_scope,
+        set_multiplex_context, set_secret_scope,
+    )
+    from gateway.config import PlatformConfig
+    from hermes_cli import env_loader
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from plugins.platforms.irc.adapter import IRCAdapter
+
+    home = tmp_path / "home"
+    profile = home / "profiles/secondary" if secondary else home
+    profile.mkdir(parents=True)
+    helper = tmp_path / "helper"
+    helper.write_text(
+        "#!/bin/sh\nprintf 'IRC_SERVER=irc.example.org\\nIRC_PORT=6697\\nIRC_USE_TLS=true\\n"
+        f"IRC_PROXY_URL={proxy}\\nIRC_SASL_PASSWORD=fixture-credential\\n"
+        "IRC_SERVER_PASSWORD=fixture-credential\\nIRC_NICKSERV_PASSWORD=fixture-credential\\n'\n")
+    helper.chmod(0o700)
+    (profile / "config.yaml").write_text(
+        "secrets:\n  command:\n    enabled: true\n    override_existing: true\n"
+        f"    command: {helper}\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "managed"))
+    for key in ("IRC_SERVER", "IRC_PORT", "IRC_USE_TLS", "IRC_PROXY_URL",
+                "IRC_SASL_PASSWORD", "IRC_SERVER_PASSWORD", "IRC_NICKSERV_PASSWORD"):
+        monkeypatch.setenv(key, "")
+    for name, value in (("_started", False), ("_published", False), ("_pending", None), ("_context", None)):
+        monkeypatch.setattr(inputs, name, value)
+    env_loader.reset_secret_source_cache()
+    project = tmp_path / "runtime.env"
+    inputs.begin_gateway_startup_inputs(home, project)
+    if secondary:
+        env_loader.hydrate_profile_secret_sources(profile)
+    else:
+        load_hermes_dotenv(hermes_home=home, project_env=project)
+    home_token = set_hermes_home_override(profile)
+    multiplex_token = set_multiplex_context(secondary)
+    secret_token = set_secret_scope(build_profile_secret_scope(profile) if secondary else None)
+    try:
+        adapter = IRCAdapter(PlatformConfig(enabled=True, extra={
+            "server": "127.0.0.1", "port": 16697, "use_tls": False, "channel": "#agents",
+        }))
+        inputs.publish_gateway_startup_inputs()
+        path = home / "gateway_startup_inputs.json"
+        original = path.read_bytes()
+        snapshot = json.loads(original)
+        route = snapshot["routes"][str(profile)]["irc"]
+        assert route == adapter.startup_route()
+        assert route == {
+            "server": "irc.example.org", "port": 6697, "use_tls": True,
+            "proxy": ({"invalid": True} if "fixture-credential" in proxy else
+                      {"scheme": "http", "hostname": "proxy.example", "port": 8080} if proxy else None),
+        }
+        assert b"fixture-credential" not in original
+        assert not {"sasl_account", "sasl_password", "server_password", "nickserv_password"} & route.keys()
+        adapter.server = "later.example"
+        inputs.record_gateway_startup_route("irc", adapter.startup_route())
+        inputs.publish_gateway_startup_inputs()
+        assert path.read_bytes() == original
+    finally:
+        reset_secret_scope(secret_token)
+        reset_multiplex_context(multiplex_token)
+        reset_hermes_home_override(home_token)
+        env_loader.reset_secret_source_cache()

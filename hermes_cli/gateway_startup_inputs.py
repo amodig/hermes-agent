@@ -1,4 +1,4 @@
-"""Metadata-only evidence of the files a gateway started with, never a live reload."""
+"""Startup file metadata and non-secret adapter routes, never a live reload."""
 from __future__ import annotations
 
 import hashlib
@@ -11,7 +11,7 @@ import stat
 import psutil
 
 from hermes_cli.managed_scope import get_managed_dir
-from hermes_constants import PROFILE_ID_RE, get_process_hermes_home, named_profile_is_live
+from hermes_constants import PROFILE_ID_RE, get_hermes_home, get_process_hermes_home, named_profile_is_live
 from utils import atomic_json_write
 
 _SNAPSHOT_NAME = "gateway_startup_inputs.json"
@@ -105,7 +105,7 @@ def write_startup_inputs(home: Path, snapshot: dict) -> None:
 
 
 def require_unchanged_startup_inputs(home: Path, project_env: Path, secondary_homes=(), *,
-                                     pid: int, start_time: float, check_authority: bool = True) -> None:
+                                     pid: int, start_time: float, check_authority: bool = True) -> dict:
     snapshot = json.loads((home / _SNAPSHOT_NAME).read_text(encoding="utf-8"))
     if (not isinstance(snapshot, dict) or snapshot.get("pid") != pid
             or snapshot.get("start_time") != start_time or not isinstance(snapshot.get("inputs"), dict)):
@@ -122,6 +122,7 @@ def require_unchanged_startup_inputs(home: Path, project_env: Path, secondary_ho
         if not isinstance(entry, dict) or entry.get("kind") != kind or "state" not in entry:
             raise ValueError(f"{path}: startup input snapshot has no presence record")
         _require_matching_file(path, kind, entry["state"])
+    return snapshot
 
 
 def begin_gateway_startup_inputs(home: Path, project_env: Path) -> None:
@@ -162,6 +163,13 @@ def extend_gateway_startup_inputs() -> None:
     except (OSError, ValueError):
         _pending = None
         _log.warning("Gateway startup input metadata unavailable; installed verification will refuse", exc_info=True)
+
+
+def record_gateway_startup_route(platform: str, route: dict) -> None:
+    """Adapters supply only non-secret route fields after resolving their scoped inputs."""
+    if _pending is not None and not _published:
+        routes = _pending.setdefault("routes", {}).setdefault(str(get_hermes_home().absolute()), {})
+        routes[platform] = route
 
 
 def publish_gateway_startup_inputs() -> None:

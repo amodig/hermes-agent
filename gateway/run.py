@@ -5947,9 +5947,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if not _start_gateway_claim_pid_file(force=force):
         return False
 
-    from hermes_cli.gateway_startup_inputs import publish_gateway_startup_inputs
-    publish_gateway_startup_inputs()
-
     # Right after the PID claim (which makes us authoritative); non-fatal — consumers fall back to scan.
     _control_server = await _start_gateway_start_control_socket(runner)
     # Now the attach channel answers: republish the host record with the settled served set.
@@ -5988,6 +5985,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if not success:
         _shutdown_gateway_health_export(runner)
         return False
+
+    # The PID-claim winner publishes once, after scoped secret hydration and adapter construction.
+    from hermes_cli.gateway_startup_inputs import publish_gateway_startup_inputs
+    publish_gateway_startup_inputs()
 
     def _recover_pending() -> None:
         recovered = _recover_pending_flushes(runner)

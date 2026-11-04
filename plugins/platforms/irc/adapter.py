@@ -300,6 +300,22 @@ class IRCAdapter(BasePlatformAdapter):
         self._inbox = deque(maxlen=INBOX_LIMIT)
         self._hello_replies: Dict[str, float] = {}
         self._hello_reply_tasks: Dict[str, asyncio.Task] = {}
+        from hermes_cli.gateway_startup_inputs import record_gateway_startup_route
+        record_gateway_startup_route("irc", self.startup_route())
+
+    def startup_route(self) -> dict:
+        """Transport inputs only; never persist proxy credentials or SASL material."""
+        proxy_route = None
+        if self.proxy_url:
+            try:
+                proxy = urlsplit(self.proxy_url)
+                if (proxy.scheme != "http" or not proxy.hostname or proxy.username or proxy.password
+                        or proxy.path not in ("", "/") or proxy.query or proxy.fragment):
+                    raise ValueError("invalid-proxy")
+                proxy_route = {"scheme": proxy.scheme, "hostname": proxy.hostname, "port": proxy.port or 80}
+            except ValueError:
+                proxy_route = {"invalid": True}
+        return {"server": self.server, "port": self.port, "use_tls": bool(self.use_tls), "proxy": proxy_route}
 
     def toolsets_for_source(self, source):
         return ["no_tools"] if self.coordination else None
