@@ -70,6 +70,17 @@ def test_junit_report_is_understood(tmp_path: Path) -> None:
     assert "known     tests/a/test_known.py::test_listed" in result.stdout
 
 
+def test_unparseable_failing_run_is_not_treated_as_known(tmp_path: Path) -> None:
+    """A crashed or timed-out shard leaves no FAILED line; it must still fail."""
+    crash = "subprocess killed by signal 9\n"
+    lenient = _run(tmp_path, crash)
+    assert lenient.returncode == 0  # no failures to classify, no evidence of one
+
+    strict = _run(tmp_path, crash, "--require-failures")
+    assert strict.returncode == 1
+    assert "UNEXPECTED (unparseable)" in strict.stdout
+
+
 def test_stale_entry_reported_and_optionally_fatal(tmp_path: Path) -> None:
     green = "1 passed in 0.01s\n"
     lenient = _run(tmp_path, green)

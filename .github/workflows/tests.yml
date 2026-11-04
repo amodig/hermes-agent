@@ -91,6 +91,11 @@ jobs:
             test-durations-${{ matrix.slice }}-
 
       - name: Run tests
+        id: tests
+        # The shard's exit status is decided by the next step, which can tell a
+        # pre-existing failure from this PR's; keep the raw status visible here
+        # and let the classifier own the gate.
+        continue-on-error: true
         # Per-file isolation via scripts/run_tests.sh: each test file runs
         # in its own freshly-spawned `python -m pytest <file>` subprocess
         # with bounded parallelism. No xdist, no shared workers, no
@@ -99,7 +104,9 @@ jobs:
         # Native runner slices cover the same discovered suite without exceeding
         # the hosted job's one-hour limit; each file still runs exactly once.
         run: |
-          scripts/run_tests.sh -j 2 --files-from "$RUNNER_TEMP/test-slice-files.txt"
+          set -o pipefail
+          scripts/run_tests.sh -j 2 --files-from "$RUNNER_TEMP/test-slice-files.txt" 2>&1 \
+            | tee "$RUNNER_TEMP/pytest.log"
         env:
           # The sealed-runtime handoff file takes over 12 minutes serially;
           # individual bootstrap/turn deadlines remain unchanged.
@@ -108,6 +115,16 @@ jobs:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+
+      - name: Classify failures against the known-failures baseline
+        # Entries in .github/known-pre-existing-failures.txt were observed
+        # failing on the base branch, so they are reported here and do not gate
+        # the shard; anything else does. This is a comparison, not a waiver: the
+        # baseline names a commit and date per entry, and a *known* test failing
+        # for a new reason still reads as known — check the log when in doubt.
+        if: steps.tests.outcome == 'failure'
+        run: |
+          "$HERMES_PYTHON" scripts/check_known_failures.py --require-failures "$RUNNER_TEMP/pytest.log"
 
       - name: Save per-file duration cache (main only)
         # Only green first-attempt durations are written by the runner, so

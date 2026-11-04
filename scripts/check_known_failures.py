@@ -10,6 +10,9 @@ Usage:
     scripts/check_known_failures.py REPORT             # pytest output or junit xml
     scripts/check_known_failures.py --list             # print the baseline
     scripts/check_known_failures.py --fail-on-stale REPORT
+    scripts/check_known_failures.py --require-failures REPORT   # CI: a failing
+        # run that yields no parseable failure line (crash, timeout, killed
+        # worker) must never read as "nothing unexpected"
 
 Exit codes: 0 when every failure is listed (or there are none), 1 when at least
 one failure is not in the baseline, 2 on usage error.
@@ -95,6 +98,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE)
     parser.add_argument("--list", action="store_true", help="print the baseline and exit")
     parser.add_argument("--fail-on-stale", action="store_true", help="also fail when a baseline entry no longer fails")
+    parser.add_argument(
+        "--require-failures",
+        action="store_true",
+        help="fail when the report contains no parseable failure (a crashed or timed-out run)",
+    )
     args = parser.parse_args(argv)
 
     if not args.baseline.is_file():
@@ -119,6 +127,13 @@ def main(argv: list[str]) -> int:
     except ET.ParseError as exc:
         print(f"check_known_failures: unreadable junit report: {exc}", file=sys.stderr)
         return 2
+
+    if args.require_failures and not failures:
+        print(
+            "UNEXPECTED (unparseable) — the run failed but the report contains no failure line;"
+            " a crash, timeout or killed worker looks like this, so it is not treated as known."
+        )
+        return 1
 
     unexpected = []
     known = []
