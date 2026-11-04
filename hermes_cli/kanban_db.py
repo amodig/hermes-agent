@@ -2358,6 +2358,21 @@ def _append_event(
     )
 
 
+def _run_ledger_head(conn: sqlite3.Connection, task_id: str) -> int:
+    """Highest run id this task has ever opened, 0 when never claimed.
+
+    Monotonic on purpose: a claim inserts a ``task_runs`` row (AUTOINCREMENT, ids are
+    never reused), while the ``tasks`` columns a cycle touches are rewound by the release
+    — ``claim_lock``, ``current_run_id`` and ``worker_pid`` return to NULL and
+    ``started_at`` only distinguishes "never claimed" (COALESCE). So this ledger is the
+    only cheap evidence that no attempt has happened since a snapshot was taken.
+    """
+    row = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM task_runs WHERE task_id = ?", (task_id,),
+    ).fetchone()
+    return int(row[0] or 0) if row is not None else 0
+
+
 def _end_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
@@ -3032,6 +3047,46 @@ def _handoff_fields(metadata: Any) -> dict[str, Any]:
         handoff["changed_files"] = [str(item) for item in changed if str(item).strip()]
     return handoff
 
+def handoff_for_run(conn: sqlite3.Connection, task_id: str, run_id: int) -> dict[str, Any]:
+    """The handoff recorded by ONE specific run of ``task_id``.
+
+    ``latest_handoff`` answers "newest", which stops being the candidate's own handoff as
+    soon as a card is rebound to an earlier attested run — the supported recovery for a
+    superseded candidate. Consumers that follow such a binding must read that run.
+    """
+    merged: dict[str, Any] = {}
+    run = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ? AND task_id = ?", (int(run_id), task_id),
+    ).fetchone()
+    if run:
+        merged.update(_handoff_fields(_json_dict(run["metadata"])))
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind IN ('completed', 'review_requested') ORDER BY id DESC LIMIT 1",
+        (task_id, int(run_id)),
+    ).fetchone()
+    if event:
+        merged.update(_handoff_fields(_json_dict(event["payload"])))
+    return merged
+
+
+def bound_handoff(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+    """The handoff of the run ``task_id`` is BOUND to, falling back to its newest.
+
+    ``rebind-candidate --replace`` restores an earlier attested run, so after that
+    recovery the newest handoff belongs to the rejected candidate. Every consumer that
+    follows a candidate binding — workspace resolution, the execution grant and claim
+    admission — must read the bound run, or it contradicts the ones that do.
+    """
+    row = conn.execute(
+        "SELECT candidate_run_id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    bound = row["candidate_run_id"] if row is not None else None
+    if isinstance(bound, int) and not isinstance(bound, bool):
+        return handoff_for_run(conn, task_id, bound)
+    return latest_handoff(conn, task_id)
+
+
 def latest_handoff(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
     """Newest durable completion or review handoff, including recovery provenance."""
     merged: dict[str, Any] = {}
@@ -3446,7 +3501,7 @@ def block_task(
             if normalized_kind is None or expected_run_id is not None or _row_get(cur_row, "block_kind") is not None:
                 return False
             classified = conn.execute(
-                "UPDATE tasks SET block_kind = ?, block_recurrences = 1 "
+                "UPDATE tasks SET block_kind = ?, block_recurrences = 1, version = version + 1 "
                 "WHERE id = ? AND status = 'blocked' AND block_kind IS NULL "
                 "AND current_run_id IS NULL",
                 (normalized_kind, task_id),
@@ -3490,6 +3545,7 @@ def block_task(
         sql = f"""
                 UPDATE tasks
                    SET status        = '{new_status}',
+                       version       = version + 1,
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
@@ -4137,9 +4193,9 @@ def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str
 
 
 def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
-    """Done-parent handoffs: newest ``completed`` run's summary+metadata,
-    falling back to ``task.result`` for pre-runs-table data. Stamped with a
-    relative age so the worker re-verifies stale upstream results."""
+    """Done-parent handoffs from the bound candidate, or newest completed run
+    when unbound. Pre-runs-table data falls back to ``task.result``. Stamped
+    with a relative age so the worker re-verifies stale upstream results."""
     parent_rows = conn.execute(
         "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id", (task_id,),
     ).fetchall()
@@ -4148,9 +4204,12 @@ def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str
         pt = get_task(conn, pid)
         if not pt or pt.status != "done":
             continue
-        runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
-        runs.sort(key=lambda r: r.started_at, reverse=True)
-        run = runs[0] if runs else None
+        runs = list_runs(conn, pid)
+        if pt.candidate_run_id is not None:
+            run = next((r for r in runs if r.id == pt.candidate_run_id), None)
+        else:
+            run = max((r for r in runs if r.outcome == "completed"),
+                      key=lambda r: r.started_at, default=None)
         if not wrote_header:
             lines.append("## Parent task results")
             lines.append(
@@ -4173,7 +4232,7 @@ def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str
         meta_line = _ctx_metadata_line(run.metadata) if run is not None else None
         if meta_line:
             lines.append(meta_line)
-        handoff = latest_handoff(conn, pid)
+        handoff = bound_handoff(conn, pid)
         if handoff.get("head_sha"):
             lines.extend([
                 "Immutable handoff (review this exact commit, not the moving branch tip):",

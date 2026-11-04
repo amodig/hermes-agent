@@ -413,6 +413,11 @@ _SPECS = [
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
+        _arg("--expected-version", type=int,
+             help="Recovery fence: require this current task version. Refuses a stale "
+                  "version or any surviving claim/run instead of reclaiming ownership, "
+                  "and records the reason comment only once the transition lands. "
+                  "Requires exactly one task id."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
     _cmd("request-review", [

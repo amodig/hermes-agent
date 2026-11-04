@@ -716,6 +716,43 @@ def test_patch_expected_version_advances_direct_mutations(
     assert current["version"] == stale_version + 1
 
 
+@pytest.mark.parametrize("edit_goal", [False, True])
+def test_patch_block_unblock_uses_transition_version_and_rejects_stale_edits(
+    client, edit_goal, monkeypatch,
+):
+    # Derived age is second-granular; freeze this test's shared wall clock so
+    # full-response equality is deterministic without relaxing any assertion.
+    now = time.time()
+    monkeypatch.setattr(time, "time", lambda: now)
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "before", "assignee": "old"},
+    ).json()["task"]
+    url = f"/api/plugins/kanban/tasks/{task['id']}"
+    for status in ("blocked", "ready"):
+        prior_version = task["version"]
+        payload = {"expected_version": prior_version, "status": status}
+        if edit_goal:
+            payload["title"] = f"edited while {status}"
+        response = client.patch(url, json=payload)
+        assert response.status_code == 200, response.text
+        task = response.json()["task"]
+        assert task["status"] == status
+        assert task["version"] == prior_version + 1 + int(edit_goal)
+        if edit_goal:
+            assert task["title"] == payload["title"]
+        before = client.get(url).json()
+        stale = client.patch(url, json={
+            "expected_version": prior_version, "status": "blocked",
+            "title": "must not land",
+        })
+        assert stale.status_code == 409
+        after = client.get(url).json()
+        assert after["task"] == before["task"]
+        assert after["events"] == before["events"]
+        assert after["runs"] == before["runs"]
+
+
 def test_deferred_cleanup_skips_a_reopened_task(client, tmp_path, monkeypatch):
     workspace_root = tmp_path / "workspaces"
     workspace = workspace_root / "task"

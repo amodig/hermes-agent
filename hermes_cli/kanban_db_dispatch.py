@@ -1435,6 +1435,7 @@ def _record_task_failure(
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
     infrastructure: bool = False,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -1453,6 +1454,8 @@ def _record_task_failure(
     with ``infrastructure: true`` but ``consecutive_failures`` is left alone and
     the breaker never trips; the card stays retryable and
     :func:`check_respawn_guard` spaces the retries.
+
+    ``expected_run_id`` fences rollback to its own claim; a successor is untouched.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -1463,7 +1466,9 @@ def _record_task_failure(
             "SELECT consecutive_failures, status, max_retries, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
-        if row is None:
+        if row is None or (
+            expected_run_id is not None and row["current_run_id"] != expected_run_id
+        ):
             return False
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
@@ -2860,9 +2865,11 @@ def _dispatch_lane_task(
 
     use_default_spawn = spawn_fn is None
     launch: WorkerLaunch | None = None
+    spawn_entered = False
     claimed = None
     workspace = None
     resolved_branch_name = None
+    prepared_new = False
 
     if use_default_spawn:
         preflight = _kb.get_task(conn, task_id)
@@ -2877,17 +2884,20 @@ def _dispatch_lane_task(
         try:
             _check_not_stopping(should_stop, task_id)
             _require_autonomous_worker_capacity()
-            # A typed role card (review/validation) works from its candidate's
-            # commit, never from whatever HEAD the anchor repo happens to hold: the
-            # head is derived here, once, and both workspace resolution and the
-            # grant that follows see the same commit.
+            # Workspace resolution and the grant must name the same bound review pair,
+            # including a same-card review whose candidate is the card itself.
             candidate_head = _kbw.candidate_head_for_task(conn, spawn_task)
-            if spawn_task.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(
-                    spawn_task, board=board, candidate_head=candidate_head)
-            else:
-                workspace = _kbw.resolve_workspace(
-                    spawn_task, board=board, candidate_head=candidate_head)
+            contract = _kbw._role_contract(spawn_task)
+            candidate_id = (
+                contract["candidate_task_id"] if contract else task_id if lane == "review" else None)
+            handoff = _kb.bound_handoff(conn, candidate_id) if candidate_id else {}
+            candidate_pair = (
+                str(handoff.get("base_sha") or "").strip(),
+                candidate_head or str(handoff.get("head_sha") or "").strip(),
+            )
+            workspace, resolved_branch_name, prepared_new = _kbw.resolve_workspace_created(
+                spawn_task, board=board, candidate_head=candidate_head)
+            prepared_head = candidate_head or ((_kbw._git_head(workspace) or "") if prepared_new else "")
             launch = _default_spawn(
                 spawn_task, str(workspace), board=board, defer_grant=True,
                 should_stop=should_stop,
@@ -2912,18 +2922,79 @@ def _dispatch_lane_task(
             if claimed is None:
                 if launch.cancel:
                     launch.cancel()
+                _kbw.discard_prepared_worktree(
+                    spawn_task, workspace, prepared_head, board=board, prepared_new=prepared_new,
+                )
                 _note_claim_hold(
                     conn, task_id, result, lane=lane, board=board, expected_task=preflight,
                 )
                 return False
+            # This card's claim fence cannot detect a rebind on the candidate card.
+            # Either half changing invalidates the prepared worker's diff permission.
+            try:
+                bound_head = _kbw.candidate_head_for_task(conn, claimed)
+                handoff = _kb.bound_handoff(conn, candidate_id) if candidate_id else {}
+                bound_pair = (
+                    str(handoff.get("base_sha") or "").strip(),
+                    bound_head or str(handoff.get("head_sha") or "").strip(),
+                )
+            except Exception as exc:
+                candidate_problem = f"candidate is no longer resolvable: {exc}"
+            else:
+                candidate_problem = (
+                    None if bound_pair == candidate_pair
+                    else f"candidate moved from {candidate_pair} to {bound_pair} "
+                         "while the worker was prepared")
+            # Candidate-bound grants must authorize the accepted base..head even
+            # after an A→B→A rebind. Ordinary implementation grants are deliberately
+            # unbound working-tree authority and have no candidate pair to compare.
+            if candidate_id and launch.execution_grant is not None:
+                review = launch.execution_grant.review or {}
+                granted_pair = (review.get("base", ""), review.get("head", ""))
+                if not all(granted_pair) or granted_pair != candidate_pair:
+                    candidate_problem = (
+                        f"run {claimed.current_run_id} execution grant range "
+                        f"{granted_pair[0] or '<missing>'}..{granted_pair[1] or '<missing>'} "
+                        f"differs from accepted candidate {candidate_pair[0]}..{candidate_pair[1]}")
+            if candidate_problem is not None:
+                if launch.cancel:
+                    launch.cancel()
+                # The prepared checkout is at the previous candidate; a retry may be
+                # unable to move away from it, so discard it when nothing can be lost.
+                if workspace is not None:
+                    _kbw.discard_prepared_worktree(
+                        claimed, workspace, prepared_head, board=board,
+                        prepared_new=prepared_new,
+                    )
+                if _record_task_failure(
+                    conn, claimed.id, candidate_problem, outcome="spawn_failed",
+                    failure_limit=failure_limit, release_claim=True, end_run=True,
+                    expected_run_id=claimed.current_run_id,
+                ):
+                    result.auto_blocked.append(claimed.id)
+                return False
         except WorkerLaunchInterrupted as exc:
             if launch is not None and launch.cancel:
                 launch.cancel()
+            # Preparation already materialized the checkout; nothing ran in it, and the
+            # workspace was never persisted, so database-driven cleanup has no path to it.
+            if workspace is not None and spawn_task is not None:
+                _kbw.discard_prepared_worktree(
+                    spawn_task, workspace, prepared_head, board=board, prepared_new=prepared_new,
+                )
             _note_launch_cancelled(task_id, str(exc), result)
             return False
         except Exception as exc:
             if launch is not None and launch.cancel:
                 launch.cancel()
+            # Preparation materializes a detached role worktree before the spawn. If the
+            # launch fails, that checkout is a relic of an attempt in which no worker ran,
+            # and a later candidate that does not contain its commit would make every retry
+            # refuse. Discard it while nothing can be lost.
+            if workspace is not None and spawn_task is not None:
+                _kbw.discard_prepared_worktree(
+                    spawn_task, workspace, prepared_head, board=board, prepared_new=prepared_new,
+                )
             from tools.autonomous_resources import AutonomousResourceUnavailable
             from tools.process_registry import RestartSafeScopeUnavailable
 
@@ -2961,12 +3032,9 @@ def _dispatch_lane_task(
             return False
         try:
             candidate_head = _kbw.candidate_head_for_task(conn, claimed)
-            if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(
-                    claimed, board=board, candidate_head=candidate_head)
-            else:
-                workspace = _kbw.resolve_workspace(
-                    claimed, board=board, candidate_head=candidate_head)
+            workspace, resolved_branch_name, prepared_new = _kbw.resolve_workspace_created(
+                claimed, board=board, candidate_head=candidate_head)
+            prepared_head = candidate_head or ((_kbw._git_head(workspace) or "") if prepared_new else "")
         except Exception as exc:
             if _record_task_failure(
                 conn, claimed.id, f"workspace: {exc}",
@@ -2978,8 +3046,15 @@ def _dispatch_lane_task(
     try:
         assert claimed is not None
         assert workspace is not None
-        _kbw.set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
+        # Persist the kind the workspace was resolved as: a role card converted from the
+        # scratch default is a worktree, and completion cleanup follows the recorded kind.
+        workspace_kind = _kbw.effective_workspace_kind(claimed)
+        _kbw.set_workspace_path(
+            conn, claimed.id, str(workspace),
+            kind=(workspace_kind
+                  if workspace_kind != (claimed.workspace_kind or "scratch") else None),
+        )
+        if workspace_kind == "worktree":
             # A role worktree is normally detached at the candidate, and "" is the
             # truth to persist there — the historical "or wt/<id>" fallback would
             # record a branch that does not exist.
@@ -2988,10 +3063,12 @@ def _dispatch_lane_task(
                 resolved_branch_name if resolved_branch_name is not None
                 else (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
             )
-        _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        _kbw._maybe_emit_scratch_tip(conn, claimed.id, workspace_kind)
         if lane == "review":
             claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
         if launch is None:
+            # A callback may create commits before raising or returning no launch.
+            spawn_entered = True
             launch = _call_spawn_fn(spawn_fn, claimed, str(workspace), board)
         if isinstance(launch, WorkerLaunch):
             pid = launch.pid
@@ -3007,6 +3084,16 @@ def _dispatch_lane_task(
                 # forbids.
                 with _grant_boundary(grant_guard):
                     _check_not_stopping(should_stop, claimed.id)
+                    if use_default_spawn and candidate_id and (
+                        spawn_task.lifecycle_contract or {}
+                    ).get("kind") in {"code", "review", "validation"}:
+                        from hermes_cli.kanban_db_lifecycle_evidence import _retain_review_candidate
+
+                        review = (
+                            launch.execution_grant.review if launch.execution_grant is not None
+                            else {"base": candidate_pair[0], "head": candidate_pair[1]}
+                        )
+                        _retain_review_candidate(conn, claimed, candidate_id, review or {})
                     launch.grant(int(claimed.current_run_id), claimed.claim_lock)
                 return _record_granted_spawn(
                     conn, claimed, launch, str(workspace), result, board, _count_spawn,
@@ -3027,11 +3114,17 @@ def _dispatch_lane_task(
     except WorkerLaunchInterrupted as exc:
         if launch is not None and launch.cancel:
             launch.cancel()
+        if not spawn_entered:
+            _kbw.discard_prepared_worktree(
+                claimed, workspace, prepared_head, board=board, prepared_new=prepared_new)
         _pause_claimed_run_for_shutdown(conn, claimed, result, exc)
         return False
     except Exception as exc:
         if launch is not None and launch.cancel:
             launch.cancel()
+        if not spawn_entered:
+            _kbw.discard_prepared_worktree(
+                claimed, workspace, prepared_head, board=board, prepared_new=prepared_new)
         from tools.autonomous_resources import AutonomousResourceUnavailable
         from tools.process_registry import RestartSafeScopeUnavailable
 
@@ -3046,7 +3139,7 @@ def _dispatch_lane_task(
         if _record_task_failure(
             conn, claimed.id, str(exc),
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
-            infrastructure=infrastructure,
+            infrastructure=infrastructure, expected_run_id=claimed.current_run_id,
         ):
             result.auto_blocked.append(claimed.id)
         return False

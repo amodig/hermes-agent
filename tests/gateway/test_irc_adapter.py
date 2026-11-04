@@ -621,6 +621,29 @@ def _tunnel_config(**overrides):
     return config
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coordination", [True, False])
+async def test_sanctioned_transports_lock_the_same_network_account(monkeypatch, coordination):
+    monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
+    locks = []
+    for nickname, config in zip(("first-nick", "second-nick"),
+                                (_coordination_config(), _tunnel_config())):
+        config.extra["coordination"] = coordination
+        if not coordination:
+            config.extra["nickname"] = nickname
+        adapter = IRCAdapter(config)
+
+        def refuse_lock(platform, identity, message):
+            locks.append((platform, identity))
+            assert "synthetic-only" not in message
+            assert adapter.server in message
+            return False
+
+        monkeypatch.setattr(adapter, "_acquire_platform_lock", refuse_lock)
+        assert await adapter.connect() is False
+    assert locks[0] == locks[1] == ("irc", "agents-ergo:agent-hermes-cto")
+
+
 def test_public_endpoint_must_keep_tls(monkeypatch):
     """The pinned Serve endpoint carries SASL only inside TLS."""
     monkeypatch.setattr(_irc_mod, "_get_scoped_secret", lambda *args: "")
@@ -1049,3 +1072,13 @@ async def test_connect_proxy_failures_preserve_retry_class(monkeypatch, coordina
     if failure != "tls":
         conn.start_tls.assert_not_awaited()
     assert not any(line.startswith((b"JOIN ", b"PASS ", b"AUTHENTICATE ")) for line in conn.writes)
+
+
+def test_tunnel_endpoint_refuses_tls():
+    """TLS on the sanctioned tunnel cannot complete: its target listener is plaintext.
+
+    Accepting `use_tls: true` here would pass the configuration check and then fail
+    the handshake at connect time, which reads as a runtime fault rather than the
+    configuration error it is.
+    """
+    assert IRCAdapter(_tunnel_config(use_tls=True))._config_error() == "invalid-coordination-config"

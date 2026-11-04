@@ -48,7 +48,14 @@ Rules for tool code:
   at call time, never `Path.home()/.hermes` and never a module constant, so each served profile gets
   its own state.
 - **No `offset`/`limit` on instructional tools** (skills, prompts, playbooks) — models read page 1
-  and skip the rest (root rubric).
+  and skip the rest (root rubric). **Exception — stored board evidence, not instructions**:
+  `kanban_show`'s opt-in bounded mode (`section`, `offset`, `limit`, `after`, `chars`, `item`,
+  `snapshot`) pages a card's *board state*, which cannot be delivered whole at all — a card body
+  can exceed 300 KB and used to be unreachable past a spill preview. Every partial page carries
+  `complete: false` plus `next_offset`/`next_after`, and every partial or deferred value names its
+  own continuation, so an unfinished read is visible in the result rather than silent. The
+  unbounded call stays available and unchanged; skills, prompts and playbooks still take no
+  pagination.
 - **`check_fn` answers reachability/opt-in for the profile it runs under, never surface.** Results
   are TTL-cached in `registry.py::_check_fn_cache` keyed by `hermes_home_key()`, and one process
   serves many sessions AND many profiles: a probe reads credentials through

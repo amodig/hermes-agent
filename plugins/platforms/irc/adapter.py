@@ -300,6 +300,22 @@ class IRCAdapter(BasePlatformAdapter):
         self._inbox = deque(maxlen=INBOX_LIMIT)
         self._hello_replies: Dict[str, float] = {}
         self._hello_reply_tasks: Dict[str, asyncio.Task] = {}
+        from hermes_cli.gateway_startup_inputs import record_gateway_startup_route
+        record_gateway_startup_route("irc", self.startup_route())
+
+    def startup_route(self) -> dict:
+        """Transport inputs only; never persist proxy credentials or SASL material."""
+        proxy_route = None
+        if self.proxy_url:
+            try:
+                proxy = urlsplit(self.proxy_url)
+                if (proxy.scheme != "http" or not proxy.hostname or proxy.username or proxy.password
+                        or proxy.path not in ("", "/") or proxy.query or proxy.fragment):
+                    raise ValueError("invalid-proxy")
+                proxy_route = {"scheme": proxy.scheme, "hostname": proxy.hostname, "port": proxy.port or 80}
+            except ValueError:
+                proxy_route = {"invalid": True}
+        return {"server": self.server, "port": self.port, "use_tls": bool(self.use_tls), "proxy": proxy_route}
 
     def toolsets_for_source(self, source):
         return ["no_tools"] if self.coordination else None
@@ -308,6 +324,10 @@ class IRCAdapter(BasePlatformAdapter):
     def _endpoint(self) -> tuple[str, int]:
         return (self.server, int(self.port))
 
+    def _network_scope(self) -> str:
+        """Sanctioned transports share one Ergo network and identity lock."""
+        return "agents-ergo" if self._endpoint in COORDINATION_ENDPOINTS else self.server
+
     def _transport_is_sanctioned(self) -> bool:
         """TLS, or the one documented loopback tunnel to the same agents network.
 
@@ -315,8 +335,15 @@ class IRCAdapter(BasePlatformAdapter):
         network transport. The loopback endpoint is the SSH tunnel an agent host
         without Tailscale uses instead: the credential crosses a loopback socket
         inside that tunnel, and nothing else is accepted here.
+
+        `use_tls` follows the endpoint rather than being a free choice. The tunnel
+        forwards to Ergo's *plaintext* listener, so requesting TLS there is not the
+        stricter option — it is a handshake that cannot complete, and accepting it
+        would surface as ``connect_failed`` after a configuration check said yes.
         """
-        return bool(self.use_tls) or self._endpoint == TUNNEL_COORDINATION_ENDPOINT
+        if self._endpoint == TUNNEL_COORDINATION_ENDPOINT:
+            return not self.use_tls
+        return bool(self.use_tls)
 
     def _config_error(self):
         if self.coordination and (
@@ -363,8 +390,12 @@ class IRCAdapter(BasePlatformAdapter):
         self._batches.clear()
         self._clear_coordination_session()
         self._connection_started = time.time()
-        # Prevent two profiles from using the same IRC identity
-        if not self._acquire_platform_lock("irc", f"{self.server}:{self.nickname}", f"IRC identity {self.nickname}@{self.server}"):
+        # Lock the account on its network, not the transport used to reach it.
+        scope = self._network_scope()
+        identity = self.sasl_account or self.nickname
+        if not self._acquire_platform_lock(
+                "irc", f"{scope}:{identity}",
+                f"IRC identity {identity}@{scope} via {self.server}:{self.port}"):
             return False
         self._connecting = True
         try:

@@ -13,7 +13,9 @@ import shutil
 import sqlite3
 import subprocess
 import time
+import stat
 import unicodedata
+import bisect
 from pathlib import Path
 from typing import Optional
 from typing import TYPE_CHECKING
@@ -455,6 +457,17 @@ def _cleanup_worktree_workspace(
                 task_id, wp,
             )
             return
+        blockers = _worktree_removal_blockers(wp)
+        if blockers:
+            # ``worktree remove`` deletes these with the directory even though `status`
+            # called the tree clean; operator content outranks a tidy workspace.
+            _kb._log.info(
+                "Preserving worktree for task %s: %s at %s",
+                task_id, "; ".join(blockers), wp,
+            )
+            return
+        if not _worktree_refs_survive_removal(repo_root, wp):
+            return
         # Windows cannot delete a directory while this process has its current
         # directory inside it. Completed workers normally run from their own
         # linked worktree, so move this process back to the main checkout
@@ -478,6 +491,10 @@ def _cleanup_worktree_workspace(
                 return
         # No --force: git's own dirty guard re-verifies at removal time, so if
         # the tree became dirty since our check (TOCTOU) removal fails safe.
+        # Which branch the checkout is really on, before it disappears: an empty recorded
+        # branch is only the legacy auto-generated ``wt/<id>`` when the worktree was
+        # actually sitting on it. A detached role checkout has no branch to delete.
+        current_branch = _git_current_branch(wp) or ""
         release_lsp_clients(str(worktree_path))
         result = _git(repo_root, "worktree", "remove", str(wp), timeout=60)
         if result.returncode != 0:
@@ -492,9 +509,33 @@ def _cleanup_worktree_workspace(
             )
             return
         _kb._log.debug("Removed worktree workspace: %s", wp)
-        branch = (branch_name or "").strip() or f"wt/{task_id}"
+        # Only a branch this task recorded — or the legacy auto-generated name its
+        # worktree was demonstrably checked out on — may be deleted. Inventing
+        # ``wt/<id>`` for a detached role checkout would force-delete a same-named
+        # branch the card never used.
+        branch = (branch_name or "").strip()
+        if not branch and current_branch == f"wt/{task_id}":
+            branch = current_branch
         if branch.startswith("wt/"):
-            _git(repo_root, "branch", "-D", branch, timeout=30)
+            # The HEAD check above covers the checkout; the branch ref can still hold
+            # unique work (an adopted ``wt/*`` checkout that was later detached). Delete
+            # only a branch whose tip some remote-tracking ref already contains.
+            # ``refs/heads/<name>`` explicitly: a tag of the same short name shadows the
+            # branch under ``rev-parse --verify`` (warning only), which would verify the
+            # tag's tip and then delete a branch whose own tip has unique work.
+            tip = _git(
+                repo_root, "rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}", timeout=30)
+            reachable = False
+            if tip.returncode == 0 and (tip.stdout or "").strip():
+                contains = _git(
+                    repo_root, "branch", "-r", "--contains", (tip.stdout or "").strip(), timeout=60)
+                reachable = contains.returncode == 0 and bool((contains.stdout or "").strip())
+            if reachable:
+                _git(repo_root, "branch", "-D", branch, timeout=30)
+            else:
+                _kb._log.info(
+                    "Preserving branch %s for task %s: no remote-tracking ref contains it",
+                    branch, task_id)
     except Exception:
         pass  # best-effort — never block completion
 
@@ -669,6 +710,52 @@ def _is_linked_worktree_checkout(path: Path) -> bool:
     )
 
 
+def _validate_worktree_registration(repo_root: Path, target: Path) -> None:
+    """A copied .git pointer must never authorize moving a sibling's HEAD/index."""
+    from hermes_cli.worker_execution_policy import _worktree_registration_backlinks
+
+    try:
+        pointer = target / ".git"
+        info = pointer.lstat()
+        if target.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+            raise ValueError
+        contents = pointer.read_text(encoding="utf-8-sig").strip()
+        if not contents.startswith("gitdir: ") or not contents[8:].strip():
+            raise ValueError
+        git_dir = (target / contents[8:].strip()).resolve()
+        common = _git_common_dir(repo_root)
+        if common is None or _path_key(_git_common_dir(target)) != _path_key(common):
+            raise ValueError
+        if not _worktree_registration_backlinks(
+            str(common), str(git_dir), str(target.resolve()),
+        ):
+            raise ValueError
+        registered = _git(repo_root, "worktree", "list", "--porcelain", "-z", timeout=30)
+        fields = registered.stdout.split("\0")
+        if registered.returncode == 129:  # Git before 2.36 has no worktree-list -z.
+            import ast
+
+            registered = _git(
+                repo_root, "-c", "core.quotePath=true", "worktree", "list", "--porcelain",
+                timeout=30)
+            # Porcelain without -z C-quotes unusual paths, including UTF-8 octets.
+            fields = [
+                "worktree " + ast.literal_eval("b" + field[9:]).decode("utf-8")
+                if field.startswith('worktree "') else field
+                for field in registered.stdout.split("\n")
+            ]
+        if registered.returncode != 0 or not any(
+            _path_key(Path(field[9:]).resolve()) == _path_key(target.resolve())
+            for field in fields if field.startswith("worktree ")
+        ):
+            raise ValueError
+    except (OSError, UnicodeError, ValueError, SyntaxError, subprocess.SubprocessError):
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: unregistered checkout {target}; "
+            f"its .git pointer, registration backlink and worktree list must agree in {repo_root}"
+        ) from None
+
+
 def _nearest_existing_path(path: Path) -> Path:
     current = path
     while not current.exists() and current != current.parent:
@@ -687,12 +774,12 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> bool:
+    """Materialize ``target``, returning False when reusing a linked worktree."""
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None and _path_key(_git_common_dir(target)) == _path_key(repo_common):
-        return
+        return False
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
         args = ["worktree", "add", str(target), branch_name]
@@ -704,13 +791,14 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
+    return True
 
 
-def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple[Path, str]:
-    """Materialize the canonical ``<repo>/.worktrees/<task-id>`` worktree."""
+def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple[Path, str, bool]:
+    """Materialize the canonical worktree, reporting whether this call created it."""
     target = repo_root / ".worktrees" / task_id
-    _ensure_git_worktree(repo_root, target, branch_name)
-    return target, branch_name
+    created = _ensure_git_worktree(repo_root, target, branch_name)
+    return target, branch_name, created
 
 
 def _role_contract(task: Task) -> Optional[dict]:
@@ -740,7 +828,9 @@ def candidate_head_for_task(conn: sqlite3.Connection, task: Task) -> Optional[st
         raise ValueError(
             f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {task.id} names no candidate card")
     state = _kb.get_lifecycle_state(conn, task.id)
-    handoff = _kb.latest_handoff(conn, candidate_id)
+    # The lifecycle projection already names the BOUND candidate run, so the documented
+    # head must come from that same run.
+    handoff = _kb.bound_handoff(conn, candidate_id)
     head = str(state.get("head_sha") or "").strip()
     documented = str(handoff.get("head_sha") or "").strip()
     base = str(handoff.get("base_sha") or "").strip()
@@ -767,6 +857,91 @@ def _git_head(path: Path) -> Optional[str]:
     return out
 
 
+def _untracked_paths_target_tracks(repo: Path, worktree: Path, head: str) -> list[str]:
+    """Ignored files and untracked directories the target would overwrite.
+
+    ``git status --porcelain --untracked-files=all`` misses ignored files and empty
+    directories. Even ``checkout --no-overwrite-ignore`` can replace an unignored
+    empty directory with a tracked file.
+    """
+    # Two listings on purpose. Per-file first: ``--directory`` collapses a nonempty
+    # ignored directory to ``dir/``, losing which children exist, and a tracked sibling
+    # (``cache/new`` beside an ignored ``cache/local``) is not a conflict. The second
+    # listing adds all untracked directory roots, regardless of ignore status. Git
+    # collapses descendants, so check candidate paths beneath those roots on disk.
+    files = _git(
+        worktree, "ls-files", "--others", "--ignored", "--exclude-standard", "-z", timeout=60)
+    if files.returncode != 0:
+        return []
+    directories = _git(
+        worktree, "ls-files", "--others", "--directory", "-z", timeout=60,
+    )
+    if directories.returncode != 0:
+        return []
+    present = [path for path in (files.stdout or "").split("\0") if path]
+    empty_dirs = []
+    known = set(present)
+    for entry in (directories.stdout or "").split("\0"):
+        if not entry or not entry.endswith("/"):
+            continue
+        bare = entry.rstrip("/")
+        if bare not in known:
+            empty_dirs.append(bare)
+    if not present and not empty_dirs:
+        return []
+    tracked = _git(repo, "ls-tree", "-r", "--name-only", "-z", head, timeout=120)
+    if tracked.returncode != 0:
+        return []
+    # Exact matching only: case identity belongs to the filesystem, and git's own
+    # ``--no-overwrite-ignore`` guard already decides case-only conflicts correctly.
+    # Casefolding here would refuse a move that git would perform safely.
+    paths = sorted({path for path in (tracked.stdout or "").split("\0") if path})
+    if not paths:
+        return []
+    def ancestor_tracked(key):
+        parent = key
+        while "/" in parent:
+            parent = parent.rsplit("/", 1)[0]
+            index = bisect.bisect_left(paths, parent)
+            if index < len(paths) and paths[index] == parent:
+                return True
+        return False
+
+    def exact_or_tracked_child(key):
+        index = bisect.bisect_left(paths, key)
+        return (index < len(paths) and paths[index] == key) or (
+            index < len(paths) and paths[index].startswith(key + "/"))
+
+    hits = []
+    for entry in present:
+        # A file can be replaced by a tracked file, a tracked child, or a tracked
+        # ancestor (its directory path became a file).
+        if exact_or_tracked_child(entry) or ancestor_tracked(entry):
+            hits.append(entry)
+    for entry in empty_dirs:
+        # Git collapses untracked directories, hiding empty descendants. Inspect each
+        # tracked descendant too: adding a file is safe, replacing a directory is not.
+        index = bisect.bisect_left(paths, entry)
+        if (index < len(paths) and paths[index] == entry) or ancestor_tracked(entry):
+            hits.append(entry)
+        index = bisect.bisect_left(paths, entry + "/")
+        while index < len(paths) and paths[index].startswith(entry + "/"):
+            if (worktree / paths[index]).is_dir():
+                hits.append(paths[index])
+            index += 1
+    return hits
+
+
+def _index_flagged_paths(worktree: Path) -> list[str]:
+    flags = _git(worktree, "ls-files", "-v", "-z", timeout=60)
+    if flags.returncode != 0:
+        return ["<unreadable index>"]
+    return [
+        item.split(" ", 1)[1] for item in (flags.stdout or "").split("\0")
+        if item and not item.startswith("H ")
+    ]
+
+
 def _clean_tree(path: Path, label: str) -> None:
     """Refuse local tracked changes or untracked files before reusing a checkout.
 
@@ -784,6 +959,11 @@ def _clean_tree(path: Path, label: str) -> None:
         raise ValueError(
             f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {label} has local changes or untracked "
             "files; nothing was moved and no file was removed")
+    flagged = _index_flagged_paths(path)
+    if flagged:
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {label} has index flags hiding "
+            f"local changes ({', '.join(flagged[:3])}); clear the index flags first")
 
 
 def _role_repo_root(task: Task, board: Optional[str]) -> Path:
@@ -794,7 +974,14 @@ def _role_repo_root(task: Task, board: Optional[str]) -> Path:
     instead of retargeted: a reviewer pointed at a sibling's checkout would review
     work that is not its candidate.
     """
-    if not task.workspace_path:
+    # A retained managed scratch directory is storage, not a repository anchor.
+    # Ignore it only during scratch-to-role conversion; reads never rewrite the row.
+    managed_scratch = (
+        (task.workspace_kind or "scratch") == "scratch"
+        and task.workspace_path
+        and _managed_scratch_path_info(Path(task.workspace_path).expanduser())[0]
+    )
+    if not task.workspace_path or managed_scratch:
         board_slug = board if board else _kb.get_current_board()
         board_default = (_kb.read_board_metadata(board_slug).get("default_workdir") or "").strip()
         if not board_default:
@@ -856,19 +1043,38 @@ def _role_repo_root(task: Task, board: Optional[str]) -> Path:
     return repo_root
 
 
-def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Path, str]:
+def _is_ancestor(repo: Path, commit: str, head: str) -> bool:
+    if not commit:
+        return False
+    return _git(repo, "merge-base", "--is-ancestor", commit, head, timeout=60).returncode == 0
+
+
+def _commit_referenced(repo: Path, commit: str) -> bool:
+    """True when a ref that survives worktree removal still reaches ``commit``."""
+    if not commit:
+        return False
+    result = _git(repo, "for-each-ref", "--format=%(refname)", "--contains", commit, timeout=60)
+    # Git stores these three namespaces in the worktree's administrative directory,
+    # not the common ref store; removing that worktree deletes them along with HEAD.
+    return result.returncode == 0 and any(
+        not ref.startswith(("refs/worktree/", "refs/bisect/", "refs/rewritten/"))
+        for ref in (result.stdout or "").splitlines()
+    )
+
+
+def _role_worktree(
+    repo_root: Path, task: Task, candidate_head: str, board: Optional[str] = None,
+) -> tuple[Path, str, bool]:
     """Materialize this role card's own worktree at ``candidate_head``.
 
-    Returns ``(path, branch)`` with an empty branch for the detached checkout that a
-    role worktree normally is. An existing canonical worktree must have its own
-    exact registration backlink before any status or checkout can touch its index.
-    It is reused only when already at ``candidate_head``; a clean named-branch
-    checkout of another commit is moved onto the candidate with a non-force detach
-    (its branch ref is untouched). Local files, including ignored collisions, are
-    preserved on refusal.
+    Returns ``(path, branch, created)`` with an empty branch for the detached
+    checkout that a role worktree normally is. An existing canonical worktree
+    must have its own exact registration backlink before any status or checkout
+    can touch its index. It is reused only when already at ``candidate_head``;
+    a clean named-branch checkout of another commit is moved onto the candidate
+    with a non-force detach (its branch ref is untouched). Local files, including
+    ignored collisions, are preserved on refusal.
     """
-    from hermes_cli.worker_execution_policy import _worktree_registration_backlinks
-
     if not _COMMIT_ID.match(candidate_head or ""):
         raise ValueError(
             f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {task.id} has no full candidate commit")
@@ -879,47 +1085,87 @@ def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Pa
             f"in {repo_root}")
     head = resolved
     target = repo_root / ".worktrees" / task.id
+
+    def confirm_candidate() -> None:
+        from hermes_cli.sqlite_safe_read import connect_tracked
+
+        db_path = _kb.kanban_db_path(board=board).resolve()
+        try:
+            with contextlib.closing(connect_tracked(
+                db_path.as_uri() + "?mode=ro", tracking_path=db_path,
+                uri=True, timeout=1.0,
+            )) as conn:
+                conn.row_factory = sqlite3.Row
+                shared = _workspace_in_use_by_other(conn, task.id, target) if target.exists() else None
+                # Operator rebinds do not take admission. Re-read immediately before
+                # checkout, not before the potentially slow Git safety checks.
+                confirmed = candidate_head_for_task(conn, task)
+                if confirmed != candidate_head:
+                    raise ValueError(
+                        f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: candidate moved from "
+                        f"{candidate_head} to {confirmed} before workspace preparation")
+        except (OSError, sqlite3.Error):
+            shared = "unknown"
+        if shared is not None:
+            detail = ("is registered to another non-terminal task" if shared == "shared"
+                      else "cannot be checked for another task's registration")
+            raise ValueError(
+                f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: checkout collision at {target}: {detail}")
+
     if target.is_symlink() or (target.exists() and not target.is_dir()):
         raise ValueError(
             f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is not a real directory")
     if not target.exists():
         target.parent.mkdir(parents=True, exist_ok=True)
+        confirm_candidate()
         result = _git(repo_root, "worktree", "add", "--detach", str(target), head, timeout=120)
         if result.returncode != 0:
             raise ValueError(
                 f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: git worktree add failed for {target} at "
                 f"{head}: {(result.stderr or result.stdout or '').strip()[:300]}")
+        _validate_worktree_registration(repo_root, target)
         if _git_head(target) != head:
             raise ValueError(
                 f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} did not land on {head}")
-        return target.resolve(strict=False), ""
+        return target.resolve(strict=False), "", True
     # An existing canonical checkout: prove it belongs to this repository, then never
     # discard what is in it.
-    repo_root = repo_root.resolve(strict=False)
-    repo_common = _git_common_dir(repo_root)
-    if not _is_linked_worktree_checkout(target) or (
-        _path_key(_git_common_dir(target)) != _path_key(repo_common)
-    ):
-        raise ValueError(
-            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is not a linked worktree of "
-            f"{repo_root}")
-    git_dir = _git_abs_path(target, "--git-dir")
-    if repo_common is None or git_dir is None or not _worktree_registration_backlinks(
-        str(repo_common), str(git_dir), str(target.resolve(strict=False))
-    ):
-        raise ValueError(
-            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target}'s git directory registration "
-            "does not backlink this checkout; nothing was moved")
+    _validate_worktree_registration(repo_root, target)
     _clean_tree(target, str(target))
+    # Ignored files and empty directories are invisible to the clean-tree check.
+    clobbered = _untracked_paths_target_tracks(repo_root, target, head)
+    if clobbered:
+        shown = ", ".join(clobbered[:3])
+        raise ValueError(
+            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} holds ignored file(s) or "
+            f"untracked directories the candidate {head} tracks ({shown}); "
+            "moving it would overwrite them")
     current = _git_head(target)
     branch = _git_current_branch(target) or ""
     if current == head:
-        return target.resolve(strict=False), branch
+        confirm_candidate()
+        return target.resolve(strict=False), branch, False
     if not branch:
-        raise ValueError(
-            f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is detached at "
-            f"{current or 'an unknown commit'}, not the candidate {head}; moving it would "
-            "strand work that is reachable from no branch")
+        # A detached checkout is the normal shape for a role worktree, and after a
+        # rework its old candidate is simply not the new one. Follow the new candidate
+        # when moving cannot strand anything — the old commit is contained in the new
+        # candidate, or a common ref still reaches it — and refuse otherwise.
+        if not (_is_ancestor(target, current, head) or _commit_referenced(target, current)):
+            raise ValueError(
+                f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is detached at "
+                f"{current or 'an unknown commit'}, not the candidate {head}, and nothing "
+                "reaches that commit; moving it would strand work")
+        confirm_candidate()
+        result = _git(
+            target, "checkout", "--no-overwrite-ignore", "--detach", head, timeout=120)
+        if result.returncode != 0:
+            raise ValueError(
+                f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: could not move {target} onto {head}: "
+                f"{(result.stderr or result.stdout or '').strip()[:300]}")
+        if _git_head(target) != head:
+            raise ValueError(
+                f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} did not land on {head}")
+        return target.resolve(strict=False), "", False
     # Detaching leaves the branch ref behind, and the completion cleanup deletes a
     # ``wt/<id>`` branch once the *detached* HEAD is clean and pushed. So only move a
     # branch whose tip the candidate already contains: anything else is unique work.
@@ -928,7 +1174,9 @@ def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Pa
             f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} is checked out on {branch} at "
             f"{current}, which the candidate {head} does not contain; detaching would "
             "strand that work")
-    result = _git(target, "checkout", "--detach", "--no-overwrite-ignore", head, timeout=120)
+    confirm_candidate()
+    result = _git(
+            target, "checkout", "--no-overwrite-ignore", "--detach", head, timeout=120)
     if result.returncode != 0:
         raise ValueError(
             f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: could not move {target} onto {head}: "
@@ -936,7 +1184,7 @@ def _role_worktree(repo_root: Path, task: Task, candidate_head: str) -> tuple[Pa
     if _git_head(target) != head:
         raise ValueError(
             f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {target} did not land on {head}")
-    return target.resolve(strict=False), ""
+    return target.resolve(strict=False), "", False
 
 
 def _validate_role_directory(task: Task, path: Path, candidate_head: Optional[str]) -> None:
@@ -961,6 +1209,15 @@ def _validate_role_directory(task: Task, path: Path, candidate_head: Optional[st
 
 def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None,
                                 candidate_head: Optional[str] = None) -> tuple[Path, str]:
+    """Resolve a worktree, retaining the historical (path, branch) API."""
+    path, branch, _created = _resolve_worktree_workspace_created(
+        task, board=board, candidate_head=candidate_head)
+    return path, branch
+
+
+def _resolve_worktree_workspace_created(
+    task: Task, *, board: Optional[str] = None, candidate_head: Optional[str] = None,
+) -> tuple[Path, str, bool]:
     """Resolve + materialize a linked git worktree for ``task``. With no
     ``task.workspace_path`` the anchor is the board's ``default_workdir`` so
     every worktree lands under a board-owned repo (``<repo>/.worktrees/<id>``)
@@ -971,7 +1228,8 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None,
             raise ValueError(
                 f"{_CANDIDATE_WORKSPACE_UNAVAILABLE}: {task.id} is a typed role card; its "
                 "worktree is materialized at the candidate commit, never at HEAD")
-        return _role_worktree(_role_repo_root(task, board), task, candidate_head)
+        repo_root = _role_repo_root(task, board)
+        return _role_worktree(repo_root, task, candidate_head, board)
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if not task.workspace_path:
         board_slug = board if board else _kb.get_current_board()
@@ -1008,7 +1266,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None,
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
-            return requested_resolved, actual_branch
+            return requested_resolved, actual_branch, False
         # The requested path is an existing checkout of a DIFFERENT task's
         # branch (decompose children inherit the root's workspace_path
         # verbatim, so siblings all point here). Reusing it would run this task
@@ -1018,11 +1276,11 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None,
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if _path_key(fallback.resolve(strict=False)) != _path_key(requested_resolved):
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
-                return fallback.resolve(strict=False), branch_name
+                created = _ensure_git_worktree(fallback_root, fallback, branch_name)
+                return fallback.resolve(strict=False), branch_name, created
         # No repo to anchor a fallback on (or the occupied path IS this task's
         # own canonical worktree): keep the legacy reuse rather than fail dispatch.
-        return requested_resolved, actual_branch or branch_name
+        return requested_resolved, actual_branch or branch_name, False
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and _path_key(requested_resolved) == _path_key(repo_root):
@@ -1034,8 +1292,8 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None,
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
-    return requested, branch_name
+    created = _ensure_git_worktree(repo_root, requested, branch_name)
+    return requested, branch_name, created
 
 
 def resolve_workspace(task: Task, *, board: Optional[str] = None,
@@ -1053,10 +1311,28 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None,
     and an explicit ``dir`` workspace is verified in place against that commit.
     Persist via ``set_workspace_path``.
     """
-    kind = task.workspace_kind or "scratch"
+    return resolve_workspace_created(
+        task, board=board, candidate_head=candidate_head)[0]
+
+
+def resolve_workspace_created(
+    task: Task, *, board: Optional[str] = None, candidate_head: Optional[str] = None,
+) -> tuple[Path, Optional[str], bool]:
+    """(path, branch, created) — created is True only when this call made the checkout.
+
+    Ordinary cards retain custom targets and inherited-sibling repair; role cards
+    retain their candidate-pinned canonical checkout. Non-worktree directories
+    have no branch and never authorize worktree discard.
+    """
+    kind = effective_workspace_kind(task)
     if kind == "worktree":
-        return _resolve_worktree_workspace(
-            task, board=board, candidate_head=candidate_head)[0]
+        # ``scratch`` is the create_task default, so a typed review/validation card can
+        # arrive here without a checkout. An empty scratch directory is not evidence:
+        # the role would either inspect nothing or — with a legacy explicit path — the
+        # repository's current tree instead of the candidate. A role card therefore
+        # always resolves a worktree at the candidate commit, or a named refusal.
+        return _resolve_worktree_workspace_created(
+            task, board=board, candidate_head=candidate_head)
     if kind == "scratch" and not task.workspace_path:
         p = _kb.workspaces_root(board=board) / task.id
     elif kind == "scratch":
@@ -1083,7 +1359,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None,
     else:
         raise ValueError(f"unknown workspace_kind: {kind}")
     p.mkdir(parents=True, exist_ok=True)
-    return p
+    return p, None, False
 
 
 def _set_task_column(conn: sqlite3.Connection, task_id: str, column: str, value: str) -> None:
@@ -1091,8 +1367,224 @@ def _set_task_column(conn: sqlite3.Connection, task_id: str, column: str, value:
         conn.execute(f"UPDATE tasks SET {column} = ? WHERE id = ?", (value, task_id))
 
 
-def set_workspace_path(conn: sqlite3.Connection, task_id: str, path: Path | str) -> None:
-    _set_task_column(conn, task_id, "workspace_path", str(path))
+def _worktree_removal_blockers(worktree: Path) -> list[str]:
+    """Content ``git worktree remove`` would delete although ``status`` calls it clean.
+
+    Index flags hide modified files; status also omits ignored entries and
+    untracked empty directories. Non-force ``worktree remove`` deletes them all.
+    """
+    reasons: list[str] = []
+    flagged = _index_flagged_paths(worktree)
+    if flagged:
+        reasons.append(f"index flags prevent verification: {', '.join(flagged[:3])}")
+    untracked = _git(
+        worktree, "ls-files", "--others", "--directory", "-z", timeout=60,
+    )
+    if untracked.returncode != 0:
+        reasons.append("untracked entries could not be read")
+    elif (untracked.stdout or "").strip("\0"):
+        reasons.append("untracked entries (including ignored files or empty directories) are present")
+    return reasons
+
+
+def _worktree_refs_survive_removal(repo_root: Path, worktree: Path) -> bool:
+    """Preserve checkout refs and private recovery history until common refs reach them."""
+    help_result = _git(worktree, "for-each-ref", "-h", timeout=60)
+    if help_result.returncode not in (0, 129):
+        _kb._log.warning("Preserving worktree at %s: cannot probe checkout refs", worktree)
+        return False
+    root_refs_supported = "--include-root-refs" in (
+        (help_result.stdout or "") + (help_result.stderr or ""))
+    options = ["--include-root-refs"] if root_refs_supported else []
+    refs = _git(worktree, "for-each-ref", *options, "--format=%(refname)", timeout=60)
+    if refs.returncode != 0:
+        _kb._log.warning("Preserving worktree at %s: cannot enumerate checkout refs", worktree)
+        return False
+    revisions = [(ref, ref) for ref in ["HEAD", *(refs.stdout or "").splitlines()]]
+    # Even --include-root-refs omits multivalued FETCH_HEAD/MERGE_HEAD.
+    # Scan their files on every Git version; older Git needs other root refs too.
+    git_dir = _git_abs_path(worktree, "--git-dir")
+    if git_dir is None:
+        return False
+    try:
+        for path in git_dir.iterdir():
+            ref = path.name
+            if ref in {"FETCH_HEAD", "MERGE_HEAD"}:
+                for line in path.read_text(encoding="ascii").splitlines():
+                    object_id = line.split()[0]
+                    if not _COMMIT_ID.fullmatch(object_id):
+                        raise ValueError("invalid pseudoref")
+                    revisions.append((ref, object_id))
+            elif not root_refs_supported and (ref.endswith("_HEAD") or ref in {
+                "AUTO_MERGE", "BISECT_EXPECTED_REV", "MERGE_AUTOSTASH",
+                "NOTES_MERGE_PARTIAL", "NOTES_MERGE_REF",
+            }):
+                revisions.append((ref, ref))
+    except (OSError, ValueError, IndexError):
+        _kb._log.warning("Preserving worktree at %s: cannot enumerate checkout refs", worktree)
+        return False
+    common_objects = None
+
+    def anchor_survives(ref: str, revision: str) -> bool:
+        nonlocal common_objects
+        # A tag's message/signature belongs to its raw object, not its peeled commit.
+        resolved = _git(worktree, "rev-parse", "--verify", revision, timeout=60)
+        object_id = (resolved.stdout or "").strip()
+        kind = _git(worktree, "cat-file", "-t", object_id, timeout=60)
+        if resolved.returncode != 0 or kind.returncode != 0:
+            _kb._log.warning(
+                "Preserving worktree at %s: cannot resolve checkout ref %s", worktree, ref)
+            return False
+        if kind.stdout.strip() == "commit":
+            survives = _commit_referenced(repo_root, object_id)
+        else:
+            if common_objects is None:
+                # Default objectname is unpeeled; --contains would peel tag objects.
+                objects = _git(
+                    repo_root, "for-each-ref", "--format=%(objectname) %(refname)", timeout=60)
+                if objects.returncode != 0:
+                    _kb._log.warning(
+                        "Preserving worktree at %s: cannot enumerate surviving objects", worktree)
+                    return False
+                common_objects = {
+                    oid for oid, name in (
+                        line.split(" ", 1) for line in (objects.stdout or "").splitlines()
+                    )
+                    if not name.startswith(("refs/worktree/", "refs/bisect/", "refs/rewritten/"))
+                }
+            survives = object_id in common_objects
+        if not survives:
+            _kb._log.info(
+                "Preserving worktree at %s: no surviving ref reaches %s %s from %s",
+                worktree, kind.stdout.strip(), object_id, ref)
+        return survives
+
+    for ref, revision in revisions:
+        if not anchor_survives(ref, revision):
+            return False
+    # --single-worktree excludes sibling HEAD logs; shared branch logs survive
+    # removal and must not hold an otherwise disposable checkout hostage.
+    reflog = _git(
+        worktree, "reflog", "show", "--single-worktree", "--all",
+        "--format=%gD", timeout=60)
+    if reflog.returncode != 0:
+        _kb._log.warning("Preserving worktree at %s: cannot enumerate reflogs", worktree)
+        return False
+    checked = set()
+    for ref in dict.fromkeys(
+        entry.split("@{", 1)[0] for entry in (reflog.stdout or "").splitlines()
+    ):
+        if ref.startswith("refs/") and not ref.startswith(
+            ("refs/worktree/", "refs/bisect/", "refs/rewritten/")
+        ):
+            continue
+        # %H exposes only new IDs. The oldest retained record's old ID may be
+        # an object's sole anchor, so inspect both columns of the raw log.
+        log_path = _git(
+            worktree, "rev-parse", "--path-format=absolute", "--git-path", f"logs/{ref}",
+            timeout=60)
+        try:
+            if log_path.returncode != 0 or not (log_path.stdout or "").strip():
+                raise ValueError("cannot locate reflog")
+            with Path(log_path.stdout.strip()).open("rb") as entries:
+                for entry in entries:
+                    old, new, _ = entry.split(b" ", 2)
+                    for raw in (old, new):
+                        object_id = raw.decode("ascii")
+                        if not _COMMIT_ID.fullmatch(object_id):
+                            raise ValueError("invalid reflog object ID")
+                        if not object_id.strip("0") or object_id in checked:
+                            continue
+                        if not anchor_survives(f"{ref} reflog", object_id):
+                            return False
+                        checked.add(object_id)
+        except (OSError, ValueError):
+            _kb._log.warning(
+                "Preserving worktree at %s: cannot read reflog %s", worktree, ref)
+            return False
+    return True
+
+
+def discard_prepared_worktree(
+    task: Task, path: Path | str, prepared_head: str, *, board: Optional[str] = None,
+    prepared_new: bool = True,
+) -> bool:
+    """Reclaim a worktree prepared for a claim that was then refused.
+
+    Only this attempt's new, clean canonical checkout at its prepared head can be
+    reclaimed. If removing it would lose private refs or recovery history, move the
+    whole registered worktree aside instead, leaving the canonical path free for a
+    retry at a different candidate. Return True when that path has been reclaimed.
+    """
+    # A reused detached checkout's commit can be its last anchor, so an attempt
+    # that did not create the directory must not remove it.
+    if not prepared_new:
+        return False
+    try:
+        repo_root = _role_repo_root(task, board)
+        target = repo_root / ".worktrees" / task.id
+        candidate = Path(path).expanduser()
+        if _path_key(candidate.resolve(strict=False)) != _path_key(target.resolve(strict=False)):
+            return False
+        if not target.is_dir() or not _is_linked_worktree_checkout(target):
+            return False
+        _validate_worktree_registration(repo_root, target)
+        if _git_head(target) != prepared_head:
+            return False
+        _clean_tree(target, str(target))
+        if _worktree_removal_blockers(target):
+            return False
+        if not _worktree_refs_survive_removal(repo_root, target):
+            recovery = target.with_name(f"{task.id}.recovery-{time.time_ns()}")
+            result = _git(repo_root, "worktree", "move", str(target), str(recovery), timeout=60)
+            if result.returncode != 0:
+                _kb._log.warning(
+                    "prepared workspace at %s could not move to %s: %s",
+                    target, recovery, (result.stderr or result.stdout or "").strip()[:300])
+                return False
+            _kb._log.info("Preserved prepared workspace for task %s at %s", task.id, recovery)
+            return True
+        result = _git(repo_root, "worktree", "remove", str(target), timeout=60)
+        if result.returncode != 0:
+            # Not atomic: a partial removal leaves a checkout that resolves as dirty, so
+            # make the failure visible instead of silently poisoning every retry.
+            _kb._log.warning(
+                "prepared workspace at %s was not fully removed: %s",
+                target, (result.stderr or result.stdout or "").strip()[:300])
+            return False
+        return True
+    except Exception as exc:
+        _kb._log.warning("prepared workspace at %s was not removed: %s", path, exc)
+        return False
+
+
+def effective_workspace_kind(task: Task) -> str:
+    """The kind a workspace resolves as, which is what must be persisted.
+
+    A typed role card is never ``scratch``: resolution gives it a linked worktree at the
+    candidate commit, so recording it as scratch would send completion through scratch
+    cleanup — an ``rmtree`` of a registered worktree instead of ``git worktree remove``.
+    """
+    kind = task.workspace_kind or "scratch"
+    if kind == "scratch" and _role_contract(task) is not None:
+        return "worktree"
+    return kind
+
+
+def set_workspace_path(
+    conn: sqlite3.Connection, task_id: str, path: Path | str, *, kind: Optional[str] = None,
+) -> None:
+    """Persist the resolved workspace. Path and kind go in one transaction: a crash
+    between two writes would leave a worktree path recorded as ``scratch``, which is
+    exactly the pair completion cleanup mis-branches on."""
+    if kind is None:
+        _set_task_column(conn, task_id, "workspace_path", str(path))
+        return
+    with _kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ?, workspace_kind = ? WHERE id = ?",
+            (str(path), kind, task_id),
+        )
 
 
 def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str) -> None:

@@ -903,34 +903,209 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
                       f"Unlinked {args.parent_id} -> {args.child_id}")
 
 
+def _discard_if_still_ours(
+    conn, pending, workspace, prepared_head: str, prepared_run_head: int,
+    *, prepared_new: bool,
+) -> bool:
+    """Remove the prepared checkout only while this attempt provably still owns the card.
+
+    The removal is serialized against the claim itself under the shared
+    dispatch-admission fence, with a re-read that must show an unchanged ownership tuple
+    AND an unchanged run ledger. The ledger is what makes it a proof: a claim/release
+    cycle rewinds every ``tasks`` column the tuple covers, so only ``task_runs``
+    remembers that an attempt happened. Anything else preserves the worktree.
+    """
+    from hermes_cli.kanban_db_lifecycle_claims import (
+        _claim_connection_is_current,
+        _dispatch_admission_lock,
+    )
+
+    with _dispatch_admission_lock(allow_nested=True) as acquired:
+        if not acquired or not _claim_connection_is_current(conn):
+            return False
+        current = kb.get_task(conn, pending.id)
+        if current is None or _claim_ownership(current) != _claim_ownership(pending):
+            # Any claim cycle moves at least one of these — a run is opened with the
+            # claim's pid and start time, and releasing or reclaiming it leaves them
+            # behind. ``version`` alone does not change on claim/release, so it cannot
+            # prove the checkout is still ours.
+            return False
+        if current.status == "running" or current.claim_lock:
+            return False
+        if kb._run_ledger_head(conn, pending.id) != prepared_run_head:
+            return False
+        return kbw.discard_prepared_worktree(
+            pending, workspace, prepared_head, prepared_new=prepared_new)
+
+
+def _claim_ownership(task) -> tuple:
+    """The fields a claim cycle changes, used to prove nobody else has run this card."""
+    return (
+        task.version,
+        task.status,
+        task.claim_lock or "",
+        task.current_run_id or 0,
+        task.worker_pid or 0,
+        task.started_at or 0,
+        task.assignee or "",
+    )
+
+
+def _claim_preflight(conn, task) -> Optional[str]:
+    """Why this card cannot be claimed, without writing or materializing anything.
+
+    This mirrors ``claim_task``'s own admission so it never refuses something the claim
+    would accept: a dangling ``current_run_id`` is reclaimed rather than refused, an
+    actively forced promotion may proceed, and the parent-handoff and pull-request
+    guards count as refusals. Only a live claim lock disqualifies ownership. A
+    concurrent edit can still land after this check — the claim itself is fenced to
+    ``task`` — but the common refusals no longer create a workspace.
+    """
+    from hermes_cli.kanban_db_lifecycle_claims import (
+        _forceable_dependency_override,
+        _forced_promotion_active,
+    )
+
+    if task.status != "ready":
+        return f"status={task.status} lock={task.claim_lock or '(none)'}"
+    if task.claim_lock:
+        return f"already claimed (lock={task.claim_lock})"
+    if kb._parent_handoff_start_error(conn, task.id) is not None:
+        return "the parent handoff cannot be started"
+    dependencies = kb.evaluate_dependencies(conn, task.id)
+    if not dependencies["satisfied"] and not (
+        _forced_promotion_active(conn, task.id)
+        and _forceable_dependency_override(dependencies)
+    ):
+        detail = ", ".join(
+            f"{item['parent_id']} ({item['code']})" for item in dependencies["blockers"][:3])
+        return f"unsatisfied dependencies: {detail}"
+    if kb._active_pr_guard_reason(conn, task.id) is not None:
+        return "an active pull request needs acknowledgement"
+    return None
+
+
 def _cmd_claim(args: argparse.Namespace) -> int:
-    with kbc.connect_closing() as conn:
-        # Prepare the exact candidate workspace before committing a claim; a
-        # refusal must leave no running card or open run behind.
+    # One admission fence owns preparation through persistence, never worker execution.
+    with kbc.connect_closing() as conn, kbc._dispatch_admission_lock() as admitted:
+        if not admitted or not kbc._claim_connection_is_current(conn):
+            return _err(f"cannot claim {args.task_id}: dispatch admission unavailable")
+        # Derive the candidate AND materialize the workspace before claiming: either
+        # step can refuse (an unresolvable candidate, a dirty canonical worktree, a
+        # missing candidate commit, a checkout sitting on another commit), and a claim
+        # that already committed ready->running would strand the card running with no
+        # worker holding it. Resolution reads only fields the claim does not change.
         pending = kb.get_task(conn, args.task_id)
         try:
+            # Two non-mutating steps, then the one that creates a directory:
+            # 1. the candidate is resolved first, so an unresolvable role card fails
+            #    without materializing anything;
+            # 2. claimability is preflighted before materialization — a card that cannot
+            #    be claimed must not leave a checkout (and branch) behind, because a stale
+            #    detached role checkout can refuse the retry against a newer candidate.
             candidate_head = (
                 kbw.candidate_head_for_task(conn, pending) if pending is not None else None)
+            prepared_run_head = (
+                kb._run_ledger_head(conn, pending.id) if pending is not None else 0)
+            blocked = _claim_preflight(conn, pending) if pending is not None else None
+            if blocked:
+                return _err(f"cannot claim {args.task_id}: {blocked}")
+            resolved_kind = (
+                kbw.effective_workspace_kind(pending) if pending is not None else "scratch")
+            prepared_new = False
+            if pending is None:
+                workspace, resolved_branch = None, None
+            else:
+                # Detached role checkouts report "", never an invented branch.
+                workspace, resolved_branch, prepared_new = kbw.resolve_workspace_created(
+                    pending, candidate_head=candidate_head)
+            # A non-role card has no candidate commit, so the head this attempt prepared is
+            # the checkout it just resolved. Without it the discard guard compares against
+            # "" and can never reclaim an ordinary prepared worktree.
+            prepared_head = candidate_head or (
+                kbw._git_head(workspace) if workspace is not None else None) or ""
         except ValueError as exc:
             return _err(f"kanban: {exc}")
-        if pending is None:
-            return _err(f"no such task: {args.task_id}")
-        if pending.status != "ready" or pending.claim_lock is not None:
-            return _err(f"cannot claim {args.task_id}: status={pending.status} "
-                        f"lock={pending.claim_lock or '(none)'}")
-        try:
-            workspace = kbw.resolve_workspace(pending, candidate_head=candidate_head)
-        except ValueError as exc:
-            return _err(f"kanban: {exc}")
+        # Fence the claim to the row this workspace was derived from: an operator edit
+        # that lands during resolution must refuse here rather than let a worker run in
+        # a workspace computed from the previous lifecycle/workspace fields.
         task = kb.claim_task(
             conn, args.task_id, ttl_seconds=args.ttl, expected_task=pending)
         if task is None:
             existing = kb.get_task(conn, args.task_id)
+            # A refusal after materialization must not leave the checkout behind — but only
+            # while this attempt still owns the card. Reading the row proves nothing: another
+            # dispatcher can claim it between that read and the removal, and its worker may
+            # already be starting there. So take the same admission fence the claim uses and
+            # remove only an unchanged row that nobody owns.
+            if workspace is not None and pending is not None and resolved_kind == "worktree":
+                _discard_if_still_ours(
+                    conn, pending, workspace, prepared_head, prepared_run_head,
+                    prepared_new=prepared_new)
             if existing is None:
                 return _err(f"no such task: {args.task_id}")
             return _err(f"cannot claim {args.task_id}: status={existing.status} "
-                        f"lock={existing.claim_lock or '(none)'}")
-        kbw.set_workspace_path(conn, task.id, str(workspace))
+                        f"lock={existing.claim_lock or '(none)'} "
+                        f"(the task changed while its workspace was resolved)")
+        # A successful claim proves the row still existed, so resolution above ran.
+        # Persist the kind it was resolved as: a role card converted from the scratch
+        # default is a worktree now, and completion cleanup follows the recorded kind.
+        # Another operator can rebind the candidate card between resolution and this
+        # claim; that changes neither this row nor its version, so the fence above cannot
+        # see it. Re-read the binding before reporting a workspace, and undo the claim
+        # rather than leaving a worker pinned to a candidate the board no longer names.
+        claim_error = None
+        if candidate_head is not None:
+            try:
+                confirmed = kbw.candidate_head_for_task(conn, task)
+            except ValueError:
+                confirmed = None
+            if confirmed != candidate_head:
+                claim_error = f"candidate moved from {candidate_head} to {confirmed}"
+            else:
+                # Duplicate task ids across boards sharing a repository are an operator
+                # setup error. This fences only a moving checkout, not same-head sharing;
+                # it does not provide cross-board locking.
+                try:
+                    if resolved_kind == "worktree":
+                        kbw._validate_worktree_registration(
+                            kbw._role_repo_root(pending, None), workspace)
+                    current_head = kbw._git_head(workspace)
+                    if current_head != prepared_head:
+                        raise ValueError(
+                            f"candidate_workspace_unavailable: prepared workspace {workspace} "
+                            f"moved from {prepared_head} to {current_head}")
+                except ValueError as exc:
+                    claim_error = str(exc)
+        if claim_error is not None:
+            from hermes_cli.kanban_db_dispatch import _record_task_failure
+
+            rolled_back = False
+            current = kb.get_task(conn, task.id)
+            if (current is not None
+                    and current.current_run_id == task.current_run_id
+                    and current.claim_lock == task.claim_lock):
+                kbw.discard_prepared_worktree(
+                    pending, workspace, prepared_head, prepared_new=prepared_new)
+                _record_task_failure(
+                    conn, task.id, f"{claim_error} during the claim",
+                    outcome="spawn_failed", release_claim=True, end_run=True,
+                    expected_run_id=task.current_run_id,
+                )
+                current = kb.get_task(conn, task.id)
+                rolled_back = (current is not None
+                               and current.current_run_id is None
+                               and current.claim_lock is None)
+            outcome = ("the claim was released" if rolled_back else
+                       f"the claim could not be rolled back (run {task.current_run_id}): "
+                       "claim ownership changed")
+            return _err(f"kanban: {claim_error} while {args.task_id} was claimed; {outcome}")
+        kbw.set_workspace_path(
+            conn, task.id, str(workspace),
+            kind=resolved_kind if resolved_kind != (pending.workspace_kind or "scratch") else None,
+        )
+        if resolved_branch is not None:
+            kbw.set_branch_name(conn, task.id, resolved_branch)
     print(f"Claimed {task.id}\nWorkspace: {workspace}")
     return 0
 
@@ -1285,12 +1460,30 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     if rc:
         return rc
     reason = _stripped_or_none(getattr(args, "reason", None))
-    author = _profile_author() if reason else None
+    expected_version = getattr(args, "expected_version", None)
+    author = _profile_author() if (reason or expected_version is not None) else None
     suffix = f": {reason}" if reason else ""
+    if expected_version is not None and len(ids) != 1:
+        return _err("kanban unblock: --expected-version requires exactly one task id", 2)
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
+        def op(tid):
+            if expected_version is None:
+                return kb.unblock_task(conn, tid)
+            # Fenced recovery: the audit comment is written by the transition itself,
+            # so a stale refusal leaves no comment before the mutation it describes.
+            return kb.unblock_task(
+                conn, tid, expected_version=expected_version, reason=reason, author=author,
+            )
+
+        if expected_version is None:
+            op = _commented(conn, reason, author, "UNBLOCK", op)
+        failure = (
+            "cannot unblock {} (not blocked/scheduled?)" if expected_version is None
+            else "cannot unblock {}: stale version, changed state, or active claim; "
+                 "refresh with kanban show before retrying"
+        )
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
-                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+                           lambda tid: failure.format(tid))
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:

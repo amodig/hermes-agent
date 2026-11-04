@@ -789,7 +789,7 @@ def _candidate_snapshot(
         "run_id": candidate_run_id,
         "head_sha": (
             lifecycle.get("head_sha") if lifecycle
-            else _latest_head(conn, candidate_id, cache=cache)
+            else _json_column(run["metadata"]).get("head_sha") if run else None
         ),
         "goal_revision_id": _task_goal_revision_id(row),
     }

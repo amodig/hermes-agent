@@ -219,6 +219,11 @@ class GrantAuthorityTests(WorkerStartupFixture):
                 "preparation_id": PREPARATION_ID,
                 "runtime_identity": self.identity.as_dict(),
                 "spawn_receipt": "pending",
+                # A frame with no execution fields at all is diagnosable, not guessed at.
+                "execution": {
+                    "granted": False, "inspect": False, "recipes": [],
+                    "refusal": "execution_unavailable",
+                },
             },
         )
         with self.environment():
@@ -670,6 +675,244 @@ class BoardProofTests(WorkerStartupFixture):
                                   side_effect=sqlite3.OperationalError("locked")), \
                 self.refusal():
             worker_startup.worker_startup_snapshot()
+
+
+class ExecutionDiagnosticsTests(WorkerStartupFixture):
+    """A withheld capability must be diagnosable without granting anything."""
+
+    def execution_section(
+        self, *, inspect=True, recipes=(), task_id=None, board=None,
+        preparation_id=PREPARATION_ID, workspace=None,
+    ):
+        """A real bound authority section for this fixture's workspace."""
+        from hermes_cli.worker_execution_common import ExecutionGrant
+
+        directories = {}
+        for name in ("execution-parent", "journal", "runtime-parent"):
+            path = self.directory / name
+            path.mkdir(exist_ok=True)
+            info = os.lstat(path)
+            directories[name] = {
+                "path": str(path), "device": int(info.st_dev), "inode": int(info.st_ino),
+            }
+        workspace_path = Path(workspace or self.workspace)
+        info = os.lstat(workspace_path)
+        return ExecutionGrant(
+            policy_digest="sha256:" + "0" * 64,
+            task_id=task_id or self.task_id,
+            profile=PROFILE,
+            board=board or BOARD,
+            preparation_id=preparation_id,
+            workspace={
+                "path": str(workspace_path),
+                "device": int(info.st_dev), "inode": int(info.st_ino),
+            },
+            git=None,
+            image_store=None,
+            inspect=inspect,
+            role="review",
+            extra_source_paths=(),
+            recipes=tuple(dict(recipe) for recipe in recipes),
+            review=None,
+            policy_plugin={},
+            runtime={
+                "generation": "fixture-generation",
+                "dependency_fingerprint": "fixture-dependency-fingerprint",
+                "code_sha": "fixture-code-sha",
+            },
+            execution_parent=directories["execution-parent"],
+            journal_dir=directories["journal"],
+            runtime_parent=directories["runtime-parent"],
+        ).bind(self.run_id, CLAIM_LOCK)
+
+    def retain_with(self, **frame):
+        """Retain a frame for a live board; call after ``write_worker_state()``."""
+        with self.environment():
+            worker_startup._retain_worker_grant(self.grant(**frame), self.identity)
+            return worker_startup.worker_startup_snapshot()["execution"]
+
+    def test_inspect_only_authority_reports_granted_inspection(self):
+        """Also the pre-existing frame shape: an authority section and no refusal key."""
+        self.write_worker_state()
+        execution = self.retain_with(worker_execution=self.execution_section(inspect=True))
+        self.assertEqual(
+            execution,
+            {"granted": True, "inspect": True, "recipes": [], "refusal": None},
+        )
+
+    def test_withheld_inspection_is_reported_as_not_granted(self):
+        self.write_worker_state()
+        execution = self.retain_with(worker_execution=self.execution_section(inspect=False))
+        self.assertEqual(
+            execution,
+            {"granted": True, "inspect": False, "recipes": [], "refusal": None},
+        )
+
+    def test_granted_recipe_is_named_without_its_argv_or_image(self):
+        self.write_worker_state()
+        recipe = {
+            "id": "offline-verification",
+            "image": "sha256:" + "1" * 64,
+            "argv": ["python3", "-I", "/workspace/check.py"],
+            "timeout_seconds": 30,
+            "services": [],
+        }
+        execution = self.retain_with(
+            worker_execution=self.execution_section(recipes=(recipe,)))
+        self.assertEqual(
+            execution,
+            {
+                "granted": True, "inspect": True,
+                "recipes": ["offline-verification"], "refusal": None,
+            },
+        )
+        encoded = json.dumps(execution)
+        for detail in ("/workspace/check.py", "1" * 64, "timeout_seconds", "services"):
+            self.assertNotIn(detail, encoded)
+
+    def test_withheld_authority_reports_its_refusal_code(self):
+        for code in (
+            "policy_not_configured", "candidate_workspace_unavailable",
+            "workspace_ambiguous", "inspection_disabled", "resolution_failed",
+        ):
+            with self.subTest(code=code):
+                self.new_fixture()
+                self.write_worker_state()
+                execution = self.retain_with(worker_execution_refusal=code)
+                self.assertEqual(
+                    execution,
+                    {
+                        "granted": False, "inspect": False, "recipes": [],
+                        "refusal": code,
+                    },
+                )
+
+    def test_absent_and_null_refusals_do_not_invent_a_configuration_diagnosis(self):
+        self.retain()
+        with self.environment():
+            self.assertEqual(
+                worker_startup.worker_startup_snapshot()["execution"]["refusal"],
+                "execution_unavailable",
+            )
+        self.new_fixture()
+        self.write_worker_state()
+        self.assertEqual(
+            self.retain_with(worker_execution_refusal=None)["refusal"],
+            "execution_unavailable",
+        )
+
+    def test_dispatcher_null_refusal_beside_a_grant_is_not_a_refusal(self):
+        """The dispatcher sends the field on every frame; null beside authority means granted.
+
+        Real dispatcher proof caught this: reading an explicit null as a refusal made
+        the retained grant refuse itself and dropped the execution tools.
+        """
+        self.write_worker_state()
+        execution = self.retain_with(
+            worker_execution=self.execution_section(inspect=True),
+            worker_execution_refusal=None,
+        )
+        self.assertEqual(
+            execution,
+            {"granted": True, "inspect": True, "recipes": [], "refusal": None},
+        )
+
+    def test_authority_and_refusal_together_refuse(self):
+        self.write_worker_state()
+        with self.environment(), self.refusal():
+            worker_startup._retain_worker_grant(
+                self.grant(
+                    worker_execution=self.execution_section(),
+                    worker_execution_refusal="policy_not_configured",
+                ),
+                self.identity,
+            )
+        self.assertIsNone(worker_startup._GRANT)
+
+    def test_malformed_refusal_fields_refuse(self):
+        for value in (
+            "Policy_Not_Configured", "resolution_failed: /home/x/secret",
+            "", "a" * 65, "with space", "../etc/passwd", "ünicode", 7,
+            ["policy_not_configured"],
+        ):
+            with self.subTest(value=value):
+                self.new_fixture()
+                self.write_worker_state()
+                with self.environment(), self.refusal():
+                    worker_startup._retain_worker_grant(
+                        self.grant(worker_execution_refusal=value), self.identity)
+                self.assertIsNone(worker_startup._GRANT)
+
+    def test_authority_bound_elsewhere_is_refused_even_with_a_matching_digest(self):
+        """The digest is unkeyed, so retained-context checks must refuse a rebuilt section."""
+        cases = (
+            {"task_id": "t_someone_else"},
+            {"board": "another-board"},
+            {"preparation_id": "another-preparation"},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                self.new_fixture()
+                self.write_worker_state()
+                with self.environment(), self.refusal():
+                    worker_startup._retain_worker_grant(
+                        self.grant(worker_execution=self.execution_section(**overrides)),
+                        self.identity,
+                    )
+
+    def test_bootstrap_loses_the_capability_instead_of_crashing(self):
+        """The bootstrap catches only WorkerStartupUnavailable, so this must arrive as one."""
+        self.write_worker_state()
+        with self.environment():
+            runtime._retain_worker_startup_grant(
+                self.grant(
+                    worker_execution=self.execution_section(task_id="t_someone_else")),
+                self.identity,
+            )
+            self.assertIsNone(worker_startup._GRANT)
+            self.assertFalse(worker_startup.worker_startup_available())
+
+    def test_environment_cannot_forge_the_diagnostic(self):
+        self.retain()
+        with self.environment(
+            HERMES_WORKER_EXECUTION="1",
+            HERMES_WORKER_EXECUTION_RECIPE="offline-verification",
+            HERMES_KANBAN_EXECUTION_INSPECT="1",
+            HERMES_KANBAN_WORKER_EXECUTION='{"inspect": true}',
+        ):
+            execution = worker_startup.worker_startup_snapshot()["execution"]
+        self.assertEqual(
+            execution,
+            {
+                "granted": False, "inspect": False, "recipes": [],
+                "refusal": "execution_unavailable",
+            },
+        )
+
+
+class ExecutionRefusalCodeTests(unittest.TestCase):
+    """Only a stable lowercase code may cross the dispatcher's grant pipe."""
+
+    def test_only_the_code_crosses(self):
+        code = worker_runtime._execution_refusal_code
+        self.assertEqual(code(None), "policy_not_configured")
+        self.assertEqual(code("workspace_ambiguous"), "workspace_ambiguous")
+        self.assertEqual(
+            code("candidate_workspace_unavailable: head deadbeef"), "candidate_workspace_unavailable",
+        )
+        self.assertEqual(
+            code("execution_directories_unavailable: [Errno 13] /home/x/.cache"),
+            "execution_directories_unavailable",
+        )
+        self.assertEqual(
+            code("resolution_failed: RuntimeError: /home/x/secret"), "resolution_failed",
+        )
+
+    def test_anything_else_becomes_resolution_failed(self):
+        code = worker_runtime._execution_refusal_code
+        for detail in ("Policy_Not_Configured", "", "with space", "../etc/passwd", "a" * 65, "ünicode"):
+            with self.subTest(detail=detail):
+                self.assertEqual(code(detail), "resolution_failed")
 
 
 if __name__ == "__main__":

@@ -489,14 +489,15 @@ def test_validation_card_resolves_review_role(fixture):
     assert pair == {"base": fixture.base, "head": fixture.head}
 
 
-def test_symlink_cycle_is_refused(fixture):
+@pytest.mark.parametrize("from_commit", [False, True])
+def test_symlink_cycle_is_refused(fixture, from_commit):
     os.symlink("b.py", fixture.repo / "a.py")
     os.symlink("a.py", fixture.repo / "b.py")
     _git(fixture.repo, "add", "a.py", "b.py")
     _git(fixture.repo, "commit", "-qm", "cycle")
     authority = _authority(fixture)
     with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
-        wes._scan_source(authority)
+        wes._scan_source(authority, from_commit=from_commit)
     assert excinfo.value.code == "unsafe_symlink"
 
 
@@ -747,6 +748,8 @@ def test_diff_only_accepts_the_granted_review_pair(fixture, monkeypatch):
     # A review claim only keeps execution authority while the board names the
     # immutable pair and the workspace HEAD is on it; this test is about the diff
     # capability, so it supplies that pair and then pins the diff itself.
+    _git(fixture.repo, "reset", "-q")
+    _git(fixture.repo, "checkout", "--", "app.py")
     pair = {"base": fixture.base, "head": fixture.head}
     monkeypatch.setattr(wep, "resolve_review_context", lambda *_a, **_k: ("review", pair))
     authority = _authority(fixture, status="review", review=pair)
@@ -1003,6 +1006,68 @@ def test_opt_in_refuses_a_retargeted_checkout_behind_a_registration(fixture):
     assert grant is None and refusal == "workspace_not_granted"
 
 
+def test_opt_in_resolves_relative_registry_backlinks_without_granting_a_sibling(fixture):
+    task_id, db_path, target = _task_worktree(fixture)
+    git_dir = Path(_git(target, "rev-parse", "--absolute-git-dir"))
+    pointer = git_dir / "gitdir"
+    for backlink, allowed in ((target / ".git", True),
+                              (target.parent / "unrelated" / ".git", False)):
+        pointer.write_text(os.path.relpath(backlink, git_dir) + "\n", encoding="utf-8")
+        grant, refusal = _resolve(
+            fixture, _opt_in_section(fixture.repo, fixture.images),
+            workspace=str(target), task_id=task_id, db_path=db_path,
+        )
+        if allowed:
+            assert refusal is None and grant is not None
+            assert grant.workspace["path"] == str(target)
+            assert grant.git["git_dir"] == str(git_dir)
+        else:
+            assert grant is None and refusal == "workspace_not_granted"
+
+
+def test_relative_worktree_is_inspected_and_verified(fixture, monkeypatch):
+    from hermes_cli import worker_execution_podman as backend
+
+    _git(fixture.repo, "config", "worktree.useRelativePaths", "true")
+    task_id, db_path, target = _task_worktree(fixture)
+    git_dir = Path(_git(target, "rev-parse", "--absolute-git-dir"))
+    assert not Path((git_dir / "gitdir").read_text().strip()).is_absolute()
+    assert _git(fixture.repo, "config", "extensions.relativeworktrees") == "true"
+    grant, refusal = _resolve(
+        fixture, _opt_in_section(fixture.repo, fixture.images, recipes={"check": {
+            "image": PINNED_PY, "argv": ["/bin/true"], "timeout_seconds": 30, "services": [],
+        }}), workspace=str(target), task_id=task_id, db_path=db_path)
+    assert refusal is None and grant is not None
+    stub = SimpleNamespace(
+        task_id=task_id, profile="tester", board="fixture", preparation_id="prep-fixture",
+        run_id=7, claim_lock="claim-fixture", workspace=str(target),
+        db_path=db_path, runtime_identity=_identity(),
+    )
+    authority = wep.parse_grant_section(grant.bind(7, "claim-fixture"), stub)
+    monkeypatch.setattr(we, "_authorize_execution", lambda: (stub, authority))
+    monkeypatch.setattr(we, "_require_execution_approval", lambda *a, **kw: None)
+    monkeypatch.setattr(we, "_reauthorize_live_claim", lambda *a: None)
+    ran = []
+
+    def run_verification(**kwargs):
+        ran.append(kwargs["source_dir"])
+        assert (kwargs["source_dir"] / "app.py").read_bytes() == (target / "app.py").read_bytes()
+        return {"ok": True, "accepted": True, "cleanup_ok": True}
+
+    monkeypatch.setattr(backend, "run_verification", run_verification)
+    inspected = json.loads(we.worker_inspect({"operation": "summary"}))
+    assert inspected["ok"], inspected
+    assert inspected["git"]["head"] == fixture.head
+    verified = json.loads(we.worker_verify({"recipe": "check", "source_digest": inspected["source_digest"]}))
+    assert verified["accepted"] is True, verified
+    assert len(ran) == 1
+    assert verified["source_digest"] == inspected["source_digest"]
+    # Unknown extensions still refuse even after a grant was resolved successfully.
+    _git(fixture.repo, "config", "extensions.unsupported", "true")
+    refused = json.loads(we.worker_inspect({"operation": "summary"}))
+    assert refused["error"] == "git_unsupported", refused
+
+
 def test_claimed_legacy_review_card_still_has_the_review_role(fixture):
     """A claimed review reads ``running``; its lane is the recorded resume status."""
     from hermes_cli import kanban_db
@@ -1095,9 +1160,10 @@ def test_materialized_review_source_must_be_the_reviewed_commit(fixture, monkeyp
         lambda *_a, **_k: ("review", {"base": fixture.base, "head": fixture.head}))
     authority = _authority(fixture)
     assert authority.role == "review"
-    # Inspection still works against a dirty reviewed candidate — that is how a
-    # reviewer explains the dirt.
-    assert wes._scan_source(authority).head == fixture.head
+    # Inspection and verification describe the same immutable source; dirt refuses.
+    with pytest.raises(wec.WorkerExecutionRefused) as inspected:
+        wes._scan_source(authority)
+    assert inspected.value.code == "source_changed"
     run_root = fixture.root / "run"
     run_root.mkdir()
     with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
@@ -1123,16 +1189,290 @@ def test_materialized_review_source_must_be_the_reviewed_commit(fixture, monkeyp
     assert excinfo.value.code == "source_changed"
 
 
+def test_review_inspection_refuses_staged_bytes_restored_in_worktree(fixture, monkeypatch):
+    _git(fixture.repo, "add", "-A")
+    _git(fixture.repo, "commit", "-qm", "clean reviewed candidate")
+    head = _git(fixture.repo, "rev-parse", "HEAD")
+    monkeypatch.setattr(
+        wep, "resolve_review_context",
+        lambda *_a, **_k: ("review", {"base": fixture.base, "head": head}))
+    authority = _authority(fixture)
+    grant = SimpleNamespace(task_id="review", run_id=7, profile="reviewer", preparation_id="probe")
+    expected = wes._inspect_summary(grant, authority)
+    path = fixture.repo / "app.py"
+    committed = path.read_bytes()
+    assert wes._scan_source(authority).entry("app.py").digest == "sha256:" + wec.sha256_hex(committed)
+
+    path.write_bytes(b"staged bytes are not the reviewed commit\n")
+    _git(fixture.repo, "add", "app.py")
+    path.write_bytes(committed)
+    assert _git(fixture.repo, "status", "--porcelain", "--", "app.py") == "MM app.py"
+    for inspect in (
+        lambda: wes._inspect_summary(grant, authority),
+        lambda: wes._scan_source(authority, from_commit=True),
+    ):
+        with pytest.raises(wec.WorkerExecutionRefused) as refused:
+            inspect()
+        assert refused.value.code == "source_changed"
+        assert f"frozen index diverges from bound commit {head}" in str(refused.value)
+
+    _git(fixture.repo, "add", "app.py")
+    clean = wes._inspect_summary(grant, authority)
+    assert clean["git"]["head"] == head and clean["source_digest"] == expected["source_digest"]
+
+
+def test_materialized_review_source_refuses_index_flags_that_hide_changes(
+    fixture, monkeypatch,
+):
+    """`assume-unchanged`/`skip-worktree` make a modified file report clean.
+
+    Without this guard the copy would carry working-tree bytes that are not in the
+    reviewed commit, while `git diff --quiet HEAD` said the tree matched.
+    """
+    monkeypatch.setattr(
+        wep, "resolve_review_context",
+        lambda *_a, **_k: ("review", {"base": fixture.base, "head": fixture.head}))
+    authority = _authority(fixture)
+
+    for index, flag in enumerate(("--assume-unchanged", "--skip-worktree")):
+        run_root = fixture.root / f"flagged-run-{index}"
+        run_root.mkdir()
+        _git(fixture.repo, "update-index", flag, "app.py")
+        (fixture.repo / "app.py").write_text("print('swapped')\n", encoding="utf-8")
+        with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+            wes._materialize_source(authority, run_root)
+        assert excinfo.value.code == "source_changed", flag
+        assert "index flags" in str(excinfo.value), flag
+
+        _git(fixture.repo, "update-index", flag.replace("--", "--no-"), "app.py")
+        _git(fixture.repo, "checkout", "--", "app.py")
+
+
+def test_review_materialization_preserves_each_committed_file_mode(fixture, monkeypatch):
+    script = fixture.repo / "a.sh"
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    script.chmod(0o755)
+    (fixture.repo / "z.txt").write_text("plain\n", encoding="utf-8")
+    _git(fixture.repo, "add", "-A")
+    _git(fixture.repo, "commit", "-qm", "mixed executable modes")
+    head = _git(fixture.repo, "rev-parse", "HEAD")
+    monkeypatch.setattr(
+        wep, "resolve_review_context",
+        lambda *_a, **_k: ("review", {"base": fixture.base, "head": head}))
+    authority = _authority(fixture)
+    inspected = wes._scan_source(authority)
+    run_root = fixture.root / "mixed-mode-run"
+    run_root.mkdir()
+    snapshot, source = wes._materialize_source(authority, run_root)
+
+    assert snapshot.source_digest == inspected.source_digest
+    assert snapshot.entry("a.sh").executable is True
+    assert snapshot.entry("z.txt").executable is False
+    assert (source / "a.sh").stat().st_mode & 0o777 == 0o755
+    assert (source / "z.txt").stat().st_mode & 0o777 == 0o644
+    assert (source / "a.sh").read_bytes() == script.read_bytes()
+
+
+@pytest.mark.parametrize("drift", ["none", "worktree", "index"])
+def test_review_verifies_the_inspected_digest_with_eol_normalization(fixture, monkeypatch, drift):
+    from hermes_cli import worker_execution_podman as backend
+
+    (fixture.repo / ".gitattributes").write_text("*.txt text eol=crlf\n", encoding="utf-8")
+    (fixture.repo / "normalized.txt").write_bytes(b"first\nsecond\n")
+    _git(fixture.repo, "add", "-A")
+    _git(fixture.repo, "commit", "-qm", "normalized candidate")
+    head = _git(fixture.repo, "rev-parse", "HEAD")
+    (fixture.repo / "normalized.txt").unlink()
+    _git(fixture.repo, "checkout", "--", "normalized.txt")
+    assert (fixture.repo / "normalized.txt").read_bytes() == b"first\r\nsecond\r\n"
+    monkeypatch.setattr(
+        wep, "resolve_review_context",
+        lambda *_a, **_k: ("review", {"base": fixture.base, "head": head}))
+    authority = _authority(fixture, recipes={"check": {
+        "image": PINNED_PY, "argv": ["/bin/true"], "timeout_seconds": 30, "services": [],
+    }})
+    grant = SimpleNamespace(task_id="review", run_id=7, profile="reviewer", preparation_id="probe")
+    inspected = wes._inspect_summary(grant, authority)
+    page = wes._inspect_read({
+        "path": "normalized.txt", "start_line": 2, "line_count": 1,
+        "expected_source_digest": inspected["source_digest"],
+    }, authority)
+    assert page["text"] == "second\n"
+    assert page["next_line"] is None
+    assert page["source_digest"] == inspected["source_digest"]
+    monkeypatch.setattr(we, "_authorize_execution", lambda: (grant, authority))
+    monkeypatch.setattr(we, "_require_execution_approval", lambda *a, **kw: None)
+    monkeypatch.setattr(we, "_reauthorize_live_claim", lambda *a: None)
+    ran = []
+
+    def run_verification(**kwargs):
+        ran.append(kwargs["source_dir"])
+        assert (kwargs["source_dir"] / "normalized.txt").read_bytes() == b"first\nsecond\n"
+        if drift != "none":
+            (fixture.repo / "normalized.txt").write_bytes(b"changed\r\n")
+            if drift == "index":
+                _git(fixture.repo, "add", "normalized.txt")
+        return {"ok": True, "accepted": True, "cleanup_ok": True}
+
+    monkeypatch.setattr(backend, "run_verification", run_verification)
+    result = json.loads(we.worker_verify({"recipe": "check", "source_digest": inspected["source_digest"]}))
+    assert len(ran) == 1
+    if drift == "none":
+        assert result["accepted"] is True, result
+        assert result["source_digest"] == inspected["source_digest"]
+        assert result["head"] == head
+    else:
+        assert result["accepted"] is False
+        assert result["error"] == "source_changed"
+
+
+@pytest.mark.parametrize("replacement", ["deleted", "symlink", "directory"])
+def test_review_materialization_ignores_worktree_deletion_and_type_changes(
+    fixture, monkeypatch, replacement,
+):
+    committed = b"print('reviewed commit')\n"
+    path = fixture.repo / "gone.py"
+    path.write_bytes(committed)
+    path.chmod(0o755)
+    link = fixture.repo / "docs" / "link"
+    link.symlink_to("../gone.py")
+    _git(fixture.repo, "add", "-A")
+    _git(fixture.repo, "commit", "-qm", "reviewed files and link")
+    head = _git(fixture.repo, "rev-parse", "HEAD")
+    monkeypatch.setattr(
+        wep, "resolve_review_context",
+        lambda *_a, **_k: ("review", {"base": fixture.base, "head": head}))
+    (fixture.repo / "extra.txt").write_bytes(b"granted extra\n")
+    authority = _authority(fixture, extras=["extra.txt"])
+    expected = wes._scan_source(authority)
+    tracked = wes._git_tracked
+
+    def replace_after_cleanliness_proof(git):
+        entries = tracked(git)
+        path.unlink()
+        if replacement == "symlink":
+            path.symlink_to("app.py")
+        elif replacement == "directory":
+            path.mkdir()
+        link.unlink()
+        link.write_bytes(b"not the committed link\n")
+        return entries
+
+    monkeypatch.setattr(wes, "_git_tracked", replace_after_cleanliness_proof)
+    run_root = fixture.root / "replaced-run"
+    run_root.mkdir()
+    snapshot, source = wes._materialize_source(authority, run_root)
+
+    assert snapshot.source_digest == expected.source_digest
+    assert snapshot.entry("gone.py") == expected.entry("gone.py")
+    assert not (source / "gone.py").is_symlink()
+    assert (source / "gone.py").read_bytes() == committed
+    assert (source / "gone.py").stat().st_mode & 0o777 == 0o755
+    assert (source / "docs" / "link").readlink() == Path("../gone.py")
+    assert (source / "extra.txt").read_bytes() == b"granted extra\n"
+
+
+def test_implementation_materialization_preserves_working_tree_edits(fixture):
+    authority = _authority(fixture)
+    assert authority.role == "implementation"
+    inspected = wes._scan_source(authority)
+    run_root = fixture.root / "implementation-run"
+    run_root.mkdir()
+    snapshot, source = wes._materialize_source(authority, run_root)
+
+    assert (source / "app.py").read_bytes() == b"print('dirty')\n"
+    assert (source / "notes.txt").read_bytes() == b"staged\n"
+    assert snapshot.source_digest == inspected.source_digest
+    assert snapshot.entry("app.py").digest == inspected.entry("app.py").digest
+
+
+def test_review_many_files_use_bounded_git_batches(fixture, monkeypatch):
+    for index in range(64):
+        (fixture.repo / f"small-{index:03}.bin").write_bytes(
+            b"\x00\n" + bytes([index]) + b"\r\ncommitted bytes\n")
+    _git(fixture.repo, "add", "-A")
+    _git(fixture.repo, "commit", "-qm", "many small blobs")
+    head = _git(fixture.repo, "rev-parse", "HEAD")
+    monkeypatch.setattr(
+        wep, "resolve_review_context",
+        lambda *_a, **_k: ("review", {"base": fixture.base, "head": head}))
+    authority = _authority(fixture)
+    # The previous per-file path is the byte oracle, outside the measured scan.
+    expected = {}
+    for record in _git(fixture.repo, "ls-files", "--stage").splitlines():
+        metadata, name = record.split("\t")
+        oid = metadata.split()[1]
+        expected[name] = subprocess.run(
+            ["git", "-C", str(fixture.repo), "cat-file", "blob", oid],
+            check=True, capture_output=True,
+        ).stdout
+    calls = []
+    run = wes.SyntheticGit.run
+
+    def record(self, args, **kwargs):
+        calls.append(args)
+        return run(self, args, **kwargs)
+
+    monkeypatch.setattr(wes.SyntheticGit, "run", record)
+    source = fixture.root / "many-files-copy"
+    source.mkdir()
+    snapshot = wes._scan_source(authority, materialize=source)
+    assert {entry.path for entry in snapshot.entries} == set(expected)
+    for entry in snapshot.entries:
+        assert (source / entry.path).read_bytes() == expected[entry.path]
+        assert entry.size == len(expected[entry.path])
+        assert entry.digest == "sha256:" + wec.sha256_hex(expected[entry.path])
+    cat_file_calls = [args for args in calls if args[0] == "cat-file"]
+    print(f"frozen scan: files={len(expected)}, run={len(calls)}, cat-file={len(cat_file_calls)}")
+    assert len(cat_file_calls) <= 2
+    assert len(calls) <= 8  # Includes the frozen-index/commit equality precondition.
+
+
+def test_review_blob_bound_is_checked_before_buffering(fixture, monkeypatch):
+    _git(fixture.repo, "add", "-A")
+    _git(fixture.repo, "commit", "-qm", "clean candidate")
+    head = _git(fixture.repo, "rev-parse", "HEAD")
+    monkeypatch.setattr(
+        wep, "resolve_review_context",
+        lambda *_a, **_k: ("review", {"base": fixture.base, "head": head}))
+    authority = _authority(fixture)
+    first_oid = _git(fixture.repo, "rev-parse", "HEAD:app.py")
+    oversized_oid = _git(fixture.repo, "rev-parse", "HEAD:docs/readme.md")
+    last_oid = _git(fixture.repo, "rev-parse", "HEAD:notes.txt")
+    monkeypatch.setattr(wes, "MAX_INVENTORY_BYTES", (fixture.repo / "app.py").stat().st_size)
+    calls = []
+    run = wes.SyntheticGit.run
+
+    def record(self, args, **kwargs):
+        if args[0] == "cat-file":
+            calls.append((args, kwargs.get("input")))
+        return run(self, args, **kwargs)
+
+    monkeypatch.setattr(wes.SyntheticGit, "run", record)
+    run_root = fixture.root / "bounded-run"
+    run_root.mkdir()
+    with pytest.raises(wec.WorkerExecutionRefused) as excinfo:
+        wes._materialize_source(authority, run_root)
+    assert excinfo.value.code == "source_too_large"
+    assert calls == [(
+        ["cat-file", "--batch-check=%(objectsize)"],
+        "".join(f"{oid}\n{oid}^{{blob}}\n" for oid in (
+            first_oid, oversized_oid, last_oid,
+        )).encode("ascii"),
+    )]
+
+
 @pytest.mark.parametrize(
     ("flag", "change"),
     [
         ("--assume-unchanged", "bytes"),
         ("--skip-worktree", "bytes"),
         ("--assume-unchanged", "link"),
-        (None, "mode"),
     ],
 )
-def test_materialized_review_checks_copied_bytes_and_modes(fixture, monkeypatch, flag, change):
+def test_materialized_review_refuses_flagged_content_without_mutating_source(
+    fixture, monkeypatch, flag, change,
+):
     _git(fixture.repo, "reset", "-q")
     _git(fixture.repo, "checkout", "--", "app.py")
     (fixture.repo / "notes.txt").unlink()
@@ -1151,10 +1491,6 @@ def test_materialized_review_checks_copied_bytes_and_modes(fixture, monkeypatch,
     elif change == "link":
         (fixture.repo / "alias").unlink()
         os.symlink("./app.py", fixture.repo / "alias")
-    else:
-        # Git tests the owner execute bit; materialization copies ANY execute bit
-        # as 0755, so this apparently clean source would execute a different mode.
-        (fixture.repo / "app.py").chmod(0o654)
     _git(fixture.repo, "diff", "--quiet", "HEAD", "--")
     index_before = (fixture.repo / ".git" / "index").read_bytes()
     bytes_before = (fixture.repo / "app.py").read_bytes()
@@ -1172,7 +1508,7 @@ def test_materialized_review_checks_copied_bytes_and_modes(fixture, monkeypatch,
 
 
 @pytest.mark.parametrize("object_format", ["sha1", "sha256"])
-def test_materialized_review_accepts_exact_candidate_with_index_flags(fixture, monkeypatch, object_format):
+def test_review_committed_tree_supports_both_object_formats(fixture, monkeypatch, object_format):
     repo = fixture.root / "candidate"
     repo.mkdir()
     _git(repo, "init", "-q", f"--object-format={object_format}")
@@ -1191,8 +1527,6 @@ def test_materialized_review_accepts_exact_candidate_with_index_flags(fixture, m
         lambda *_a, **_k: ("review", {"base": fixture.base, "head": fixture.head}))
     (repo / "extra.txt").write_bytes(b"granted extra\n")
     authority = _authority(fixture, extras=["extra.txt"])
-    _git(repo, "update-index", "--assume-unchanged", "run.sh", "alias")
-    _git(repo, "update-index", "--skip-worktree", "plain.txt")
     index_before = (repo / ".git" / "index").read_bytes()
     inspected = wes._scan_source(authority)
     run_root = fixture.root / "run"
@@ -1208,3 +1542,13 @@ def test_materialized_review_accepts_exact_candidate_with_index_flags(fixture, m
     assert os.readlink(source_dir / "alias") == "./plain.txt"
     assert (source_dir / "extra.txt").read_bytes() == b"granted extra\n"
     assert (repo / ".git" / "index").read_bytes() == index_before
+
+    # Clean flagged indexes are refused too: they cannot attest review evidence.
+    _git(repo, "update-index", "--assume-unchanged", "run.sh", "alias")
+    _git(repo, "update-index", "--skip-worktree", "plain.txt")
+    flagged_index = (repo / ".git" / "index").read_bytes()
+    with pytest.raises(wec.WorkerExecutionRefused) as refused:
+        wes._scan_source(authority)
+    assert refused.value.code == "source_changed"
+    assert "index flags" in str(refused.value)
+    assert (repo / ".git" / "index").read_bytes() == flagged_index

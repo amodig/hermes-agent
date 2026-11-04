@@ -320,23 +320,30 @@ def test_goal_reopen_clears_terminal_result(kanban_home):
                 "validation_required": False,
             },
         )
+        blocked = kb.get_task(conn, task_id)
+        assert blocked is not None
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET status = 'done', completed_at = 123, result = ? "
                 "WHERE id = ?",
                 ("obsolete result", task_id),
             )
+        completed = kb.get_task(conn, task_id)
+        assert completed is not None
+        # Leaving blocked advances the optimistic fence even for a raw SQL writer.
+        assert completed.version == blocked.version + 1
 
         assert kb.update_task(
             conn,
             task_id,
             title="revised code goal",
-            expected_version=1,
+            expected_version=completed.version,
             reason="revise completed goal",
         )
 
         task = kb.get_task(conn, task_id)
         assert task is not None
+        assert task.version == completed.version + 1
         assert task.status == "ready"
         assert task.result is None
         assert task.completed_at is None

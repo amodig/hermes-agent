@@ -442,7 +442,7 @@ def _worktree_registration_backlinks(common_dir: str, git_dir: str, workspace: s
     except (OSError, UnicodeDecodeError):
         return False
     wanted = os.path.normpath(os.path.join(workspace, ".git"))
-    return bool(recorded) and os.path.normpath(recorded) == wanted
+    return bool(recorded) and os.path.normpath(os.path.join(captured, recorded)) == wanted
 
 
 def _resolve_worktree_opt_in(
@@ -653,7 +653,8 @@ def resolve_review_context(db_path: str, task_id: str) -> tuple[str, Optional[di
             return "implementation", None
         if not isinstance(candidate_id, str) or not candidate_id:
             return role, None
-        handoff = kanban_db.latest_handoff(connection, candidate_id)
+        # The candidate card's BOUND run, not its newest one.
+        handoff = kanban_db.bound_handoff(connection, candidate_id)
         base = str(handoff.get("base_sha") or "").strip()
         head = str(handoff.get("head_sha") or "").strip()
         if not _OBJECT_ID_RE.match(base) or not _OBJECT_ID_RE.match(head):

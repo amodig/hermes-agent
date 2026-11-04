@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import json
 import os
 import posixpath
@@ -38,7 +39,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Iterator, Mapping, Optional
 
 TOOL_INSPECT = "kanban_worker_inspect"
 TOOL_VERIFY = "kanban_worker_verify"
@@ -334,12 +335,11 @@ class SyntheticGit:
                 name = key.split(".", 1)[1]
                 if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", name):
                     _refuse("git_unsupported", "Git extension name is not supported for inspection")
-                if name == "worktreeconfig":
-                    # Per-worktree config only overrides core.worktree/bare; the synthetic
-                    # repo supplies its own config and every Git call pins --work-tree, so
-                    # the extension is accepted and not reproduced.
+                if name in {"worktreeconfig", "relativeworktrees"}:
+                    # The synthetic repo supplies its own config and pins --work-tree;
+                    # neither source per-worktree config nor registration is reproduced.
                     if value.lower() not in {"true", "false"}:
-                        _refuse("git_unsupported", "Git worktreeConfig value is not supported")
+                        _refuse("git_unsupported", f"Git {name} value is not supported")
                     continue
                 if name not in {"objectformat"}:
                     _refuse("git_unsupported", f"Git extension {name} is not supported for inspection")
@@ -438,7 +438,9 @@ class SyntheticGit:
             dirnames[:] = [name for name in dirnames if not (base / name).is_symlink()]
         return objects
 
-    def run(self, args: list[str], *, cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
+    def run(
+        self, args: list[str], *, cwd: Optional[Path] = None, input: Optional[bytes] = None,
+    ) -> subprocess.CompletedProcess:
         from hermes_cli._subprocess_compat import harden_git_argv
 
         objects = self.object_dir()
@@ -451,7 +453,8 @@ class SyntheticGit:
         ]
         try:
             return subprocess.run(  # noqa: S603 -- fixed executable, validated argv
-                argv, cwd=str(cwd or self.root), env=env, stdin=subprocess.DEVNULL,
+                argv, cwd=str(cwd or self.root), env=env,
+                stdin=subprocess.DEVNULL if input is None else None, input=input,
                 capture_output=True, timeout=GIT_TIMEOUT_SECONDS,
             )
         except (OSError, subprocess.SubprocessError) as exc:
@@ -478,11 +481,41 @@ def _git_text(git: SyntheticGit, args: list[str]) -> str:
         _refuse("git_unsupported", "Git output is not valid UTF-8")
 
 
-def _git_tracked(git: SyntheticGit, *, tree: Optional[str] = None) -> dict[str, tuple[str, str]]:
-    """``path -> (mode, object id)`` from the index or immutable tree; no worktree access."""
-    raw = git.run(["ls-tree", "-r", "-z", tree] if tree is not None else ["ls-files", "--stage", "-z"])
+def _reject_index_flags(git: SyntheticGit) -> None:
+    """Refuse paths whose index entry can hide changed content.
+
+    ``assume-unchanged`` and ``skip-worktree`` make Git report a modified file as
+    clean, and the digest then hashes the modified working-tree bytes — a copy of the
+    reviewed commit that is not the reviewed commit. ``ls-files -v`` marks such entries
+    with anything other than ``H``.
+    """
+    listing = git.run(["ls-files", "-v", "-z"])
+    if listing.returncode != 0:
+        _refuse("git_unavailable", "Git index flags could not be read")
+    flagged = []
+    for item in listing.stdout.split(b"\x00"):
+        if not item:
+            continue
+        tag, _, path = item.partition(b" ")
+        if tag != b"H":
+            try:
+                flagged.append(path.decode("utf-8", "strict"))
+            except UnicodeDecodeError:
+                flagged.append("<non-utf8 path>")
+    if flagged:
+        _refuse(
+            "source_changed",
+            f"{len(flagged)} tracked path(s) hide modifications behind index flags "
+            f"(assume-unchanged/skip-worktree); verification cannot prove the copy is the "
+            f"reviewed commit: {', '.join(sorted(flagged)[:3])}",
+        )
+
+
+def _git_tracked(git: SyntheticGit) -> dict[str, tuple[str, str]]:
+    """``path -> (mode, object id)`` from the index; no worktree access."""
+    raw = git.run(["ls-files", "--stage", "-z"])
     if raw.returncode != 0:
-        _refuse("git_unavailable", "Git source inventory could not be read")
+        _refuse("git_unavailable", "Git index could not be read")
     tracked: dict[str, tuple[str, str]] = {}
     for item in raw.stdout.split(b"\x00"):
         if not item:
@@ -492,11 +525,11 @@ def _git_tracked(git: SyntheticGit, *, tree: Optional[str] = None) -> dict[str, 
             fields = header.decode("ascii").split(" ")
             name = path.decode("utf-8", "strict")
         except UnicodeDecodeError:
-            _refuse("git_unsupported", "Git source inventory contains a non-UTF-8 path")
+            _refuse("git_unsupported", "Git index contains a non-UTF-8 path")
         if len(fields) != 3:
-            _refuse("git_unsupported", "Git source inventory entry is malformed")
+            _refuse("git_unsupported", "Git index entry is malformed")
         _validate_source_name(name)
-        tracked[name] = (fields[0], fields[2] if tree is not None else fields[1])
+        tracked[name] = (fields[0], fields[1])
     return tracked
 
 
@@ -509,18 +542,63 @@ def _index_digest(git: SyntheticGit) -> str:
         return "sha256:" + sha256_hex(handle.read())
 
 
+def _committed_blobs(git: SyntheticGit, oids: list[str]) -> Iterator[tuple[int, bytes]]:
+    """Bound the whole frozen inventory before buffering any committed bytes."""
+    if not oids:
+        return
+    # Keep the frozen index's object names, with the same blob peeling as
+    # ``cat-file blob <oid>`` (not HEAD:path, filters or checkout conversion).
+    # Check both sizes: ``-s`` measures a tag itself, while ``blob`` peels it.
+    requests = "".join(f"{oid}\n{oid}^{{blob}}\n" for oid in oids).encode("ascii")
+    checked = git.run(["cat-file", "--batch-check=%(objectsize)"], input=requests)
+    lines = checked.stdout.splitlines()
+    if checked.returncode != 0 or len(lines) != 2 * len(oids):
+        _refuse("git_unavailable", "a reviewed blob size could not be read")
+    sizes = []
+    total = 0
+    for index in range(0, len(lines), 2):
+        pair = []
+        for offset, label in ((0, "blob size"), (1, "blob")):
+            raw = lines[index + offset]
+            if raw.endswith(b" missing"):
+                _refuse("git_unavailable", f"a reviewed {label} could not be read")
+            try:
+                size = int(raw)
+            except ValueError:
+                _refuse("git_unsupported", "a reviewed blob size is malformed")
+            if size < 0:
+                _refuse("git_unsupported", "a reviewed blob size is malformed")
+            if size > MAX_INVENTORY_BYTES - total:
+                _refuse("source_too_large", "the granted source set exceeds the byte bound")
+            pair.append(size)
+        sizes.append(pair)
+        total += pair[1]
+    blobs = git.run(
+        ["cat-file", "--batch=%(objectsize)"],
+        input="".join(f"{oid}^{{blob}}\n" for oid in oids).encode("ascii"),
+    )
+    if blobs.returncode != 0:
+        _refuse("git_unavailable", "a reviewed blob could not be read")
+    stream = io.BytesIO(blobs.stdout)
+    for original_size, size in sizes:
+        if stream.readline() != f"{size}\n".encode("ascii"):
+            _refuse("git_unavailable", "a reviewed blob could not be read")
+        data = stream.read(size)
+        if len(data) != size or stream.read(1) != b"\n":
+            _refuse("git_unavailable", "a reviewed blob could not be read")
+        yield original_size, data
+
+
 def _scan_source(
     authority: ExecutionAuthority,
     *,
     materialize: Optional[Path] = None,
+    from_commit: bool = False,
 ) -> SourceSnapshot:
-    """Inventory accepted source; review copies must match the immutable candidate.
-
-    Compare the bytes and modes actually copied, not Git's worktree cleanliness:
-    index flags, cached stat data and clean filters must not authorize different code.
-    """
+    """Build one bounded inventory from tracked paths plus granted extra source files."""
     if authority.git is None:
         raise WorkerExecutionRefused("workspace_not_a_repository", "granted workspace is not a Git repository")
+    from_commit = from_commit or authority.role == "review"
     git = SyntheticGit(authority.workspace_path, authority.git)
     try:
         head_result = git.run(["rev-parse", "HEAD"])
@@ -539,11 +617,10 @@ def _scan_source(
                 branch = symbolic.stdout.decode("utf-8", "strict").strip().removeprefix("refs/heads/")
             except UnicodeDecodeError:
                 raise WorkerExecutionRefused("git_unsupported", "Git branch is malformed")
-        candidate = None
-        if materialize is not None and str(getattr(authority, "role", "unknown")) == "review":
-            # Materializing means running the recipe against a COPY. For a review
-            # claim the copy must be the reviewed commit itself: same HEAD as the
-            # granted pair, and no tracked or staged modification on top of it.
+        if authority.role == "review":
+            # A review's source is the bound commit: inspection, paging and the recipe
+            # must describe the same bytes, not checkout normalization or staged edits.
+            # Enforce this at inspection and the final scan, not just before copying.
             if authority.review is None:
                 raise WorkerExecutionRefused(
                     "source_changed", "no immutable candidate handoff is bound to this claim")
@@ -551,9 +628,14 @@ def _scan_source(
             if not granted_head or head.lower() != granted_head:
                 raise WorkerExecutionRefused(
                     "source_changed", "the granted workspace HEAD is not the reviewed head")
+            # The diff guard alone is not proof: ``assume-unchanged`` and
+            # ``skip-worktree`` make a modified file report clean, and the copy would then
+            # carry bytes that are not in the reviewed commit. Sparse checkouts are refused
+            # for the same reason — a copy missing tracked paths is not the commit either.
+            _reject_index_flags(git)
             dirty = git.run([
-                "diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv",
-                "--ignore-submodules=all", granted_head, "--",
+                "diff", "--quiet", "--no-ext-diff", "--no-textconv",
+                "--ignore-submodules=all", "HEAD", "--",
             ])
             if dirty.returncode == 1:
                 raise WorkerExecutionRefused(
@@ -564,7 +646,6 @@ def _scan_source(
                 # An unreadable comparison is not a clean tree.
                 raise WorkerExecutionRefused(
                     "git_unsupported", "Git could not verify the candidate is unmodified")
-            candidate = _git_tracked(git, tree=granted_head)
         tracked = _git_tracked(git)
         extras = [list(_split_relative(item, "extra_source_paths")) for item in authority.extra_source_paths]
         reserved_tracked = [path for path in tracked if _reserved(path.split("/"))]
@@ -590,26 +671,67 @@ def _scan_source(
             accepted[name] = "file"
         entries: list[SourceEntry] = []
         link_targets: dict[str, tuple[str, str]] = {}
-        copied_tracked: dict[str, tuple[str, str]] = {}
-        object_hash = hashlib.sha1 if len(head) == 40 else hashlib.sha256
         total_bytes = 0
         if len(accepted) > MAX_INVENTORY_ENTRIES:
             raise WorkerExecutionRefused("source_too_large", "the granted source set exceeds the entry bound")
+        if from_commit:
+            # The worktree can match HEAD while the frozen index contains staged
+            # bytes (MM). Prove the batch's object ids belong to this commit first.
+            indexed = git.run(["diff-index", "--cached", "--exit-code", head, "--"])
+            if indexed.returncode == 1:
+                raise WorkerExecutionRefused(
+                    "source_changed", f"the frozen index diverges from bound commit {head}")
+            if indexed.returncode != 0:
+                raise WorkerExecutionRefused(
+                    "git_unsupported", "Git could not verify the frozen index matches the bound commit")
+        committed_blobs = _committed_blobs(
+            git, [tracked[name][1] for name in sorted(tracked)] if from_commit else [],
+        )
         with SafeRoot(authority.workspace_path) as root:
             for name in sorted(accepted):
                 parts = name.split("/")
-                try:
-                    info = root.lstat(parts)
-                except FileNotFoundError:
-                    entries.append(SourceEntry(name, "deleted", False, 0, "deleted"))
-                    continue
-                except OSError as exc:
-                    raise WorkerExecutionRefused("source_unreadable", _bounded(exc))
-                # The worktree entry's ACTUAL type decides how it is hashed and copied;
-                # the index only selects the path. A tracked symlink replaced by a file
-                # (or the reverse) is therefore represented, never silently dropped.
-                if stat.S_ISLNK(info.st_mode):
-                    target = root.readlink(parts)
+                target = None
+                if from_commit and name in tracked:
+                    # The frozen index names the reviewed commit's type and bytes.
+                    # Worktree deletion or replacement after the cleanliness proof
+                    # must not change the copy. Granted extras still use the worktree.
+                    entry_mode, _oid = tracked[name]
+                    size, data = next(committed_blobs)
+                    if max(size, len(data)) > MAX_INVENTORY_BYTES - total_bytes:
+                        raise WorkerExecutionRefused(
+                            "source_too_large", "the granted source set exceeds the byte bound")
+                    total_bytes += len(data)
+                    if entry_mode == "120000":
+                        target = data.decode("utf-8", "surrogateescape")
+                    else:
+                        if materialize is not None:
+                            target_path = materialize / name
+                            target_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                            with open(target_path, "xb") as written_commit:
+                                written_commit.write(data)
+                            with contextlib.suppress(OSError):
+                                os.chmod(target_path, 0o755 if entry_mode == "100755" else 0o644)
+                        entries.append(SourceEntry(
+                            name, "file", entry_mode == "100755", len(data),
+                            "sha256:" + sha256_hex(data),
+                        ))
+                        continue
+                else:
+                    try:
+                        info = root.lstat(parts)
+                    except FileNotFoundError:
+                        entries.append(SourceEntry(name, "deleted", False, 0, "deleted"))
+                        continue
+                    except OSError as exc:
+                        raise WorkerExecutionRefused("source_unreadable", _bounded(exc))
+                    # Outside commit mode the actual worktree type is authoritative.
+                    if stat.S_ISLNK(info.st_mode):
+                        target = root.readlink(parts)
+                    elif not stat.S_ISREG(info.st_mode):
+                        raise WorkerExecutionRefused("unsupported_source_type", "the granted source set contains a non-regular entry")
+                    elif int(info.st_nlink) != 1:
+                        raise WorkerExecutionRefused("hardlinked_source", "the granted source set contains a hard-linked file")
+                if target is not None:
                     parent = "/".join(parts[:-1])
                     joined = posixpath.normpath(posixpath.join(parent, target)) if parent else posixpath.normpath(target)
                     normalized = joined.replace(os.sep, "/")
@@ -624,12 +746,7 @@ def _scan_source(
                         raise WorkerExecutionRefused("unsafe_symlink", "the granted source set contains a symlink cycle")
                     # The digest binds the exact link text that is copied; normalization
                     # is only for containment and graph validation.
-                    link_bytes = target.encode("utf-8", "surrogateescape")
-                    digest = "sha256:" + sha256_hex(link_bytes)
-                    if candidate is not None and name in tracked:
-                        blob = object_hash(f"blob {len(link_bytes)}\0".encode("ascii"), usedforsecurity=False)
-                        blob.update(link_bytes)
-                        copied_tracked[name] = ("120000", blob.hexdigest())
+                    digest = "sha256:" + sha256_hex(target.encode("utf-8", "surrogateescape"))
                     link_targets[name] = (target, normalized)
                     entries.append(SourceEntry(name, "link", False, len(target), digest))
                     if materialize is not None:
@@ -637,10 +754,6 @@ def _scan_source(
                         target_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                         os.symlink(target, target_path)
                     continue
-                if not stat.S_ISREG(info.st_mode):
-                    raise WorkerExecutionRefused("unsupported_source_type", "the granted source set contains a non-regular entry")
-                if int(info.st_nlink) != 1:
-                    raise WorkerExecutionRefused("hardlinked_source", "the granted source set contains a hard-linked file")
                 try:
                     fd = root.open_file(parts)
                 except OSError as exc:
@@ -650,10 +763,6 @@ def _scan_source(
                     if not stat.S_ISREG(opened.st_mode) or int(opened.st_nlink) != 1:
                         raise WorkerExecutionRefused("hardlinked_source", "the granted source set changed during inspection")
                     digest = hashlib.sha256()
-                    blob = (
-                        object_hash(f"blob {opened.st_size}\0".encode("ascii"), usedforsecurity=False)
-                        if candidate is not None and name in tracked else None
-                    )
                     written = None
                     if materialize is not None:
                         target_path = materialize / name
@@ -668,8 +777,6 @@ def _scan_source(
                             if total_bytes > MAX_INVENTORY_BYTES:
                                 raise WorkerExecutionRefused("source_too_large", "the granted source set exceeds the byte bound")
                             digest.update(chunk)
-                            if blob is not None:
-                                blob.update(chunk)
                             if written is not None:
                                 written.write(chunk)
                     finally:
@@ -682,14 +789,10 @@ def _scan_source(
                     os.close(fd)
                 executable = bool(opened.st_mode & 0o111)
                 entries.append(SourceEntry(name, "file", executable, int(opened.st_size), "sha256:" + digest.hexdigest()))
-                if blob is not None:
-                    copied_tracked[name] = ("100755" if executable else "100644", blob.hexdigest())
                 if materialize is not None:
-                    os.chmod(materialize / name, 0o755 if executable else 0o644)
+                    with contextlib.suppress(OSError):
+                        os.chmod(materialize / name, 0o755 if executable else 0o644)
         _validate_link_graph(link_targets, accepted)
-        if candidate is not None and copied_tracked != candidate:
-            raise WorkerExecutionRefused(
-                "source_changed", "the copied tracked content or modes do not match the reviewed commit")
         digests = sorted(entry.digest_line() for entry in entries)
         source_digest = "sha256:" + sha256_hex(b"".join(digests) + b"HEAD\x00" + head.encode("ascii"))
         return SourceSnapshot(
@@ -858,12 +961,18 @@ def _line_page(data: bytes, start_line: int, line_count: int) -> tuple[list[str]
 
 def _read_file_page(
     root: SafeRoot, parts: list[str], entry: SourceEntry, start_line: int, line_count: int,
+    *, blob: Optional[bytes] = None,
 ) -> tuple[str, Optional[int]]:
-    """One pass over the opened file: hash every byte AND collect the requested lines."""
-    try:
-        fd = root.open_file(parts)
-    except OSError as exc:
-        raise WorkerExecutionRefused("source_unreadable", _bounded(exc))
+    """One paging pass over worktree or committed bytes, hashing every byte."""
+    fd = None
+    if blob is None:
+        try:
+            fd = root.open_file(parts)
+        except OSError as exc:
+            raise WorkerExecutionRefused("source_unreadable", _bounded(exc))
+        reader = os.fdopen(fd, "rb")
+    else:
+        reader = io.BytesIO(blob)
     digest = hashlib.sha256()
     wanted_start = max(0, start_line - 1)
     wanted_end = wanted_start + line_count
@@ -873,14 +982,15 @@ def _read_file_page(
     pending = bytearray()
     last_chunk = b""
     binary = False
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or int(info.st_nlink) != 1:
-            _refuse("unsupported_source_type", "requested source is not a single regular file")
-        if info.st_size > MAX_INVENTORY_BYTES:
+    with reader:
+        if fd is not None:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or int(info.st_nlink) != 1:
+                _refuse("unsupported_source_type", "requested source is not a single regular file")
+        if (info.st_size if fd is not None else len(blob)) > MAX_INVENTORY_BYTES:
             _refuse("source_too_large", "requested source exceeds the byte bound")
         while True:
-            chunk = os.read(fd, 1024 * 1024)
+            chunk = reader.read(1024 * 1024)
             if not chunk:
                 break
             digest.update(chunk)
@@ -915,11 +1025,10 @@ def _read_file_page(
                 _refuse("page_too_large", "the requested page exceeds the byte bound")
             page.append(bytes(pending))
         total_lines = completed_lines + (1 if last_chunk and not last_chunk.endswith(b"\n") else 0)
-        after = os.fstat(fd)
-        if (after.st_size, after.st_mtime_ns, after.st_ino) != (info.st_size, info.st_mtime_ns, info.st_ino):
-            raise WorkerExecutionRefused("source_changed", "requested source changed during inspection")
-    finally:
-        os.close(fd)
+        if fd is not None:
+            after = os.fstat(fd)
+            if (after.st_size, after.st_mtime_ns, after.st_ino) != (info.st_size, info.st_mtime_ns, info.st_ino):
+                raise WorkerExecutionRefused("source_changed", "requested source changed during inspection")
     if binary:
         raise WorkerExecutionRefused("binary_content", "requested source is binary")
     if "sha256:" + digest.hexdigest() != entry.digest:
@@ -1099,8 +1208,21 @@ def _inspect_read(args: Mapping[str, Any], authority: ExecutionAuthority) -> dic
     _check_expected(args, "expected_source_digest", snapshot.source_digest)
     start_line = int(args.get("start_line", 1))
     line_count = int(args.get("line_count", PAGE_DEFAULT_LINES))
+    blob = None
+    if authority.role == "review":
+        git = SyntheticGit(authority.workspace_path, authority.git)
+        try:
+            if name in _git_tracked(git):
+                # The scan already bounded this immutable commit's blob. Granted
+                # extra files still come from the checkout, just as in the scan.
+                result = git.run(["cat-file", "blob", f"{snapshot.head}:{name}"])
+                if result.returncode != 0:
+                    _refuse("git_unavailable", "a reviewed blob could not be read")
+                blob = result.stdout
+        finally:
+            git.close()
     with SafeRoot(authority.workspace_path) as root:
-        text, next_line = _read_file_page(root, parts, entry, start_line, line_count)
+        text, next_line = _read_file_page(root, parts, entry, start_line, line_count, blob=blob)
     return {
         "ok": True,
         "operation": "read",
@@ -1224,6 +1346,7 @@ def _check_expected(args: Mapping[str, Any], key: str, actual: str) -> None:
 
 
 def _materialize_source(authority: ExecutionAuthority, run_root: Path) -> tuple[SourceSnapshot, Path]:
+    """Copy reviewed commit bytes for review; retain working edits for implementation."""
     source_dir = run_root / "source"
     source_dir.mkdir(mode=0o700)
     snapshot = _scan_source(authority, materialize=source_dir)

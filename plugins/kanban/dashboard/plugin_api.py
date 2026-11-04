@@ -936,8 +936,12 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if payload.assignee is not None and not review_assignee_deferred:
             with _map_errors(409, RuntimeError, ValueError):
                 _require_ok(kanban_db.assign_task(conn, task_id, payload.assignee or None))
+        mutation_version = request_version
         if payload.status is not None:
             _patch_status(conn, task_id, payload, review_assignee_deferred)
+            # The request fence was checked under this write transaction. Block
+            # and unblock now advance it themselves; later edits use that token.
+            mutation_version = kanban_db.get_task(conn, task_id).version
         for wanted, apply, _refused in _OVERRIDE_OPS:
             if wanted(payload):
                 with _map_errors(400, ValueError, RuntimeError):
@@ -950,16 +954,16 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 task_id,
                 payload,
                 board,
-                expected_version=request_version,
+                expected_version=mutation_version,
             )
         # Goal CAS must see the request version before reprioritization bumps it.
         if payload.priority is not None:
             _set_priority(conn, task_id, payload.priority, board)
-        # Goal and priority mutators own their version bumps. The route supplies
-        # one only for status/assignment/override-only requests.
+        # Supply a bump only when neither the transition nor another mutator did.
         if (
             not wants_cas_update
             and payload.priority is None
+            and mutation_version == request_version
             and (
                 payload.status is not None
                 or payload.assignee is not None

@@ -343,34 +343,31 @@ def _commit_completion(
                         metadata=metadata,
                     )
                     stamp_run_id = synthetic_run_id
-                should_stamp = typed_phase == "implementation" or synthetic_run_id is not None or not (
-                    isinstance(metadata, dict)
-                    and isinstance(metadata.get("lifecycle"), dict)
-                )
-                if should_stamp:
-                    try:
-                        metadata = _kb._stamp_lifecycle_metadata(
-                            conn,
-                            task_id,
-                            metadata,
-                            phase=typed_phase,
-                            run_id=stamp_run_id,
-                            verdict=verdict,
+                # Recheck the grant's candidate inside the completion write transaction;
+                # the preflight envelope cannot authorize a binding changed since then.
+                try:
+                    metadata = _kb._stamp_lifecycle_metadata(
+                        conn,
+                        task_id,
+                        metadata,
+                        phase=typed_phase,
+                        run_id=stamp_run_id,
+                        verdict=verdict,
+                    )
+                except LifecycleEvidenceError as error:
+                    if synthetic_run_id is not None:
+                        conn.execute(
+                            "DELETE FROM task_runs WHERE id = ? AND task_id = ?",
+                            (synthetic_run_id, task_id),
                         )
-                    except LifecycleEvidenceError as error:
-                        if synthetic_run_id is not None:
-                            conn.execute(
-                                "DELETE FROM task_runs WHERE id = ? AND task_id = ?",
-                                (synthetic_run_id, task_id),
-                            )
-                        _kb._append_event(
-                            conn,
-                            task_id,
-                            "completion_blocked_lifecycle",
-                            {"reason": str(error)},
-                            run_id=expected_run_id,
-                        )
-                        return False, None, error, accepted_task_ids
+                    _kb._append_event(
+                        conn,
+                        task_id,
+                        "completion_blocked_lifecycle",
+                        {"reason": str(error)},
+                        run_id=expected_run_id,
+                    )
+                    return False, None, error, accepted_task_ids
             prior_status = _kb._task_status(conn, task_id)
             implementation_routing = _implementation_routing(conn, task_id)
             target_status = (

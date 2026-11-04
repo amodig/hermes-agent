@@ -1579,6 +1579,8 @@ _hermes_home = get_process_hermes_home()
 # Load ~/.hermes/.env first: user-managed env files must override stale shell exports on restart.
 from hermes_cli.env_loader import load_hermes_dotenv
 _env_path = _hermes_home / '.env'
+from hermes_cli.gateway_startup_inputs import begin_gateway_startup_inputs
+begin_gateway_startup_inputs(_hermes_home, Path(__file__).resolve().parents[1] / ".env")
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
 
 
@@ -5983,6 +5985,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if not success:
         _shutdown_gateway_health_export(runner)
         return False
+
+    # The PID-claim winner publishes once, after scoped secret hydration and adapter construction.
+    from hermes_cli.gateway_startup_inputs import publish_gateway_startup_inputs
+    publish_gateway_startup_inputs()
 
     def _recover_pending() -> None:
         recovered = _recover_pending_flushes(runner)

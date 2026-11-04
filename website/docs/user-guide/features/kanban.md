@@ -543,6 +543,42 @@ Dispatcher-owned workers receive their task lifecycle tools automatically.
 | `kanban_archive` | (Orchestrators) retire a detached invalid card without falsely completing it. | `board`, `task_id`, `expected_version`, `reason` |
 | `kanban_requeue_handoff` | (Orchestrators) recover a pre-enforcement completion lacking immutable `head_sha`. | `board`, `task_id`, `expected_version`, `reason`, historical evidence as needed |
 
+For operator recovery, pass the observed `expected_version` to `kanban_unblock`
+(CLI: `unblock ID --expected-version V`) and an audit reason. Every transition
+into or out of `blocked` or `scheduled` advances the task version, including
+promotion and a spawn failure returning to `blocked`; an already-versioned
+write is not incremented twice. In-place block classification also advances it.
+An old fence cannot release a newer gate: refresh with `kanban_show`/`kanban show`
+after a refusal. Existing boards acquire this invariant on their first writable
+open under the updated runtime.
+These increments do not revise the effective goal or reset the independent block-recurrence counter.
+Read the current version again after a gate transition before revising a goal;
+the version observed while it was blocked is stale even if it is now terminal.
+
+Bounded `kanban_show` string pages use raw stored character positions for
+`offset`, `next_offset`, and `total_chars`, not the length of the redacted output.
+Slices expand across whole secrets before redaction; a newly registered secret
+can move a page's reported start backwards, but never skips subsequent evidence.
+Use the returned continuation, not the rendered text length, for the next page.
+An implicit request pinned by `HERMES_KANBAN_DB` keeps `board` absent from its
+continuations; explicit cross-board requests keep their board. The snapshot still
+binds the original resolved board and database file, so changing the route refuses.
+The complete JSON response remains bounded to 32 KiB.
+Public fields between redacted form credentials page normally; each changed
+region is indivisible, not the entire span from the first secret to the last.
+Masking uses the original form context even when a continuation starts inside a
+public field or the form has leading/trailing whitespace.
+Bare-token URL credentials are indivisible too, but their public host, path and
+query page normally; starting inside userinfo does not lose the masking context.
+Registered vault values are scrubbed before generic URL head/tail masking, including
+values overlapping userinfo boundaries; paging must not reveal their prefix or suffix.
+Control-split tokens use the redactor's same eligibility rules: an independently
+matching token followed by a newline does not make the next public line indivisible.
+
+A candidate mismatch during deferred worker preparation rolls back only its
+own run. If an operator reclaimed it meanwhile, the restored card and history
+are untouched, but the attempt's newly created checkout is still discarded.
+
 A typical worker turn looks like:
 
 ```
@@ -607,6 +643,82 @@ worktree, and optional patch hash. The original completion, runs, comments,
 and edges remain; dependents stay gated until the same parent is recommitted
 and completed with an immutable head.
 
+Typed reviewer/tester workspaces and completion evidence use the bound implementation
+run and its head, including when recovery selects an older run with only top-level
+handoff metadata. The review or validation execution's own run id never substitutes
+for that candidate id. Deferred launches refuse if either the bound base or head
+changes during preparation.
+Role worktrees must have their own Git registration: the checkout's `.git`
+pointer, the administrative directory's backlink, and `git worktree list` must
+all identify that checkout. A copied sibling pointer refuses with
+`candidate_workspace_unavailable` before either checkout is moved.
+Git before 2.36 uses the newline-delimited porcelain listing when `-z` is
+unsupported, decoding quoted paths without relaxing any registration check.
+Untracked empty directories, ignored or not, also refuse if the candidate would
+replace them or any ancestor with files, including descendants beneath a collapsed
+directory root and empty siblings beneath currently tracked directories.
+New files can still be added inside an existing directory when no existing
+directory is overwritten.
+Existing checkouts with `assume-unchanged` or `skip-worktree` index flags refuse
+with `candidate_workspace_unavailable`, even when `git status` looks clean: clear
+those flags and preserve or commit any local edits before retrying. A refused
+claim or failed launch may remove only a checkout that attempt created, never one
+with index flags or untracked entries, including ignored files and unignored empty
+directories. Completion cleanup uses the same content guard. For custom launchers,
+automatic preparation discard stops at callback entry, not its return: a callback that creates a commit,
+resets HEAD, and raises may leave that commit only in `ORIG_HEAD` or the private
+HEAD reflog, which worktree removal would destroy.
+Default deferred launches also reclaim their newly created checkout on failures
+before the grant, including candidate retention after the workspace was persisted.
+Cleanup uses the head captured at preparation, never a newly rebound candidate;
+reused checkouts are untouched. Failure accounting is fenced to the claimed run:
+an operator reclaim before retention leaves its restored lane and retry budget
+unchanged, with no stale `gave_up` event.
+Completion, teardown, and prepared-checkout discard share the same surviving-ref
+guard: the prepared commit, detached HEAD, and
+every commit referenced inside the checkout (including private pseudoreferences
+such as `ORIG_HEAD`, private reflog history and private refs) must
+still be reachable from a common Git ref that survives worktree removal,
+not `refs/worktree/*`, `refs/bisect/*`, or `refs/rewritten/*`. Private reflogs
+are located with `git rev-parse --git-path logs/<ref>` and read as raw records:
+both old and new object IDs must survive, including the oldest retained entry's
+old ID, which `git reflog show --format=%H` does not report. Root-ref enumeration
+uses `for-each-ref --include-root-refs` only when `git for-each-ref -h` advertises
+it; older Git enumerates the checkout's recovery-ref files instead, including
+`NOTES_MERGE_PARTIAL`/`NOTES_MERGE_REF`. Every object in `FETCH_HEAD`/`MERGE_HEAD`
+is checked on all Git versions: even `--include-root-refs` omits these multivalued
+pseudorefs. Non-commit anchors (including annotated tags, trees and blobs) require
+their raw object ID to be named directly by a surviving common ref, for both
+checkout refs and reflog records. Peeling a tag or finding its commit with
+`--contains` does not protect the tag's own message or signature. The guard uses
+`git for-each-ref --format='%(objectname) %(refname)'` without peeling, excluding
+the three private namespaces above.
+An enumeration or resolution failure still preserves the checkout. A refusal names the
+unprotected object and ref. When removal cannot prove history survives, a newly created
+clean checkout is moved intact to `.worktrees/<id>.recovery-<unique-suffix>` using
+`git worktree move`; its private refs and reflogs remain reachable there, and the
+canonical task path is free for a fresh preparation after a candidate rebind. Failure
+to move leaves it in place and logs a warning. Existing creation and claim-ownership
+fences still apply: a reused or successor-owned checkout is never moved by discard.
+Moving a reused detached checkout onto a new candidate still requires its commit to
+be contained in the new candidate or anchored by a surviving ref.
+Before persisting a direct role claim, the CLI rechecks the registration and
+prepared head. A changed checkout or candidate binding releases only this
+attempt's claim; a successor run and a moved checkout are preserved. Duplicate
+task ids across boards sharing a repository are an operator setup error: this
+check fences a moved checkout, not same-head sharing, and is not a cross-board lock.
+Ordinary worktree cards retain custom target paths; an inherited sibling checkout
+resolves to the card's own worktree rather than sharing the sibling's branch.
+
+Verification materializes committed bytes and per-file executable modes for review
+claims, checking each blob against the remaining inventory bound before reading it.
+Implementation claims instead copy the granted working-tree source, including
+tracked edits, so the verified digest describes the worker's actual changes.
+Both inspection and verification accept validated `extensions.worktreeConfig` and
+`extensions.relativeWorktrees` booleans without copying them into the synthetic
+repository; it uses neither the source's per-worktree config nor its registration.
+Other unsupported Git extensions still refuse inspection.
+
 ### Unstartable review quarantine
 
 A `REVIEW` card whose recorded immutable head no longer matches its branch or
@@ -618,6 +730,12 @@ when no branch was recorded — never the review card's assigned branch.
 For this explicit provenance, a dirty recorded workspace also refuses as
 `handoff_unverifiable`; ordinary implementation handoffs retain their existing
 exact-head check without a claim-time dirty-worktree check.
+
+Typed review preparation still requires a repository anchor, including when the
+card was created with the default scratch workspace. If a valid parent handoff
+changes while the worker is being prepared, the claim recheck cancels that
+ungranted worker without opening a run; eligible READY work can use the slot.
+A competing claim is preserved and is not reported as our handoff refusal.
 
 `hermes kanban dispatch --dry-run --json` predicts the same refusal without
 writing anything: each `handoff_refused` entry carries `task_id`, the guard
@@ -1197,10 +1315,15 @@ through preparation, claim commit, and grant. Contention or an unavailable
 shared lock defers the whole tick without board writes. This serializes
 preparation, not worker execution; it does not replace native worker admission.
 
-Direct `ready` and `review` claims, including `hermes kanban claim`, take the
-same gate through transaction commit. A busy/unavailable gate refuses the
-claim without opening a run. Only claims may reuse a gate already owned by
-their process/thread/root; nested dispatch and board removal remain exclusive.
+Direct `ready` and `review` claims take the same gate through transaction commit.
+`hermes kanban claim` holds it from the initial task/candidate read through workspace
+preparation, claim, rollback if needed, and path/kind/branch persistence; it exits
+before reporting the result and never spans worker execution or cancellation.
+Role worktrees re-read the bound candidate immediately before checkout mutation,
+so an operator rebind refuses stale preparation without moving a successor's checkout.
+A busy/unavailable gate refuses the claim without opening a run. Only claims may
+reuse a gate already owned by their process/thread/root; nested dispatch and board
+removal remain exclusive.
 
 Disk connections capture their shared root, original logical open path, and
 physical file identity under admission. Dispatch and direct claims revalidate

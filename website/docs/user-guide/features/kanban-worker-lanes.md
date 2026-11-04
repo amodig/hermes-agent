@@ -87,9 +87,10 @@ The kanban kernel enforces that exactly one of these terminates each run. A work
 Review and validation workspaces are pinned to the candidate commit. Before
 changing an existing role checkout, the dispatcher verifies its exact worktree
 registration and refuses checkout collisions with ignored local files.
-Materialized tracked content and executable modes must match the immutable
-candidate tree, independently of live-index optimization flags such as
-`assume-unchanged` and `skip-worktree`; mismatches refuse execution.
+Review evidence and materialized tracked content use the bound commit's bytes
+and executable modes, not working-tree normalization. The frozen index must
+equal that commit before its object IDs are read; `assume-unchanged` and
+`skip-worktree` entries refuse inspection and execution even when currently clean.
 Manual claims validate the workspace before committing a claim or opening a run;
 the claim's task-snapshot fence rejects intervening card changes.
 
@@ -100,6 +101,31 @@ For code-changing tasks, pick the review model encoded by the task graph:
 - **Human-only boards:** set `kanban.review_dispatch: false`. A task can then remain in `review` until a human approves it or uses `reopen-review`/the dashboard to return it to `ready`/`todo`.
 
 Both review models carry their structured handoff on the lifecycle transition itself. Do not place secrets, tokens, or raw PII in `summary` or `metadata`; run rows are durable.
+
+Review grants retain the accepted candidate run and exact `base..head` range on
+the review run before releasing the worker. Completion checks the current binding
+against that retained pair, again inside the completion write transaction. A rebind
+after the grant refuses with both ranges (even when the head is unchanged), leaving
+the review attempt open rather than approving another run. An unchanged binding,
+including an earlier attested run restored before the grant with
+`rebind-candidate --replace`, completes against that candidate.
+
+Role checkout preparation refuses `candidate_workspace_unavailable` if another
+non-terminal card, including the same task ID on another board, has registered the
+canonical checkout. It leaves that checkout's HEAD untouched; the owning card and
+terminal registrations do not block reuse. Repository `include_worktrees` grants
+accept Git's absolute and relative registry backlinks, but never a sibling's backlink.
+
+When granted, `kanban_worker_inspect` reports and pages the reviewed commit's bytes,
+not the checkout's line-ending normalization. Its source digest is the one
+`kanban_worker_verify` requires for the copied recipe source. Review inspection,
+materialization, and the final verification comparison refuse a checkout with
+tracked or staged changes (`source_changed`). Implementation inspection continues
+to include working-tree edits. Explicitly granted extra source files are read from
+the checkout in both roles.
+Frozen inventories use one Git batch size check before buffering any blobs, then
+one batch read of those same index object IDs. Entry and byte limits still apply;
+no checkout filters or line-ending conversion run during the copy.
 
 The injected `KANBAN_GUIDANCE` covers both graph shapes, `kanban_complete`, the same-card review loop, and `kanban_block` for genuine blockers.
 
@@ -140,6 +166,14 @@ So lane authors don't have to reimplement these:
 - **Stale claim TTL** — a worker that claims and then never heartbeats / completes / blocks gets reclaimed after `DEFAULT_CLAIM_TTL_SECONDS` (15 min default) — but only if the worker process has actually died. A live worker (slow model spending 20+ min in one tool-free LLM call) gets the claim *extended* instead of killed; only a dead PID is reclaimed.
 - **Crashed worker** — a worker whose host-local PID has vanished is detected by `detect_crashed_workers` and reaped; the task increments `consecutive_failures` and may auto-block when the breaker trips.
 - **Run-level retry** — when a task is retried (post-block, post-crash, post-reclaim), the worker can use the `expected_run_id` parameter on terminating tools to fail fast if its own run was already superseded.
+- **Candidate-mismatch rollback** — direct claims hold admission through ownership
+  recheck, prepared-worktree discard, and run-fenced failure recording. A successor
+  run receives no failure counter, claim release, or event from the losing attempt.
+  Worktree reuse is recorded where the resolver decides to reuse it: an existing
+  operator-created checkout is never marked as attempt-created for rollback removal.
+  Rollback waits up to one second for admission. If the lock stays unavailable, it
+  preserves the checkout and reports that the claim remains open, with the run ID
+  for operator recovery; it never reports an unperformed release.
 - **Per-task max runtime** — `task.max_runtime_seconds` hard-caps wall-clock time per run, regardless of PID liveness. Catches genuinely-deadlocked workers that the live-PID extension would otherwise keep running.
 - **Stranded-task detection** — a ready task whose assignee never produces a claim within `kanban.stranded_threshold_seconds` (default 30 min) shows up in `hermes kanban diagnostics` as a `stranded_in_ready` warning. Severity escalates to error at 2x the threshold and critical at 6x. Catches typo'd assignees, deleted profiles, and down external worker pools in one signal — identity-agnostic, no per-board allowlist to curate.
 - **Running with open parents** — a `running` card whose direct parent is not `done`/`archived` (the parent reopened mid-run, or the link predates the running-child refusal) shows a `running_with_open_parents` warning: the dependency gate is not serialising the two runs and `kanban_complete` will be refused until the parent finishes. Read-only; suggests `hermes kanban unlink`.
