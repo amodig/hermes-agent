@@ -719,7 +719,7 @@ def _validate_worktree_registration(repo_root: Path, target: Path) -> None:
         info = pointer.lstat()
         if target.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
             raise ValueError
-        contents = pointer.read_text(encoding="utf-8").strip()
+        contents = pointer.read_text(encoding="utf-8-sig").strip()
         if not contents.startswith("gitdir: ") or not contents[8:].strip():
             raise ValueError
         git_dir = (target / contents[8:].strip()).resolve()

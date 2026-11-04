@@ -1183,7 +1183,7 @@ def _run_recovery_case(root: Path, *, policy_root: Path, image_store: Path) -> d
         "policy_sha": _recovery_git(policy_root, "rev-parse", "HEAD"),
         "policy_source_digest": _tree_digest(policy_root),
         "driver_sha256": sha256_file(Path(__file__)),
-        "image": {"reference": PYTHON_IMAGE, **json.loads((image_store / "inventory.json").read_text())["images"][PYTHON_IMAGE]},
+        "image": {"reference": PYTHON_IMAGE, **json.loads((image_store / "inventory.json").read_text(encoding="utf-8-sig"))["images"][PYTHON_IMAGE]},
         "recipe": {"id": "offline", **OFFLINE_RECIPE}, "profiles": {}, "graphs": {},
     }
     graphs = []
@@ -1224,7 +1224,7 @@ def _run_recovery_case(root: Path, *, policy_root: Path, image_store: Path) -> d
             "recipes": {} if variant == "inspect_only" else {"offline": OFFLINE_RECIPE},
         })
     policy = {"protocol": 1, "image_store": str(image_store), "workspaces": workspaces}
-    (root / "hermes" / "config.yaml").write_text(yaml.safe_dump({"toolsets": ["kanban"], "kanban": {"worker_execution": policy}}))
+    (root / "hermes" / "config.yaml").write_text(yaml.safe_dump({"toolsets": ["kanban"], "kanban": {"worker_execution": policy}}), encoding="utf-8")
     receipt["fixture_policy_digest"] = sha256_bytes(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode())
     receipt["fixture_policy"] = policy
     active = {}
@@ -1237,16 +1237,16 @@ def _run_recovery_case(root: Path, *, policy_root: Path, image_store: Path) -> d
             for role in ("implementer", "reviewer", "tester"):
                 home = root / "hermes" / "profiles" / role
                 write_hermes_home(home, server.base_url)
-                fake = yaml.safe_load((home / "config.yaml").read_text())
+                fake = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8-sig"))
                 source = policy_root / "profiles" / role
-                config = yaml.safe_load((source / "config.yaml").read_text())
+                config = yaml.safe_load((source / "config.yaml").read_text(encoding="utf-8-sig"))
                 config["model"] = fake["model"]
                 config["memory"] = {"memory_enabled": False, "user_profile_enabled": False}
                 config.pop("remnic", None)
                 config["hooks"] = {}
                 config["plugins"]["enabled"] = ["cto-consequence-guard"]
                 config["telemetry"] = fake["telemetry"]
-                (home / "config.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
+                (home / "config.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
                 shutil.copyfile(source / "SOUL.md", home / "SOUL.md")
                 plugin = home / "plugins" / "cto-consequence-guard"
                 plugin.mkdir(parents=True)
@@ -1359,7 +1359,7 @@ def _run_recovery_case(root: Path, *, policy_root: Path, image_store: Path) -> d
     finally:
         connection.close()
         # Retain observations even on a failed assertion, outside teardown's reach.
-        (root / "recovery-observations.json").write_text(json.dumps(receipt, indent=2, sort_keys=True))
+        (root / "recovery-observations.json").write_text(json.dumps(receipt, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def _tree_digest(root: Path) -> str:
@@ -1511,7 +1511,7 @@ def main(argv: list[str] | None = None) -> int:
                 if case == "recovery":
                     observations = root / case / "recovery-observations.json"
                     if observations.is_file():
-                        receipts[case] = json.loads(observations.read_text())
+                        receipts[case] = json.loads(observations.read_text(encoding="utf-8-sig"))
                 _cancel_worker()
                 raise
             if args.receipt:

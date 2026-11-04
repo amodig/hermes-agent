@@ -106,7 +106,7 @@ def write_startup_inputs(home: Path, snapshot: dict) -> None:
 
 def require_unchanged_startup_inputs(home: Path, project_env: Path, secondary_homes=(), *,
                                      pid: int, start_time: float, check_authority: bool = True) -> dict:
-    snapshot = json.loads((home / _SNAPSHOT_NAME).read_text(encoding="utf-8"))
+    snapshot = json.loads((home / _SNAPSHOT_NAME).read_text(encoding="utf-8-sig"))
     if (not isinstance(snapshot, dict) or snapshot.get("pid") != pid
             or snapshot.get("start_time") != start_time or not isinstance(snapshot.get("inputs"), dict)):
         raise ValueError("startup input snapshot does not identify the serving gateway PID/start time")

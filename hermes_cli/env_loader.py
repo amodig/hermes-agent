@@ -455,6 +455,24 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
         pass  # best-effort — don't block gateway startup
 
 
+def _extend_startup_inputs() -> None:
+    """Record gateway startup inputs when this build carries the recorder.
+
+    The worker source slice ships only the modules a bootstrap needs, so the
+    gateway-only recorder may be absent there. Absent means "records nothing";
+    installed verification still refuses for a missing snapshot (fail closed),
+    so the worker must not die on the import.
+    """
+
+    try:
+        from hermes_cli.gateway_startup_inputs import extend_gateway_startup_inputs
+    except ModuleNotFoundError as exc:
+        if exc.name != "hermes_cli.gateway_startup_inputs":
+            raise
+        return
+    extend_gateway_startup_inputs()
+
+
 def load_hermes_dotenv(
     *,
     hermes_home: str | os.PathLike | None = None,
@@ -524,8 +542,7 @@ def load_hermes_dotenv(
 
     # A gateway may select its managed layer in dotenv. Record its metadata
     # before either the secret-source config or the managed overlay reads it.
-    from hermes_cli.gateway_startup_inputs import extend_gateway_startup_inputs
-    extend_gateway_startup_inputs()
+    _extend_startup_inputs()
 
     # The override=True loads above wrote the raw .env line (``__BITWARDEN_MANAGED__`` placeholder, stale
     # token) back over a value an external source resolved on an earlier call, and the source pass below is a
@@ -553,9 +570,9 @@ def load_hermes_dotenv(
         _apply_external_secret_sources(home_path)
     # Secret sources may change authority selectors too; freeze that layer before
     # consumption, then record the final selection if managed dotenv redirects it.
-    extend_gateway_startup_inputs()
+    _extend_startup_inputs()
     _apply_managed_env(load_pass=load_pass)
-    extend_gateway_startup_inputs()
+    _extend_startup_inputs()
 
     # config.yaml owns terminal.*, but the override=True loads above let a stale TERMINAL_ENV=docker in
     # ~/.hermes/.env win on every reload and flip the backend mid-session in long-lived processes.
