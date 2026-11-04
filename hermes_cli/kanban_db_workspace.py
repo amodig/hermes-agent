@@ -943,11 +943,12 @@ def _index_flagged_paths(worktree: Path) -> list[str]:
 
 
 def _clean_tree(path: Path, label: str) -> None:
-    """Refuse to move a checkout that holds anything git would have to overwrite.
+    """Refuse local tracked changes or untracked files before reusing a checkout.
 
-    Untracked files count: a reviewer's scratch notes are still work, and only the
-    operator can decide they are disposable. A failing ``git status`` never reads as
-    clean.
+    A reviewer's scratch notes are still work, and only the operator can decide
+    they are disposable. A failing ``git status`` never reads as clean. Ignored
+    files are invisible here; checkout must use ``--no-overwrite-ignore`` so a
+    candidate's tracked file cannot silently replace them.
     """
     result = _git(path, "status", "--porcelain", "--untracked-files=all", timeout=60)
     if result.returncode != 0:
@@ -1066,11 +1067,13 @@ def _role_worktree(
 ) -> tuple[Path, str, bool]:
     """Materialize this role card's own worktree at ``candidate_head``.
 
-    Returns ``(path, branch, created)`` with an empty branch for the detached checkout
-    that a role worktree normally is. An existing canonical worktree is reused only when it
-    is already ``candidate_head``; a clean named-branch checkout of another commit is
-    moved onto the candidate with a non-force detach (its branch ref is untouched),
-    and anything dirtier is refused with the files preserved.
+    Returns ``(path, branch, created)`` with an empty branch for the detached
+    checkout that a role worktree normally is. An existing canonical worktree
+    must have its own exact registration backlink before any status or checkout
+    can touch its index. It is reused only when already at ``candidate_head``;
+    a clean named-branch checkout of another commit is moved onto the candidate
+    with a non-force detach (its branch ref is untouched). Local files, including
+    ignored collisions, are preserved on refusal.
     """
     if not _COMMIT_ID.match(candidate_head or ""):
         raise ValueError(

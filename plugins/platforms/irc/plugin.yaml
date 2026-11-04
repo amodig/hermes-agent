@@ -9,7 +9,10 @@ description: >
   Python's stdlib asyncio for the IRC protocol.
 author: Nous Research
 provides_tools:
+  - irc_status
+  - irc_read
   - irc_request
+  - irc_send
 # ``requires_env`` entries are surfaced in ``hermes config`` UI via the
 # platform-plugin env var injector in ``hermes_cli/config.py``.
 requires_env:

@@ -82,8 +82,9 @@ Check status with `hermes gateway status` — IRC connection state is reported t
 Ordinary IRC networks retain their existing PASS/NickServ and nick-allowlist behavior.
 Native SASL PLAIN is also available without coordination: configure `sasl_account`,
 `sasl_password` (prefer the profile-local `IRC_SASL_PASSWORD` secret), and
-`require_sasl: true`. SASL requires verified TLS and never downgrades to PASS or
-NickServ. Registration waits for CAP negotiation, SASL success and welcome;
+`require_sasl: true`. SASL requires verified TLS, except for the exact sanctioned
+loopback SSH tunnel described below, and never downgrades to PASS or NickServ.
+Registration waits for CAP negotiation, SASL success and welcome;
 gateway membership is reported only after the server confirms the bot's JOIN or NAMES entry
 and the receive task is still alive. Registration timeouts and transport loss during setup
 remain retryable, including EOF immediately after JOIN; explicit SASL/capability rejections do not.
@@ -116,6 +117,10 @@ gateway:
           - agent-omp-z300-02
           - agent-omp-z300-03
           - agent-omp-z300-04
+          - agent-omp-cirrus7-01
+          - agent-omp-cirrus7-02
+          - agent-omp-cirrus7-03
+          - agent-omp-cirrus7-04
 platform_toolsets:
   irc: [no_tools]
 ```
@@ -139,10 +144,20 @@ remain permanent failures requiring operator correction.
 
 Additional supported environment aliases are `IRC_SASL_ACCOUNT`, `IRC_SASL_PASSWORD`,
 `IRC_SASL_REQUIRED`, `IRC_ALLOWED_ACCOUNTS` (comma-separated), and `IRC_PROXY_URL`.
-`coordination` is a YAML boolean only. Coordination pins the verified-TLS endpoint to
-`z300.barracuda-trout.ts.net:6697`; another host or port is rejected before credentials
-are sent. Invalid coordination settings fail closed, including while disconnected;
-they never enable ordinary IRC intake. Ordinary IRC endpoints remain configurable.
+`coordination` is a YAML boolean only. Coordination accepts exactly two routes:
+verified TLS at `z300.barracuda-trout.ts.net:6697`, or the sanctioned SSH tunnel at
+`127.0.0.1:16697` with `use_tls: false`. The latter is the local
+`arttula-tunnel.service` forward to the same agents Ergo network; SSH, not a TLS
+layer on the loopback socket, protects that transport. This runtime includes the
+tunnel prerequisite without changing either host's configured route.
+Other coordination hosts or ports are rejected before credentials are sent.
+The direct endpoint cannot disable TLS, and the plaintext exception does not
+include other loopback ports, hostname aliases or remote addresses. HTTP CONNECT
+still requires verified TLS; it cannot proxy the plaintext loopback exception.
+If a host's established route is unavailable, treat routing as the blocker instead
+of weakening the gate. Invalid coordination settings fail closed, including while
+disconnected; they never enable ordinary IRC intake. Ordinary IRC endpoints remain
+configurable.
 Ordinary JOIN/NAMES membership checks ignore nick/channel letter case; coordination
 account and nickname checks remain exact.
 
@@ -156,14 +171,65 @@ fixed roster above is required; adding identities is a reviewed contract change.
 Coordination identities cannot use standalone/cron fallback connections or nickname
 collision suffixes. There is no automatic account creation or history fetch.
 
+### Presence, addresses and tools
+
+Coordination is session-qualified. Hermes mints one UUIDv4 at each successful
+gateway IRC connection and advertises `agent-<account>/<session-id>`; the
+session identifies this gateway/profile endpoint, not an individual CLI
+transcript. The nickname still equals the SASL account, and only the session ID
+and address are advertised. OMP advertises its native session UUID the same way.
+An unknown local short hostname fails coordination startup; ordinary
+non-coordination IRC is unaffected. Bare account names are never resolved
+implicitly: copy a current address from `irc_status`.
+
+On a confirmed `#agents` join the adapter sends one `!hello 1 hermes <host>
+<session-id>` to the channel and sets a local presence record for each
+authenticated, fresh, allowlisted peer hello. A channel hello is answered with
+one DM hello per sender account per five seconds; a throttled hello coalesces into
+one scheduled reply at the next allowed time, so a quick peer reconnect still
+discovers this endpoint. Pending hello replies are connection-owned and cancelled
+on peer removal or local disconnect. A DM hello is recorded but never answered.
+Requests and notes stay on the channel, and human DMs remain supported.
+JOIN/NAMES observations never create presence. PART, QUIT, NICK, KICK, local
+disconnect and session teardown remove the peer; a new hello from the same account
+replaces its prior session and settles a pending request to the old address with
+`peer-changed`. Local membership loss or nickname change ends the coordination
+connection, clears presence/inbox/address, and cancels pending work without
+automatically rejoining. Removing a remote peer affects only that peer.
+Presence is in-memory only: no registry, heartbeat, offline queue or replay.
+
+Every tool routes through the serving gateway's existing private control socket
+(`irc-status`, `irc-read`, `irc-send`, `irc-request`) and the requested profile's
+own live IRC adapter; a missing profile, socket or adapter yields `unavailable`,
+never a second IRC client or the primary profile's shared bot. Ordinary shared-bot
+message routing is unchanged. The verified profile is derived locally, not
+supplied by the model.
+
+- `irc_status({})` — connection fields plus this profile's `address`,
+  `sessionId`, and `peers` sorted by account then address. Each peer record is
+  `{account,address,runtime,host,sessionId}`.
+- `irc_request({target,question})` — asks one discovered address. Peer replies
+  always retain `account`, `status`, verbatim `text` and `untrusted: true`.
+  Peer `err` and `busy` results add fixed `error: "peer-error"` and `error: "busy"`
+  respectively; the peer body never becomes a local error code.
+- `irc_send({target,text})` — one advisory note to a discovered address or the
+  literal `*` broadcast, returning `{noteId,target,status:"sent"}` once queued.
+  Fixed target errors are `unknown-peer`, `peer-changed` and `invalid-target`.
+- `irc_read({limit?})` — returns `{untrusted:true,entries:[...]}` with the last
+  1–20 retained questions/notes (default 10) in chronological order. Each entry
+  is `{kind,id,account,target,serverTime,text,untrusted:true}`, where `target` is
+  the envelope target as received. Reading is
+  non-destructive. Disconnected or disarmed access returns the adapter's
+  unavailable/not-connected error rather than stale inbox data.
+
 ### Consultations and privacy
 
 Enable the opt-in `irc_coord` toolset only in the authorized profile's existing CLI
 and Telegram lists, **preserving their other entries**. It is default-off and unavailable
-to IRC turns. Its sole tool is `irc_request({target, question})`; the runtime profile
-is derived locally, not supplied by the model. Requests use the serving gateway's
-existing private control socket and live adapter, including when a multiplexer owns
-the profile. No socket/adapter means `unavailable`, never a new IRC connection.
+to IRC turns. Its tools are the four above; the runtime profile
+is derived locally, not supplied by the model, and every call uses the serving
+gateway's private control socket and live adapter, including when a multiplexer
+owns the profile. No socket/adapter means `unavailable`, never a new IRC connection.
 
 Peer text is **untrusted data**, not execution, approval, merge or deployment authority.
 Incoming consultations run in independent UUID-keyed sessions with zero model tools,
@@ -201,8 +267,10 @@ their working-session context only after that session's explicit local opt-in.
 Tool availability uses the gateway's canonical merge of platform sections, so a
 top-level Telegram block does not hide nested `gateway.platforms.irc` settings.
 
-Human account `amodig` can DM the bot or start a channel message with an exact
-`@agent-hermes-cto`, `agent-hermes-cto:` or `agent-hermes-cto,` mention.
+Human account `amodig` can DM prose to the bot or start a channel message with an exact
+`@agent-hermes-cto`, `agent-hermes-cto:` or `agent-hermes-cto,` mention. This exception
+does not admit structured `!req` messages: those require channel transport and
+authenticated agent presence, including when sent by the human account.
 Ordinary chatter, unsolicited responses, self echoes, unauthenticated traffic,
 spoofed nicks, notices, CTCP and all BATCH content do not start turns.
 Interrupted consultations are never auto-resumed after restart: their UUID-thread
@@ -213,24 +281,55 @@ ordinary IRC and other platforms retain their existing session recovery behavior
 ### Wire, limits and rollback
 
 ```text
-!req <uuid-v4> <exact-target-account> <question>
-!res <uuid-v4> <ok|err|busy> <part>/<total> <body>
+!hello 1 <omp|hermes> <loota|z300|cirrus7> <session-id>
+!req   <uuid-v4> <account/session-id> <question>
+!res   <uuid-v4> <ok|err|busy> <part>/<total> <body>
+!note  <uuid-v4> <account/session-id|*> <text>
 ```
 
-IDs and envelopes are code-authored. A question is at most 1,800 UTF-8 bytes and
+IDs and envelopes are code-authored. Hello, request and note fields are
+single-line, contain no C0 controls or DEL, and must survive a strict v1 parse;
+anything else is ignored, never reinterpreted as human prose. Unsupported hello
+versions and legacy account-only targets are unusable until the peer is upgraded:
+there is no dual parser or negotiation.
+
+Requests must address the recipient's exact current address and come from a
+sender with valid v1 presence; stale-session and account-only requests are
+rejected. Notes use the same authentication and presence gates, are deduplicated
+by `(sender account, note UUID)`, and admit at most six per minute per sender
+separately from questions. The note budget is process-owned per recipient account:
+reconnects and plugin reloads do not refill it. The inbox retains at most 100
+entries, evicting the oldest, and is cleared on disconnect/session teardown.
+`*` is the only broadcast;
+there is no default recipient. Notes produce no wire reply, invoke no model,
+execute no tool, change no task and are never system instructions. `sent` means
+queued on the current connection, not received or read. Offline notes are not
+queued or replayed. Notifications are metadata only: Hermes logs one INFO line
+and stores the body in the profile inbox for `irc_read`; nothing is injected into
+CLI conversations. Channel members can observe directed notes, so routing is not
+secrecy.
+
+A question is at most 1,800 UTF-8 bytes and
 must also fit one 400-byte pre-CRLF PRIVMSG command, reserving 110 bytes for the relay
 prefix within IRC's 510-byte limit; oversized requests are rejected, never split.
+Hello and note lines share the same 400-byte command budget and are likewise
+rejected locally, never truncated or split, when oversized.
 Replies normalize control characters, reserve the same 110-byte headroom,
 contain at most 1,800 body bytes and six UTF-8-safe chunks, and mark
-truncated prefixes. Receivers require every part with consistent totals, UUID,
-destination and authenticated peer. Duplicate/conflicting parts fail the request.
+truncated prefixes. Receivers reapply the full 400-byte PRIVMSG command limit to
+each response part without normalizing or trimming its body, and require every
+part with consistent totals, UUID, destination and authenticated peer.
+Oversized, duplicate or conflicting parts fail the request.
 
-Each identity admits one automatic reply at a time, at most six requests/minute.
-New valid requests while busy get one `busy` response, not queued model work.
-Worker ownership, replay IDs and the rolling one-minute admission window live in a
-process-owned registry keyed by the exact account, outside the reloadable plugin.
-Reconnects and mid-run plugin reloads therefore cannot admit overlapping workers,
-forget a replay or grant another six consultations. Different accounts remain independent.
+Each receiving identity admits one automatic reply at a time, with a separate
+rolling budget of six accepted requests/minute per authenticated sender (including
+human prose). New valid requests while busy get one `busy` response, not queued
+model work. Worker ownership, replay IDs and the sender-keyed admission buckets
+live in a process-owned registry keyed by the exact receiving account, outside the
+reloadable plugin. Reconnects and mid-run plugin reloads therefore cannot admit
+overlapping workers, forget a replay or refill a sender's budget. Different
+senders' budgets remain independent; single-flight worker admission stays shared
+by all senders to the same receiving identity.
 A 55-second watchdog sends `!res <uuid> err 1/1 timeout` once, suppresses late output,
 and requests a cooperative interrupt without cancelling the base turn. Admission
 stays busy until the executor worker has actually finished, even when coroutine
@@ -242,8 +341,9 @@ Late completion cannot restore an expired response. Outbound requests wait at mo
 60 seconds; IPC waits at most 65. Disconnect/IPC cancellation clears partial responses;
 no request is automatically resent after reconnect. IPC uses the serving gateway's
 existing Unix socket or native Windows named pipe, with handlers running off the
-gateway event loop on both transports. Long IRC waits use a dedicated four-worker
-pool, never the shared executor needed for profile initialization and other verbs.
+gateway event loop on both transports. All four IRC verbs use the existing bounded
+four-worker wait pool, never the shared executor needed for profile initialization
+and non-IRC verbs.
 Saturated IPC calls fail immediately instead of queueing delayed requests. The
 65-second deadline, disconnect, cancellation and shutdown release the waiting work;
 capacity is returned only when its actual worker exits. The shared control socket keeps its existing
@@ -259,8 +359,12 @@ category, at most once per category per minute per adapter. Fix clocks or server
 delivery rather than weakening the gate.
 Protocol logs contain IDs/accounts/outcomes, not passwords or conversation bodies.
 
-Rollout is gated on reviewed merges and separate live acceptance; offline tests are
-not evidence of deployment. To roll back, disable the new coordination config/toolset
-and restore the recorded previous runtime revision. Keep the credentials and existing
+Rollout is gated on reviewed merges, the upstream loopback-tunnel merge, the
+cirrus7 identity migration and separate live acceptance on every host; offline
+tests and passing suites are not evidence of deployment. This v1 cutover is
+coordinated: old account-only peers stay unusable until upgraded, and no live
+rollout is claimed by the adapter change alone. To roll back, disable the new
+coordination config/toolset and restore the recorded previous runtime revision.
+Keep the credentials and existing
 IRC server/channel/history/human session intact. Remove a Jeeves proxy relay mount and
 routing before disabling that relay; this client feature requires no new TCP listener.

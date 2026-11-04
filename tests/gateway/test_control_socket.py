@@ -264,7 +264,8 @@ def test_default_identify_payload_shape(home: Path, monkeypatch):
         assert await server.start()
         try:
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, lambda: identify_gateway(home))
+            # Check the payload contract, not cold metadata collection latency.
+            return await loop.run_in_executor(None, lambda: identify_gateway(home, timeout=10))
         finally:
             await server.stop()
 
@@ -359,6 +360,13 @@ def test_collect_fleet_versions_falls_back_to_state_file(tmp_path: Path, monkeyp
     )
     monkeypatch.setattr(
         "gateway.control_socket.identify_gateway", lambda h, **kw: None
+    )
+    # The fallback classifier compares the served checkout with the updater's.
+    # Pin that to this checkout: the real probe reads the pytest process's own
+    # VIRTUAL_ENV, which points at a different checkout when testing a worktree.
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt._gateway_code_root",
+        lambda pid, home: ur._updater_code_root(),
     )
     (home / "gateway_state.json").write_text(
         json.dumps(
@@ -484,8 +492,10 @@ def test_windows_pipe_query_is_bounded_when_the_peer_never_answers(home: Path, m
 
 
 def test_irc_request_native_socket_profile_scope_and_disconnect(home, monkeypatch):
+    PEER_ADDRESS = "agent-jeeves/0f5e4d3c-2b1a-8c9d-8e7f-6a5b4c3d2e1f"
     from contextlib import asynccontextmanager
     from types import SimpleNamespace
+    from gateway.config import Platform
     from gateway.irc_coordination import irc_request_verb
     from hermes_constants import get_hermes_home, set_hermes_home_override, reset_hermes_home_override
     import gateway.run
@@ -512,19 +522,16 @@ def test_irc_request_native_socket_profile_scope_and_disconnect(home, monkeypatc
                     await asyncio.Event().wait()
                 finally:
                     unwound.set()
-            return {"requestId": request_id, "account": target, "status": "ok", "text": "untrusted peer data"}
+            return {"requestId": request_id, "account": target.split("/")[0], "status": "ok",
+                    "text": "untrusted peer data", "untrusted": True}
 
         adapter = SimpleNamespace(coordination=True, is_connected=True, request_peer=request_peer)
         homes = {name: home / name for name in ("alpha", "beta")}
 
-        def authorization_adapter(platform, profile):
-            assert platform.value == "irc"
-            assert get_hermes_home() == homes[profile]
-            return adapter
-
         runner = SimpleNamespace(
             served_profile_names=lambda: list(homes), _served_profile_homes=homes,
-            _primary_profile_name="alpha", _authorization_adapter=authorization_adapter,
+            _primary_profile_name="alpha", adapters={Platform("irc"): adapter},
+            _profile_adapters={"beta": {Platform("irc"): adapter}},
             _async_scope_or_null=lambda factory, path: factory(path))
         handler = irc_request_verb(runner, asyncio.get_running_loop())
         server = GatewayControlServer(home, verb_handlers={"irc-request": handler})
@@ -533,19 +540,19 @@ def test_irc_request_native_socket_profile_scope_and_disconnect(home, monkeypatc
             for profile in ("alpha", "beta", "alpha"):
                 result = await asyncio.to_thread(
                     query_gateway_control, home, "irc-request",
-                    params={"profile": profile, "target": "agent-jeeves", "question": "hello"}, timeout=3)
+                    params={"profile": profile, "target": PEER_ADDRESS, "question": "hello"}, timeout=3)
                 assert result["status"] == "ok" and result["account"] == "agent-jeeves"
             assert [call[0] for call in calls] == [homes["alpha"], homes["beta"], homes["alpha"]]
             for params, error in [
-                ({"profile": "other", "target": "agent-jeeves", "question": "hello"}, "unavailable"),
+                ({"profile": "other", "target": PEER_ADDRESS, "question": "hello"}, "unavailable"),
                 ({"profile": "alpha", "target": "agent-*", "question": "hello"}, "invalid-request"),
-                ({"profile": "alpha", "target": "agent-jeeves", "question": "x" * 1801}, "question-too-large"),
+                ({"profile": "alpha", "target": PEER_ADDRESS, "question": "x" * 1801}, "request-too-long"),
             ]:
                 result = await asyncio.to_thread(query_gateway_control, home, "irc-request", params=params, timeout=3)
                 assert result["error"] == error
             reader, writer = await asyncio.open_unix_connection(str(resolve_client_socket_path(home)))
             writer.write(json.dumps({"protocol": 1, "verb": "irc-request", "params": {
-                "profile": "alpha", "target": "agent-jeeves", "question": "wait"}}).encode() + b"\n")
+                "profile": "alpha", "target": PEER_ADDRESS, "question": "wait"}}).encode() + b"\n")
             await writer.drain()
             await asyncio.wait_for(started.wait(), 3)
             writer.close()
@@ -651,8 +658,10 @@ def test_concurrent_irc_waits_leave_default_executor_and_other_verbs_live(home, 
     import concurrent.futures
     import threading
     from contextlib import asynccontextmanager
+    PEER_ADDRESS = "agent-jeeves/0f5e4d3c-2b1a-8c9d-8e7f-6a5b4c3d2e1f"
     from types import SimpleNamespace
     import gateway.control_socket as control
+    from gateway.config import Platform
     import gateway.irc_coordination as coordination
     import gateway.run
 
@@ -698,7 +707,8 @@ def test_concurrent_irc_waits_leave_default_executor_and_other_verbs_live(home, 
         homes = {f"profile-{index}": home / f"profile-{index}" for index in range(count)}
         runner = SimpleNamespace(
             served_profile_names=lambda: list(homes), _served_profile_homes=homes,
-            _primary_profile_name="profile-0", _authorization_adapter=lambda *args: adapter,
+            _primary_profile_name="profile-0", adapters={Platform("irc"): adapter},
+            _profile_adapters={name: {Platform("irc"): adapter} for name in homes if name != "profile-0"},
             _async_scope_or_null=lambda factory, path: factory(path))
         verb = coordination.irc_request_verb(runner, loop)
 
@@ -734,7 +744,7 @@ def test_concurrent_irc_waits_leave_default_executor_and_other_verbs_live(home, 
             reader, writer = await asyncio.open_unix_connection(str(resolve_client_socket_path(home)))
             clients.append(writer)
             writer.write(json.dumps({"protocol": 1, "id": index, "verb": verb, "params": {
-                "profile": f"profile-{index}", "target": "agent-jeeves", "question": "hold"}}).encode() + b"\n")
+                "profile": f"profile-{index}", "target": PEER_ADDRESS, "question": "hold"}}).encode() + b"\n")
             await writer.drain()
             return asyncio.create_task(reader.readline())
 
@@ -821,3 +831,141 @@ def test_irc_private_wait_pipe_returns_success(home):
             await server.stop()
 
     _run(scenario())
+
+
+def test_irc_verbs_initialize_secondary_profiles_with_one_default_worker(home, monkeypatch):
+    import concurrent.futures
+    import threading
+    from types import SimpleNamespace
+    import gateway.run
+    from gateway.irc_coordination import (
+        irc_read_verb, irc_request_verb, irc_send_verb, irc_status_verb,
+    )
+    from agent.secret_scope import get_secret
+    from gateway.config import GatewayConfig, Platform
+    from gateway.profile_routing import parse_profile_routes
+    from hermes_constants import get_hermes_home
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: home.parent)
+    monkeypatch.setattr("hermes_cli.managed_scope.load_managed_env", lambda: {})
+    scope_threads = []
+    load_scope = gateway.run._load_profile_secret_scope
+
+    def recorded_scope(profile_home):
+        scope_threads.append(threading.current_thread().name)
+        return load_scope(profile_home)
+
+    monkeypatch.setattr(gateway.run, "_load_profile_secret_scope", recorded_scope)
+
+    peer = "agent-jeeves/0f5e4d3c-2b1a-8c9d-8e7f-6a5b4c3d2e1f"
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="single-default"))
+        calls = []
+
+        def make_adapter(profile):
+            inbox = []
+
+            def check_scope():
+                assert get_hermes_home() == homes[profile]
+                assert get_secret("IRC_SCOPE_SENTINEL") == profile
+                calls.append(profile)
+
+            async def request_peer(target, question, *, request_id):
+                check_scope()
+                return {"requestId": request_id, "account": target.split("/")[0], "status": "ok",
+                        "text": f"{profile} answer", "untrusted": True}
+
+            async def send_note(target, text, *, note_id=None):
+                check_scope()
+                inbox.append({"kind": "note", "id": note_id, "account": "peer", "target": target,
+                              "serverTime": "t", "text": text, "untrusted": True})
+                return {"noteId": note_id, "target": target, "status": "sent"}
+
+            def read_inbox(limit=10):
+                check_scope()
+                return {"untrusted": True, "entries": inbox[-limit:]}
+
+            def status_payload():
+                check_scope()
+                return {"connected": True, "address": f"{profile}/session",
+                        "sessionId": "session", "peers": []}
+
+            return SimpleNamespace(coordination=True, is_connected=True, request_peer=request_peer,
+                                   send_note=send_note, read_inbox=read_inbox, status_payload=status_payload)
+
+        homes = {name: home / "profiles" / name for name in ("alpha", "beta", "ops")}
+        for name, profile_home in homes.items():
+            profile_home.mkdir(parents=True)
+            (profile_home / ".env").write_text(f"IRC_SCOPE_SENTINEL={name}\n")
+        runner = object.__new__(gateway.run.GatewayRunner)
+        runner._served_profile_homes = homes
+        runner._primary_profile_name = "alpha"
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.config.profile_routes = parse_profile_routes([
+            {"name": "ops-dm", "platform": "telegram", "profile": "ops", "chat_id": "72719239"}])
+        runner.adapters = {Platform("irc"): make_adapter("alpha"), Platform.TELEGRAM: object()}
+        runner._profile_adapters = {"beta": {Platform("irc"): make_adapter("beta")}, "ops": {}}
+        monkeypatch.setattr(gateway.run, "_multiplex_profile_homes", lambda config: list(homes.items()))
+        # Real runner message routing borrows the primary bot even for IRC. The control
+        # verbs must require ownership, without changing shared-bot Telegram delivery.
+        assert runner._is_shared_bot_satellite("ops")
+        assert runner._authorization_adapter(Platform("irc"), "ops") is runner.adapters[Platform("irc")]
+        assert runner._authorization_adapter(Platform.TELEGRAM, "ops") is runner.adapters[Platform.TELEGRAM]
+        server = GatewayControlServer(home, verb_handlers={
+            "irc-status": irc_status_verb(runner, loop),
+            "irc-read": irc_read_verb(runner, loop),
+            "irc-send": irc_send_verb(runner, loop),
+            "irc-request": irc_request_verb(runner, loop),
+        })
+        assert await server.start()
+
+        async def call(verb, profile, **params):
+            # The async client must not itself occupy the sole default worker.
+            reader, writer = await asyncio.open_unix_connection(str(resolve_client_socket_path(home)))
+            try:
+                writer.write(json.dumps({"verb": verb, "params": {"profile": profile, **params}}).encode() + b"\n")
+                await writer.drain()
+                response = json.loads(await asyncio.wait_for(reader.readline(), 3))
+                assert response["ok"], response
+                return response["result"]
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        try:
+            for profile in ("alpha", "beta", "alpha"):
+                assert (await call("irc-read", profile))["entries"] == []
+                status = await call("irc-status", profile)
+                assert status["address"] == f"{profile}/session" and status["peers"] == []
+            sent = await call("irc-send", "alpha", target=peer, text="alpha note")
+            assert sent["status"] == "sent" and sent["target"] == peer
+            await call("irc-send", "beta", target="*", text="beta note")
+            assert [e["text"] for e in (await call("irc-read", "alpha"))["entries"]] == ["alpha note"]
+            assert [e["text"] for e in (await call("irc-read", "beta"))["entries"]] == ["beta note"]
+            assert (await call("irc-read", "alpha", limit=0))["error"] == "invalid-limit"
+            ok = await call("irc-request", "beta", target=peer, question="hello")
+            assert ok["status"] == "ok" and ok["text"] == "beta answer" and ok["untrusted"] is True
+            assert (await call("irc-send", "alpha", target="agent-jeeves", text="x"))["error"] == "invalid-target"
+            assert (await call("irc-request", "alpha", target="agent-jeeves", question="x"))["error"] == "invalid-request"
+            assert (await call("irc-status", "other"))["error"] == "unavailable"
+            calls_before = list(calls)
+            for verb, params in (
+                ("irc-status", {}), ("irc-read", {}),
+                ("irc-send", {"target": "*", "text": "must not reach primary"}),
+                ("irc-request", {"target": peer, "question": "must not reach primary"}),
+            ):
+                assert (await call(verb, "ops", **params))["error"] == "unavailable"
+            assert calls == calls_before
+            assert [e["text"] for e in (await call("irc-read", "alpha"))["entries"]] == ["alpha note"]
+            assert runner._authorization_adapter(Platform.TELEGRAM, "ops") is runner.adapters[Platform.TELEGRAM]
+            assert scope_threads and all(name.startswith("single-default") for name in scope_threads)
+            assert get_hermes_home() == home  # Each profile scope unwound on the loop.
+        finally:
+            await server.stop()
+
+    _run(scenario())
+
